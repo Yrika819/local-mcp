@@ -1,5 +1,6 @@
 mod approvals;
 mod config;
+mod fallback;
 mod mcp;
 mod sandbox;
 
