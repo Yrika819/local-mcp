@@ -11,9 +11,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, config, sandbox};
+use crate::{approvals, config, fallback, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const HOST_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Job {
     session_id: String,
@@ -107,7 +108,8 @@ fn tools() -> Value {
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
+        {"name":"codex_fallback","description":"Hand a task to Codex CLI when Local MCP is blocked by an operational environment restriction. The router uses GPT-5.6 Luna low for execution/recovery-only work and medium when code repair is explicitly required. Policy/safety refusals, semantic failures, authority/hash mismatches, remote races, and CI failures are rejected instead of bypassed. Codex keeps its normal workspace-write sandbox and automatic approval review. Requires local-mcp approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1},"blocker":{"type":"string","minLength":1},"phase":{"type":"string"},"requires_code_change":{"type":"boolean","default":false},"remote_side_effect":{"type":"string","enum":["none","not_started","unknown"],"default":"none"},"cwd":{"type":"string"}},"required":["session_id","task","blocker"],"additionalProperties":false}},
+        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode. Returns normally when it finishes within 20 seconds; longer commands continue as a background job and return a job_id for poll_job/stop_job.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
     ]);
     for tool in tools.as_array_mut().unwrap() {
         if let Some(session_id) = tool
@@ -176,6 +178,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
         "stop_job" => stop_job(&args, &session).await,
+        "codex_fallback" => codex_fallback(&args, &session).await,
         "without_sandbox" => without_sandbox(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
     }
@@ -393,9 +396,34 @@ async fn spawn_sandboxed_command(
     let session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
-        let result = sandbox::run(&command, &cwd, &roots, None)
-            .await
-            .and_then(render_output);
+        let output = sandbox::run(&command, &cwd, &roots, None).await;
+        let result = match output {
+            Ok(output) => {
+                if output.status != 0
+                    && let Some(reason) =
+                        fallback::auto_operational_reason(&command, &output.stdout, &output.stderr)
+                {
+                    let blocker = format!(
+                        "{reason}: exit={}\nstdout:\n{}\nstderr:\n{}",
+                        output.status, output.stdout, output.stderr
+                    );
+                    match run_exact_command_codex_fallback(&session_id, &command, &cwd, &blocker)
+                        .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(fallback_error) => {
+                            let original = render_output(output).unwrap_err();
+                            Err(anyhow::anyhow!(
+                                "{original:#}\nautomatic Codex fallback also failed: {fallback_error:#}"
+                            ))
+                        }
+                    }
+                } else {
+                    render_output(output)
+                }
+            }
+            Err(error) => Err(error),
+        };
         report_command_finished(session_id, &task_command, &result).await;
         result
     });
@@ -489,6 +517,120 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+async fn codex_fallback(args: &Value, session: &config::Session) -> Result<Value> {
+    let task = args
+        .get("task")
+        .and_then(Value::as_str)
+        .context("missing task")?;
+    anyhow::ensure!(task.len() <= 128 * 1024, "task is too large");
+    let blocker = args
+        .get("blocker")
+        .and_then(Value::as_str)
+        .context("missing blocker")?;
+    anyhow::ensure!(blocker.len() <= 64 * 1024, "blocker is too large");
+    let phase = args.get("phase").and_then(Value::as_str);
+    let requires_code_change = args
+        .get("requires_code_change")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let remote_side_effect = args
+        .get("remote_side_effect")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let route = fallback::route(blocker, requires_code_change, remote_side_effect)?;
+    let cwd = cwd(args, &session.cwd)?;
+    let command = fallback::codex_command(&cwd, route.effort)?;
+    let prompt = fallback::handoff_prompt(&cwd, task, blocker, phase, route);
+
+    if !approvals::request(
+        &session.id,
+        "codex_fallback",
+        format!(
+            "model={} effort={} cwd={}{}",
+            fallback::model(),
+            route.effort.as_str(),
+            cwd.display(),
+            if route.recovery_only {
+                " mode=recovery-only"
+            } else {
+                ""
+            }
+        ),
+        cwd.clone(),
+    )
+    .await?
+    {
+        anyhow::bail!("user denied codex_fallback")
+    }
+
+    let session_id = session.id.clone();
+    let label = format!(
+        "Codex fallback {}/{}",
+        fallback::model(),
+        route.effort.as_str()
+    );
+    approvals::activity(
+        &session_id,
+        format!("Starting {label}"),
+        Some(format!(
+            "└ {}",
+            if route.recovery_only {
+                "recovery-only"
+            } else {
+                "continuation"
+            }
+        )),
+    )
+    .await;
+
+    let task_label = label.clone();
+    let handle = tokio::spawn(async move {
+        let result = sandbox::run_unrestricted(&command, &cwd, Some(prompt.as_bytes()))
+            .await
+            .and_then(render_output);
+        report_command_finished(session_id, &task_label, &result).await;
+        result
+    });
+    store_job(session, label, handle, "Started").await
+}
+
+async fn run_exact_command_codex_fallback(
+    session_id: &str,
+    blocked_command: &[String],
+    cwd: &Path,
+    blocker: &str,
+) -> Result<String> {
+    let route = fallback::route(blocker, false, "none")?;
+    anyhow::ensure!(
+        route.effort == fallback::Effort::Low,
+        "automatic execution fallback must remain low effort"
+    );
+    if !approvals::request(
+        session_id,
+        "codex_fallback",
+        format!(
+            "automatic execution-only fallback: model={} effort=low argv={blocked_command:?}",
+            fallback::model()
+        ),
+        cwd.to_owned(),
+    )
+    .await?
+    {
+        anyhow::bail!("user denied automatic codex fallback")
+    }
+
+    let command = fallback::codex_command(cwd, fallback::Effort::Low)?;
+    let prompt = fallback::exact_command_prompt(cwd, blocked_command, blocker);
+    approvals::activity(
+        session_id,
+        format!("Falling back to {}/low", fallback::model()),
+        Some("└ execution-only operational fallback".to_owned()),
+    )
+    .await;
+    let output = sandbox::run_unrestricted(&command, cwd, Some(prompt.as_bytes())).await?;
+    render_output(output)
+}
+
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
@@ -502,26 +644,33 @@ async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Valu
     {
         anyhow::bail!("user denied without_sandbox")
     }
-    run_and_report(session.id.clone(), command, cwd, true, &[]).await
-}
 
-async fn run_and_report(
-    session_id: String,
-    command: Vec<String>,
-    cwd: PathBuf,
-    unrestricted: bool,
-    roots: &[PathBuf],
-) -> Result<Value> {
     let rendered_command = render_command(&command);
-    approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
-    let output = if unrestricted {
-        sandbox::run_unrestricted(&command, &cwd, None).await
-    } else {
-        sandbox::run(&command, &cwd, roots, None).await
-    };
-    let result = output.and_then(render_output);
-    report_command_finished(session_id, &rendered_command, &result).await;
-    text_result(result?)
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+
+    let session_id = session.id.clone();
+    let task_command = rendered_command.clone();
+    let handle = tokio::spawn(async move {
+        let result = sandbox::run_unrestricted(&command, &cwd, None)
+            .await
+            .and_then(render_output);
+        report_command_finished(session_id, &task_command, &result).await;
+        result
+    });
+
+    let mut handle = handle;
+    match tokio::time::timeout(HOST_FOREGROUND_TIMEOUT, &mut handle).await {
+        Ok(joined) => text_result(joined.context("command task failed")??),
+        Err(_) => {
+            store_job(
+                session,
+                rendered_command,
+                handle,
+                "Backgrounded host command",
+            )
+            .await
+        }
+    }
 }
 
 fn render_command(command: &[String]) -> String {

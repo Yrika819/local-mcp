@@ -72,9 +72,23 @@ image reads, directory listings, file edits with unified diffs and line counts,
 and command start/completion with output, in a compact Codex-style timeline.
 `execute` returns its normal result for commands that finish within 30 seconds.
 Longer commands continue in the background and return a `job_id`; use `poll_job`
-to check for completion or `stop_job` to terminate them. Use `start_command`
-when a command should run in the background immediately without the 30-second
-foreground wait.
+to check for completion or `stop_job` to terminate them. `without_sandbox`
+uses a 20-second foreground limit, then backgrounds long host-native
+commands instead of holding one MCP tool call open indefinitely. Use
+`start_command` when a sandboxed command should run in the background
+immediately without the 30-second foreground wait.
+
+Codex fallback is enabled by default (set `LOCAL_MCP_CODEX_FALLBACK=off` to
+disable it). Operational sandbox failures from supported build/test executables (for example
+VSTest socket/permission restrictions) can be handed to Codex CLI automatically.
+The automatic execution-only route uses GPT-5.6 Luna with low reasoning effort.
+The explicit `codex_fallback` tool uses low effort for execution/recovery-only
+handoffs and medium effort when a code change is explicitly required. Policy
+or safety refusals, semantic/authority/hash failures, remote races, CI failures,
+and commands with remote side effects are not automatically retried. The model
+defaults to `gpt-5.6-luna` and can be overridden with
+`LOCAL_MCP_CODEX_FALLBACK_MODEL`; `LOCAL_MCP_CODEX_CLI_PATH` can override the
+Codex executable path.
 
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
