@@ -90,13 +90,13 @@ fn tools() -> Value {
     #[cfg(windows)]
     let write_file_description = "Write a UTF-8 file directly on the Windows host without a Codex sandbox. Relative paths use the session working directory.";
     #[cfg(not(windows))]
-    let execute_description = "Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.";
+    let execute_description = "Execute argv without a shell in the Local MCP sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. Policy V2 accepted_exit_codes and structured operation metadata are additive.";
     #[cfg(windows)]
-    let execute_description = "Execute argv without a shell directly on the Windows host. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    let execute_description = "Execute argv without a shell directly on the Windows host. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode. Policy V2 metadata is accepted, but executable SANDBOX_PERMISSION fallback requires a sandboxed primary execution and does not apply to this host-native path.";
     #[cfg(not(windows))]
-    let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.";
+    let start_command_description = "Start argv immediately as a background job in the Local MCP sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required. Policy V2 accepted_exit_codes and structured operation metadata are additive.";
     #[cfg(windows)]
-    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode. Policy V2 metadata is accepted, but executable SANDBOX_PERMISSION fallback requires a sandboxed primary execution and does not apply to this host-native path.";
 
     let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
@@ -104,14 +104,56 @@ fn tools() -> Value {
         {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
-        {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"accepted_exit_codes":{"type":"array","items":{"type":"integer"},"maxItems":32},"operation":{"type":"object"},"fallback_depth":{"type":"integer","minimum":0,"maximum":1}},"required":["session_id","command"]}},
+        {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"accepted_exit_codes":{"type":"array","items":{"type":"integer"},"maxItems":32},"operation":{"type":"object"},"fallback_depth":{"type":"integer","minimum":0,"maximum":1}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"codex_fallback","description":"Hand a task to Codex CLI when Local MCP is blocked by an operational environment restriction. The router uses GPT-5.6 Luna low for execution/recovery-only work and medium when code repair is explicitly required. Policy/safety refusals, semantic failures, authority/hash mismatches, remote races, and CI failures are rejected instead of bypassed. Codex keeps its normal workspace-write sandbox and automatic approval review. Requires local-mcp approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1},"blocker":{"type":"string","minLength":1},"phase":{"type":"string"},"requires_code_change":{"type":"boolean","default":false},"remote_side_effect":{"type":"string","enum":["none","not_started","unknown"],"default":"none"},"cwd":{"type":"string"}},"required":["session_id","task","blocker"],"additionalProperties":false}},
+        {"name":"codex_fallback","description":"Policy V2 explicit Codex fallback. Defaults to DIAGNOSE_ONLY and always runs Codex read-only. EXECUTE_AUTHORIZED_OPERATION additionally requires an explicit structured allowlisted operation and exact command; the host, not Codex, executes the generated exact operation and independently verifies it. Platform/safety blocks are terminal.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1},"blocker":{"type":"string","minLength":1},"phase":{"type":"string"},"mode":{"type":"string","enum":["DIAGNOSE_ONLY","EXECUTE_AUTHORIZED_OPERATION"],"default":"DIAGNOSE_ONLY"},"failure_class":{"type":"string","enum":["SANDBOX_PERMISSION","HOST_ENVIRONMENT","TOOL_MISSING","NETWORK_REMOTE","SEMANTIC_FAILURE","PLATFORM_SAFETY","TRANSPORT_FAILURE","UNKNOWN"]},"original_host_reached":{"type":"boolean"},"original_command_started":{"type":"boolean"},"original_command_finished":{"type":"boolean"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"operation":{"type":"object"},"fallback_depth":{"type":"integer","minimum":0,"maximum":1},"cwd":{"type":"string"},"requires_code_change":{"type":"boolean","default":false},"remote_side_effect":{"type":"string","enum":["none","not_started","unknown"],"default":"none"}},"required":["session_id","task","blocker"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode. Returns normally when it finishes within 20 seconds; longer commands continue as a background job and return a job_id for poll_job/stop_job.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
     ]);
+    let operation_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": [
+                    "read_only_command",
+                    "git_stage_paths",
+                    "git_create_ref",
+                    "git_commit",
+                    "git_push_ref",
+                    "github_workflow_dispatch",
+                    "other_remote_mutation",
+                    "unstructured"
+                ]
+            },
+            "authorized": {"type": "boolean", "default": false},
+            "operation_id": {"type": "string", "maxLength": 128},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "source": {"type": "string"},
+            "destination": {"type": "string"},
+            "target": {"type": "string"},
+            "create_only": {"type": "boolean", "default": false},
+            "force": {"type": "boolean", "default": false},
+            "attempt_budget_remaining": {"type": "integer", "minimum": 0, "default": 1},
+            "side_effect_budget_remaining": {"type": "integer", "minimum": 0, "default": 1},
+            "side_effect_state": {
+                "type": "string",
+                "enum": ["CONFIRMED_NOT_PERFORMED", "CONFIRMED_PERFORMED", "UNKNOWN"]
+            }
+        },
+        "required": ["type"]
+    });
     for tool in tools.as_array_mut().unwrap() {
+        if matches!(
+            tool.get("name").and_then(Value::as_str),
+            Some("execute" | "start_command" | "codex_fallback")
+        ) && let Some(operation) = tool.pointer_mut("/inputSchema/properties/operation")
+        {
+            *operation = operation_schema.clone();
+        }
         if let Some(session_id) = tool
             .pointer_mut("/inputSchema/properties/session_id")
             .and_then(Value::as_object_mut)
@@ -367,6 +409,59 @@ async fn start_command(args: &Value, session: &config::Session) -> Result<Value>
     store_job(session, rendered_command, handle, "Started").await
 }
 
+#[derive(Clone)]
+struct ExecutionPolicy {
+    request_id: String,
+    accepted_exit_codes: Vec<i32>,
+    operation: Option<fallback::OperationContract>,
+    fallback_depth: u8,
+    primary_execution_mode: fallback::PrimaryExecutionMode,
+}
+
+fn primary_execution_mode() -> fallback::PrimaryExecutionMode {
+    #[cfg(windows)]
+    {
+        fallback::PrimaryExecutionMode::HostNative
+    }
+    #[cfg(not(windows))]
+    {
+        fallback::PrimaryExecutionMode::Sandboxed
+    }
+}
+
+fn primary_execution_requires_approval(mode: fallback::PrimaryExecutionMode) -> bool {
+    mode == fallback::PrimaryExecutionMode::HostNative
+}
+
+fn ensure_primary_execution_authorized(
+    mode: fallback::PrimaryExecutionMode,
+    approved: bool,
+    operation: &str,
+) -> Result<()> {
+    if primary_execution_requires_approval(mode) && !approved {
+        anyhow::bail!("user denied {operation}");
+    }
+    Ok(())
+}
+
+fn execution_policy(args: &Value) -> Result<ExecutionPolicy> {
+    let fallback_depth = args
+        .get("fallback_depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    anyhow::ensure!(
+        fallback_depth <= fallback::max_depth() as u64,
+        "fallback_depth exceeds configured maximum"
+    );
+    Ok(ExecutionPolicy {
+        request_id: Uuid::new_v4().to_string(),
+        accepted_exit_codes: fallback::accepted_exit_codes(args.get("accepted_exit_codes"))?,
+        operation: fallback::operation_from_value(args.get("operation"))?,
+        fallback_depth: fallback_depth as u8,
+        primary_execution_mode: primary_execution_mode(),
+    })
+}
+
 async fn spawn_sandboxed_command(
     operation: &str,
     args: &Value,
@@ -374,60 +469,490 @@ async fn spawn_sandboxed_command(
 ) -> Result<(String, JoinHandle<Result<String>>)> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
-    #[cfg(windows)]
-    if !approvals::request(
-        &session.id,
-        operation,
-        format!("argv: {command:?}"),
-        cwd.clone(),
-    )
-    .await?
-    {
-        anyhow::bail!("user denied {operation}")
+    let policy = execution_policy(args)?;
+    if primary_execution_requires_approval(policy.primary_execution_mode) {
+        let approved = approvals::request(
+            &session.id,
+            operation,
+            format!("argv: {command:?}"),
+            cwd.clone(),
+        )
+        .await?;
+        ensure_primary_execution_authorized(policy.primary_execution_mode, approved, operation)?;
     }
-    #[cfg(not(windows))]
-    let _ = operation;
     let mut roots = session.permitted_directories.clone();
     if !roots.iter().any(|root| cwd.starts_with(root)) {
         roots.push(cwd.clone());
     }
+
+    let pre_index_snapshot =
+        capture_index_snapshot_if_needed(&command, &cwd, policy.operation.as_ref()).await;
+
     let rendered_command = render_command(&command);
-    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    approvals::activity(
+        &session.id,
+        format!("Running {rendered_command}"),
+        Some(format!("└ request_id={}", policy.request_id)),
+    )
+    .await;
     let session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
-        let output = sandbox::run(&command, &cwd, &roots, None).await;
-        let result = match output {
-            Ok(output) => {
-                if output.status != 0
-                    && let Some(reason) =
-                        fallback::auto_operational_reason(&command, &output.stdout, &output.stderr)
-                {
-                    let blocker = format!(
-                        "{reason}: exit={}\nstdout:\n{}\nstderr:\n{}",
-                        output.status, output.stdout, output.stderr
-                    );
-                    match run_exact_command_codex_fallback(&session_id, &command, &cwd, &blocker)
-                        .await
-                    {
-                        Ok(result) => Ok(result),
-                        Err(fallback_error) => {
-                            let original = render_output(output).unwrap_err();
-                            Err(anyhow::anyhow!(
-                                "{original:#}\nautomatic Codex fallback also failed: {fallback_error:#}"
-                            ))
-                        }
-                    }
-                } else {
-                    render_output(output)
-                }
-            }
-            Err(error) => Err(error),
-        };
+        let attempt = sandbox::run_tracked(&command, &cwd, &roots, None).await;
+        let result = process_sandboxed_attempt(
+            &session_id,
+            &command,
+            &cwd,
+            &policy,
+            pre_index_snapshot,
+            attempt,
+        )
+        .await;
         report_command_finished(session_id, &task_command, &result).await;
         result
     });
     Ok((rendered_command, handle))
+}
+
+async fn process_sandboxed_attempt(
+    session_id: &str,
+    command: &[String],
+    cwd: &Path,
+    policy: &ExecutionPolicy,
+    pre_index_snapshot: Option<String>,
+    attempt: std::result::Result<sandbox::Output, sandbox::RunError>,
+) -> Result<String> {
+    let (lifecycle, exit_code, stdout, stderr, execution_error) = match attempt {
+        Ok(output) => (
+            fallback::LifecycleEvidence::completed(),
+            Some(output.status),
+            output.stdout,
+            output.stderr,
+            None,
+        ),
+        Err(error) => (
+            fallback::LifecycleEvidence {
+                host_reached: true,
+                command_started: error.command_started,
+                command_finished: error.command_finished,
+            },
+            None,
+            String::new(),
+            String::new(),
+            Some(format!("{:#}", error.error)),
+        ),
+    };
+
+    let side_effect_class = fallback::infer_side_effect_class(command, policy.operation.as_ref());
+    let classification = fallback::classify(fallback::ClassificationInput {
+        command,
+        accepted_exit_codes: &policy.accepted_exit_codes,
+        primary_execution_mode: policy.primary_execution_mode,
+        lifecycle,
+        exit_code,
+        stdout: &stdout,
+        stderr: &stderr,
+        execution_error: execution_error.as_deref(),
+        side_effect_class,
+        authoritative_platform_safety: false,
+    });
+
+    let local_not_performed_proof = if policy
+        .operation
+        .as_ref()
+        .is_some_and(|operation| operation.kind == fallback::OperationType::GitStagePaths)
+        && classification.failure_class != fallback::FailureClass::Success
+    {
+        match (
+            pre_index_snapshot.as_ref(),
+            capture_git_index_snapshot(command, cwd).await.as_ref(),
+        ) {
+            (Some(before), Some(after)) => Some(before == after),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let side_effect_state = fallback::infer_side_effect_state(
+        side_effect_class,
+        lifecycle,
+        classification.failure_class,
+        local_not_performed_proof,
+    );
+    let budget_before = fallback::Budget::from_operation(policy.operation.as_ref());
+    let budget_after_primary = budget_before.after_state(side_effect_state);
+    let scope_valid = policy
+        .operation
+        .as_ref()
+        .is_some_and(|operation| operation.scope_matches(command));
+    let decision = fallback::decide(fallback::DecisionInput {
+        failure_class: classification.failure_class,
+        safety_signal: classification.safety_signal,
+        primary_execution_mode: policy.primary_execution_mode,
+        lifecycle,
+        operation: policy.operation.as_ref(),
+        side_effect_class,
+        side_effect_state,
+        fallback_depth: policy.fallback_depth,
+        max_depth: fallback::max_depth(),
+        budget: budget_after_primary,
+        scope_valid,
+        automatic_enabled: fallback::automatic_enabled(),
+        auto_execute_enabled: fallback::auto_execute_enabled(),
+    });
+
+    emit_fallback_trace(
+        session_id,
+        policy,
+        lifecycle,
+        exit_code,
+        classification.failure_class,
+        side_effect_class,
+        side_effect_state,
+        &decision,
+        budget_before,
+        budget_after_primary,
+        None,
+    )
+    .await;
+
+    if decision.action == fallback::FallbackAction::Execute {
+        let operation = policy
+            .operation
+            .as_ref()
+            .context("execute fallback missing operation contract")?;
+        match execute_authorized_operation_fallback(
+            session_id,
+            command,
+            cwd,
+            policy,
+            operation,
+            pre_index_snapshot.as_deref(),
+            budget_after_primary,
+        )
+        .await
+        {
+            Ok((fallback_output, budget_after_fallback, verification_passed)) => {
+                emit_fallback_trace(
+                    session_id,
+                    policy,
+                    lifecycle,
+                    Some(fallback_output.status),
+                    classification.failure_class,
+                    side_effect_class,
+                    fallback::SideEffectState::ConfirmedPerformed,
+                    &decision,
+                    budget_before,
+                    budget_after_fallback,
+                    Some(verification_passed),
+                )
+                .await;
+                return Ok(execution_payload(
+                    policy,
+                    lifecycle,
+                    Some(fallback_output.status),
+                    &fallback_output.stdout,
+                    &fallback_output.stderr,
+                    None,
+                    classification.failure_class,
+                    side_effect_class,
+                    fallback::SideEffectState::ConfirmedPerformed,
+                    &decision,
+                    budget_after_fallback,
+                    Some(verification_passed),
+                    None,
+                ));
+            }
+            Err(fallback_error) => {
+                emit_fallback_trace(
+                    session_id,
+                    policy,
+                    lifecycle,
+                    exit_code,
+                    classification.failure_class,
+                    side_effect_class,
+                    side_effect_state,
+                    &decision,
+                    budget_before,
+                    budget_after_primary,
+                    Some(false),
+                )
+                .await;
+                let payload = execution_payload(
+                    policy,
+                    lifecycle,
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                    execution_error.as_deref(),
+                    classification.failure_class,
+                    side_effect_class,
+                    side_effect_state,
+                    &decision,
+                    budget_after_primary,
+                    Some(false),
+                    Some(&format!("{fallback_error:#}")),
+                );
+                anyhow::bail!(payload);
+            }
+        }
+    }
+
+    let payload = execution_payload(
+        policy,
+        lifecycle,
+        exit_code,
+        &stdout,
+        &stderr,
+        execution_error.as_deref(),
+        classification.failure_class,
+        side_effect_class,
+        side_effect_state,
+        &decision,
+        budget_after_primary,
+        None,
+        None,
+    );
+    if matches!(
+        classification.failure_class,
+        fallback::FailureClass::Success | fallback::FailureClass::ExpectedState
+    ) {
+        Ok(payload)
+    } else {
+        anyhow::bail!(payload)
+    }
+}
+
+async fn capture_index_snapshot_if_needed(
+    command: &[String],
+    cwd: &Path,
+    operation: Option<&fallback::OperationContract>,
+) -> Option<String> {
+    if operation.is_some_and(|operation| {
+        operation.kind == fallback::OperationType::GitStagePaths && operation.scope_matches(command)
+    }) {
+        capture_git_index_snapshot(command, cwd).await
+    } else {
+        None
+    }
+}
+
+async fn capture_git_index_snapshot(command: &[String], cwd: &Path) -> Option<String> {
+    let git = command.first()?.clone();
+    let output = sandbox::run_unrestricted(
+        &[git, "ls-files".into(), "--stage".into(), "-z".into()],
+        cwd,
+        None,
+    )
+    .await
+    .ok()?;
+    (output.status == 0).then_some(output.stdout)
+}
+
+async fn execute_authorized_operation_fallback(
+    session_id: &str,
+    original_command: &[String],
+    cwd: &Path,
+    policy: &ExecutionPolicy,
+    operation: &fallback::OperationContract,
+    pre_index_snapshot: Option<&str>,
+    budget_before_fallback: fallback::Budget,
+) -> Result<(sandbox::Output, fallback::Budget, bool)> {
+    anyhow::ensure!(
+        policy.fallback_depth == 0,
+        "fallback recursion is not allowed"
+    );
+    anyhow::ensure!(
+        operation.authorized,
+        "operation is not explicitly authorized"
+    );
+    anyhow::ensure!(
+        operation.auto_execute_allowlisted(),
+        "operation is not executable-fallback allowlisted"
+    );
+    anyhow::ensure!(
+        operation.scope_matches(original_command),
+        "operation scope drift detected before fallback"
+    );
+    anyhow::ensure!(
+        !budget_before_fallback.locked
+            && budget_before_fallback.attempt_remaining > 0
+            && budget_before_fallback.side_effect_remaining > 0,
+        "fallback budget is exhausted or locked"
+    );
+
+    if !approvals::request(
+        session_id,
+        "codex_fallback_v2_execute",
+        format!(
+            "request_id={} mode=EXECUTE_AUTHORIZED_OPERATION operation={} paths={} budget={}/{}",
+            policy.request_id,
+            operation.kind.as_str(),
+            operation.paths.len(),
+            budget_before_fallback.attempt_remaining,
+            budget_before_fallback.side_effect_remaining
+        ),
+        cwd.to_owned(),
+    )
+    .await?
+    {
+        anyhow::bail!("user denied executable Codex fallback");
+    }
+
+    // Codex is intentionally read-only in Policy V2. It cannot broaden the
+    // mutation. The host executes only the exact structured operation below.
+    let codex_command = fallback::codex_read_only_command(cwd, fallback::Effort::Low)?;
+    let preflight_prompt = fallback::execute_preflight_prompt(cwd, &policy.request_id, operation);
+    let codex_output =
+        sandbox::run_unrestricted(&codex_command, cwd, Some(preflight_prompt.as_bytes())).await?;
+    anyhow::ensure!(
+        codex_output.status == 0,
+        "Codex read-only preflight failed: exit={} stderr={}",
+        codex_output.status,
+        codex_output.stderr
+    );
+
+    let exact_command = operation.build_exact_command(original_command)?;
+    let output = sandbox::run_unrestricted(&exact_command, cwd, None).await?;
+
+    let verification_passed = match operation.kind {
+        fallback::OperationType::GitStagePaths => {
+            if output.status != 0 {
+                false
+            } else {
+                let before =
+                    pre_index_snapshot.context("missing pre-fallback Git index snapshot")?;
+                let after = capture_git_index_snapshot(original_command, cwd)
+                    .await
+                    .context("failed to capture post-fallback Git index snapshot")?;
+                fallback::verify_index_change_scope(before, &after, &operation.paths)
+            }
+        }
+        fallback::OperationType::ReadOnlyCommand => {
+            policy.accepted_exit_codes.contains(&output.status)
+        }
+        _ => false,
+    };
+
+    anyhow::ensure!(
+        verification_passed,
+        "post-fallback verification did not confirm the exact authorized postcondition"
+    );
+
+    let budget_after = if operation.side_effect_class() == fallback::SideEffectClass::None {
+        fallback::Budget {
+            attempt_remaining: budget_before_fallback.attempt_remaining.saturating_sub(1),
+            side_effect_remaining: budget_before_fallback.side_effect_remaining,
+            locked: false,
+        }
+    } else {
+        budget_before_fallback.consume_fallback()
+    };
+
+    Ok((output, budget_after, true))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execution_payload(
+    policy: &ExecutionPolicy,
+    lifecycle: fallback::LifecycleEvidence,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    execution_error: Option<&str>,
+    failure_class: fallback::FailureClass,
+    side_effect_class: fallback::SideEffectClass,
+    side_effect_state: fallback::SideEffectState,
+    decision: &fallback::FallbackDecision,
+    budget_after: fallback::Budget,
+    verification_passed: Option<bool>,
+    fallback_error: Option<&str>,
+) -> String {
+    json!({
+        "request_id": policy.request_id,
+        "operation_type": policy.operation.as_ref().map(|operation| operation.kind.as_str()).unwrap_or("unstructured"),
+        "primary_execution_mode": policy.primary_execution_mode.as_str(),
+        "host_reached": lifecycle.host_reached,
+        "command_started": lifecycle.command_started,
+        "command_finished": lifecycle.command_finished,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "execution_error": execution_error,
+        "failure_class": failure_class.as_str(),
+        "side_effect_class": side_effect_class.as_str(),
+        "side_effect_state": side_effect_state.as_str(),
+        "fallback_decision": {
+            "action": decision.action.as_str(),
+            "reason_code": decision.reason_code.as_str(),
+            "operation_authorized": decision.operation_authorized,
+            "side_effect_state": decision.side_effect_state.as_str(),
+            "attempt_budget_remaining": decision.attempt_budget_remaining,
+            "side_effect_budget_remaining": decision.side_effect_budget_remaining,
+            "budget_locked": decision.budget_locked,
+            "verification_required": decision.verification_required,
+        },
+        "fallback_mode": decision.mode.map(|mode| mode.as_str()),
+        "fallback_depth": policy.fallback_depth,
+        "remaining_attempt_budget": budget_after.attempt_remaining,
+        "remaining_side_effect_budget": budget_after.side_effect_remaining,
+        "budget_locked": budget_after.locked,
+        "verification": {
+            "required": decision.verification_required,
+            "passed": verification_passed,
+        },
+        "fallback_error": fallback_error,
+    })
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_fallback_trace(
+    session_id: &str,
+    policy: &ExecutionPolicy,
+    lifecycle: fallback::LifecycleEvidence,
+    exit_code: Option<i32>,
+    failure_class: fallback::FailureClass,
+    side_effect_class: fallback::SideEffectClass,
+    side_effect_state: fallback::SideEffectState,
+    decision: &fallback::FallbackDecision,
+    budget_before: fallback::Budget,
+    budget_after: fallback::Budget,
+    verification_passed: Option<bool>,
+) {
+    let trace = json!({
+        "request_id": policy.request_id,
+        "operation_type": policy.operation.as_ref().map(|operation| operation.kind.as_str()).unwrap_or("unstructured"),
+        "primary_execution_mode": policy.primary_execution_mode.as_str(),
+        "host_reached": lifecycle.host_reached,
+        "command_started": lifecycle.command_started,
+        "command_finished": lifecycle.command_finished,
+        "exit_code": exit_code,
+        "failure_class": failure_class.as_str(),
+        "side_effect_class": side_effect_class.as_str(),
+        "side_effect_state": side_effect_state.as_str(),
+        "fallback_action": decision.action.as_str(),
+        "reason_code": decision.reason_code.as_str(),
+        "fallback_depth": policy.fallback_depth,
+        "budget_before": {
+            "attempt": budget_before.attempt_remaining,
+            "side_effect": budget_before.side_effect_remaining,
+            "locked": budget_before.locked,
+        },
+        "budget_after": {
+            "attempt": budget_after.attempt_remaining,
+            "side_effect": budget_after.side_effect_remaining,
+            "locked": budget_after.locked,
+        },
+        "verification_passed": verification_passed,
+    });
+    approvals::activity(
+        session_id,
+        format!("Fallback V2 {}", policy.request_id),
+        Some(format!("└ {}", trace)),
+    )
+    .await;
 }
 
 async fn store_job(
@@ -528,107 +1053,201 @@ async fn codex_fallback(args: &Value, session: &config::Session) -> Result<Value
         .and_then(Value::as_str)
         .context("missing blocker")?;
     anyhow::ensure!(blocker.len() <= 64 * 1024, "blocker is too large");
-    let phase = args.get("phase").and_then(Value::as_str);
-    let requires_code_change = args
-        .get("requires_code_change")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let remote_side_effect = args
-        .get("remote_side_effect")
-        .and_then(Value::as_str)
-        .unwrap_or("none");
-    let route = fallback::route(blocker, requires_code_change, remote_side_effect)?;
     let cwd = cwd(args, &session.cwd)?;
-    let command = fallback::codex_command(&cwd, route.effort)?;
-    let prompt = fallback::handoff_prompt(&cwd, task, blocker, phase, route);
+    let request_id = Uuid::new_v4().to_string();
+    let mode = args
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("DIAGNOSE_ONLY");
 
-    if !approvals::request(
-        &session.id,
-        "codex_fallback",
-        format!(
-            "model={} effort={} cwd={}{}",
-            fallback::model(),
-            route.effort.as_str(),
-            cwd.display(),
-            if route.recovery_only {
-                " mode=recovery-only"
-            } else {
-                ""
-            }
-        ),
-        cwd.clone(),
-    )
-    .await?
+    let explicit_failure_class = args
+        .get("failure_class")
+        .and_then(Value::as_str)
+        .map(parse_failure_class)
+        .transpose()?;
+    let original_host_reached = args
+        .get("original_host_reached")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let safety_probe = fallback::classify(fallback::ClassificationInput {
+        command: &[],
+        accepted_exit_codes: &[0],
+        primary_execution_mode: primary_execution_mode(),
+        lifecycle: fallback::LifecycleEvidence {
+            host_reached: original_host_reached,
+            command_started: false,
+            command_finished: false,
+        },
+        exit_code: None,
+        stdout: "",
+        stderr: "",
+        execution_error: Some(blocker),
+        side_effect_class: fallback::SideEffectClass::Unknown,
+        authoritative_platform_safety: explicit_failure_class
+            == Some(fallback::FailureClass::PlatformSafety),
+    });
+
+    if safety_probe.safety_signal
+        || explicit_failure_class == Some(fallback::FailureClass::PlatformSafety)
     {
-        anyhow::bail!("user denied codex_fallback")
+        anyhow::bail!("terminal platform/safety classification: Codex fallback is not permitted");
     }
 
-    let session_id = session.id.clone();
-    let label = format!(
-        "Codex fallback {}/{}",
-        fallback::model(),
-        route.effort.as_str()
-    );
-    approvals::activity(
-        &session_id,
-        format!("Starting {label}"),
-        Some(format!(
-            "└ {}",
-            if route.recovery_only {
-                "recovery-only"
+    match mode {
+        "DIAGNOSE_ONLY" => {
+            let failure_class = explicit_failure_class.unwrap_or(safety_probe.failure_class);
+            let requires_code_change = args
+                .get("requires_code_change")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let effort = if requires_code_change {
+                fallback::Effort::Medium
             } else {
-                "continuation"
+                fallback::Effort::Low
+            };
+            if !approvals::request(
+                &session.id,
+                "codex_fallback_v2_diagnose",
+                format!(
+                    "request_id={} mode=DIAGNOSE_ONLY class={} model={} effort={}",
+                    request_id,
+                    failure_class.as_str(),
+                    fallback::model(),
+                    effort.as_str()
+                ),
+                cwd.clone(),
+            )
+            .await?
+            {
+                anyhow::bail!("user denied diagnostic Codex fallback");
             }
-        )),
-    )
-    .await;
 
-    let task_label = label.clone();
-    let handle = tokio::spawn(async move {
-        let result = sandbox::run_unrestricted(&command, &cwd, Some(prompt.as_bytes()))
-            .await
-            .and_then(render_output);
-        report_command_finished(session_id, &task_label, &result).await;
-        result
-    });
-    store_job(session, label, handle, "Started").await
+            let command = fallback::codex_read_only_command(&cwd, effort)?;
+            let prompt = fallback::diagnose_prompt(&cwd, &request_id, failure_class, blocker);
+            let session_id = session.id.clone();
+            let label = format!(
+                "Codex fallback diagnose {}/{}",
+                fallback::model(),
+                effort.as_str()
+            );
+            let task_label = label.clone();
+            let handle = tokio::spawn(async move {
+                let result = sandbox::run_unrestricted(&command, &cwd, Some(prompt.as_bytes()))
+                    .await
+                    .and_then(render_output);
+                report_command_finished(session_id, &task_label, &result).await;
+                result
+            });
+            store_job(session, label, handle, "Started").await
+        }
+        "EXECUTE_AUTHORIZED_OPERATION" => {
+            let failure_class = explicit_failure_class
+                .context("EXECUTE_AUTHORIZED_OPERATION requires failure_class")?;
+            anyhow::ensure!(
+                failure_class == fallback::FailureClass::SandboxPermission,
+                "executable fallback requires SANDBOX_PERMISSION"
+            );
+            anyhow::ensure!(
+                args.get("original_host_reached").and_then(Value::as_bool) == Some(true),
+                "executable fallback requires authoritative original_host_reached=true"
+            );
+            anyhow::ensure!(
+                args.get("original_command_started")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                "executable fallback requires authoritative original_command_started=true"
+            );
+
+            let command = required_command(args)?;
+            let operation = fallback::operation_from_value(args.get("operation"))?
+                .context("EXECUTE_AUTHORIZED_OPERATION requires operation")?;
+            anyhow::ensure!(
+                operation.side_effect_state
+                    == Some(fallback::SideEffectState::ConfirmedNotPerformed),
+                "executable fallback requires CONFIRMED_NOT_PERFORMED side-effect state"
+            );
+            let policy = ExecutionPolicy {
+                request_id,
+                accepted_exit_codes: vec![0],
+                operation: Some(operation.clone()),
+                fallback_depth: args
+                    .get("fallback_depth")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u8,
+                primary_execution_mode: primary_execution_mode(),
+            };
+            anyhow::ensure!(
+                policy.fallback_depth == 0,
+                "fallback recursion is not allowed"
+            );
+
+            let lifecycle = fallback::LifecycleEvidence {
+                host_reached: true,
+                command_started: true,
+                command_finished: args
+                    .get("original_command_finished")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let budget = fallback::Budget::from_operation(Some(&operation));
+            let decision = fallback::decide(fallback::DecisionInput {
+                failure_class,
+                safety_signal: false,
+                primary_execution_mode: policy.primary_execution_mode,
+                lifecycle,
+                operation: Some(&operation),
+                side_effect_class: operation.side_effect_class(),
+                side_effect_state: fallback::SideEffectState::ConfirmedNotPerformed,
+                fallback_depth: 0,
+                max_depth: fallback::max_depth(),
+                budget,
+                scope_valid: operation.scope_matches(&command),
+                automatic_enabled: fallback::automatic_enabled(),
+                auto_execute_enabled: fallback::auto_execute_enabled(),
+            });
+            anyhow::ensure!(
+                decision.action == fallback::FallbackAction::Execute,
+                "fallback policy blocked execution: {}",
+                decision.reason_code.as_str()
+            );
+
+            let pre_index_snapshot =
+                capture_index_snapshot_if_needed(&command, &cwd, Some(&operation)).await;
+            let session_id = session.id.clone();
+            let label = format!(
+                "Codex fallback execute {}/{}",
+                fallback::model(),
+                operation.kind.as_str()
+            );
+            let task_label = label.clone();
+            let handle = tokio::spawn(async move {
+                let result = execute_authorized_operation_fallback(
+                    &session_id,
+                    &command,
+                    &cwd,
+                    &policy,
+                    &operation,
+                    pre_index_snapshot.as_deref(),
+                    budget,
+                )
+                .await
+                .and_then(|(output, _, verified)| {
+                    anyhow::ensure!(verified, "post-fallback verification failed");
+                    render_output(output)
+                });
+                report_command_finished(session_id, &task_label, &result).await;
+                result
+            });
+            store_job(session, label, handle, "Started").await
+        }
+        other => anyhow::bail!("unsupported fallback mode: {other}"),
+    }
 }
 
-async fn run_exact_command_codex_fallback(
-    session_id: &str,
-    blocked_command: &[String],
-    cwd: &Path,
-    blocker: &str,
-) -> Result<String> {
-    let route = fallback::route(blocker, false, "none")?;
-    anyhow::ensure!(
-        route.effort == fallback::Effort::Low,
-        "automatic execution fallback must remain low effort"
-    );
-    if !approvals::request(
-        session_id,
-        "codex_fallback",
-        format!(
-            "automatic execution-only fallback: model={} effort=low argv={blocked_command:?}",
-            fallback::model()
-        ),
-        cwd.to_owned(),
-    )
-    .await?
-    {
-        anyhow::bail!("user denied automatic codex fallback")
-    }
-
-    let command = fallback::codex_command(cwd, fallback::Effort::Low)?;
-    let prompt = fallback::exact_command_prompt(cwd, blocked_command, blocker);
-    approvals::activity(
-        session_id,
-        format!("Falling back to {}/low", fallback::model()),
-        Some("└ execution-only operational fallback".to_owned()),
-    )
-    .await;
-    let output = sandbox::run_unrestricted(&command, cwd, Some(prompt.as_bytes())).await?;
-    render_output(output)
+fn parse_failure_class(value: &str) -> Result<fallback::FailureClass> {
+    serde_json::from_value(Value::String(value.to_owned()))
+        .with_context(|| format!("invalid failure_class: {value}"))
 }
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
@@ -780,6 +1399,35 @@ mod tests {
         assert_eq!(shell_word("hello world"), "\"hello world\"");
     }
 
+    #[test]
+    fn host_native_primary_execution_requires_approval() {
+        assert!(primary_execution_requires_approval(
+            fallback::PrimaryExecutionMode::HostNative
+        ));
+        assert!(!primary_execution_requires_approval(
+            fallback::PrimaryExecutionMode::Sandboxed
+        ));
+    }
+
+    #[test]
+    fn approval_denial_stops_host_native_primary_execution() {
+        let error = ensure_primary_execution_authorized(
+            fallback::PrimaryExecutionMode::HostNative,
+            false,
+            "execute",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("user denied execute"));
+        assert!(
+            ensure_primary_execution_authorized(
+                fallback::PrimaryExecutionMode::HostNative,
+                true,
+                "execute",
+            )
+            .is_ok()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn describes_windows_command_execution_as_approved_host_access() {
@@ -796,6 +1444,16 @@ mod tests {
             assert!(description.contains("Windows host"));
             assert!(description.contains("requires approval"));
             assert!(description.contains("filesystem and network access"));
+            assert!(description.contains("SANDBOX_PERMISSION"));
+            let properties = &tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["inputSchema"]["properties"];
+            assert!(properties.get("accepted_exit_codes").is_some());
+            assert!(properties.get("operation").is_some());
+            assert!(properties.get("fallback_depth").is_some());
         }
 
         let write_file_description = tools
@@ -822,6 +1480,130 @@ mod tests {
         assert_eq!(result["content"][0]["type"], "image");
         assert_eq!(result["content"][0]["mimeType"], "image/png");
         assert_eq!(result["content"][0]["data"], STANDARD.encode(bytes));
+    }
+
+    #[tokio::test]
+    async fn initialize_dispatch_remains_compatible() {
+        let result = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        assert_eq!(result["serverInfo"]["name"], "local-mcp");
+        assert_eq!(result["protocolVersion"], "2025-06-18");
+    }
+
+    #[test]
+    fn execute_schema_exposes_policy_v2_metadata_additively() {
+        let tools = tools();
+        let execute = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "execute")
+            .unwrap();
+        let properties = &execute["inputSchema"]["properties"];
+        assert!(properties.get("command").is_some());
+        assert!(properties.get("accepted_exit_codes").is_some());
+        assert!(properties.get("operation").is_some());
+        assert!(properties.get("fallback_depth").is_some());
+    }
+
+    #[tokio::test]
+    async fn expected_nonzero_exit_returns_normal_structured_result() {
+        let policy = ExecutionPolicy {
+            request_id: "expected-state-test".into(),
+            accepted_exit_codes: vec![0, 1],
+            operation: None,
+            fallback_depth: 0,
+            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
+        };
+        let command = vec![
+            "git".into(),
+            "show-ref".into(),
+            "--verify".into(),
+            "refs/heads/absent".into(),
+        ];
+        let result = process_sandboxed_attempt(
+            "non-running-test-session",
+            &command,
+            &std::env::temp_dir(),
+            &policy,
+            None,
+            Ok(sandbox::Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["exit_code"], 1);
+        assert_eq!(value["failure_class"], "EXPECTED_STATE");
+        assert_eq!(value["fallback_decision"]["action"], "NONE");
+    }
+
+    #[tokio::test]
+    async fn successful_execution_preserves_stdout_stderr_and_exit_code() {
+        let policy = ExecutionPolicy {
+            request_id: "success-test".into(),
+            accepted_exit_codes: vec![0],
+            operation: None,
+            fallback_depth: 0,
+            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
+        };
+        let result = process_sandboxed_attempt(
+            "non-running-test-session",
+            &["/bin/echo".into(), "ok".into()],
+            &std::env::temp_dir(),
+            &policy,
+            None,
+            Ok(sandbox::Output {
+                status: 0,
+                stdout: "stdout".into(),
+                stderr: "stderr".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["stdout"], "stdout");
+        assert_eq!(value["stderr"], "stderr");
+        assert_eq!(value["failure_class"], "SUCCESS");
+        assert_eq!(value["primary_execution_mode"], "SANDBOXED");
+    }
+
+    #[tokio::test]
+    async fn semantic_nonzero_exit_is_returned_without_executable_fallback() {
+        let policy = ExecutionPolicy {
+            request_id: "semantic-test".into(),
+            accepted_exit_codes: vec![0],
+            operation: None,
+            fallback_depth: 0,
+            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
+        };
+        let error = process_sandboxed_attempt(
+            "non-running-test-session",
+            &["dotnet".into(), "test".into()],
+            &std::env::temp_dir(),
+            &policy,
+            None,
+            Ok(sandbox::Output {
+                status: 1,
+                stdout: "Test Run Failed. Failed tests: 1".into(),
+                stderr: String::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let value: Value = serde_json::from_str(&error.to_string()).unwrap();
+        assert_eq!(value["failure_class"], "SEMANTIC_FAILURE");
+        assert_eq!(value["fallback_decision"]["action"], "NONE");
     }
 
     #[tokio::test]

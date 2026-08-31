@@ -24,12 +24,37 @@ fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(path).map_err(|error| anyhow::anyhow!(error))
 }
 
-pub async fn run(
+#[derive(Debug)]
+pub struct RunError {
+    pub error: anyhow::Error,
+    pub command_started: bool,
+    pub command_finished: bool,
+}
+
+impl RunError {
+    fn new(error: anyhow::Error, command_started: bool, command_finished: bool) -> Self {
+        Self {
+            error,
+            command_started,
+            command_finished,
+        }
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RunError {}
+
+fn sandbox_process(
     command: &[String],
     cwd: &Path,
     writable_roots: &[PathBuf],
-    stdin: Option<&[u8]>,
-) -> Result<Output> {
+    stdin_present: bool,
+) -> Result<(PathBuf, Command)> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -110,27 +135,59 @@ pub async fn run(
         .current_dir(&cwd)
         .env_clear()
         .envs(safe_environment())
-        .stdin(if stdin.is_some() {
+        .stdin(if stdin_present {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    Ok((cwd, process))
+}
+
+pub async fn run_tracked(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> std::result::Result<Output, RunError> {
+    let (_, mut process) = sandbox_process(command, cwd, writable_roots, stdin.is_some())
+        .map_err(|error| RunError::new(error, false, false))?;
     let mut child = process
         .spawn()
-        .context("failed to start sandboxed command")?;
+        .context("failed to start primary command")
+        .map_err(|error| RunError::new(error, false, false))?;
+
     if let Some(bytes) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
     {
-        child_stdin.write_all(bytes).await?;
+        child_stdin
+            .write_all(bytes)
+            .await
+            .map_err(|error| RunError::new(error.into(), true, false))?;
     }
-    let output = child.wait_with_output().await?;
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| RunError::new(error.into(), true, false))?;
     Ok(Output {
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+pub async fn run(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_tracked(command, cwd, writable_roots, stdin)
+        .await
+        .map_err(|error| error.error)
 }
 
 pub async fn run_unrestricted(
@@ -187,6 +244,30 @@ fn safe_environment() -> HashMap<String, String> {
             .map(|value| (name.to_owned(), value))
     })
     .collect()
+}
+
+#[cfg(test)]
+mod unrestricted_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn host_native_execution_preserves_exit_and_output() -> Result<()> {
+        let cwd = std::env::temp_dir();
+        let output = run_unrestricted(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf stdout; printf stderr >&2; exit 0".into(),
+            ],
+            &cwd,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, "stdout");
+        assert_eq!(output.stderr, "stderr");
+        Ok(())
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
