@@ -81,10 +81,21 @@ fn sandbox_process(
                 false,
                 false,
             );
-        let executable = std::env::current_exe()?
+        let executable_dir = std::env::current_exe()?
             .parent()
             .context("local-mcp executable has no parent directory")?
-            .join("codex-linux-sandbox");
+            .to_owned();
+        let mut executable = executable_dir.join("codex-linux-sandbox");
+        #[cfg(test)]
+        if !executable.is_file()
+            && executable_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
+            && let Some(debug_dir) = executable_dir.parent()
+        {
+            let test_helper = debug_dir.join("codex-linux-sandbox");
+            if test_helper.is_file() {
+                executable = test_helper;
+            }
+        }
         anyhow::ensure!(
             executable.is_file(),
             "sandbox helper is missing: {}",
@@ -253,16 +264,21 @@ mod unrestricted_tests {
     #[tokio::test]
     async fn host_native_execution_preserves_exit_and_output() -> Result<()> {
         let cwd = std::env::temp_dir();
-        let output = run_unrestricted(
-            &[
-                "/bin/sh".into(),
-                "-c".into(),
-                "printf stdout; printf stderr >&2; exit 0".into(),
-            ],
-            &cwd,
-            None,
-        )
-        .await?;
+        #[cfg(unix)]
+        let command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf stdout; printf stderr >&2; exit 0".into(),
+        ];
+        #[cfg(windows)]
+        let command = vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "[Console]::Out.Write('stdout'); [Console]::Error.Write('stderr'); exit 0".into(),
+        ];
+        let output = run_unrestricted(&command, &cwd, None).await?;
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout, "stdout");
         assert_eq!(output.stderr, "stderr");

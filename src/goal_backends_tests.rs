@@ -116,7 +116,10 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
             ModelRole::Replanner,
         ]
     );
-    assert!(calls.iter().all(|call| call.cwd() == session.cwd));
+    let canonical_session_cwd = std::fs::canonicalize(&session.cwd).unwrap();
+    assert!(calls.iter().all(|call| {
+        std::fs::canonicalize(call.cwd()).unwrap() == canonical_session_cwd
+    }));
     for call in calls.iter() {
         assert!(call.prompt().contains("untrusted request data"));
         assert!(call.prompt().contains("Return JSON only"));

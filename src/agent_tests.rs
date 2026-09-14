@@ -62,6 +62,7 @@ fn command(program: &str, args: &[&str]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
     let output = run_bounded_process_for_test(

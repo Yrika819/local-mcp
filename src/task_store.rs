@@ -327,12 +327,10 @@ impl TaskStore {
         let directory = path.parent().expect("goal path always has parent");
         std::fs::create_dir_all(directory)?;
         let bytes = serde_json::to_vec_pretty(goal)?;
-        let temporary = directory.join(format!(
-            ".{}.{}.{}.tmp",
-            goal.id().as_str(),
-            std::process::id(),
-            Uuid::new_v4()
-        ));
+        // Keep the atomic temporary name short. The UUID is sufficient for
+        // create_new uniqueness and avoids pushing valid 64-byte session IDs
+        // over legacy Windows MAX_PATH limits.
+        let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
 
         #[cfg(test)]
         if self.fault == Some(FaultPoint::BeforeTempWrite) {

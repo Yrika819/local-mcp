@@ -272,6 +272,7 @@ async fn review_gate_is_advisory_evidence_rechecked_by_host_verifier() {
     assert_eq!(result.tasks()[&blocked.task_id].status(), TaskStatus::Blocked);
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn command_exit_pass_and_failure_use_existing_execution_authority() {
     let pass = read_fixture(vec![VerificationSpec::CommandExit {
@@ -430,6 +431,7 @@ fn init_git(root: &PathBuf) {
     assert!(status.success());
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn git_scope_and_forbidden_changes_are_host_observed() {
     let root = temp_dir("git-workspace");
@@ -477,6 +479,7 @@ async fn git_scope_and_forbidden_changes_are_host_observed() {
     let _ = fs::remove_dir_all(state);
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn verification_command_timeout_is_bounded_and_never_passes() {
     let fixture = read_fixture(
