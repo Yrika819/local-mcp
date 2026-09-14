@@ -1,0 +1,917 @@
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::config;
+use crate::goal::{GOAL_SCHEMA_VERSION, GOAL_STORE_FORMAT, Goal, GoalId};
+use crate::orchestrator_error::OrchestratorError;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultPoint {
+    BeforeTempWrite,
+    BeforeReplace,
+}
+
+pub(crate) struct TaskStore {
+    state_root: PathBuf,
+    #[cfg(test)]
+    fault: Option<FaultPoint>,
+}
+
+impl TaskStore {
+    pub(crate) fn new() -> Result<Self, OrchestratorError> {
+        Ok(Self {
+            state_root: config::state_dir().map_err(|error| {
+                OrchestratorError::PersistenceIo(std::io::Error::other(error.to_string()))
+            })?,
+            #[cfg(test)]
+            fault: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_state_root(state_root: PathBuf) -> Self {
+        Self {
+            state_root,
+            fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn goal_path_for_test(&self, session_id: &str, goal_id: &GoalId) -> Result<PathBuf, OrchestratorError> {
+        self.goal_path(session_id, goal_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fault(state_root: PathBuf, fault: FaultPoint) -> Self {
+        Self {
+            state_root,
+            fault: Some(fault),
+        }
+    }
+
+    pub(crate) fn create_goal(&self, goal: &Goal) -> Result<(), OrchestratorError> {
+        self.validate_session_id(goal.session_id())?;
+        if goal.revision() != 1 {
+            return Err(OrchestratorError::CorruptGoal(
+                "new goal must begin at revision 1".to_owned(),
+            ));
+        }
+        goal.validate()?;
+        self.with_session_lock(goal.session_id(), || {
+            let existing = self.load_all_unlocked(goal.session_id())?;
+            if existing.iter().any(|candidate| !candidate.is_terminal()) {
+                return Err(OrchestratorError::ActiveGoalAlreadyExists);
+            }
+            let path = self.goal_path(goal.session_id(), goal.id())?;
+            if path.exists() {
+                return Err(OrchestratorError::CorruptGoal(
+                    "goal ID already exists".to_owned(),
+                ));
+            }
+            self.commit_goal_unlocked(goal)
+        })
+    }
+
+    pub(crate) fn load_goal(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+    ) -> Result<Goal, OrchestratorError> {
+        self.validate_session_id(session_id)?;
+        goal_id_validate(goal_id)?;
+        self.with_session_lock(session_id, || self.load_goal_unlocked(session_id, goal_id))
+    }
+
+    pub(crate) fn list_goals_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Goal>, OrchestratorError> {
+        self.validate_session_id(session_id)?;
+        self.with_session_lock(session_id, || self.load_all_unlocked(session_id))
+    }
+
+    pub(crate) fn load_active_goal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Goal>, OrchestratorError> {
+        let goals = self.list_goals_for_session(session_id)?;
+        let active = goals
+            .into_iter()
+            .filter(|goal| !goal.is_terminal())
+            .collect::<Vec<_>>();
+        match active.len() {
+            0 => Ok(None),
+            1 => Ok(active.into_iter().next()),
+            _ => Err(OrchestratorError::CorruptGoal(
+                "more than one non-terminal Goal exists for the session".to_owned(),
+            )),
+        }
+    }
+
+    pub(crate) fn mutate_goal<T, F>(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+        expected_revision: u64,
+        mutate: F,
+    ) -> Result<T, OrchestratorError>
+    where
+        F: FnOnce(&mut Goal, &str) -> Result<T, OrchestratorError>,
+    {
+        self.validate_session_id(session_id)?;
+        goal_id_validate(goal_id)?;
+        self.with_session_lock(session_id, || {
+            let mut goal = self.load_goal_unlocked(session_id, goal_id)?;
+            if goal.schema_version() == 1 {
+                return Err(OrchestratorError::SchemaUpgradeRequired(1));
+            }
+            if goal.revision() != expected_revision {
+                return Err(OrchestratorError::RevisionConflict {
+                    expected: expected_revision,
+                    actual: goal.revision(),
+                });
+            }
+            let now = utc_now_rfc3339();
+            let result = mutate(&mut goal, &now)?;
+            let next_revision = goal.revision().checked_add(1).ok_or_else(|| {
+                OrchestratorError::CorruptGoal("goal revision overflow".to_owned())
+            })?;
+            goal.set_committed_revision(next_revision, &now);
+            goal.validate()?;
+            self.commit_goal_unlocked(&goal)?;
+            Ok(result)
+        })
+    }
+
+    pub(crate) fn mutate_goal_snapshot<F>(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+        expected_revision: u64,
+        mutate: F,
+    ) -> Result<Goal, OrchestratorError>
+    where
+        F: FnOnce(&mut Goal, &str) -> Result<(), OrchestratorError>,
+    {
+        self.validate_session_id(session_id)?;
+        goal_id_validate(goal_id)?;
+        self.with_session_lock(session_id, || {
+            let mut goal = self.load_goal_unlocked(session_id, goal_id)?;
+            if goal.schema_version() == 1 {
+                return Err(OrchestratorError::SchemaUpgradeRequired(1));
+            }
+            if goal.revision() != expected_revision {
+                return Err(OrchestratorError::RevisionConflict {
+                    expected: expected_revision,
+                    actual: goal.revision(),
+                });
+            }
+            let before = goal.clone();
+            let now = utc_now_rfc3339();
+            mutate(&mut goal, &now)?;
+            if goal == before {
+                return Ok(goal);
+            }
+            let next_revision = goal.revision().checked_add(1).ok_or_else(|| {
+                OrchestratorError::CorruptGoal("goal revision overflow".to_owned())
+            })?;
+            goal.set_committed_revision(next_revision, &now);
+            goal.validate()?;
+            self.commit_goal_unlocked(&goal)?;
+            Ok(goal)
+        })
+    }
+
+    pub(crate) fn recover_goal(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+        expected_revision: u64,
+    ) -> Result<Goal, OrchestratorError> {
+        self.validate_session_id(session_id)?;
+        goal_id_validate(goal_id)?;
+        self.with_session_lock(session_id, || {
+            let mut goal = self.load_goal_unlocked(session_id, goal_id)?;
+            if goal.schema_version() == 1 {
+                return Err(OrchestratorError::SchemaUpgradeRequired(1));
+            }
+            if goal.revision() != expected_revision {
+                return Err(OrchestratorError::RevisionConflict {
+                    expected: expected_revision,
+                    actual: goal.revision(),
+                });
+            }
+            let now = utc_now_rfc3339();
+            if !goal.recover_stale_running(&now)? {
+                return Ok(goal);
+            }
+            let next_revision = goal.revision().checked_add(1).ok_or_else(|| {
+                OrchestratorError::CorruptGoal("goal revision overflow".to_owned())
+            })?;
+            goal.set_committed_revision(next_revision, &now);
+            goal.validate()?;
+            self.commit_goal_unlocked(&goal)?;
+            Ok(goal)
+        })
+    }
+
+    fn load_all_unlocked(&self, session_id: &str) -> Result<Vec<Goal>, OrchestratorError> {
+        let directory = self.session_goal_dir(session_id)?;
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths = std::fs::read_dir(&directory)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && path.is_file()
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut goals = Vec::with_capacity(paths.len());
+        for path in paths {
+            let goal = self.load_path_unlocked(&path)?;
+            if goal.session_id() != session_id {
+                return Err(OrchestratorError::CorruptGoal(
+                    "goal session binding does not match containing directory".to_owned(),
+                ));
+            }
+            goals.push(goal);
+        }
+        Ok(goals)
+    }
+
+    fn load_goal_unlocked(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+    ) -> Result<Goal, OrchestratorError> {
+        let path = self.goal_path(session_id, goal_id)?;
+        if !path.is_file() {
+            return Err(OrchestratorError::GoalNotFound);
+        }
+        let goal = self.load_path_unlocked(&path)?;
+        if goal.session_id() != session_id || goal.id() != goal_id {
+            return Err(OrchestratorError::CorruptGoal(
+                "goal identity does not match durable path".to_owned(),
+            ));
+        }
+        Ok(goal)
+    }
+
+    fn load_path_unlocked(&self, path: &Path) -> Result<Goal, OrchestratorError> {
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            OrchestratorError::CorruptGoal("authoritative Goal JSON does not parse".to_owned())
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            OrchestratorError::CorruptGoal("authoritative Goal JSON is not an object".to_owned())
+        })?;
+        match object.get("store_format").and_then(Value::as_str) {
+            Some(GOAL_STORE_FORMAT) => {}
+            _ => {
+                return Err(OrchestratorError::CorruptGoal(
+                    "missing or unsupported store_format".to_owned(),
+                ));
+            }
+        }
+        let schema_version = object
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal("missing schema_version".to_owned())
+            })?;
+        if schema_version == 1 {
+            let status = object.get("status").and_then(Value::as_str).ok_or_else(|| {
+                OrchestratorError::CorruptGoal("legacy schema-1 Goal is missing status".to_owned())
+            })?;
+            if !matches!(status, "COMPLETED" | "FAILED" | "CANCELLED") {
+                return Err(OrchestratorError::SchemaUpgradeRequired(1));
+            }
+            let mut legacy = value;
+            let legacy_object = legacy.as_object_mut().expect("validated object");
+            let criteria = legacy_object.remove("completion_criteria").unwrap_or_else(|| Value::Array(Vec::new()));
+            legacy_object.insert("legacy_completion_criteria".to_owned(), criteria);
+            legacy_object.insert("completion_criteria".to_owned(), Value::Array(Vec::new()));
+            let old_final = legacy_object.remove("final_verification").unwrap_or(Value::Null);
+            legacy_object.insert("legacy_final_verification".to_owned(), old_final);
+            legacy_object.insert("final_verifications".to_owned(), Value::Array(Vec::new()));
+            legacy_object.insert("final_verification_spec".to_owned(), Value::Null);
+            let goal: Goal = serde_json::from_value(legacy).map_err(|error| {
+                OrchestratorError::CorruptGoal(format!("legacy durable Goal shape is invalid: {error}"))
+            })?;
+            goal.validate()?;
+            return Ok(goal);
+        }
+        if schema_version != GOAL_SCHEMA_VERSION as u64 {
+            return Err(OrchestratorError::UnsupportedSchema(schema_version));
+        }
+        let goal: Goal = serde_json::from_value(value).map_err(|error| {
+            OrchestratorError::CorruptGoal(format!("durable Goal shape is invalid: {error}"))
+        })?;
+        goal.validate()?;
+        Ok(goal)
+    }
+
+    fn commit_goal_unlocked(&self, goal: &Goal) -> Result<(), OrchestratorError> {
+        goal.validate()?;
+        let path = self.goal_path(goal.session_id(), goal.id())?;
+        let directory = path.parent().expect("goal path always has parent");
+        std::fs::create_dir_all(directory)?;
+        let bytes = serde_json::to_vec_pretty(goal)?;
+        let temporary = directory.join(format!(
+            ".{}.{}.{}.tmp",
+            goal.id().as_str(),
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+
+        #[cfg(test)]
+        if self.fault == Some(FaultPoint::BeforeTempWrite) {
+            return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
+                "injected temp write failure",
+            )));
+        }
+
+        let write_result = (|| -> Result<(), OrchestratorError> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+
+            #[cfg(test)]
+            if self.fault == Some(FaultPoint::BeforeReplace) {
+                return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
+                    "injected atomic replace failure",
+                )));
+            }
+
+            atomic_replace(&temporary, &path)?;
+            sync_parent_directory(directory)?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        write_result
+    }
+
+    fn with_session_lock<T, F>(&self, session_id: &str, operation: F) -> Result<T, OrchestratorError>
+    where
+        F: FnOnce() -> Result<T, OrchestratorError>,
+    {
+        let directory = self.session_goal_dir(session_id)?;
+        std::fs::create_dir_all(&directory)?;
+        let lock_path = directory.join(".lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock.lock()?;
+        let result = operation();
+        let unlock_result = lock.unlock();
+        match (result, unlock_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(OrchestratorError::PersistenceIo(error)),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    fn validate_session_id(&self, session_id: &str) -> Result<(), OrchestratorError> {
+        config::validate_session_id(session_id)
+            .map_err(|_| OrchestratorError::UnsafeIdentifier("session".to_owned()))
+    }
+
+    fn session_goal_dir(&self, session_id: &str) -> Result<PathBuf, OrchestratorError> {
+        self.validate_session_id(session_id)?;
+        Ok(self.state_root.join("goals").join(session_id))
+    }
+
+    fn goal_path(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+    ) -> Result<PathBuf, OrchestratorError> {
+        goal_id_validate(goal_id)?;
+        Ok(self
+            .session_goal_dir(session_id)?
+            .join(format!("{}.json", goal_id.as_str())))
+    }
+}
+
+fn goal_id_validate(goal_id: &GoalId) -> Result<(), OrchestratorError> {
+    let canonical = GoalId::parse(goal_id.as_str())?;
+    if canonical != *goal_id {
+        return Err(OrchestratorError::UnsafeIdentifier("GoalId".to_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn atomic_replace(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let existing = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let new = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(directory: &Path) -> std::io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_directory: &Path) -> std::io::Result<()> {
+    // MoveFileExW is requested with WRITE_THROUGH. Opening directories for
+    // FlushFileBuffers requires additional platform privileges/flags, so V1
+    // relies on the documented replace primitive on Windows.
+    Ok(())
+}
+
+pub(crate) fn utc_now_rfc3339() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_unix_seconds(seconds)
+}
+
+fn format_unix_seconds(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fallback::{SideEffectClass, SideEffectState};
+    use crate::goal::GoalStatus;
+    use crate::task::{
+        ReplaySafety, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
+        TaskTransitionContext, WorkerKind,
+    };
+
+    const NOW: &str = "2026-01-01T00:00:00Z";
+
+    fn state_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("local-mcp-phase2-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn goal(session: &str) -> Goal {
+        Goal::new(
+            session,
+            PathBuf::from("/tmp/project"),
+            "durable objective",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap()
+    }
+
+    fn read_only_scope() -> TaskScope {
+        TaskScope::new(
+            vec![PathBuf::from("src")],
+            vec![],
+            TaskOperationKind::ReadOnly,
+            ReplaySafety::SafeReadOnly,
+        )
+    }
+
+    fn mutation_scope() -> TaskScope {
+        TaskScope::new(
+            vec![PathBuf::from("src")],
+            vec![],
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        )
+    }
+
+    fn make_running_task(goal: &mut Goal, scope: TaskScope, worker: WorkerKind) -> crate::task::TaskId {
+        let id = goal
+            .add_task("task", "task objective", true, worker, scope, vec![], 3, NOW)
+            .unwrap();
+        goal.transition_to(GoalStatus::Running, NOW).unwrap();
+        goal.transition_task(&id, TaskStatus::Ready, TaskTransitionContext::default(), NOW)
+            .unwrap();
+        goal.transition_task(&id, TaskStatus::Running, TaskTransitionContext::default(), NOW)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn rfc3339_formatter_has_known_epoch() {
+        assert_eq!(format_unix_seconds(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_unix_seconds(86_400), "1970-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn create_persist_reload_survives_new_store_instance() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-a");
+        store.create_goal(&goal).unwrap();
+        drop(store);
+        let reloaded_store = TaskStore::with_state_root(root.clone());
+        let loaded = reloaded_store.load_goal("session-a", goal.id()).unwrap();
+        assert_eq!(loaded.id(), goal.id());
+        assert_eq!(loaded.revision(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_advances_revision_exactly_once_and_reloads() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-b");
+        let id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        store
+            .mutate_goal("session-b", &id, 1, |goal, now| {
+                goal.add_task(
+                    "task",
+                    "objective",
+                    true,
+                    WorkerKind::CodexReadonly,
+                    read_only_scope(),
+                    vec![],
+                    2,
+                    now,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.load_goal("session-b", &id).unwrap().revision(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_revision_is_rejected_without_overwrite() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-c");
+        let id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        store
+            .mutate_goal("session-c", &id, 1, |_goal, _now| Ok(()))
+            .unwrap();
+        let error = store
+            .mutate_goal("session-c", &id, 1, |_goal, _now| Ok(()))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OrchestratorError::RevisionConflict { expected: 1, actual: 2 }
+        ));
+        assert_eq!(store.load_goal("session-c", &id).unwrap().revision(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn second_active_goal_is_rejected_but_terminal_history_can_coexist() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let active = goal("session-d");
+        store.create_goal(&active).unwrap();
+        assert!(matches!(
+            store.create_goal(&goal("session-d")),
+            Err(OrchestratorError::ActiveGoalAlreadyExists)
+        ));
+
+        let other_session = "session-e";
+        let mut historical = goal(other_session);
+        historical.transition_to(GoalStatus::Failed, NOW).unwrap();
+        store.create_goal(&historical).unwrap();
+        let next = goal(other_session);
+        store.create_goal(&next).unwrap();
+        assert_eq!(store.list_goals_for_session(other_session).unwrap().len(), 2);
+        assert_eq!(store.load_active_goal(other_session).unwrap().unwrap().id(), next.id());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_json_is_rejected_and_preserved() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-f");
+        let path = store.goal_path("session-f", goal.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not-json").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            store.load_goal("session-f", goal.id()),
+            Err(OrchestratorError::CorruptGoal(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_and_missing_schema_are_rejected() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        for (session, schema, expected_unsupported) in [
+            ("schema-old", Some(0_u64), true),
+            ("schema-new", Some((GOAL_SCHEMA_VERSION + 1) as u64), true),
+            ("schema-missing", None, false),
+        ] {
+            let goal = goal(session);
+            let path = store.goal_path(session, goal.id()).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut value = serde_json::to_value(&goal).unwrap();
+            match schema {
+                Some(version) => value["schema_version"] = Value::from(version),
+                None => {
+                    value.as_object_mut().unwrap().remove("schema_version");
+                }
+            }
+            std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+            let error = store.load_goal(session, goal.id()).unwrap_err();
+            if expected_unsupported {
+                assert!(matches!(error, OrchestratorError::UnsupportedSchema(_)));
+            } else {
+                assert!(matches!(error, OrchestratorError::CorruptGoal(_)));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_identifiers_and_missing_goal_are_rejected() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal_id = GoalId::new();
+        for unsafe_id in ["", "..", "../escape", "/absolute", "slash/name", "ユニコード"] {
+            assert!(matches!(
+                store.load_goal(unsafe_id, &goal_id),
+                Err(OrchestratorError::UnsafeIdentifier(_))
+            ));
+        }
+        assert!(GoalId::parse("../escape").is_err());
+        assert!(matches!(
+            store.load_goal("safe-session", &goal_id),
+            Err(OrchestratorError::GoalNotFound)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_save_leaves_no_temp_file() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-g");
+        store.create_goal(&goal).unwrap();
+        let directory = store.session_goal_dir("session-g").unwrap();
+        let leaked = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leaked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn injected_write_and_replace_failures_preserve_authoritative_final() {
+        let root = state_root();
+        let normal = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-h");
+        let id = goal.id().clone();
+        normal.create_goal(&goal).unwrap();
+        let final_path = normal.goal_path("session-h", &id).unwrap();
+        let before = std::fs::read(&final_path).unwrap();
+
+        for fault in [FaultPoint::BeforeTempWrite, FaultPoint::BeforeReplace] {
+            let failing = TaskStore::with_fault(root.clone(), fault);
+            assert!(failing
+                .mutate_goal("session-h", &id, 1, |_goal, _now| Ok(()))
+                .is_err());
+            assert_eq!(std::fs::read(&final_path).unwrap(), before);
+            assert_eq!(normal.load_goal("session-h", &id).unwrap().revision(), 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_structural_mutation_preserves_authoritative_revision_and_bytes() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let mut goal = goal("session-transactional");
+        let a = goal
+            .add_task(
+                "a",
+                "a objective",
+                true,
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                vec![],
+                2,
+                NOW,
+            )
+            .unwrap();
+        let b = goal
+            .add_task(
+                "b",
+                "b objective",
+                true,
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                vec![],
+                2,
+                NOW,
+            )
+            .unwrap();
+        goal.strengthen_task_dependencies(&b, vec![a.clone()]).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let final_path = store.goal_path("session-transactional", &goal_id).unwrap();
+        let before_bytes = std::fs::read(&final_path).unwrap();
+
+        let error = store
+            .mutate_goal("session-transactional", &goal_id, 1, |goal, _now| {
+                goal.strengthen_task_dependencies(&a, vec![b.clone()])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(error, OrchestratorError::InvalidDag(_)));
+
+        let reloaded = store.load_goal("session-transactional", &goal_id).unwrap();
+        assert_eq!(reloaded, goal);
+        assert_eq!(reloaded.revision(), 1);
+        assert_eq!(std::fs::read(&final_path).unwrap(), before_bytes);
+        let directory = store.session_goal_dir("session-transactional").unwrap();
+        let leaked = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leaked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_readonly_running_recovers_durably_to_retryable() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let mut goal = goal("session-i");
+        let task_id = make_running_task(&mut goal, read_only_scope(), WorkerKind::CodexReadonly);
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let recovered = store.recover_goal("session-i", &goal_id, 1).unwrap();
+        assert_eq!(recovered.revision(), 2);
+        assert_eq!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Retryable);
+        assert_eq!(
+            store.load_goal("session-i", &goal_id).unwrap().tasks().get(&task_id).unwrap().status(),
+            TaskStatus::Retryable
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_unknown_mutation_recovers_durably_to_blocked() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let mut goal = goal("session-j");
+        let task_id = make_running_task(&mut goal, mutation_scope(), WorkerKind::LocalOperation);
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            Some("operation-1".into()),
+            Some("scope-1".into()),
+            Some("request-1".into()),
+            Some(SideEffectClass::LocalMutation),
+            Some(SideEffectState::Unknown),
+            Some(1),
+            Some(1),
+        )
+        .unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let recovered = store.recover_goal("session-j", &goal_id, 1).unwrap();
+        assert_eq!(recovered.status(), GoalStatus::Blocked);
+        assert_eq!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Blocked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independently_proven_mutation_recovers_to_verifying_never_completed() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let mut goal = goal("session-k");
+        let task_id = make_running_task(&mut goal, mutation_scope(), WorkerKind::LocalOperation);
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            Some("operation-2".into()),
+            Some("scope-2".into()),
+            Some("request-2".into()),
+            Some(SideEffectClass::LocalMutation),
+            Some(SideEffectState::ConfirmedPerformed),
+            Some(0),
+            Some(0),
+        )
+        .unwrap();
+        goal.task_add_evidence(
+            &task_id,
+            TaskEvidence::RecoveryReconciliation {
+                summary: "independent postcondition proof".into(),
+                side_effect_state: SideEffectState::ConfirmedPerformed,
+                postcondition_proven: true,
+            },
+        )
+        .unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let recovered = store.recover_goal("session-k", &goal_id, 1).unwrap();
+        assert_eq!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Verifying);
+        assert_ne!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Completed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_lock_is_os_backed_and_exclusive() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let directory = store.session_goal_dir("lock-session").unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".lock");
+        let first = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let second = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        first.lock().unwrap();
+        assert!(second.try_lock().is_err());
+        first.unlock().unwrap();
+        second.try_lock().unwrap();
+        second.unlock().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deterministic_serialization_is_stable_for_same_snapshot() {
+        let goal = goal("session-l");
+        let first = serde_json::to_vec_pretty(&goal).unwrap();
+        let second = serde_json::to_vec_pretty(&goal).unwrap();
+        assert_eq!(first, second);
+    }
+}

@@ -1012,6 +1012,17 @@ impl Effort {
 }
 
 pub fn codex_read_only_command(cwd: &Path, effort: Effort) -> Result<Vec<String>> {
+    codex_read_only_command_with_model(cwd, effort, &model())
+}
+
+/// Builds the existing read-only Codex invocation with a host-selected model.
+/// The explicit model argument is intentionally kept below the MCP surface so
+/// Goal callers cannot select a provider or model per request.
+pub fn codex_read_only_command_with_model(
+    cwd: &Path,
+    effort: Effort,
+    model: &str,
+) -> Result<Vec<String>> {
     let codex = codex_path();
     if codex.is_absolute() {
         anyhow::ensure!(
@@ -1024,11 +1035,12 @@ pub fn codex_read_only_command(cwd: &Path, effort: Effort) -> Result<Vec<String>
         codex.to_string_lossy().into_owned(),
         "exec".to_owned(),
         "-m".to_owned(),
-        model(),
+        model.to_owned(),
         "-c".to_owned(),
         format!("model_reasoning_effort={:?}", effort.as_str()),
         "--ephemeral".to_owned(),
         "--ignore-user-config".to_owned(),
+        "--skip-git-repo-check".to_owned(),
         "-s".to_owned(),
         "read-only".to_owned(),
         "-C".to_owned(),

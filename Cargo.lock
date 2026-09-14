@@ -2243,6 +2243,7 @@ dependencies = [
  "rama-utils",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "tokio",
  "uuid",
