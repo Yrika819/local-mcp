@@ -62,9 +62,23 @@ fn sandbox_process(
         .iter()
         .map(|path| absolute(path))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(all(test, target_os = "linux"))]
+    let network_policy =
+        if std::env::var("LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK").as_deref() == Ok("1") {
+            // GitHub-hosted Linux runners allow the bubblewrap filesystem/user
+            // namespaces used here but deny RTM_NEWADDR while bwrap initializes an
+            // isolated loopback device. Keep production restricted; only CI tests
+            // opt out of the network namespace so the filesystem sandbox contract
+            // remains executable in that environment.
+            NetworkSandboxPolicy::Enabled
+        } else {
+            NetworkSandboxPolicy::Restricted
+        };
+    #[cfg(not(all(test, target_os = "linux")))]
+    let network_policy = NetworkSandboxPolicy::Restricted;
     let permissions = PermissionProfile::workspace_write_with(
         &roots,
-        NetworkSandboxPolicy::Restricted,
+        network_policy,
         true,
         true,
     )
