@@ -1134,6 +1134,33 @@ impl Goal {
         Ok(true)
     }
 
+    pub(crate) fn reconcile_exhausted_readonly_replan_task(
+        &mut self,
+        task_id: &TaskId,
+        authority: &crate::replanner::ReadonlyReplanRecoveryAuthority,
+        next_plan_revision: u32,
+        now: &str,
+    ) -> Result<bool, OrchestratorError> {
+        let mut candidate = self.clone();
+        let plan_revision_before = candidate.plan_revision;
+        let reconciled = candidate
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .reconcile_exhausted_readonly_replan(
+                authority,
+                plan_revision_before,
+                next_plan_revision,
+                now,
+            )?;
+        if !reconciled {
+            return Ok(false);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(true)
+    }
+
     pub(crate) fn complete_task_from_verifier(
         &mut self,
         task_id: &TaskId,

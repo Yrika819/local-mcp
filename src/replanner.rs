@@ -119,6 +119,16 @@ pub(crate) fn replanner_request_for_model_backend_test(cwd: PathBuf) -> Replanne
     }
 }
 
+pub(crate) struct ReadonlyReplanRecoveryAuthority {
+    _private: (),
+}
+
+impl ReadonlyReplanRecoveryAuthority {
+    fn for_replanner() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ReplannerError {
     ReplannerUnavailable,
@@ -253,6 +263,7 @@ struct ValidatedReplan {
     strengthen_mandatory: Vec<TaskId>,
     add_criterion_requirements: Vec<(CompletionCriterionId, Vec<ValidatedTaskRef>)>,
     resolve_needs_replan: Vec<TaskId>,
+    reconcile_exhausted_readonly: Vec<TaskId>,
 }
 
 #[derive(Clone, Debug)]
@@ -923,6 +934,7 @@ fn parse_and_validate_proposal(
         .map(|(target, _)| target.clone())
         .collect::<BTreeSet<_>>();
     let mut validated_resolution = Vec::with_capacity(proposal.resolve_needs_replan.len());
+    let mut reconcile_exhausted_readonly = Vec::new();
     let mut seen_resolution = BTreeSet::new();
     for task_id in proposal.resolve_needs_replan {
         let task_id = parse_existing_task_id(&task_id, goal)?;
@@ -947,6 +959,14 @@ fn parse_and_validate_proposal(
                 "resolving NEEDS_REPLAN requires a committed new hard dependency".to_owned(),
             ));
         }
+        if task.semantic_attempts_remaining() == 0 {
+            if !task.can_reconcile_exhausted_readonly_replan() {
+                return Err(ReplannerError::NoSafeReplan(
+                    "NEEDS_REPLAN Task exhausted semantic attempts and is not eligible for bounded non-mutating readonly replan reconciliation".to_owned(),
+                ));
+            }
+            reconcile_exhausted_readonly.push(task_id.clone());
+        }
         validated_resolution.push(task_id);
     }
 
@@ -957,6 +977,7 @@ fn parse_and_validate_proposal(
         strengthen_mandatory: validated_mandatory,
         add_criterion_requirements: validated_criterion_requirements,
         resolve_needs_replan: validated_resolution,
+        reconcile_exhausted_readonly,
     })
 }
 
@@ -1043,6 +1064,7 @@ fn materialize_validated_replan(
         .plan_revision()
         .checked_add(1)
         .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
+    let reconcile_exhausted_readonly = validated.reconcile_exhausted_readonly.clone();
 
     let mut materialized = Vec::with_capacity(validated.new_tasks.len());
     let mut local_to_id = BTreeMap::<String, TaskId>::new();
@@ -1135,6 +1157,21 @@ fn materialize_validated_replan(
             Ok((criterion_id, requirements))
         })
         .collect::<Result<Vec<_>, OrchestratorError>>()?;
+
+    let recovery_authority = ReadonlyReplanRecoveryAuthority::for_replanner();
+    for task_id in reconcile_exhausted_readonly {
+        if !goal.reconcile_exhausted_readonly_replan_task(
+            &task_id,
+            &recovery_authority,
+            next_plan_revision,
+            now,
+        )? {
+            return Err(OrchestratorError::InvalidDag(
+                "validated exhausted readonly replan reconciliation became ineligible before commit"
+                    .to_owned(),
+            ));
+        }
+    }
 
     goal.apply_replan_mutation(
         ReplanMutation {
@@ -1232,8 +1269,8 @@ mod tests {
     use crate::fallback::{SideEffectClass, SideEffectState};
     use crate::goal::{CheckpointReason, GoalBlocker};
     use crate::task::{
-        ReplaySafety, TaskDependency, TaskEvidence, TaskScope, TaskTransitionContext,
-        VerificationCheckResult, VerificationOutcome,
+        ReadonlyReplanRecoveryAuthorityKind, ReplaySafety, TaskDependency, TaskEvidence, TaskScope,
+        TaskTransitionContext, VerificationCheckResult, VerificationOutcome,
     };
     use crate::task_store::FaultPoint;
 
@@ -1368,6 +1405,68 @@ mod tests {
         base_fixture(false)
     }
 
+    fn exhaust_trigger_with_second_needs_replan(
+        fixture: &Fixture,
+        safe_latest: bool,
+    ) -> (crate::task::AttemptId, crate::task::AttemptId) {
+        let current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let updated = fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &fixture.goal_id,
+                current.revision(),
+                |goal, now| {
+                    goal.transition_task(
+                        &fixture.trigger_id,
+                        TaskStatus::Pending,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.transition_task(
+                        &fixture.trigger_id,
+                        TaskStatus::Ready,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.transition_task(
+                        &fixture.trigger_id,
+                        TaskStatus::Running,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.task_bind_latest_attempt_execution(
+                        &fixture.trigger_id,
+                        (!safe_latest).then(|| "unsafe-op-2".to_owned()),
+                        (!safe_latest).then(|| "unsafe-scope-2".to_owned()),
+                        None,
+                        Some(SideEffectClass::None),
+                        Some(SideEffectState::ConfirmedNotPerformed),
+                        Some(0),
+                        Some(0),
+                    )?;
+                    goal.transition_task(
+                        &fixture.trigger_id,
+                        TaskStatus::NeedsReplan,
+                        TaskTransitionContext::default(),
+                        now,
+                    )
+                },
+            )
+            .unwrap();
+        let task = &updated.tasks()[&fixture.trigger_id];
+        assert_eq!(task.attempts().len(), 2);
+        assert_eq!(task.semantic_attempts_consumed(), 2);
+        assert_eq!(task.semantic_attempts_remaining(), 0);
+        (
+            task.attempts()[0].id().clone(),
+            task.attempts()[1].id().clone(),
+        )
+    }
+
     fn existing_ref(id: &TaskId) -> Value {
         json!({"ref_kind": "EXISTING", "task_id": id.as_str()})
     }
@@ -1473,6 +1572,68 @@ mod tests {
             current.plan_revision(),
             proposal,
         )
+    }
+
+    #[test]
+    fn exhausted_readonly_needs_replan_reconciles_append_only_with_new_prerequisite() {
+        let fixture = fixture();
+        let (attempt_1, attempt_2) = exhaust_trigger_with_second_needs_replan(&fixture, true);
+        let before = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let task_before = &before.tasks()[&fixture.trigger_id];
+        assert!(task_before.can_reconcile_exhausted_readonly_replan());
+        assert_eq!(task_before.max_attempts(), 2);
+        let mut proposal = proposal_value(&fixture);
+        proposal["add_tasks"][0] = writer_task("repair", vec![]);
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), 2);
+        let task = &result.tasks()[&fixture.trigger_id];
+        assert_eq!(task.status(), TaskStatus::Pending);
+        assert_eq!(task.max_attempts(), 2);
+        assert_eq!(task.attempts().len(), 2);
+        assert_eq!(task.attempts()[0].id(), &attempt_1);
+        assert_eq!(task.attempts()[1].id(), &attempt_2);
+        assert_eq!(task.semantic_attempts_consumed(), 1);
+        assert_eq!(task.semantic_attempts_remaining(), 1);
+        assert_eq!(task.readonly_replan_reconciliations(), 1);
+        assert!(task.evidence().iter().any(|evidence| matches!(
+            evidence,
+            TaskEvidence::ReadonlyReplanRecovery {
+                attempt_id,
+                authority: ReadonlyReplanRecoveryAuthorityKind::Replanner,
+                plan_revision_before: 1,
+                plan_revision_after: 2,
+                side_effect_state: SideEffectState::ConfirmedNotPerformed,
+            } if attempt_id == &attempt_2
+        )));
+        let repair = result
+            .tasks()
+            .values()
+            .find(|candidate| candidate.created_plan_revision() == 2)
+            .unwrap();
+        assert_eq!(repair.worker(), WorkerKind::CodexWriter);
+        assert_eq!(repair.status(), TaskStatus::Ready);
+        assert!(task
+            .dependencies()
+            .iter()
+            .any(|dependency| dependency.task_id() == repair.id()));
+    }
+
+    #[test]
+    fn exhausted_readonly_needs_replan_reconciliation_rejects_unsafe_latest_attempt_atomically() {
+        let fixture = fixture();
+        exhaust_trigger_with_second_needs_replan(&fixture, false);
+        let before = bytes(&fixture);
+        let durable = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert!(!durable.tasks()[&fixture.trigger_id].can_reconcile_exhausted_readonly_replan());
+        let result = apply(&fixture, &proposal_bytes(&fixture));
+        assert!(matches!(result, Err(ReplannerError::NoSafeReplan(_))));
+        assert_eq!(bytes(&fixture), before);
     }
 
     #[test]

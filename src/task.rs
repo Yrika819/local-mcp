@@ -306,6 +306,7 @@ impl WorkerReport {
 }
 
 pub(crate) const MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK: u32 = 3;
+pub(crate) const MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK: u32 = 2;
 const LEGACY_READONLY_TIMEOUT_REPORT: &str =
     "READONLY_BACKEND_ERROR: readonly model invocation failed: model invocation timed out";
 
@@ -325,6 +326,12 @@ pub(crate) enum ReadonlyTransportRecoveryKind {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ReadonlyTransportRecoveryAuthorityKind {
     GoalResume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum ReadonlyReplanRecoveryAuthorityKind {
+    Replanner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +472,13 @@ pub(crate) enum TaskEvidence {
         authority: ReadonlyTransportRecoveryAuthorityKind,
         side_effect_state: SideEffectState,
         postcondition_proven: bool,
+    },
+    ReadonlyReplanRecovery {
+        attempt_id: AttemptId,
+        authority: ReadonlyReplanRecoveryAuthorityKind,
+        plan_revision_before: u32,
+        plan_revision_after: u32,
+        side_effect_state: SideEffectState,
     },
     StructuredObservation {
         requirement_id: String,
@@ -651,7 +665,7 @@ impl Task {
     pub(crate) fn semantic_attempts_consumed(&self) -> u32 {
         self.attempts
             .iter()
-            .filter(|attempt| !self.is_readonly_transport_attempt(attempt.id()))
+            .filter(|attempt| !self.is_semantic_budget_exempt_attempt(attempt.id()))
             .count() as u32
     }
 
@@ -695,6 +709,50 @@ impl Task {
             } => evidence_attempt_id == attempt_id,
             _ => false,
         })
+    }
+
+    pub(crate) fn readonly_replan_reconciliations(&self) -> u32 {
+        self.evidence
+            .iter()
+            .filter(|evidence| matches!(evidence, TaskEvidence::ReadonlyReplanRecovery { .. }))
+            .count() as u32
+    }
+
+    pub(crate) fn can_reconcile_exhausted_readonly_replan(&self) -> bool {
+        if self.status != TaskStatus::NeedsReplan
+            || self.worker != WorkerKind::CodexReadonly
+            || self.scope.operation_kind != TaskOperationKind::ReadOnly
+            || self.scope.replay_safety != ReplaySafety::SafeReadOnly
+            || self.semantic_attempts_remaining() != 0
+            || self.readonly_replan_reconciliations()
+                >= MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK
+            || !self.blockers.is_empty()
+        {
+            return false;
+        }
+        self.latest_attempt().is_some_and(|attempt| {
+            attempt.worker == WorkerKind::CodexReadonly
+                && attempt.outcome == Some(AttemptOutcome::NeedsReplan)
+                && attempt.operation_id.is_none()
+                && attempt.scope_identity.is_none()
+                && attempt.side_effect_class == Some(SideEffectClass::None)
+                && attempt.side_effect_state == Some(SideEffectState::ConfirmedNotPerformed)
+        })
+    }
+
+    fn is_readonly_replan_reconciled_attempt(&self, attempt_id: &AttemptId) -> bool {
+        self.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaskEvidence::ReadonlyReplanRecovery {
+                attempt_id: evidence_attempt_id,
+                ..
+            } if evidence_attempt_id == attempt_id
+        ))
+    }
+
+    fn is_semantic_budget_exempt_attempt(&self, attempt_id: &AttemptId) -> bool {
+        self.is_readonly_transport_attempt(attempt_id)
+            || self.is_readonly_replan_reconciled_attempt(attempt_id)
     }
 
     pub(crate) fn created_plan_revision(&self) -> u32 {
@@ -835,6 +893,65 @@ impl Task {
                         .to_owned(),
                 ));
             }
+        }
+        let mut replan_recovery_attempts = BTreeSet::new();
+        for evidence in &self.evidence {
+            let TaskEvidence::ReadonlyReplanRecovery {
+                attempt_id,
+                authority,
+                plan_revision_before,
+                plan_revision_after,
+                side_effect_state,
+            } = evidence
+            else {
+                continue;
+            };
+            if *authority != ReadonlyReplanRecoveryAuthorityKind::Replanner
+                || *side_effect_state != SideEffectState::ConfirmedNotPerformed
+                || plan_revision_before.checked_add(1) != Some(*plan_revision_after)
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "invalid readonly replan recovery evidence".to_owned(),
+                ));
+            }
+            if !replan_recovery_attempts.insert(attempt_id.clone())
+                || transport_evidence_attempts.contains(attempt_id)
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "duplicate or conflicting readonly recovery evidence for one attempt".to_owned(),
+                ));
+            }
+            let attempt = self
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id() == attempt_id)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "readonly replan recovery references a missing attempt".to_owned(),
+                    )
+                })?;
+            if self.worker != WorkerKind::CodexReadonly
+                || self.scope.operation_kind != TaskOperationKind::ReadOnly
+                || self.scope.replay_safety != ReplaySafety::SafeReadOnly
+                || attempt.worker != WorkerKind::CodexReadonly
+                || attempt.outcome != Some(AttemptOutcome::NeedsReplan)
+                || attempt.operation_id.is_some()
+                || attempt.scope_identity.is_some()
+                || attempt.side_effect_class != Some(SideEffectClass::None)
+                || attempt.side_effect_state != Some(SideEffectState::ConfirmedNotPerformed)
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "readonly replan recovery requires a conclusively non-mutating NEEDS_REPLAN attempt"
+                        .to_owned(),
+                ));
+            }
+        }
+        if replan_recovery_attempts.len() as u32
+            > MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "readonly replan recovery budget exceeded".to_owned(),
+            ));
         }
         if self.status == TaskStatus::Running && self.attempts.is_empty() {
             return Err(OrchestratorError::CorruptGoal(
@@ -1479,6 +1596,39 @@ impl Task {
         Ok(true)
     }
 
+    pub(crate) fn reconcile_exhausted_readonly_replan(
+        &mut self,
+        _authority: &crate::replanner::ReadonlyReplanRecoveryAuthority,
+        plan_revision_before: u32,
+        plan_revision_after: u32,
+        now: &str,
+    ) -> Result<bool, OrchestratorError> {
+        if !self.can_reconcile_exhausted_readonly_replan()
+            || plan_revision_before.checked_add(1) != Some(plan_revision_after)
+        {
+            return Ok(false);
+        }
+        let attempt_id = self
+            .latest_attempt()
+            .expect("eligible NEEDS_REPLAN task has a latest attempt")
+            .id
+            .clone();
+        self.evidence.push(TaskEvidence::ReadonlyReplanRecovery {
+            attempt_id,
+            authority: ReadonlyReplanRecoveryAuthorityKind::Replanner,
+            plan_revision_before,
+            plan_revision_after,
+            side_effect_state: SideEffectState::ConfirmedNotPerformed,
+        });
+        self.updated_at = now.to_owned();
+        if self.semantic_attempts_remaining() == 0 {
+            return Err(OrchestratorError::CorruptGoal(
+                "readonly replan recovery failed to restore one bounded semantic attempt".to_owned(),
+            ));
+        }
+        Ok(true)
+    }
+
     fn latest_verification_passed(&self) -> bool {
         self.verification_results
             .last()
@@ -1595,6 +1745,111 @@ mod tests {
             serde_json::to_string(&WorkerKind::CodexWriter).unwrap(),
             "\"CODEX_WRITER\""
         );
+    }
+
+    #[test]
+    fn readonly_replan_reconciliation_budget_is_finite() {
+        let mut task = Task::new(
+            "bounded",
+            "bounded",
+            true,
+            WorkerKind::CodexReadonly,
+            read_only_scope(),
+            vec![],
+            1,
+            0,
+            NOW,
+        )
+        .unwrap();
+        for generation in 0..MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK {
+            task.transition_to(
+                TaskStatus::Ready,
+                true,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            task.transition_to(
+                TaskStatus::Running,
+                true,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            task.bind_latest_attempt_execution(
+                None,
+                None,
+                None,
+                Some(SideEffectClass::None),
+                Some(SideEffectState::ConfirmedNotPerformed),
+                Some(0),
+                Some(0),
+            )
+            .unwrap();
+            task.transition_to(
+                TaskStatus::NeedsReplan,
+                true,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(task.semantic_attempts_remaining(), 0);
+            let attempt_id = task.latest_attempt().unwrap().id().clone();
+            task.evidence.push(TaskEvidence::ReadonlyReplanRecovery {
+                attempt_id,
+                authority: ReadonlyReplanRecoveryAuthorityKind::Replanner,
+                plan_revision_before: generation,
+                plan_revision_after: generation + 1,
+                side_effect_state: SideEffectState::ConfirmedNotPerformed,
+            });
+            task.validate_local().unwrap();
+            assert_eq!(task.semantic_attempts_remaining(), 1);
+            task.transition_to(
+                TaskStatus::Pending,
+                false,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+        }
+
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.bind_latest_attempt_execution(
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(0),
+            Some(0),
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::NeedsReplan,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            task.readonly_replan_reconciliations(),
+            MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK
+        );
+        assert_eq!(task.semantic_attempts_remaining(), 0);
+        assert!(!task.can_reconcile_exhausted_readonly_replan());
     }
 
     #[test]

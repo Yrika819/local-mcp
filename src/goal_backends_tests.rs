@@ -191,6 +191,11 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
             .contains("resolve_needs_replan MUST be a JSON array of existing Task ID strings")
     );
     assert!(calls[4].prompt().contains("never a boolean"));
+    assert!(calls[4].prompt().contains("EXISTING task_id MUST be an exact existing UUID"));
+    assert!(calls[4].prompt().contains("Never create self-dependencies"));
+    assert!(calls[4].prompt().contains("omit already-mandatory tasks"));
+    assert!(calls[4].prompt().contains("the SAME proposal MUST add a new hard prerequisite directly"));
+    assert!(calls[4].prompt().contains("add a CODEX_WRITER task with LOCAL_MUTATION and VERIFY_BEFORE_RETRY"));
 }
 
 #[test]
