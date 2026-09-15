@@ -175,6 +175,22 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     );
     assert!(calls[3].prompt().contains("never an array"));
     assert!(calls[3].prompt().contains("evidence MUST be a JSON array"));
+    assert!(
+        calls[4]
+            .prompt()
+            .contains("add MUST be a JSON array even when adding one verification")
+    );
+    assert!(
+        calls[4]
+            .prompt()
+            .contains("add_task_refs MUST be a JSON array")
+    );
+    assert!(
+        calls[4]
+            .prompt()
+            .contains("resolve_needs_replan MUST be a JSON array of existing Task ID strings")
+    );
+    assert!(calls[4].prompt().contains("never a boolean"));
 }
 
 #[test]
