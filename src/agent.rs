@@ -21,6 +21,7 @@ pub(crate) const GOAL_MODEL_ENV: &str = "LOCAL_MCP_GOAL_MODEL";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelRole {
     Planner,
+    Readonly,
     Writer,
     Reviewer,
     Replanner,
@@ -30,6 +31,7 @@ impl ModelRole {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Planner => "PLANNER",
+            Self::Readonly => "READONLY",
             Self::Writer => "WRITER",
             Self::Reviewer => "REVIEWER",
             Self::Replanner => "REPLANNER",
@@ -279,7 +281,10 @@ fn configured_model() -> Result<String, AgentError> {
     }
 }
 
-fn configured_model_from(goal_model: Option<&str>, fallback_model: &str) -> Result<String, AgentError> {
+fn configured_model_from(
+    goal_model: Option<&str>,
+    fallback_model: &str,
+) -> Result<String, AgentError> {
     let model = goal_model.unwrap_or(fallback_model);
     if model.trim().is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
         return Err(AgentError::InvalidConfiguration);

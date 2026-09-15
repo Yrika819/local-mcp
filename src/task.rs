@@ -19,8 +19,9 @@ macro_rules! durable_id {
             }
 
             pub(crate) fn parse(value: &str) -> Result<Self, OrchestratorError> {
-                let uuid = Uuid::parse_str(value)
-                    .map_err(|_| OrchestratorError::UnsafeIdentifier(stringify!($name).to_owned()))?;
+                let uuid = Uuid::parse_str(value).map_err(|_| {
+                    OrchestratorError::UnsafeIdentifier(stringify!($name).to_owned())
+                })?;
                 Ok(Self(uuid.to_string()))
             }
 
@@ -31,7 +32,9 @@ macro_rules! durable_id {
             fn validate(&self) -> Result<(), OrchestratorError> {
                 let canonical = Self::parse(&self.0)?;
                 if canonical.0 != self.0 {
-                    return Err(OrchestratorError::UnsafeIdentifier(stringify!($name).to_owned()));
+                    return Err(OrchestratorError::UnsafeIdentifier(
+                        stringify!($name).to_owned(),
+                    ));
                 }
                 Ok(())
             }
@@ -354,6 +357,10 @@ impl TaskAttempt {
 
     pub(crate) fn id(&self) -> &AttemptId {
         &self.id
+    }
+
+    pub(crate) fn side_effect_class(&self) -> Option<SideEffectClass> {
+        self.side_effect_class
     }
 
     pub(crate) fn side_effect_state(&self) -> Option<SideEffectState> {
@@ -693,74 +700,109 @@ impl Task {
     ) -> Result<(), OrchestratorError> {
         let from = self.status;
         if from.is_terminal() {
-            return Err(invalid_task_transition(from, next, "terminal task state is immutable"));
+            return Err(invalid_task_transition(
+                from,
+                next,
+                "terminal task state is immutable",
+            ));
         }
         let allowed = matches!(
             (from, next),
-            (TaskStatus::Pending, TaskStatus::Ready | TaskStatus::Cancelled)
-                | (TaskStatus::Ready, TaskStatus::Running | TaskStatus::Cancelled)
-                | (
-                    TaskStatus::Running,
-                    TaskStatus::Verifying
-                        | TaskStatus::Retryable
-                        | TaskStatus::Blocked
-                        | TaskStatus::NeedsReplan
-                        | TaskStatus::Failed
-                        | TaskStatus::Cancelled
-                )
-                | (
-                    TaskStatus::Verifying,
-                    TaskStatus::Completed
-                        | TaskStatus::Retryable
-                        | TaskStatus::Blocked
-                        | TaskStatus::NeedsReplan
-                        | TaskStatus::Failed
-                        | TaskStatus::Cancelled
-                )
-                | (
-                    TaskStatus::Retryable,
-                    TaskStatus::Ready | TaskStatus::Failed | TaskStatus::Cancelled
-                )
-                | (
-                    TaskStatus::Blocked,
-                    TaskStatus::Ready
-                        | TaskStatus::NeedsReplan
-                        | TaskStatus::Failed
-                        | TaskStatus::Cancelled
-                )
-                | (
-                    TaskStatus::NeedsReplan,
-                    TaskStatus::Pending
-                        | TaskStatus::Blocked
-                        | TaskStatus::Failed
-                        | TaskStatus::Cancelled
-                )
+            (
+                TaskStatus::Pending,
+                TaskStatus::Ready | TaskStatus::Cancelled
+            ) | (
+                TaskStatus::Ready,
+                TaskStatus::Running | TaskStatus::Cancelled
+            ) | (
+                TaskStatus::Running,
+                TaskStatus::Verifying
+                    | TaskStatus::Retryable
+                    | TaskStatus::Blocked
+                    | TaskStatus::NeedsReplan
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+            ) | (
+                TaskStatus::Verifying,
+                TaskStatus::Completed
+                    | TaskStatus::Retryable
+                    | TaskStatus::Blocked
+                    | TaskStatus::NeedsReplan
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+            ) | (
+                TaskStatus::Retryable,
+                TaskStatus::Ready | TaskStatus::Failed | TaskStatus::Cancelled
+            ) | (
+                TaskStatus::Blocked,
+                TaskStatus::Ready
+                    | TaskStatus::NeedsReplan
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+            ) | (
+                TaskStatus::NeedsReplan,
+                TaskStatus::Pending
+                    | TaskStatus::Blocked
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+            )
         );
         #[cfg(not(test))]
-        if from == TaskStatus::Verifying && next == TaskStatus::Completed { return Err(invalid_task_transition(from, next, "direct completion rejected")); }
+        if from == TaskStatus::Verifying && next == TaskStatus::Completed {
+            return Err(invalid_task_transition(
+                from,
+                next,
+                "direct completion rejected",
+            ));
+        }
         if !allowed {
-            return Err(invalid_task_transition(from, next, "transition is not in the V1 state table"));
+            return Err(invalid_task_transition(
+                from,
+                next,
+                "transition is not in the V1 state table",
+            ));
         }
         if next == TaskStatus::Ready {
             if !dependencies_satisfied {
-                return Err(invalid_task_transition(from, next, "hard dependencies are incomplete"));
+                return Err(invalid_task_transition(
+                    from,
+                    next,
+                    "hard dependencies are incomplete",
+                ));
             }
             if !self.blockers.is_empty() {
-                return Err(invalid_task_transition(from, next, "task still has blockers"));
+                return Err(invalid_task_transition(
+                    from,
+                    next,
+                    "task still has blockers",
+                ));
             }
             if from == TaskStatus::Retryable && !self.retry_allowed() {
-                return Err(invalid_task_transition(from, next, "retry policy/budget does not permit another attempt"));
+                return Err(invalid_task_transition(
+                    from,
+                    next,
+                    "retry policy/budget does not permit another attempt",
+                ));
             }
         }
         if from == TaskStatus::Ready && next == TaskStatus::Running {
             if !dependencies_satisfied {
-                return Err(invalid_task_transition(from, next, "hard dependencies are incomplete"));
+                return Err(invalid_task_transition(
+                    from,
+                    next,
+                    "hard dependencies are incomplete",
+                ));
             }
             let number = self.attempts.len() as u32 + 1;
             if number > self.max_attempts {
-                return Err(invalid_task_transition(from, next, "task attempt budget is exhausted"));
+                return Err(invalid_task_transition(
+                    from,
+                    next,
+                    "task attempt budget is exhausted",
+                ));
             }
-            self.attempts.push(TaskAttempt::new(number, self.worker, now));
+            self.attempts
+                .push(TaskAttempt::new(number, self.worker, now));
         }
         if from == TaskStatus::Running && next == TaskStatus::Verifying {
             if self
@@ -791,8 +833,13 @@ impl Task {
                 "cancellation requires stopped worker and reconciled side effects",
             ));
         }
-        if matches!(next, TaskStatus::Retryable | TaskStatus::Blocked | TaskStatus::NeedsReplan | TaskStatus::Failed)
-            || (from == TaskStatus::Running && next == TaskStatus::Verifying)
+        if matches!(
+            next,
+            TaskStatus::Retryable
+                | TaskStatus::Blocked
+                | TaskStatus::NeedsReplan
+                | TaskStatus::Failed
+        ) || (from == TaskStatus::Running && next == TaskStatus::Verifying)
         {
             if let Some(attempt) = self.attempts.last_mut() {
                 if attempt.finished_at.is_none() {
@@ -875,7 +922,11 @@ impl Task {
                     "invalid durable operation identity".to_owned(),
                 ));
             }
-            if attempt.operation_id.as_ref().is_some_and(|old| old != &new_id) {
+            if attempt
+                .operation_id
+                .as_ref()
+                .is_some_and(|old| old != &new_id)
+            {
                 return Err(OrchestratorError::InvalidDag(
                     "operation identity cannot be rewritten within an attempt".to_owned(),
                 ));
@@ -883,7 +934,11 @@ impl Task {
             attempt.operation_id = Some(new_id);
         }
         if let Some(new_scope) = scope_identity {
-            if attempt.scope_identity.as_ref().is_some_and(|old| old != &new_scope) {
+            if attempt
+                .scope_identity
+                .as_ref()
+                .is_some_and(|old| old != &new_scope)
+            {
                 return Err(OrchestratorError::InvalidDag(
                     "scope identity cannot be rewritten within an attempt".to_owned(),
                 ));
@@ -994,7 +1049,10 @@ impl Task {
         candidate: Vec<TaskDependency>,
         completed_dependencies: &BTreeSet<TaskId>,
     ) -> Result<(), OrchestratorError> {
-        if !matches!(self.status, TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan) {
+        if !matches!(
+            self.status,
+            TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan
+        ) {
             return Err(OrchestratorError::InvalidDag(
                 "dependencies cannot change for active or terminal tasks".to_owned(),
             ));
@@ -1010,7 +1068,8 @@ impl Task {
             .collect::<BTreeSet<_>>();
         if proposed.len() != candidate.len() || !current.is_subset(&proposed) {
             return Err(OrchestratorError::InvalidDag(
-                "replanning may add hard dependencies but may not remove or duplicate them".to_owned(),
+                "replanning may add hard dependencies but may not remove or duplicate them"
+                    .to_owned(),
             ));
         }
         if proposed.contains(&self.id) {
@@ -1035,7 +1094,10 @@ impl Task {
         &mut self,
         candidate: Vec<VerificationSpec>,
     ) -> Result<(), OrchestratorError> {
-        if !matches!(self.status, TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan) {
+        if !matches!(
+            self.status,
+            TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan
+        ) {
             return Err(OrchestratorError::InvalidDag(
                 "verification cannot change for active or terminal tasks".to_owned(),
             ));
@@ -1107,14 +1169,18 @@ impl Task {
             return Ok(());
         }
 
-        let reconciled_postcondition = self.evidence.iter().rev().find_map(|evidence| match evidence {
-            TaskEvidence::RecoveryReconciliation {
-                side_effect_state,
-                postcondition_proven,
-                ..
-            } => Some((*side_effect_state, *postcondition_proven)),
-            _ => None,
-        });
+        let reconciled_postcondition =
+            self.evidence
+                .iter()
+                .rev()
+                .find_map(|evidence| match evidence {
+                    TaskEvidence::RecoveryReconciliation {
+                        side_effect_state,
+                        postcondition_proven,
+                        ..
+                    } => Some((*side_effect_state, *postcondition_proven)),
+                    _ => None,
+                });
         if matches!(
             reconciled_postcondition,
             Some((SideEffectState::ConfirmedPerformed, true))
@@ -1127,7 +1193,8 @@ impl Task {
         let attempt = self.latest_attempt();
         let state = attempt.and_then(|attempt| attempt.side_effect_state);
         let remaining_attempt = attempt.and_then(|attempt| attempt.remaining_attempt_budget);
-        let remaining_side_effect = attempt.and_then(|attempt| attempt.remaining_side_effect_budget);
+        let remaining_side_effect =
+            attempt.and_then(|attempt| attempt.remaining_side_effect_budget);
         if state == Some(SideEffectState::ConfirmedNotPerformed)
             && can_retry_attempt
             && remaining_attempt.unwrap_or(0) > 0
@@ -1257,7 +1324,10 @@ mod tests {
             let decoded: TaskStatus = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, status);
         }
-        assert_eq!(serde_json::to_string(&WorkerKind::CodexWriter).unwrap(), "\"CODEX_WRITER\"");
+        assert_eq!(
+            serde_json::to_string(&WorkerKind::CodexWriter).unwrap(),
+            "\"CODEX_WRITER\""
+        );
     }
 
     #[test]
@@ -1277,10 +1347,16 @@ mod tests {
             active_worker_stopped: true,
             side_effect_reconciled: true,
         };
-        task.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
-        task.transition_to(TaskStatus::Running, true, context, NOW).unwrap();
-        assert!(task.transition_to(TaskStatus::Completed, true, context, NOW).is_err());
-        task.transition_to(TaskStatus::Verifying, true, context, NOW).unwrap();
+        task.transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
+        task.transition_to(TaskStatus::Running, true, context, NOW)
+            .unwrap();
+        assert!(
+            task.transition_to(TaskStatus::Completed, true, context, NOW)
+                .is_err()
+        );
+        task.transition_to(TaskStatus::Verifying, true, context, NOW)
+            .unwrap();
         task.record_verification_result(VerificationResult::new(
             VerificationOutcome::Passed,
             vec![],
@@ -1288,52 +1364,104 @@ mod tests {
             NOW,
         ))
         .unwrap();
-        task.transition_to(TaskStatus::Completed, true, context, NOW).unwrap();
+        task.transition_to(TaskStatus::Completed, true, context, NOW)
+            .unwrap();
         assert_eq!(task.status(), TaskStatus::Completed);
     }
 
     #[test]
     fn legal_retry_block_and_replan_transitions_are_enforced() {
         let context = TaskTransitionContext::default();
-        for target in [TaskStatus::Retryable, TaskStatus::Blocked, TaskStatus::NeedsReplan, TaskStatus::Failed] {
+        for target in [
+            TaskStatus::Retryable,
+            TaskStatus::Blocked,
+            TaskStatus::NeedsReplan,
+            TaskStatus::Failed,
+        ] {
             let mut task = task(WorkerKind::CodexReadonly);
-            task.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
-            task.transition_to(TaskStatus::Running, true, context, NOW).unwrap();
+            task.transition_to(TaskStatus::Ready, true, context, NOW)
+                .unwrap();
+            task.transition_to(TaskStatus::Running, true, context, NOW)
+                .unwrap();
             task.transition_to(target, true, context, NOW).unwrap();
         }
         let mut retry = task(WorkerKind::CodexReadonly);
-        retry.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
-        retry.transition_to(TaskStatus::Running, true, context, NOW).unwrap();
-        retry.transition_to(TaskStatus::Retryable, true, context, NOW).unwrap();
-        retry.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
+        retry
+            .transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
+        retry
+            .transition_to(TaskStatus::Running, true, context, NOW)
+            .unwrap();
+        retry
+            .transition_to(TaskStatus::Retryable, true, context, NOW)
+            .unwrap();
+        retry
+            .transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
 
         let mut blocked = task(WorkerKind::CodexReadonly);
-        blocked.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
-        blocked.transition_to(TaskStatus::Running, true, context, NOW).unwrap();
-        blocked.transition_to(TaskStatus::Blocked, true, context, NOW).unwrap();
-        blocked.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
+        blocked
+            .transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
+        blocked
+            .transition_to(TaskStatus::Running, true, context, NOW)
+            .unwrap();
+        blocked
+            .transition_to(TaskStatus::Blocked, true, context, NOW)
+            .unwrap();
+        blocked
+            .transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
 
         let mut replan = task(WorkerKind::CodexReadonly);
-        replan.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
-        replan.transition_to(TaskStatus::Running, true, context, NOW).unwrap();
-        replan.transition_to(TaskStatus::NeedsReplan, true, context, NOW).unwrap();
-        replan.transition_to(TaskStatus::Pending, true, context, NOW).unwrap();
+        replan
+            .transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
+        replan
+            .transition_to(TaskStatus::Running, true, context, NOW)
+            .unwrap();
+        replan
+            .transition_to(TaskStatus::NeedsReplan, true, context, NOW)
+            .unwrap();
+        replan
+            .transition_to(TaskStatus::Pending, true, context, NOW)
+            .unwrap();
     }
 
     #[test]
     fn representative_illegal_task_transitions_are_rejected() {
         let context = TaskTransitionContext::default();
         let mut pending = task(WorkerKind::CodexReadonly);
-        assert!(pending.transition_to(TaskStatus::Completed, true, context, NOW).is_err());
-        pending.transition_to(TaskStatus::Ready, true, context, NOW).unwrap();
-        assert!(pending.transition_to(TaskStatus::Completed, true, context, NOW).is_err());
-        pending.transition_to(TaskStatus::Running, true, context, NOW).unwrap();
-        assert!(pending.transition_to(TaskStatus::Completed, true, context, NOW).is_err());
+        assert!(
+            pending
+                .transition_to(TaskStatus::Completed, true, context, NOW)
+                .is_err()
+        );
+        pending
+            .transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
+        assert!(
+            pending
+                .transition_to(TaskStatus::Completed, true, context, NOW)
+                .is_err()
+        );
+        pending
+            .transition_to(TaskStatus::Running, true, context, NOW)
+            .unwrap();
+        assert!(
+            pending
+                .transition_to(TaskStatus::Completed, true, context, NOW)
+                .is_err()
+        );
     }
 
     #[test]
     fn terminal_tasks_are_immutable() {
-        for terminal in [TaskStatus::Completed, TaskStatus::Failed, TaskStatus::Cancelled] {
+        for terminal in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
             let mut task = task(WorkerKind::CodexReadonly);
             task.status = terminal;
             if terminal == TaskStatus::Completed {
@@ -1344,27 +1472,72 @@ mod tests {
                     NOW,
                 ));
             }
-            assert!(task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW).is_err());
+            assert!(
+                task.transition_to(
+                    TaskStatus::Running,
+                    true,
+                    TaskTransitionContext::default(),
+                    NOW
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn ready_requires_completed_dependencies() {
         let mut task = task(WorkerKind::CodexReadonly);
-        assert!(task.transition_to(TaskStatus::Ready, false, TaskTransitionContext::default(), NOW).is_err());
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW).unwrap();
+        assert!(
+            task.transition_to(
+                TaskStatus::Ready,
+                false,
+                TaskTransitionContext::default(),
+                NOW
+            )
+            .is_err()
+        );
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
     }
 
     #[test]
     fn active_cancel_requires_worker_stop_and_side_effect_reconciliation() {
         let mut task = task(WorkerKind::CodexReadonly);
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW).unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW).unwrap();
-        assert!(task.transition_to(TaskStatus::Cancelled, true, TaskTransitionContext::default(), NOW).is_err());
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            task.transition_to(
+                TaskStatus::Cancelled,
+                true,
+                TaskTransitionContext::default(),
+                NOW
+            )
+            .is_err()
+        );
         task.transition_to(
             TaskStatus::Cancelled,
             true,
-            TaskTransitionContext { active_worker_stopped: true, side_effect_reconciled: true },
+            TaskTransitionContext {
+                active_worker_stopped: true,
+                side_effect_reconciled: true,
+            },
             NOW,
         )
         .unwrap();
@@ -1379,8 +1552,20 @@ mod tests {
             TaskOperationKind::LocalMutation,
             ReplaySafety::VerifyBeforeRetry,
         );
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW).unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW).unwrap();
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         task.bind_latest_attempt_execution(
             Some("operation-1".into()),
             Some("scope-1".into()),
@@ -1391,15 +1576,10 @@ mod tests {
             Some(1),
         )
         .unwrap();
-        assert!(task.bind_latest_attempt_execution(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(2),
-            Some(1),
-        ).is_err());
+        assert!(
+            task.bind_latest_attempt_execution(None, None, None, None, None, Some(2), Some(1),)
+                .is_err()
+        );
     }
 
     fn running_mutation_task() -> Task {
@@ -1410,10 +1590,20 @@ mod tests {
             TaskOperationKind::LocalMutation,
             ReplaySafety::VerifyBeforeRetry,
         );
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         task
     }
 
@@ -1431,8 +1621,8 @@ mod tests {
         )
         .unwrap();
         let before = task.clone();
-        assert!(task
-            .bind_latest_attempt_execution(
+        assert!(
+            task.bind_latest_attempt_execution(
                 Some("operation-1".into()),
                 Some("scope-1".into()),
                 Some("request-2".into()),
@@ -1441,7 +1631,8 @@ mod tests {
                 Some(2),
                 Some(1),
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(task, before);
     }
 
@@ -1459,8 +1650,8 @@ mod tests {
         )
         .unwrap();
         let before = task.clone();
-        assert!(task
-            .bind_latest_attempt_execution(
+        assert!(
+            task.bind_latest_attempt_execution(
                 Some("operation-1".into()),
                 Some("scope-1".into()),
                 Some("request-2".into()),
@@ -1469,7 +1660,8 @@ mod tests {
                 Some(1),
                 Some(2),
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(task, before);
     }
 
@@ -1488,8 +1680,8 @@ mod tests {
         .unwrap();
 
         let before_identity = task.clone();
-        assert!(task
-            .bind_latest_attempt_execution(
+        assert!(
+            task.bind_latest_attempt_execution(
                 Some("operation-2".into()),
                 Some("scope-1".into()),
                 None,
@@ -1498,12 +1690,13 @@ mod tests {
                 Some(1),
                 Some(1),
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(task, before_identity);
 
         let before_scope = task.clone();
-        assert!(task
-            .bind_latest_attempt_execution(
+        assert!(
+            task.bind_latest_attempt_execution(
                 Some("operation-1".into()),
                 Some("scope-2".into()),
                 None,
@@ -1512,7 +1705,8 @@ mod tests {
                 Some(1),
                 Some(1),
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(task, before_scope);
     }
 
@@ -1529,16 +1723,31 @@ mod tests {
             Some(1),
         )
         .unwrap();
-        task.transition_to(TaskStatus::Retryable, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
+        task.transition_to(
+            TaskStatus::Retryable,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
 
         let before = task.clone();
-        assert!(task
-            .bind_latest_attempt_execution(
+        assert!(
+            task.bind_latest_attempt_execution(
                 Some("operation-1".into()),
                 Some("scope-1".into()),
                 None,
@@ -1547,15 +1756,28 @@ mod tests {
                 Some(2),
                 Some(1),
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(task, before);
     }
 
     #[test]
     fn stale_readonly_running_recovers_to_retryable() {
         let mut task = task(WorkerKind::CodexReadonly);
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW).unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW).unwrap();
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         task.recover_stale_running("2026-01-02T00:00:00Z").unwrap();
         assert_eq!(task.status(), TaskStatus::Retryable);
     }
@@ -1563,13 +1785,36 @@ mod tests {
     #[test]
     fn stale_unknown_mutation_recovers_to_blocked() {
         let mut task = task(WorkerKind::LocalOperation);
-        task.scope = TaskScope::new(vec![], vec![], TaskOperationKind::LocalMutation, ReplaySafety::VerifyBeforeRetry);
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW).unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW).unwrap();
+        task.scope = TaskScope::new(
+            vec![],
+            vec![],
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        );
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         task.bind_latest_attempt_execution(
-            Some("op".into()), None, None, Some(SideEffectClass::LocalMutation),
-            Some(SideEffectState::Unknown), Some(1), Some(1),
-        ).unwrap();
+            Some("op".into()),
+            None,
+            None,
+            Some(SideEffectClass::LocalMutation),
+            Some(SideEffectState::Unknown),
+            Some(1),
+            Some(1),
+        )
+        .unwrap();
         task.recover_stale_running("2026-01-02T00:00:00Z").unwrap();
         assert_eq!(task.status(), TaskStatus::Blocked);
     }
@@ -1577,18 +1822,42 @@ mod tests {
     #[test]
     fn independently_proven_mutation_recovers_to_verifying_not_completed() {
         let mut task = task(WorkerKind::LocalOperation);
-        task.scope = TaskScope::new(vec![], vec![], TaskOperationKind::LocalMutation, ReplaySafety::VerifyBeforeRetry);
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW).unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW).unwrap();
+        task.scope = TaskScope::new(
+            vec![],
+            vec![],
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        );
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         task.bind_latest_attempt_execution(
-            Some("op".into()), None, None, Some(SideEffectClass::LocalMutation),
-            Some(SideEffectState::ConfirmedPerformed), Some(0), Some(0),
-        ).unwrap();
+            Some("op".into()),
+            None,
+            None,
+            Some(SideEffectClass::LocalMutation),
+            Some(SideEffectState::ConfirmedPerformed),
+            Some(0),
+            Some(0),
+        )
+        .unwrap();
         task.add_evidence(TaskEvidence::RecoveryReconciliation {
             summary: "postcondition independently proven".into(),
             side_effect_state: SideEffectState::ConfirmedPerformed,
             postcondition_proven: true,
-        }).unwrap();
+        })
+        .unwrap();
         task.recover_stale_running("2026-01-02T00:00:00Z").unwrap();
         assert_eq!(task.status(), TaskStatus::Verifying);
         assert_ne!(task.status(), TaskStatus::Completed);
@@ -1603,16 +1872,25 @@ mod tests {
         let completed = BTreeSet::from([dep_a.clone(), dep_b.clone()]);
         assert!(task.strengthen_dependencies(vec![], &completed).is_err());
         task.strengthen_dependencies(
-            vec![TaskDependency::completed(dep_a), TaskDependency::completed(dep_b)],
+            vec![
+                TaskDependency::completed(dep_a),
+                TaskDependency::completed(dep_b),
+            ],
             &completed,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let original = VerificationSpec::ReviewGate { max_blocking_findings: 0 };
+        let original = VerificationSpec::ReviewGate {
+            max_blocking_findings: 0,
+        };
         task.verification = vec![original.clone()];
         assert!(task.strengthen_verification(vec![]).is_err());
         task.strengthen_verification(vec![
             original,
-            VerificationSpec::StructuredEvidence { requirement_id: "extra".into() },
-        ]).unwrap();
+            VerificationSpec::StructuredEvidence {
+                requirement_id: "extra".into(),
+            },
+        ])
+        .unwrap();
     }
 }

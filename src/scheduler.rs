@@ -3,15 +3,18 @@ use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_verifier::{self, GoalVerifierError};
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::{self, PlannerBackend, PlannerError};
+use crate::readonly_worker::{self, ReadonlyBackend, ReadonlyError};
 use crate::replanner::{self, ReplannerBackend, ReplannerError};
 use crate::task::{Task, TaskId, TaskStatus, WorkerKind};
 use crate::task_store::TaskStore;
 use crate::verifier::{self, VerifierError};
+use crate::worker_capability::{self, ReadyWorkerRoute};
 use crate::writer::{self, ReviewerBackend, WriterBackend, WriterError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchedulerAuthority {
     Planner,
+    Readonly,
     Writer,
     Verifier,
     GoalVerifier,
@@ -43,6 +46,7 @@ pub(crate) enum SchedulerDecision {
     VerifyTask { task_id: TaskId },
     VerifyGoal,
     Replan { trigger_task_id: TaskId },
+    RunReadonly { task_id: TaskId },
     RunWriter { task_id: TaskId },
     UnsupportedWorker { task_id: TaskId, worker: WorkerKind },
     NoAction { reason: SchedulerNoActionReason },
@@ -55,6 +59,7 @@ impl SchedulerDecision {
             | Self::Replan {
                 trigger_task_id: task_id,
             }
+            | Self::RunReadonly { task_id }
             | Self::RunWriter { task_id }
             | Self::UnsupportedWorker { task_id, .. } => Some(task_id),
             Self::PlanInitial | Self::VerifyGoal | Self::NoAction { .. } => None,
@@ -68,6 +73,7 @@ pub(crate) enum SchedulerAction {
     VerifyTask,
     VerifyGoal,
     Replan,
+    RunReadonly,
     RunWriter,
     UnsupportedWorker,
     NoAction,
@@ -78,7 +84,10 @@ pub(crate) enum SchedulerStepOutcome {
     Applied,
     NoAction(SchedulerNoActionReason),
     UnsupportedWorker(WorkerKind),
-    RevisionConflict { expected: u64, actual: u64 },
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
     LowerAuthorityError {
         authority: SchedulerAuthority,
         detail: String,
@@ -223,14 +232,23 @@ pub(crate) fn select_next_action(goal: &Goal) -> Result<SchedulerDecision, Sched
     // priority durable gates and prevent final-verification entry.
     let goal_verification_eligible = goal.status() == GoalStatus::Running
         && goal.final_verification_spec().is_some()
-        && goal.tasks().values().filter(|task| task.mandatory()).all(|task| {
-            task.status() == TaskStatus::Completed
-                && task.blockers().is_empty()
-                && !task.has_unknown_side_effect()
-                && task.verification_results().last().is_some_and(|result| result.outcome() == crate::task::VerificationOutcome::Passed)
-        })
+        && goal
+            .tasks()
+            .values()
+            .filter(|task| task.mandatory())
+            .all(|task| {
+                task.status() == TaskStatus::Completed
+                    && task.blockers().is_empty()
+                    && !task.has_unknown_side_effect()
+                    && task.verification_results().last().is_some_and(|result| {
+                        result.outcome() == crate::task::VerificationOutcome::Passed
+                    })
+            })
         && !goal.blockers().iter().any(|blocker| blocker.mandatory())
-        && !goal.tasks().values().any(|task| task.has_unknown_side_effect())
+        && !goal
+            .tasks()
+            .values()
+            .any(|task| task.has_unknown_side_effect())
         && !goal.has_task_status(TaskStatus::Running)
         && !goal.has_task_status(TaskStatus::Verifying)
         && !goal.has_task_status(TaskStatus::NeedsReplan);
@@ -249,22 +267,31 @@ pub(crate) fn select_next_action(goal: &Goal) -> Result<SchedulerDecision, Sched
                 reason: SchedulerNoActionReason::BlockedTasks,
             });
         }
-        if task.worker() == WorkerKind::CodexWriter {
-            if let Some((holder, _)) = ordered_workspace_leases(goal, task_id).next() {
-                return Ok(SchedulerDecision::NoAction {
-                    reason: SchedulerNoActionReason::WriterLeaseHeld {
-                        holder: holder.clone(),
-                    },
+        match worker_capability::ready_worker_route(task.worker()) {
+            Some(ReadyWorkerRoute::Readonly) => {
+                return Ok(SchedulerDecision::RunReadonly {
+                    task_id: task_id.clone(),
                 });
             }
-            return Ok(SchedulerDecision::RunWriter {
-                task_id: task_id.clone(),
-            });
+            Some(ReadyWorkerRoute::Writer) => {
+                if let Some((holder, _)) = ordered_workspace_leases(goal, task_id).next() {
+                    return Ok(SchedulerDecision::NoAction {
+                        reason: SchedulerNoActionReason::WriterLeaseHeld {
+                            holder: holder.clone(),
+                        },
+                    });
+                }
+                return Ok(SchedulerDecision::RunWriter {
+                    task_id: task_id.clone(),
+                });
+            }
+            None => {
+                return Ok(SchedulerDecision::UnsupportedWorker {
+                    task_id: task_id.clone(),
+                    worker: task.worker(),
+                });
+            }
         }
-        return Ok(SchedulerDecision::UnsupportedWorker {
-            task_id: task_id.clone(),
-            worker: task.worker(),
-        });
     }
 
     if goal.has_task_status(TaskStatus::Running) {
@@ -316,18 +343,20 @@ pub(crate) fn select_scheduler_action(goal: &Goal) -> Result<SchedulerSelection,
     })
 }
 
-pub(crate) async fn scheduler_step<P, W, R, RP>(
+pub(crate) async fn scheduler_step<P, RB, W, R, RP>(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
     expected_revision: u64,
     planner_backend: &P,
+    readonly_backend: &RB,
     writer_backend: &W,
     reviewer_backend: &R,
     replanner_backend: &RP,
 ) -> Result<SchedulerStepResult, SchedulerError>
 where
     P: PlannerBackend,
+    RB: ReadonlyBackend,
     W: WriterBackend,
     R: ReviewerBackend,
     RP: ReplannerBackend,
@@ -353,6 +382,7 @@ where
         goal_id,
         selection,
         planner_backend,
+        readonly_backend,
         writer_backend,
         reviewer_backend,
         replanner_backend,
@@ -360,18 +390,20 @@ where
     .await
 }
 
-pub(crate) async fn dispatch_selected_action<P, W, R, RP>(
+pub(crate) async fn dispatch_selected_action<P, RB, W, R, RP>(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
     selection: SchedulerSelection,
     planner_backend: &P,
+    readonly_backend: &RB,
     writer_backend: &W,
     reviewer_backend: &R,
     replanner_backend: &RP,
 ) -> Result<SchedulerStepResult, SchedulerError>
 where
     P: PlannerBackend,
+    RB: ReadonlyBackend,
     W: WriterBackend,
     R: ReviewerBackend,
     RP: ReplannerBackend,
@@ -426,6 +458,19 @@ where
                 Err(error) => map_replanner_error(&error),
             }
         }
+        SchedulerDecision::RunReadonly { task_id } => {
+            match readonly_worker::run_readonly_attempt(
+                store,
+                session,
+                goal_id,
+                task_id,
+                revision_before,
+                readonly_backend,
+            ) {
+                Ok(_) => SchedulerStepOutcome::Applied,
+                Err(error) => map_readonly_error(&error),
+            }
+        }
         SchedulerDecision::RunWriter { task_id } => {
             match writer::run_writer_attempt(
                 store,
@@ -445,9 +490,7 @@ where
         SchedulerDecision::UnsupportedWorker { worker, .. } => {
             SchedulerStepOutcome::UnsupportedWorker(*worker)
         }
-        SchedulerDecision::NoAction { reason } => {
-            SchedulerStepOutcome::NoAction(reason.clone())
-        }
+        SchedulerDecision::NoAction { reason } => SchedulerStepOutcome::NoAction(reason.clone()),
     };
 
     let revision_after = store
@@ -471,16 +514,14 @@ fn action_for_decision(decision: &SchedulerDecision) -> SchedulerAction {
         SchedulerDecision::VerifyTask { .. } => SchedulerAction::VerifyTask,
         SchedulerDecision::VerifyGoal => SchedulerAction::VerifyGoal,
         SchedulerDecision::Replan { .. } => SchedulerAction::Replan,
+        SchedulerDecision::RunReadonly { .. } => SchedulerAction::RunReadonly,
         SchedulerDecision::RunWriter { .. } => SchedulerAction::RunWriter,
         SchedulerDecision::UnsupportedWorker { .. } => SchedulerAction::UnsupportedWorker,
         SchedulerDecision::NoAction { .. } => SchedulerAction::NoAction,
     }
 }
 
-fn ordered_tasks(
-    goal: &Goal,
-    status: TaskStatus,
-) -> impl Iterator<Item = (&TaskId, &Task)> {
+fn ordered_tasks(goal: &Goal, status: TaskStatus) -> impl Iterator<Item = (&TaskId, &Task)> {
     let mut tasks = goal
         .tasks()
         .iter()
@@ -555,6 +596,13 @@ fn map_planner_error(error: &PlannerError) -> SchedulerStepOutcome {
     }
 }
 
+fn map_readonly_error(error: &ReadonlyError) -> SchedulerStepOutcome {
+    match error {
+        ReadonlyError::Store(error) => map_store_or_lower(SchedulerAuthority::Readonly, error),
+        _ => lower_error(SchedulerAuthority::Readonly, error),
+    }
+}
+
 fn map_writer_error(error: &WriterError) -> SchedulerStepOutcome {
     match error {
         WriterError::Store(error) => map_store_or_lower(SchedulerAuthority::Writer, error),
@@ -571,7 +619,9 @@ fn map_verifier_error(error: &VerifierError) -> SchedulerStepOutcome {
 
 fn map_goal_verifier_error(error: &GoalVerifierError) -> SchedulerStepOutcome {
     match error {
-        GoalVerifierError::Store(store_error) => map_store_or_lower(SchedulerAuthority::GoalVerifier, store_error),
+        GoalVerifierError::Store(store_error) => {
+            map_store_or_lower(SchedulerAuthority::GoalVerifier, store_error)
+        }
         _ => lower_error(SchedulerAuthority::GoalVerifier, error),
     }
 }
@@ -589,7 +639,10 @@ fn map_replanner_error(error: &ReplannerError) -> SchedulerStepOutcome {
     }
 }
 
-fn map_store_or_lower(authority: SchedulerAuthority, error: &OrchestratorError) -> SchedulerStepOutcome {
+fn map_store_or_lower(
+    authority: SchedulerAuthority,
+    error: &OrchestratorError,
+) -> SchedulerStepOutcome {
     if let Some((expected, actual)) = revision_conflict(error) {
         SchedulerStepOutcome::RevisionConflict { expected, actual }
     } else {
@@ -600,13 +653,15 @@ fn map_store_or_lower(authority: SchedulerAuthority, error: &OrchestratorError) 
     }
 }
 
-fn lower_error(authority: SchedulerAuthority, error: &dyn std::fmt::Display) -> SchedulerStepOutcome {
+fn lower_error(
+    authority: SchedulerAuthority,
+    error: &dyn std::fmt::Display,
+) -> SchedulerStepOutcome {
     SchedulerStepOutcome::LowerAuthorityError {
         authority,
         detail: error.to_string(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -745,6 +800,66 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct NeverReadonly {
+        calls: Cell<usize>,
+    }
+
+    impl ReadonlyBackend for NeverReadonly {
+        fn investigate(
+            &self,
+            _request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(ReadonlyError::Backend(
+                "unexpected readonly call".to_owned(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct SuccessfulReadonly {
+        calls: Cell<usize>,
+    }
+
+    impl ReadonlyBackend for SuccessfulReadonly {
+        fn investigate(
+            &self,
+            request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(json!({
+                "goal_id": request.goal_id(),
+                "task_id": request.task_id(),
+                "attempt_id": request.attempt_id(),
+                "goal_revision": request.goal_revision(),
+                "plan_revision": request.plan_revision(),
+                "status": "candidate_complete",
+                "summary": "readonly investigation complete",
+                "evidence": [{"kind":"proof","value":"host-bound observation"}]
+            })
+            .to_string()
+            .into_bytes())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingReadonly {
+        calls: Cell<usize>,
+    }
+
+    impl ReadonlyBackend for FailingReadonly {
+        fn investigate(
+            &self,
+            _request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(ReadonlyError::Backend(
+                "synthetic readonly transport failure".to_owned(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
     struct NeverWriter {
         calls: Cell<usize>,
     }
@@ -789,10 +904,17 @@ mod tests {
         fn propose_initial_plan(&self, request: &PlannerRequest) -> Result<Vec<u8>, PlannerError> {
             self.calls.set(self.calls.get() + 1);
             let request = serde_json::to_value(request).unwrap();
-            let criterion_bindings = request["completion_criteria"].as_array().unwrap().iter().map(|criterion| json!({
-                "criterion_id": criterion["criterion_id"],
-                "task_refs": ["writer"]
-            })).collect::<Vec<_>>();
+            let criterion_bindings = request["completion_criteria"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|criterion| {
+                    json!({
+                        "criterion_id": criterion["criterion_id"],
+                        "task_refs": ["writer"]
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(serde_json::to_vec(&json!({
                 "goal_id": request["goal_id"],
                 "goal_revision": request["goal_revision"],
@@ -925,7 +1047,10 @@ mod tests {
     fn planning_goal_selects_initial_planner() {
         let fixture = fixture();
         let goal = new_goal(&fixture);
-        assert_eq!(select_next_action(&goal).unwrap(), SchedulerDecision::PlanInitial);
+        assert_eq!(
+            select_next_action(&goal).unwrap(),
+            SchedulerDecision::PlanInitial
+        );
     }
 
     #[test]
@@ -937,13 +1062,39 @@ mod tests {
         let replan_id = replan.id().clone();
         let ready = task(&fixture, "writer", true, WorkerKind::CodexWriter, vec![]);
         let mut goal = running_goal(&fixture, vec![verifying, replan, ready]);
-        goal.transition_task(&verifying_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&verifying_id, TaskStatus::Verifying, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&replan_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&replan_id, TaskStatus::NeedsReplan, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &verifying_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &verifying_id,
+            TaskStatus::Verifying,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &replan_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &replan_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         assert_eq!(
             select_next_action(&goal).unwrap(),
-            SchedulerDecision::VerifyTask { task_id: verifying_id }
+            SchedulerDecision::VerifyTask {
+                task_id: verifying_id
+            }
         );
     }
 
@@ -954,11 +1105,25 @@ mod tests {
         let trigger_id = trigger.id().clone();
         let ready = task(&fixture, "writer", true, WorkerKind::CodexWriter, vec![]);
         let mut goal = running_goal(&fixture, vec![trigger, ready]);
-        goal.transition_task(&trigger_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&trigger_id, TaskStatus::NeedsReplan, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         assert_eq!(
             select_next_action(&goal).unwrap(),
-            SchedulerDecision::Replan { trigger_task_id: trigger_id }
+            SchedulerDecision::Replan {
+                trigger_task_id: trigger_id
+            }
         );
     }
 
@@ -983,7 +1148,9 @@ mod tests {
         goal.transition_to(GoalStatus::Paused, NOW).unwrap();
         assert_eq!(
             select_next_action(&goal).unwrap(),
-            SchedulerDecision::NoAction { reason: SchedulerNoActionReason::Paused }
+            SchedulerDecision::NoAction {
+                reason: SchedulerNoActionReason::Paused
+            }
         );
     }
 
@@ -1001,18 +1168,42 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_worker_is_typed_without_mutation() {
+    fn readonly_worker_is_a_typed_ready_runtime_action() {
         let fixture = fixture();
-        let readonly = task(&fixture, "readonly", true, WorkerKind::CodexReadonly, vec![]);
+        let readonly = task(
+            &fixture,
+            "readonly",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
         let id = readonly.id().clone();
         let goal = running_goal(&fixture, vec![readonly]);
         assert_eq!(
             select_next_action(&goal).unwrap(),
-            SchedulerDecision::UnsupportedWorker {
-                task_id: id,
-                worker: WorkerKind::CodexReadonly
-            }
+            SchedulerDecision::RunReadonly { task_id: id }
         );
+    }
+
+    #[test]
+    fn historical_non_runtime_workers_remain_typed_unsupported() {
+        let fixture = fixture();
+        for worker in [
+            WorkerKind::LocalOperation,
+            WorkerKind::CodexReviewer,
+            WorkerKind::Verifier,
+        ] {
+            let candidate = task(&fixture, "historical", true, worker, vec![]);
+            let id = candidate.id().clone();
+            let goal = running_goal(&fixture, vec![candidate]);
+            assert_eq!(
+                select_next_action(&goal).unwrap(),
+                SchedulerDecision::UnsupportedWorker {
+                    task_id: id,
+                    worker
+                }
+            );
+        }
     }
 
     #[test]
@@ -1022,7 +1213,10 @@ mod tests {
         let second = task(&fixture, "second", true, WorkerKind::CodexWriter, vec![]);
         let goal = running_goal(&fixture, vec![first, second]);
         let clone = goal.clone();
-        assert_eq!(select_next_action(&goal).unwrap(), select_next_action(&clone).unwrap());
+        assert_eq!(
+            select_next_action(&goal).unwrap(),
+            select_next_action(&clone).unwrap()
+        );
     }
 
     #[test]
@@ -1034,7 +1228,9 @@ mod tests {
         let goal = running_goal(&fixture, vec![optional, mandatory]);
         assert_eq!(
             select_next_action(&goal).unwrap(),
-            SchedulerDecision::RunWriter { task_id: mandatory_id }
+            SchedulerDecision::RunWriter {
+                task_id: mandatory_id
+            }
         );
     }
 
@@ -1045,7 +1241,13 @@ mod tests {
         let first_id = first.id().clone();
         let second = task(&fixture, "second", true, WorkerKind::CodexWriter, vec![]);
         let mut goal = running_goal(&fixture, vec![first, second]);
-        goal.transition_task(&first_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &first_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         assert!(matches!(
             select_next_action(&goal).unwrap(),
             SchedulerDecision::NoAction {
@@ -1064,17 +1266,32 @@ mod tests {
         let reviewer = NeverReviewer::default();
         let replanner = NeverReplanner::default();
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &planner, &writer, &reviewer, &replanner,
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &planner,
+            &NeverReadonly::default(),
+            &writer,
+            &reviewer,
+            &replanner,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.action, SchedulerAction::PlanInitial);
         assert_eq!(result.outcome, SchedulerStepOutcome::Applied);
         assert_eq!(planner.calls.get(), 1);
         assert_eq!(writer.calls.get(), 0);
-        let stored = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let stored = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         assert_eq!(stored.status(), GoalStatus::Running);
         assert_eq!(stored.tasks().len(), 1);
-        assert_eq!(stored.tasks().values().next().unwrap().status(), TaskStatus::Ready);
+        assert_eq!(
+            stored.tasks().values().next().unwrap().status(),
+            TaskStatus::Ready
+        );
     }
 
     #[tokio::test]
@@ -1084,7 +1301,13 @@ mod tests {
             path: fixture.repo.join("target.txt"),
             must_be_file: true,
         }];
-        let writer_task = task(&fixture, "writer", true, WorkerKind::CodexWriter, verification);
+        let writer_task = task(
+            &fixture,
+            "writer",
+            true,
+            WorkerKind::CodexWriter,
+            verification,
+        );
         let task_id = writer_task.id().clone();
         let goal = running_goal(&fixture, vec![writer_task]);
         let goal_id = persist(&fixture, &goal);
@@ -1093,16 +1316,31 @@ mod tests {
         let reviewer = PassingReviewer::default();
         let replanner = NeverReplanner::default();
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &planner, &writer, &reviewer, &replanner,
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &planner,
+            &NeverReadonly::default(),
+            &writer,
+            &reviewer,
+            &replanner,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.action, SchedulerAction::RunWriter);
         assert_eq!(result.outcome, SchedulerStepOutcome::Applied);
         assert_eq!(writer.calls.get(), 1);
         assert_eq!(reviewer.calls.get(), 1);
-        let stored = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let stored = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         assert_eq!(stored.tasks()[&task_id].status(), TaskStatus::Verifying);
-        assert_eq!(fs::read(fixture.repo.join("target.txt")).unwrap(), b"created\n");
+        assert_eq!(
+            fs::read(fixture.repo.join("target.txt")).unwrap(),
+            b"created\n"
+        );
     }
 
     #[tokio::test]
@@ -1112,19 +1350,49 @@ mod tests {
             path: fixture.repo.join("sentinel.txt"),
             must_be_file: true,
         }];
-        let verify_task = task(&fixture, "verify", true, WorkerKind::CodexReadonly, verification);
+        let verify_task = task(
+            &fixture,
+            "verify",
+            true,
+            WorkerKind::CodexReadonly,
+            verification,
+        );
         let task_id = verify_task.id().clone();
         let mut goal = running_goal(&fixture, vec![verify_task]);
-        goal.transition_task(&task_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&task_id, TaskStatus::Verifying, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Verifying,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         let goal_id = persist(&fixture, &goal);
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &NeverPlanner::default(), &NeverWriter::default(), &NeverReviewer::default(), &NeverReplanner::default(),
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.action, SchedulerAction::VerifyTask);
         assert_eq!(result.outcome, SchedulerStepOutcome::Applied);
-        let stored = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let stored = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         assert_eq!(stored.tasks()[&task_id].status(), TaskStatus::Completed);
         assert_ne!(stored.status(), GoalStatus::Completed);
     }
@@ -1135,23 +1403,52 @@ mod tests {
         let trigger = task(&fixture, "trigger", true, WorkerKind::CodexReadonly, vec![]);
         let trigger_id = trigger.id().clone();
         let mut goal = running_goal(&fixture, vec![trigger]);
-        goal.transition_task(&trigger_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&trigger_id, TaskStatus::NeedsReplan, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         let goal_id = persist(&fixture, &goal);
         let replanner = RepairReplanner::default();
         let writer = NeverWriter::default();
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &NeverPlanner::default(), &writer, &NeverReviewer::default(), &replanner,
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &writer,
+            &NeverReviewer::default(),
+            &replanner,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.action, SchedulerAction::Replan);
         assert_eq!(result.outcome, SchedulerStepOutcome::Applied);
         assert_eq!(replanner.calls.get(), 1);
         assert_eq!(writer.calls.get(), 0);
-        let stored = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let stored = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         assert_eq!(stored.plan_revision(), 2);
         assert_eq!(stored.tasks().len(), 2);
-        assert!(stored.tasks().values().any(|task| task.status() == TaskStatus::Ready));
+        assert!(
+            stored
+                .tasks()
+                .values()
+                .any(|task| task.status() == TaskStatus::Ready)
+        );
     }
 
     #[tokio::test]
@@ -1161,21 +1458,42 @@ mod tests {
         let goal = running_goal(&fixture, vec![writer_task]);
         let goal_id = persist(&fixture, &goal);
         let selection = select_scheduler_action(&goal).unwrap();
-        fixture.store.mutate_goal_snapshot(
-            &fixture.session.id,
-            &goal_id,
-            goal.revision(),
-            |goal, now| goal.add_checkpoint(CheckpointReason::Recovery, now),
-        ).unwrap();
+        fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &goal_id,
+                goal.revision(),
+                |goal, now| goal.add_checkpoint(CheckpointReason::Recovery, now),
+            )
+            .unwrap();
         let writer = CreatingWriter::default();
         let result = dispatch_selected_action(
-            &fixture.store, &fixture.session, &goal_id, selection,
-            &NeverPlanner::default(), &writer, &PassingReviewer::default(), &NeverReplanner::default(),
-        ).await.unwrap();
-        assert!(matches!(result.outcome, SchedulerStepOutcome::RevisionConflict { .. }));
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            selection,
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &writer,
+            &PassingReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            SchedulerStepOutcome::RevisionConflict { .. }
+        ));
         assert_eq!(writer.calls.get(), 0);
-        let stored = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
-        assert_eq!(stored.tasks().values().next().unwrap().status(), TaskStatus::Ready);
+        let stored = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(
+            stored.tasks().values().next().unwrap().status(),
+            TaskStatus::Ready
+        );
     }
 
     #[tokio::test]
@@ -1186,10 +1504,22 @@ mod tests {
         let goal_id = persist(&fixture, &goal);
         let writer = CreatingWriter::default();
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision() + 1,
-            &NeverPlanner::default(), &writer, &PassingReviewer::default(), &NeverReplanner::default(),
-        ).await.unwrap();
-        assert!(matches!(result.outcome, SchedulerStepOutcome::RevisionConflict { .. }));
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision() + 1,
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &writer,
+            &PassingReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            SchedulerStepOutcome::RevisionConflict { .. }
+        ));
         assert_eq!(writer.calls.get(), 0);
         assert_eq!(result.revision_after, goal.revision());
     }
@@ -1204,10 +1534,22 @@ mod tests {
         let goal_id = persist(&fixture, &goal);
         let before = fs::read(fixture.repo.join("sentinel.txt")).unwrap();
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &NeverPlanner::default(), &NeverWriter::default(), &NeverReviewer::default(), &NeverReplanner::default(),
-        ).await.unwrap();
-        assert_eq!(result.outcome, SchedulerStepOutcome::NoAction(SchedulerNoActionReason::Paused));
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.outcome,
+            SchedulerStepOutcome::NoAction(SchedulerNoActionReason::Paused)
+        );
         assert_eq!(result.revision_before, result.revision_after);
         assert_eq!(fs::read(fixture.repo.join("sentinel.txt")).unwrap(), before);
     }
@@ -1219,8 +1561,20 @@ mod tests {
             path: fixture.repo.join("target.txt"),
             must_be_file: true,
         }];
-        let first = task(&fixture, "first", true, WorkerKind::CodexWriter, verification.clone());
-        let second = task(&fixture, "second", true, WorkerKind::CodexWriter, verification);
+        let first = task(
+            &fixture,
+            "first",
+            true,
+            WorkerKind::CodexWriter,
+            verification.clone(),
+        );
+        let second = task(
+            &fixture,
+            "second",
+            true,
+            WorkerKind::CodexWriter,
+            verification,
+        );
         let goal = running_goal(&fixture, vec![first, second]);
         let goal_id = persist(&fixture, &goal);
         let selection = select_scheduler_action(&goal).unwrap();
@@ -1228,15 +1582,34 @@ mod tests {
         let writer = CreatingWriter::default();
         let reviewer = PassingReviewer::default();
         let result = dispatch_selected_action(
-            &fixture.store, &fixture.session, &goal_id, selection,
-            &NeverPlanner::default(), &writer, &reviewer, &NeverReplanner::default(),
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            selection,
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &writer,
+            &reviewer,
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, SchedulerStepOutcome::Applied);
         assert_eq!(writer.calls.get(), 1);
         assert_eq!(reviewer.calls.get(), 1);
-        let stored = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let stored = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         assert_eq!(stored.tasks()[&selected_id].status(), TaskStatus::Verifying);
-        assert_eq!(stored.tasks().values().filter(|task| task.status() == TaskStatus::Ready).count(), 1);
+        assert_eq!(
+            stored
+                .tasks()
+                .values()
+                .filter(|task| task.status() == TaskStatus::Ready)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1262,15 +1635,39 @@ mod tests {
             .unwrap();
         let dependent_id = dependent.id().clone();
         let mut goal = running_goal(&fixture, vec![root, dependent]);
-        goal.transition_task(&root_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&root_id, TaskStatus::Verifying, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &root_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &root_id,
+            TaskStatus::Verifying,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         let goal_id = persist(&fixture, &goal);
         let first = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &NeverPlanner::default(), &NeverWriter::default(), &NeverReviewer::default(), &NeverReplanner::default(),
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &NeverReadonly::default(),
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first.outcome, SchedulerStepOutcome::Applied);
-        let after = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let after = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         assert_eq!(after.tasks()[&dependent_id].status(), TaskStatus::Pending);
         assert_eq!(
             select_next_action(&after).unwrap(),
@@ -1289,9 +1686,18 @@ mod tests {
         let writer = CreatingWriter::default();
         let reviewer = PassingReviewer::default();
         let result = scheduler_step(
-            &fixture.store, &fixture.session, &goal_id, goal.revision(),
-            &planner, &writer, &reviewer, &NeverReplanner::default(),
-        ).await.unwrap();
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &planner,
+            &NeverReadonly::default(),
+            &writer,
+            &reviewer,
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.action, SchedulerAction::PlanInitial);
         assert_eq!(planner.calls.get(), 1);
         assert_eq!(writer.calls.get(), 0);
@@ -1300,5 +1706,326 @@ mod tests {
         assert_eq!(planner.calls.get(), 1);
         assert_eq!(writer.calls.get(), 0);
         assert_eq!(reviewer.calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn readonly_scheduler_step_invokes_backend_once_and_stops_at_verifying() {
+        let fixture = fixture();
+        let sentinel = fixture.repo.join("sentinel.txt");
+        fs::write(&sentinel, b"unchanged\n").unwrap();
+        let readonly = task(
+            &fixture,
+            "readonly-runtime",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![VerificationSpec::StructuredEvidence {
+                requirement_id: "proof".to_owned(),
+            }],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        let backend = SuccessfulReadonly::default();
+        let result = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.action, SchedulerAction::RunReadonly);
+        assert_eq!(result.outcome, SchedulerStepOutcome::Applied);
+        assert_eq!(backend.calls.get(), 1);
+        let durable = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(durable.tasks()[&task_id].status(), TaskStatus::Verifying);
+        assert_ne!(durable.tasks()[&task_id].status(), TaskStatus::Completed);
+        let attempt = durable.tasks()[&task_id].latest_attempt().unwrap();
+        assert_eq!(
+            attempt.side_effect_class(),
+            Some(crate::fallback::SideEffectClass::None)
+        );
+        assert_eq!(
+            attempt.side_effect_state(),
+            Some(crate::fallback::SideEffectState::ConfirmedNotPerformed)
+        );
+        assert!(attempt.operation_id().is_none());
+        assert!(attempt.scope_identity().is_none());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged\n");
+        assert!(!writer::holds_workspace_mutation_lease(
+            &durable.tasks()[&task_id]
+        ));
+    }
+
+    #[tokio::test]
+    async fn verifier_is_a_separate_next_step_and_alone_completes_readonly_task() {
+        let fixture = fixture();
+        let readonly = task(
+            &fixture,
+            "readonly-verify",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![VerificationSpec::StructuredEvidence {
+                requirement_id: "proof".to_owned(),
+            }],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        let backend = SuccessfulReadonly::default();
+        let first = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.action, SchedulerAction::RunReadonly);
+        let mid = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(mid.tasks()[&task_id].status(), TaskStatus::Verifying);
+        let second = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            mid.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.action, SchedulerAction::VerifyTask);
+        assert_eq!(backend.calls.get(), 1);
+        let done = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(done.tasks()[&task_id].status(), TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn stale_revision_prevents_readonly_backend_invocation() {
+        let fixture = fixture();
+        let readonly = task(&fixture, "stale", true, WorkerKind::CodexReadonly, vec![]);
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        let backend = SuccessfulReadonly::default();
+        let result = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision() + 1,
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            SchedulerStepOutcome::RevisionConflict { .. }
+        ));
+        assert_eq!(backend.calls.get(), 0);
+    }
+
+    #[test]
+    fn readonly_ready_work_does_not_wait_for_writer_mutation_lease() {
+        let fixture = fixture();
+        let writer_task = task(
+            &fixture,
+            "writer-active",
+            true,
+            WorkerKind::CodexWriter,
+            vec![],
+        );
+        let writer_id = writer_task.id().clone();
+        let readonly = task(
+            &fixture,
+            "readonly-ready",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
+        let readonly_id = readonly.id().clone();
+        let mut goal = running_goal(&fixture, vec![writer_task, readonly]);
+        goal.transition_task(
+            &writer_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        assert!(writer::holds_workspace_mutation_lease(
+            &goal.tasks()[&writer_id]
+        ));
+        assert_eq!(
+            select_next_action(&goal).unwrap(),
+            SchedulerDecision::RunReadonly {
+                task_id: readonly_id
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_transport_failure_is_non_mutating_and_bounded() {
+        let fixture = fixture();
+        let readonly = task(
+            &fixture,
+            "readonly-fail",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        let backend = FailingReadonly::default();
+        let first = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first.outcome,
+            SchedulerStepOutcome::LowerAuthorityError {
+                authority: SchedulerAuthority::Readonly,
+                ..
+            }
+        ));
+        let retryable = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(retryable.tasks()[&task_id].status(), TaskStatus::Retryable);
+        let first_attempt = retryable.tasks()[&task_id].latest_attempt().unwrap();
+        assert_eq!(
+            first_attempt.side_effect_state(),
+            Some(crate::fallback::SideEffectState::ConfirmedNotPerformed)
+        );
+        assert_eq!(
+            first_attempt.side_effect_class(),
+            Some(crate::fallback::SideEffectClass::None)
+        );
+        let revision = retryable.revision();
+        fixture
+            .store
+            .mutate_goal_snapshot(&fixture.session.id, &goal_id, revision, |goal, now| {
+                goal.transition_task(
+                    &task_id,
+                    TaskStatus::Ready,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            })
+            .unwrap();
+        let ready = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        let second = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            ready.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            second.outcome,
+            SchedulerStepOutcome::LowerAuthorityError {
+                authority: SchedulerAuthority::Readonly,
+                ..
+            }
+        ));
+        let failed = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(failed.tasks()[&task_id].status(), TaskStatus::Failed);
+        assert_eq!(failed.tasks()[&task_id].attempts().len(), 2);
+        assert_eq!(backend.calls.get(), 2);
+        assert!(
+            failed.tasks()[&task_id]
+                .attempts()
+                .iter()
+                .all(|a| a.side_effect_state()
+                    == Some(crate::fallback::SideEffectState::ConfirmedNotPerformed))
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_ready_readonly_tasks_dispatch_exactly_one_in_durable_order() {
+        let fixture = fixture();
+        let one = task(&fixture, "one", true, WorkerKind::CodexReadonly, vec![]);
+        let two = task(&fixture, "two", true, WorkerKind::CodexReadonly, vec![]);
+        let goal = running_goal(&fixture, vec![one, two]);
+        let selected = match select_next_action(&goal).unwrap() {
+            SchedulerDecision::RunReadonly { task_id } => task_id,
+            other => panic!("unexpected decision: {other:?}"),
+        };
+        let goal_id = persist(&fixture, &goal);
+        let backend = SuccessfulReadonly::default();
+        let result = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.task_id.as_ref(), Some(&selected));
+        assert_eq!(backend.calls.get(), 1);
+        let durable = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        assert_eq!(durable.tasks()[&selected].status(), TaskStatus::Verifying);
+        assert_eq!(
+            durable
+                .tasks()
+                .values()
+                .filter(|task| task.status() == TaskStatus::Ready)
+                .count(),
+            1
+        );
     }
 }

@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use crate::agent::{
-    AgentError, ModelInvocation, ModelInvocationOutput, ModelRole, ModelTransport,
-};
+use crate::agent::{AgentError, ModelInvocation, ModelInvocationOutput, ModelRole, ModelTransport};
 use crate::config;
 use crate::goal_backends::ProductionGoalBackends;
 use crate::planner::{PlannerBackend, PlannerError, planner_request_for_goal};
+use crate::readonly_worker::{
+    ReadonlyBackend, ReadonlyError, readonly_request_for_model_backend_test,
+};
 use crate::replanner::{
     ReplannerBackend, ReplannerError, replanner_request_for_model_backend_test,
 };
@@ -85,6 +86,15 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     );
     assert_eq!(
         backends
+            .readonly()
+            .investigate(&readonly_request_for_model_backend_test(
+                session.cwd.clone()
+            ))
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        backends
             .writer()
             .propose(&writer_request_for_model_backend_test(session.cwd.clone()))
             .unwrap(),
@@ -100,26 +110,31 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     assert_eq!(
         backends
             .replanner()
-            .propose_replan(&replanner_request_for_model_backend_test(session.cwd.clone()))
+            .propose_replan(&replanner_request_for_model_backend_test(
+                session.cwd.clone()
+            ))
             .unwrap(),
         raw
     );
 
     let calls = fake.calls.lock().unwrap();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(calls.len(), 5);
     assert_eq!(
         calls.iter().map(ModelInvocation::role).collect::<Vec<_>>(),
         vec![
             ModelRole::Planner,
+            ModelRole::Readonly,
             ModelRole::Writer,
             ModelRole::Reviewer,
             ModelRole::Replanner,
         ]
     );
     let canonical_session_cwd = std::fs::canonicalize(&session.cwd).unwrap();
-    assert!(calls.iter().all(|call| {
-        std::fs::canonicalize(call.cwd()).unwrap() == canonical_session_cwd
-    }));
+    assert!(
+        calls
+            .iter()
+            .all(|call| { std::fs::canonicalize(call.cwd()).unwrap() == canonical_session_cwd })
+    );
     for call in calls.iter() {
         assert!(call.prompt().contains("untrusted request data"));
         assert!(call.prompt().contains("Return JSON only"));
@@ -129,14 +144,27 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     assert!(calls[0].prompt().contains("VERIFY_BEFORE_RETRY"));
     assert!(calls[0].prompt().contains("NEVER_AUTOMATIC"));
     assert!(calls[0].prompt().contains("command:[\"argv0\",\"arg1\"]"));
-    assert!(calls[0].prompt().contains("requires 1..=64 non-empty paths"));
-    assert!(calls[0].prompt().contains("Every Task requires at least one verification entry"));
-    assert!(calls[1].prompt().contains("You are read-only"));
-    assert!(calls[2].prompt().contains("blocking_findings MUST be one non-negative JSON integer"));
-    assert!(calls[2].prompt().contains("never an array"));
-    assert!(calls[2].prompt().contains("evidence MUST be a JSON array"));
+    assert!(
+        calls[0]
+            .prompt()
+            .contains("requires 1..=64 non-empty paths")
+    );
+    assert!(
+        calls[0]
+            .prompt()
+            .contains("Every Task requires at least one verification entry")
+    );
+    assert!(calls[1].prompt().contains("read-only investigator"));
+    assert!(calls[1].prompt().contains("no writes"));
+    assert!(calls[2].prompt().contains("You are read-only"));
+    assert!(
+        calls[3]
+            .prompt()
+            .contains("blocking_findings MUST be one non-negative JSON integer")
+    );
+    assert!(calls[3].prompt().contains("never an array"));
+    assert!(calls[3].prompt().contains("evidence MUST be a JSON array"));
 }
-
 
 #[test]
 fn all_adapter_model_failures_map_once_without_retry_or_repair() {
@@ -153,6 +181,15 @@ fn all_adapter_model_failures_map_once_without_retry_or_repair() {
     ));
     assert!(matches!(
         backends
+            .readonly()
+            .investigate(&readonly_request_for_model_backend_test(
+                session.cwd.clone()
+            ))
+            .unwrap_err(),
+        ReadonlyError::Model(AgentError::Timeout)
+    ));
+    assert!(matches!(
+        backends
             .writer()
             .propose(&writer_request_for_model_backend_test(session.cwd.clone()))
             .unwrap_err(),
@@ -168,11 +205,13 @@ fn all_adapter_model_failures_map_once_without_retry_or_repair() {
     assert!(matches!(
         backends
             .replanner()
-            .propose_replan(&replanner_request_for_model_backend_test(session.cwd.clone()))
+            .propose_replan(&replanner_request_for_model_backend_test(
+                session.cwd.clone()
+            ))
             .unwrap_err(),
         ReplannerError::Model(AgentError::Timeout)
     ));
-    assert_eq!(fake.calls.lock().unwrap().len(), 4);
+    assert_eq!(fake.calls.lock().unwrap().len(), 5);
 }
 
 #[test]

@@ -3,6 +3,7 @@ use crate::goal::{GoalId, GoalStatus};
 use crate::goal_finalizer::{self, GoalFinalizationOutcome, GoalFinalizerError};
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::PlannerBackend;
+use crate::readonly_worker::ReadonlyBackend;
 use crate::replanner::ReplannerBackend;
 use crate::scheduler::{
     self, SchedulerAction, SchedulerAuthority, SchedulerNoActionReason, SchedulerStepOutcome,
@@ -63,6 +64,7 @@ pub(crate) enum GoalRunnerAuthority {
     Store,
     Scheduler,
     Planner,
+    Readonly,
     Writer,
     Verifier,
     GoalVerifier,
@@ -80,13 +82,18 @@ pub(crate) enum GoalRunStopReason {
     Blocked,
     NoAction(SchedulerNoActionReason),
     UnsupportedWorker(WorkerKind),
-    RevisionConflict { expected: u64, actual: u64 },
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
     LowerAuthorityError {
         authority: GoalRunnerAuthority,
         detail: String,
     },
     StepBudgetExhausted,
-    NoProgress { action: GoalRunTraceAction },
+    NoProgress {
+        action: GoalRunTraceAction,
+    },
     FinalizationNotReady(GoalFinalizationOutcome),
 }
 
@@ -143,7 +150,10 @@ pub(crate) struct RunnerFinalizerStepResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunnerDriverError {
-    RevisionConflict { expected: u64, actual: u64 },
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
     LowerAuthority {
         authority: GoalRunnerAuthority,
         detail: String,
@@ -164,19 +174,21 @@ pub(crate) trait GoalRunnerAuthorities {
     ) -> Result<RunnerFinalizerStepResult, RunnerDriverError>;
 }
 
-struct ProductionRunnerAuthorities<'a, P, W, R, RP> {
+struct ProductionRunnerAuthorities<'a, P, RB, W, R, RP> {
     store: &'a TaskStore,
     session: &'a config::Session,
     goal_id: &'a GoalId,
     planner_backend: &'a P,
+    readonly_backend: &'a RB,
     writer_backend: &'a W,
     reviewer_backend: &'a R,
     replanner_backend: &'a RP,
 }
 
-impl<P, W, R, RP> GoalRunnerAuthorities for ProductionRunnerAuthorities<'_, P, W, R, RP>
+impl<P, RB, W, R, RP> GoalRunnerAuthorities for ProductionRunnerAuthorities<'_, P, RB, W, R, RP>
 where
     P: PlannerBackend,
+    RB: ReadonlyBackend,
     W: WriterBackend,
     R: ReviewerBackend,
     RP: ReplannerBackend,
@@ -204,6 +216,7 @@ where
             self.goal_id,
             expected_revision,
             self.planner_backend,
+            self.readonly_backend,
             self.writer_backend,
             self.reviewer_backend,
             self.replanner_backend,
@@ -233,18 +246,20 @@ where
     }
 }
 
-pub(crate) async fn run_goal_foreground<P, W, R, RP>(
+pub(crate) async fn run_goal_foreground<P, RB, W, R, RP>(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
     limits: GoalRunLimits,
     planner_backend: &P,
+    readonly_backend: &RB,
     writer_backend: &W,
     reviewer_backend: &R,
     replanner_backend: &RP,
 ) -> GoalRunResult
 where
     P: PlannerBackend,
+    RB: ReadonlyBackend,
     W: WriterBackend,
     R: ReviewerBackend,
     RP: ReplannerBackend,
@@ -254,6 +269,7 @@ where
         session,
         goal_id,
         planner_backend,
+        readonly_backend,
         writer_backend,
         reviewer_backend,
         replanner_backend,
@@ -607,7 +623,10 @@ where
             }
         };
 
-        let recorded_after = trace.last().map(|entry| entry.revision_after).unwrap_or(current.revision);
+        let recorded_after = trace
+            .last()
+            .map(|entry| entry.revision_after)
+            .unwrap_or(current.revision);
         if current.revision != recorded_after {
             return build_result(
                 goal_id,
@@ -640,7 +659,9 @@ where
                 steps_applied,
                 GoalRunStopReason::LowerAuthorityError {
                     authority: GoalRunnerAuthority::Finalizer,
-                    detail: "Phase 9 Finalizer reported ReadyToComplete without durable COMPLETED state".to_owned(),
+                    detail:
+                        "Phase 9 Finalizer reported ReadyToComplete without durable COMPLETED state"
+                            .to_owned(),
                 },
                 current.status,
                 trace,
@@ -752,6 +773,7 @@ fn stop_from_no_action(reason: &SchedulerNoActionReason) -> GoalRunStopReason {
 fn runner_authority_from_scheduler(authority: SchedulerAuthority) -> GoalRunnerAuthority {
     match authority {
         SchedulerAuthority::Planner => GoalRunnerAuthority::Planner,
+        SchedulerAuthority::Readonly => GoalRunnerAuthority::Readonly,
         SchedulerAuthority::Writer => GoalRunnerAuthority::Writer,
         SchedulerAuthority::Verifier => GoalRunnerAuthority::Verifier,
         SchedulerAuthority::GoalVerifier => GoalRunnerAuthority::GoalVerifier,
@@ -804,7 +826,7 @@ fn trace_outcome_from_driver_error(error: &RunnerDriverError) -> GoalRunTraceOut
 pub(crate) mod test_support {
     pub(crate) use super::{
         GoalRunLimits, GoalRunStopReason, GoalRunTraceAction, GoalRunnerAuthorities,
-        GoalRunnerAuthority, RunnerDriverError,
-        RunnerFinalizerStepResult, RunnerGoalState, run_goal_with_authorities,
+        GoalRunnerAuthority, RunnerDriverError, RunnerFinalizerStepResult, RunnerGoalState,
+        run_goal_with_authorities,
     };
 }

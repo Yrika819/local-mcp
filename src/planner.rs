@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::agent::AgentError;
 use crate::config;
 use crate::goal::{
-    CompletionCriterionId, Goal, GoalCriterionBinding, GoalFinalVerificationSpec, GoalId, GoalStatus,
-    GoalVerificationRequirement,
+    CompletionCriterionId, Goal, GoalCriterionBinding, GoalFinalVerificationSpec, GoalId,
+    GoalStatus, GoalVerificationRequirement,
 };
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -17,6 +17,7 @@ use crate::task::{
     WorkerKind,
 };
 use crate::task_store::TaskStore;
+use crate::worker_capability;
 
 pub(crate) const MAX_PLAN_PROPOSAL_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_PLAN_TASKS: usize = 128;
@@ -54,7 +55,6 @@ pub(crate) struct PlannerRequest {
     allowed_operation_kinds: Vec<TaskOperationKind>,
     prohibited_operations: Vec<&'static str>,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct PlannerCriterion {
@@ -198,7 +198,10 @@ pub(crate) fn planner_request_for_goal(
             permitted_roots.push(canonical);
         }
     }
-    if !permitted_roots.iter().any(|root| goal_root.starts_with(root)) {
+    if !permitted_roots
+        .iter()
+        .any(|root| goal_root.starts_with(root))
+    {
         return Err(PlannerError::PlanAuthorityViolation(
             "Goal cwd is not inside the current session authority".to_owned(),
         ));
@@ -210,11 +213,15 @@ pub(crate) fn planner_request_for_goal(
         objective: goal.objective().to_owned(),
         title: goal.title().map(str::to_owned),
         constraints: goal.constraints().to_vec(),
-        completion_criteria: goal.completion_criteria().iter().map(|criterion| PlannerCriterion {
-            criterion_id: criterion.id().as_str().to_owned(),
-            description: criterion.description().to_owned(),
-            required: criterion.required(),
-        }).collect(),
+        completion_criteria: goal
+            .completion_criteria()
+            .iter()
+            .map(|criterion| PlannerCriterion {
+                criterion_id: criterion.id().as_str().to_owned(),
+                description: criterion.description().to_owned(),
+                required: criterion.required(),
+            })
+            .collect(),
         cwd: goal_root,
         permitted_roots,
         existing_blockers: goal
@@ -226,13 +233,7 @@ pub(crate) fn planner_request_for_goal(
                 mandatory: blocker.mandatory(),
             })
             .collect(),
-        allowed_worker_kinds: vec![
-            WorkerKind::LocalOperation,
-            WorkerKind::CodexReadonly,
-            WorkerKind::CodexWriter,
-            WorkerKind::CodexReviewer,
-            WorkerKind::Verifier,
-        ],
+        allowed_worker_kinds: worker_capability::production_plannable_worker_kinds().to_vec(),
         allowed_operation_kinds: vec![
             TaskOperationKind::ReadOnly,
             TaskOperationKind::LocalMutation,
@@ -253,7 +254,9 @@ pub(crate) fn plan_initial_goal<B: PlannerBackend>(
     goal_id: &GoalId,
     planner: &B,
 ) -> Result<Goal, PlannerError> {
-    let goal = store.load_goal(&session.id, goal_id).map_err(map_store_error)?;
+    let goal = store
+        .load_goal(&session.id, goal_id)
+        .map_err(map_store_error)?;
     let request = planner_request_for_goal(&goal, session)?;
     let output = planner.propose_initial_plan(&request)?;
     materialize_initial_plan_output(store, session, goal_id, goal.revision(), &output)
@@ -272,7 +275,9 @@ pub(crate) fn materialize_initial_plan_output(
         ));
     }
 
-    let current = store.load_goal(&session.id, goal_id).map_err(map_store_error)?;
+    let current = store
+        .load_goal(&session.id, goal_id)
+        .map_err(map_store_error)?;
     if current.revision() != expected_goal_revision {
         return Err(PlannerError::PlanConflict {
             expected: expected_goal_revision,
@@ -400,6 +405,11 @@ fn parse_and_validate_proposal(
         }
         validate_text(&task.title, MAX_PLAN_TITLE_BYTES, "Task title")?;
         validate_text(&task.objective, MAX_PLAN_OBJECTIVE_BYTES, "Task objective")?;
+        if !worker_capability::is_production_plannable(task.worker) {
+            return Err(PlannerError::PlannerSchemaViolation(
+                "Task worker is not production-plannable".to_owned(),
+            ));
+        }
         if task.dependencies.len() > MAX_DEPENDENCIES_PER_TASK {
             return Err(PlannerError::PlannerSchemaViolation(
                 "a Task has too many dependencies".to_owned(),
@@ -421,7 +431,9 @@ fn parse_and_validate_proposal(
         }
         dependency_edges = dependency_edges
             .checked_add(task.dependencies.len())
-            .ok_or_else(|| PlannerError::PlannerSchemaViolation("dependency count overflow".to_owned()))?;
+            .ok_or_else(|| {
+                PlannerError::PlannerSchemaViolation("dependency count overflow".to_owned())
+            })?;
         if dependency_edges > MAX_PLAN_DEPENDENCY_EDGES {
             return Err(PlannerError::PlannerSchemaViolation(
                 "plan exceeds the 1024 dependency-edge limit".to_owned(),
@@ -430,7 +442,9 @@ fn parse_and_validate_proposal(
 
         scope_paths = scope_paths
             .checked_add(task.scope.allowed_paths.len() + task.scope.forbidden_paths.len())
-            .ok_or_else(|| PlannerError::PlannerSchemaViolation("scope count overflow".to_owned()))?;
+            .ok_or_else(|| {
+                PlannerError::PlannerSchemaViolation("scope count overflow".to_owned())
+            })?;
         if scope_paths > MAX_SCOPE_PATHS_TOTAL {
             return Err(PlannerError::PlannerSchemaViolation(
                 "plan exceeds the 1024 scope-path limit".to_owned(),
@@ -438,7 +452,9 @@ fn parse_and_validate_proposal(
         }
         verification_entries = verification_entries
             .checked_add(task.verification.len())
-            .ok_or_else(|| PlannerError::PlannerSchemaViolation("verification count overflow".to_owned()))?;
+            .ok_or_else(|| {
+                PlannerError::PlannerSchemaViolation("verification count overflow".to_owned())
+            })?;
         if verification_entries > MAX_VERIFICATION_TOTAL {
             return Err(PlannerError::PlannerSchemaViolation(
                 "plan exceeds the 1024 verification-entry limit".to_owned(),
@@ -502,32 +518,49 @@ fn parse_and_validate_proposal(
     validate_acyclic(&validated, &by_id)?;
     validate_writer_ordering(&validated, &by_id)?;
 
-    let authoritative_criteria = goal.completion_criteria().iter()
+    let authoritative_criteria = goal
+        .completion_criteria()
+        .iter()
         .map(|criterion| (criterion.id().as_str(), criterion))
         .collect::<BTreeMap<_, _>>();
     let mut seen_criteria = BTreeSet::new();
     let mut criterion_bindings = Vec::with_capacity(proposal.criterion_bindings.len());
     for binding in proposal.criterion_bindings {
-        let criterion = authoritative_criteria.get(binding.criterion_id.as_str()).ok_or_else(|| {
-            PlannerError::PlannerSchemaViolation("criterion binding references an unknown host CompletionCriterionId".to_owned())
-        })?;
+        let criterion = authoritative_criteria
+            .get(binding.criterion_id.as_str())
+            .ok_or_else(|| {
+                PlannerError::PlannerSchemaViolation(
+                    "criterion binding references an unknown host CompletionCriterionId".to_owned(),
+                )
+            })?;
         if !seen_criteria.insert(binding.criterion_id.clone()) {
-            return Err(PlannerError::PlannerSchemaViolation("duplicate criterion binding".to_owned()));
+            return Err(PlannerError::PlannerSchemaViolation(
+                "duplicate criterion binding".to_owned(),
+            ));
         }
         if binding.task_refs.is_empty() {
-            return Err(PlannerError::PlannerSchemaViolation("required criterion binding must reference at least one proposal-local Task".to_owned()));
+            return Err(PlannerError::PlannerSchemaViolation(
+                "required criterion binding must reference at least one proposal-local Task"
+                    .to_owned(),
+            ));
         }
         let mut refs = BTreeSet::new();
         for task_ref in &binding.task_refs {
             validate_proposal_id(task_ref)?;
             if !refs.insert(task_ref.clone()) {
-                return Err(PlannerError::PlannerSchemaViolation("criterion binding contains duplicate proposal-local Task reference".to_owned()));
+                return Err(PlannerError::PlannerSchemaViolation(
+                    "criterion binding contains duplicate proposal-local Task reference".to_owned(),
+                ));
             }
             let task_index = by_id.get(task_ref.as_str()).ok_or_else(|| {
-                PlannerError::PlannerSchemaViolation("criterion binding references an unknown proposal-local Task".to_owned())
+                PlannerError::PlannerSchemaViolation(
+                    "criterion binding references an unknown proposal-local Task".to_owned(),
+                )
             })?;
             if !validated[*task_index].mandatory {
-                return Err(PlannerError::PlannerSchemaViolation("TaskVerified criterion binding requires a mandatory Task".to_owned()));
+                return Err(PlannerError::PlannerSchemaViolation(
+                    "TaskVerified criterion binding requires a mandatory Task".to_owned(),
+                ));
             }
             if validated[*task_index].verification.is_empty() {
                 return Err(PlannerError::PlannerSchemaViolation("TaskVerified criterion binding requires mechanically evaluable Task verification".to_owned()));
@@ -537,11 +570,17 @@ fn parse_and_validate_proposal(
     }
     for criterion in goal.completion_criteria() {
         if criterion.required() && !seen_criteria.contains(criterion.id().as_str()) {
-            return Err(PlannerError::PlannerSchemaViolation("required completion criterion is missing structured TaskVerified coverage".to_owned()));
+            return Err(PlannerError::PlannerSchemaViolation(
+                "required completion criterion is missing structured TaskVerified coverage"
+                    .to_owned(),
+            ));
         }
     }
 
-    Ok(ValidatedPlan { tasks: validated, criterion_bindings })
+    Ok(ValidatedPlan {
+        tasks: validated,
+        criterion_bindings,
+    })
 }
 
 pub(crate) fn validate_proposal_id(value: &str) -> Result<(), PlannerError> {
@@ -558,7 +597,11 @@ pub(crate) fn validate_proposal_id(value: &str) -> Result<(), PlannerError> {
     Ok(())
 }
 
-pub(crate) fn validate_text(value: &str, max_bytes: usize, label: &str) -> Result<(), PlannerError> {
+pub(crate) fn validate_text(
+    value: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), PlannerError> {
     if value.trim().is_empty() || value.len() > max_bytes {
         return Err(PlannerError::PlannerSchemaViolation(format!(
             "{label} must be non-empty and at most {max_bytes} bytes"
@@ -595,11 +638,14 @@ pub(crate) fn validate_and_normalize_scope(
         }
         _ => {}
     }
-    if matches!(worker, WorkerKind::CodexReadonly | WorkerKind::CodexReviewer | WorkerKind::Verifier)
-        && proposal.operation_kind != TaskOperationKind::ReadOnly
+    if matches!(
+        worker,
+        WorkerKind::CodexReadonly | WorkerKind::CodexReviewer | WorkerKind::Verifier
+    ) && proposal.operation_kind != TaskOperationKind::ReadOnly
     {
         return Err(PlannerError::PlanAuthorityViolation(
-            "read-only/reviewer/verifier WorkerKind cannot carry mutation scope in Phase 4".to_owned(),
+            "read-only/reviewer/verifier WorkerKind cannot carry mutation scope in Phase 4"
+                .to_owned(),
         ));
     }
 
@@ -649,7 +695,10 @@ fn normalize_planner_path(
             "Git pathspec magic is not allowed in Planner scope".to_owned(),
         ));
     }
-    if path.components().any(|component| component == Component::ParentDir) {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
         return Err(PlannerError::PlanAuthorityViolation(
             "parent-directory traversal is not allowed in Planner scope".to_owned(),
         ));
@@ -703,9 +752,8 @@ fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, PlannerError> {
 }
 
 fn contains_git_internal(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(component, Component::Normal(value) if value == ".git")
-    })
+    path.components()
+        .any(|component| matches!(component, Component::Normal(value) if value == ".git"))
 }
 
 pub(crate) fn validate_and_normalize_verification(
@@ -922,7 +970,10 @@ fn materialize_validated_plan(
     plan: ValidatedPlan,
     now: &str,
 ) -> Result<(), OrchestratorError> {
-    let ValidatedPlan { tasks, criterion_bindings } = plan;
+    let ValidatedPlan {
+        tasks,
+        criterion_bindings,
+    } = plan;
     let mut id_map = BTreeMap::<String, TaskId>::new();
     let mut materialized = Vec::with_capacity(tasks.len());
     for proposed in tasks {
@@ -952,7 +1003,9 @@ fn materialize_validated_plan(
             .iter()
             .map(|proposal_id| {
                 id_map.get(proposal_id).cloned().ok_or_else(|| {
-                    OrchestratorError::InvalidDag("validated dependency target disappeared".to_owned())
+                    OrchestratorError::InvalidDag(
+                        "validated dependency target disappeared".to_owned(),
+                    )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -1060,7 +1113,7 @@ mod tests {
         task_value(
             id,
             dependencies,
-            "LOCAL_OPERATION",
+            "CODEX_WRITER",
             "LOCAL_MUTATION",
             "VERIFY_BEFORE_RETRY",
         )
@@ -1094,12 +1147,24 @@ mod tests {
     }
 
     fn proposal(fixture: &Fixture, tasks: Vec<Value>) -> Vec<u8> {
-        let goal = fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap();
-        let task_refs = tasks.iter().filter_map(|task| task["proposal_id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
-        let criterion_bindings = goal.completion_criteria().iter().map(|criterion| json!({
-            "criterion_id": criterion.id().as_str(),
-            "task_refs": task_refs
-        })).collect::<Vec<_>>();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let task_refs = tasks
+            .iter()
+            .filter_map(|task| task["proposal_id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let criterion_bindings = goal
+            .completion_criteria()
+            .iter()
+            .map(|criterion| {
+                json!({
+                    "criterion_id": criterion.id().as_str(),
+                    "task_refs": task_refs
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::to_vec(&json!({
             "goal_id": fixture.goal_id.as_str(),
             "goal_revision": 1,
@@ -1143,6 +1208,10 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["goal_revision"], 1);
         assert_eq!(value["objective"], "materialize a safe plan");
+        assert_eq!(
+            value["allowed_worker_kinds"],
+            json!(["CODEX_READONLY", "CODEX_WRITER"])
+        );
         for forbidden in [
             "schema_version",
             "plan_revision",
@@ -1152,7 +1221,10 @@ mod tests {
             "skip_approval",
             "yolo",
         ] {
-            assert!(value.get(forbidden).is_none(), "unexpected field {forbidden}");
+            assert!(
+                value.get(forbidden).is_none(),
+                "unexpected field {forbidden}"
+            );
         }
     }
 
@@ -1160,7 +1232,11 @@ mod tests {
     fn valid_single_task_plan_commits_once_and_does_not_execute() {
         let fixture = fixture();
         let sentinel_before = fs::read(fixture.repo.join("sentinel.txt")).unwrap();
-        let durable = apply(&fixture, &proposal(&fixture, vec![read_only_task("inspect", &[])])).unwrap();
+        let durable = apply(
+            &fixture,
+            &proposal(&fixture, vec![read_only_task("inspect", &[])]),
+        )
+        .unwrap();
         assert_eq!(durable.revision(), 2);
         assert_eq!(durable.plan_revision(), 1);
         assert_eq!(durable.status(), GoalStatus::Running);
@@ -1172,7 +1248,10 @@ mod tests {
         assert_eq!(task.verification_results().len(), 0);
         assert_eq!(task.created_plan_revision(), 1);
         assert_eq!(task.max_attempts(), 2);
-        assert_eq!(fs::read(fixture.repo.join("sentinel.txt")).unwrap(), sentinel_before);
+        assert_eq!(
+            fs::read(fixture.repo.join("sentinel.txt")).unwrap(),
+            sentinel_before
+        );
     }
 
     #[test]
@@ -1182,7 +1261,10 @@ mod tests {
             &fixture,
             &proposal(
                 &fixture,
-                vec![read_only_task("inspect", &[]), mutation_task("implement", &["inspect"])],
+                vec![
+                    read_only_task("inspect", &[]),
+                    mutation_task("implement", &["inspect"]),
+                ],
             ),
         )
         .unwrap();
@@ -1211,11 +1293,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            durable.tasks().values().filter(|task| task.status() == TaskStatus::Ready).count(),
+            durable
+                .tasks()
+                .values()
+                .filter(|task| task.status() == TaskStatus::Ready)
+                .count(),
             2
         );
         assert_eq!(
-            durable.tasks().values().filter(|task| task.status() == TaskStatus::Pending).count(),
+            durable
+                .tasks()
+                .values()
+                .filter(|task| task.status() == TaskStatus::Pending)
+                .count(),
             1
         );
     }
@@ -1237,7 +1327,11 @@ mod tests {
         .unwrap();
         assert_eq!(durable.tasks().len(), 3);
         assert_eq!(
-            durable.tasks().values().filter(|task| task.status() == TaskStatus::Ready).count(),
+            durable
+                .tasks()
+                .values()
+                .filter(|task| task.status() == TaskStatus::Ready)
+                .count(),
             2
         );
     }
@@ -1245,7 +1339,11 @@ mod tests {
     #[test]
     fn authoritative_task_ids_are_server_generated_uuids() {
         let fixture = fixture();
-        let durable = apply(&fixture, &proposal(&fixture, vec![read_only_task("inspect", &[])])).unwrap();
+        let durable = apply(
+            &fixture,
+            &proposal(&fixture, vec![read_only_task("inspect", &[])]),
+        )
+        .unwrap();
         let task_id = durable.tasks().keys().next().unwrap();
         assert!(Uuid::parse_str(task_id.as_str()).is_ok());
         assert_ne!(task_id.as_str(), "inspect");
@@ -1261,21 +1359,36 @@ mod tests {
                 vec![read_only_task("same", &[]), read_only_task("same", &[])],
             ),
         );
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
     fn missing_dependency_is_rejected() {
         let fixture = fixture();
-        let result = apply(&fixture, &proposal(&fixture, vec![read_only_task("a", &["missing"])]));
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        let result = apply(
+            &fixture,
+            &proposal(&fixture, vec![read_only_task("a", &["missing"])]),
+        );
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
     fn self_dependency_is_rejected() {
         let fixture = fixture();
-        let result = apply(&fixture, &proposal(&fixture, vec![read_only_task("a", &["a"])]));
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        let result = apply(
+            &fixture,
+            &proposal(&fixture, vec![read_only_task("a", &["a"])]),
+        );
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1288,7 +1401,10 @@ mod tests {
                 vec![read_only_task("a", &["b"]), read_only_task("b", &["a"])],
             ),
         );
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1297,7 +1413,26 @@ mod tests {
         let mut task = read_only_task("a", &[]);
         task["worker"] = json!("MAGIC_WORKER");
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
+    }
+
+    #[test]
+    fn known_but_non_plannable_worker_kinds_are_rejected_before_commit() {
+        let fixture = fixture();
+        let before = bytes(&fixture);
+        for worker in ["LOCAL_OPERATION", "CODEX_REVIEWER", "VERIFIER"] {
+            let mut task = read_only_task("a", &[]);
+            task["worker"] = json!(worker);
+            let result = apply(&fixture, &proposal(&fixture, vec![task]));
+            assert!(matches!(
+                result,
+                Err(PlannerError::PlannerSchemaViolation(_))
+            ));
+            assert_eq!(bytes(&fixture), before);
+        }
     }
 
     #[test]
@@ -1306,7 +1441,10 @@ mod tests {
         let mut task = read_only_task("a", &[]);
         task["scope"]["allowed_paths"] = json!(["../escape"]);
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlanAuthorityViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlanAuthorityViolation(_))
+        ));
     }
 
     #[test]
@@ -1315,7 +1453,10 @@ mod tests {
         let mut task = read_only_task("a", &[]);
         task["scope"]["allowed_paths"] = json!([fixture.root.join("outside")]);
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlanAuthorityViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlanAuthorityViolation(_))
+        ));
     }
 
     #[test]
@@ -1328,7 +1469,10 @@ mod tests {
             "expected_sha256": "bad"
         }]);
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1336,8 +1480,18 @@ mod tests {
         let fixture = fixture();
         let large = vec![b'x'; MAX_PLAN_PROPOSAL_BYTES + 1];
         let result = apply(&fixture, &large);
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
-        assert_eq!(fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap().revision(), 1);
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap()
+                .revision(),
+            1
+        );
     }
 
     #[test]
@@ -1346,7 +1500,10 @@ mod tests {
         let mut task = read_only_task("a", &[]);
         task["status"] = json!("COMPLETED");
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1378,7 +1535,10 @@ mod tests {
         for candidate in invalid {
             assert!(apply(&fixture, &candidate).is_err());
             assert_eq!(bytes(&fixture), before);
-            let durable = fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap();
+            let durable = fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap();
             assert_eq!(durable.revision(), 1);
             assert_eq!(durable.plan_revision(), 0);
             assert_eq!(durable.status(), GoalStatus::Planning);
@@ -1398,9 +1558,19 @@ mod tests {
             1,
             &proposal(&fixture, vec![read_only_task("a", &[])]),
         );
-        assert!(matches!(result, Err(PlannerError::Store(OrchestratorError::PersistenceIo(_)))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::Store(OrchestratorError::PersistenceIo(_)))
+        ));
         assert_eq!(bytes(&fixture), before);
-        assert_eq!(fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap().revision(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap()
+                .revision(),
+            1
+        );
     }
 
     #[test]
@@ -1422,9 +1592,22 @@ mod tests {
             1,
             &original_proposal,
         );
-        assert!(matches!(result, Err(PlannerError::PlanConflict { expected: 1, actual: 2 })));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlanConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
         assert_eq!(bytes(&fixture), before);
-        assert_eq!(fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap().revision(), 2);
+        assert_eq!(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap()
+                .revision(),
+            2
+        );
     }
 
     #[test]
@@ -1441,9 +1624,20 @@ mod tests {
             2,
             &output,
         );
-        assert!(matches!(replay, Err(PlannerError::PlanNotApplicable(_)) | Err(PlannerError::PlanConflict { .. })));
+        assert!(matches!(
+            replay,
+            Err(PlannerError::PlanNotApplicable(_)) | Err(PlannerError::PlanConflict { .. })
+        ));
         assert_eq!(bytes(&fixture), before);
-        assert_eq!(fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap().tasks().len(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap()
+                .tasks()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1453,10 +1647,16 @@ mod tests {
             &fixture,
             &proposal(
                 &fixture,
-                vec![mutation_task("writer_a", &[]), mutation_task("writer_b", &[])],
+                vec![
+                    mutation_task("writer_a", &[]),
+                    mutation_task("writer_b", &[]),
+                ],
             ),
         );
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1475,7 +1675,11 @@ mod tests {
         .unwrap();
         assert_eq!(durable.tasks().len(), 2);
         assert_eq!(
-            durable.tasks().values().filter(|task| task.status() == TaskStatus::Ready).count(),
+            durable
+                .tasks()
+                .values()
+                .filter(|task| task.status() == TaskStatus::Ready)
+                .count(),
             1
         );
     }
@@ -1505,7 +1709,10 @@ mod tests {
                 vec![optional, read_only_task("mandatory", &["optional"])],
             ),
         );
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1514,7 +1721,10 @@ mod tests {
         let mut task = mutation_task("writer", &[]);
         task["scope"]["replay_safety"] = json!("SAFE_READ_ONLY");
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlannerSchemaViolation(_))
+        ));
     }
 
     #[test]
@@ -1523,7 +1733,10 @@ mod tests {
         let mut task = mutation_task("writer", &[]);
         task["scope"]["allowed_paths"] = json!([".git/config"]);
         let result = apply(&fixture, &proposal(&fixture, vec![task]));
-        assert!(matches!(result, Err(PlannerError::PlanAuthorityViolation(_))));
+        assert!(matches!(
+            result,
+            Err(PlannerError::PlanAuthorityViolation(_))
+        ));
     }
 
     struct FixturePlanner {
@@ -1542,7 +1755,9 @@ mod tests {
         let planner = FixturePlanner {
             output: proposal(&fixture, vec![read_only_task("inspect", &[])]),
         };
-        let durable = plan_initial_goal(&fixture.store, &fixture.session, &fixture.goal_id, &planner).unwrap();
+        let durable =
+            plan_initial_goal(&fixture.store, &fixture.session, &fixture.goal_id, &planner)
+                .unwrap();
         assert_eq!(durable.status(), GoalStatus::Running);
         assert_eq!(durable.tasks().len(), 1);
     }
@@ -1558,7 +1773,10 @@ mod tests {
             concat!("without_", "sandbox"),
             concat!("run_", "unrestricted"),
         ] {
-            assert!(!source.contains(forbidden), "forbidden execution coupling: {forbidden}");
+            assert!(
+                !source.contains(forbidden),
+                "forbidden execution coupling: {forbidden}"
+            );
         }
     }
 }

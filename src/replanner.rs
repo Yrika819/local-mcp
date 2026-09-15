@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config;
 use crate::agent::AgentError;
+use crate::config;
 use crate::goal::{
     CompletionCriterionId, Goal, GoalId, GoalStatus, GoalVerificationRequirement, ReplanMutation,
 };
@@ -16,6 +16,7 @@ use crate::task::{
     WorkerKind,
 };
 use crate::task_store::TaskStore;
+use crate::worker_capability;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ReplannerRequest {
@@ -137,12 +138,25 @@ impl fmt::Display for ReplannerError {
         match self {
             Self::ReplannerUnavailable => write!(f, "replanner backend is unavailable"),
             Self::Model(error) => write!(f, "replanner model invocation failed: {error}"),
-            Self::ReplannerOutputInvalid(reason) => write!(f, "replanner output is invalid: {reason}"),
-            Self::ReplannerSchemaViolation(reason) => write!(f, "replanner proposal violates the Phase 7 schema: {reason}"),
-            Self::RevisionConflict { expected, actual } => write!(f, "replan conflict: proposal was based on Goal revision {expected}, current revision is {actual}"),
-            Self::PlanConflict { expected, actual } => write!(f, "replan conflict: proposal was based on plan revision {expected}, current plan revision is {actual}"),
+            Self::ReplannerOutputInvalid(reason) => {
+                write!(f, "replanner output is invalid: {reason}")
+            }
+            Self::ReplannerSchemaViolation(reason) => write!(
+                f,
+                "replanner proposal violates the Phase 7 schema: {reason}"
+            ),
+            Self::RevisionConflict { expected, actual } => write!(
+                f,
+                "replan conflict: proposal was based on Goal revision {expected}, current revision is {actual}"
+            ),
+            Self::PlanConflict { expected, actual } => write!(
+                f,
+                "replan conflict: proposal was based on plan revision {expected}, current plan revision is {actual}"
+            ),
             Self::ReplanNotApplicable(reason) => write!(f, "replan is not applicable: {reason}"),
-            Self::ReplanAuthorityViolation(reason) => write!(f, "replan exceeds Goal/session authority: {reason}"),
+            Self::ReplanAuthorityViolation(reason) => {
+                write!(f, "replan exceeds Goal/session authority: {reason}")
+            }
             Self::NoSafeReplan(reason) => write!(f, "no safe replan is available: {reason}"),
             Self::Store(error) => write!(f, "durable Goal operation failed: {error}"),
         }
@@ -194,7 +208,11 @@ struct ReplanTaskProposal {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(tag = "ref_kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "ref_kind",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 enum TaskRefProposal {
     Existing { task_id: String },
     New { proposal_id: String },
@@ -287,27 +305,39 @@ pub(crate) fn replanner_request_for_goal(
             objective: task.objective().to_owned(),
             mandatory: task.mandatory(),
             status: task.status(),
-            dependencies: task.dependencies().iter().map(|dependency| dependency.task_id().as_str().to_owned()).collect(),
+            dependencies: task
+                .dependencies()
+                .iter()
+                .map(|dependency| dependency.task_id().as_str().to_owned())
+                .collect(),
             worker: task.worker(),
             scope: task.scope().clone(),
             verification: task.verification_specs().to_vec(),
             verification_results: task.verification_results().to_vec(),
             evidence: task.evidence().to_vec(),
-            blockers: task.blockers().iter().map(|blocker| ReplannerBlocker {
-                code: blocker.code().to_owned(),
-                detail: blocker.detail().to_owned(),
-                mandatory: blocker.mandatory(),
-            }).collect(),
-            attempts: task.attempts().iter().map(|attempt| ReplannerAttemptSummary {
-                attempt_id: attempt.id().as_str().to_owned(),
-                worker: attempt.worker(),
-                outcome: attempt.outcome(),
-                operation_id: attempt.operation_id().map(str::to_owned),
-                scope_identity: attempt.scope_identity().map(str::to_owned),
-                side_effect_state: attempt.side_effect_state(),
-                remaining_attempt_budget: attempt.remaining_attempt_budget(),
-                remaining_side_effect_budget: attempt.remaining_side_effect_budget(),
-            }).collect(),
+            blockers: task
+                .blockers()
+                .iter()
+                .map(|blocker| ReplannerBlocker {
+                    code: blocker.code().to_owned(),
+                    detail: blocker.detail().to_owned(),
+                    mandatory: blocker.mandatory(),
+                })
+                .collect(),
+            attempts: task
+                .attempts()
+                .iter()
+                .map(|attempt| ReplannerAttemptSummary {
+                    attempt_id: attempt.id().as_str().to_owned(),
+                    worker: attempt.worker(),
+                    outcome: attempt.outcome(),
+                    operation_id: attempt.operation_id().map(str::to_owned),
+                    scope_identity: attempt.scope_identity().map(str::to_owned),
+                    side_effect_state: attempt.side_effect_state(),
+                    remaining_attempt_budget: attempt.remaining_attempt_budget(),
+                    remaining_side_effect_budget: attempt.remaining_side_effect_budget(),
+                })
+                .collect(),
             max_attempts: task.max_attempts(),
             created_plan_revision: task.created_plan_revision(),
         })
@@ -320,25 +350,49 @@ pub(crate) fn replanner_request_for_goal(
         objective: goal.objective().to_owned(),
         title: goal.title().map(str::to_owned),
         constraints: goal.constraints().to_vec(),
-        completion_criteria: goal.completion_criteria().iter().map(|criterion| ReplannerCriterion {
-            criterion_id: criterion.id().as_str().to_owned(),
-            description: criterion.description().to_owned(),
-            required: criterion.required(),
-        }).collect(),
-        criterion_bindings: goal.final_verification_spec().map(|spec| spec.criterion_bindings().iter().map(|binding| ReplannerCriterionBindingSnapshot {
-            criterion_id: binding.criterion_id().as_str().to_owned(),
-            task_ids: binding.requirements().iter().map(|requirement| requirement.task_id().as_str().to_owned()).collect(),
-        }).collect()).unwrap_or_default(),
+        completion_criteria: goal
+            .completion_criteria()
+            .iter()
+            .map(|criterion| ReplannerCriterion {
+                criterion_id: criterion.id().as_str().to_owned(),
+                description: criterion.description().to_owned(),
+                required: criterion.required(),
+            })
+            .collect(),
+        criterion_bindings: goal
+            .final_verification_spec()
+            .map(|spec| {
+                spec.criterion_bindings()
+                    .iter()
+                    .map(|binding| ReplannerCriterionBindingSnapshot {
+                        criterion_id: binding.criterion_id().as_str().to_owned(),
+                        task_ids: binding
+                            .requirements()
+                            .iter()
+                            .map(|requirement| requirement.task_id().as_str().to_owned())
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         cwd: goal_root,
         tasks,
-        goal_blockers: goal.blockers().iter().map(|blocker| ReplannerBlocker {
-            code: blocker.code().to_owned(),
-            detail: blocker.detail().to_owned(),
-            mandatory: blocker.mandatory(),
-        }).collect(),
+        goal_blockers: goal
+            .blockers()
+            .iter()
+            .map(|blocker| ReplannerBlocker {
+                code: blocker.code().to_owned(),
+                detail: blocker.detail().to_owned(),
+                mandatory: blocker.mandatory(),
+            })
+            .collect(),
         eligible_needs_replan_task_ids,
-        allowed_worker_kinds: vec![WorkerKind::LocalOperation, WorkerKind::CodexReadonly, WorkerKind::CodexWriter, WorkerKind::CodexReviewer, WorkerKind::Verifier],
-        allowed_operation_kinds: vec![TaskOperationKind::ReadOnly, TaskOperationKind::LocalMutation, TaskOperationKind::HostNativeApproved],
+        allowed_worker_kinds: worker_capability::production_plannable_worker_kinds().to_vec(),
+        allowed_operation_kinds: vec![
+            TaskOperationKind::ReadOnly,
+            TaskOperationKind::LocalMutation,
+            TaskOperationKind::HostNativeApproved,
+        ],
         prohibited_operations: vec![
             "task execution during replanning",
             "Task or Goal completion",
@@ -359,10 +413,19 @@ pub(crate) fn replan_goal<B: ReplannerBackend>(
     goal_id: &GoalId,
     replanner: &B,
 ) -> Result<Goal, ReplannerError> {
-    let goal = store.load_goal(&session.id, goal_id).map_err(map_store_error)?;
+    let goal = store
+        .load_goal(&session.id, goal_id)
+        .map_err(map_store_error)?;
     let request = replanner_request_for_goal(&goal, session)?;
     let output = replanner.propose_replan(&request)?;
-    materialize_replan_output(store, session, goal_id, goal.revision(), goal.plan_revision(), &output)
+    materialize_replan_output(
+        store,
+        session,
+        goal_id,
+        goal.revision(),
+        goal.plan_revision(),
+        &output,
+    )
 }
 
 pub(crate) fn materialize_replan_output(
@@ -374,38 +437,65 @@ pub(crate) fn materialize_replan_output(
     output: &[u8],
 ) -> Result<Goal, ReplannerError> {
     if output.len() > planner::MAX_PLAN_PROPOSAL_BYTES {
-        return Err(ReplannerError::ReplannerSchemaViolation("proposal exceeds the 256 KiB host limit".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "proposal exceeds the 256 KiB host limit".to_owned(),
+        ));
     }
-    let current = store.load_goal(&session.id, goal_id).map_err(map_store_error)?;
+    let current = store
+        .load_goal(&session.id, goal_id)
+        .map_err(map_store_error)?;
     if current.revision() != expected_goal_revision {
-        return Err(ReplannerError::RevisionConflict { expected: expected_goal_revision, actual: current.revision() });
+        return Err(ReplannerError::RevisionConflict {
+            expected: expected_goal_revision,
+            actual: current.revision(),
+        });
     }
     if current.plan_revision() != expected_plan_revision {
-        return Err(ReplannerError::PlanConflict { expected: expected_plan_revision, actual: current.plan_revision() });
+        return Err(ReplannerError::PlanConflict {
+            expected: expected_plan_revision,
+            actual: current.plan_revision(),
+        });
     }
     ensure_replan_eligible(&current)?;
-    let goal_root = planner::validate_session_goal_binding(&current, session).map_err(map_planner_validation_error)?;
+    let goal_root = planner::validate_session_goal_binding(&current, session)
+        .map_err(map_planner_validation_error)?;
     let validated = parse_and_validate_proposal(output, &current, &goal_root)?;
 
-    store.mutate_goal_snapshot(&session.id, goal_id, expected_goal_revision, move |goal, now| {
-        if goal.plan_revision() != expected_plan_revision {
-            return Err(OrchestratorError::InvalidDag("stale replan plan revision".to_owned()));
-        }
-        materialize_validated_replan(goal, validated, now)?;
-        validate_writer_serialization(goal)?;
-        Ok(())
-    }).map_err(map_store_error)
+    store
+        .mutate_goal_snapshot(
+            &session.id,
+            goal_id,
+            expected_goal_revision,
+            move |goal, now| {
+                if goal.plan_revision() != expected_plan_revision {
+                    return Err(OrchestratorError::InvalidDag(
+                        "stale replan plan revision".to_owned(),
+                    ));
+                }
+                materialize_validated_replan(goal, validated, now)?;
+                validate_writer_serialization(goal)?;
+                Ok(())
+            },
+        )
+        .map_err(map_store_error)
 }
 
 fn ensure_replan_eligible(goal: &Goal) -> Result<(), ReplannerError> {
     if goal.is_terminal() {
-        return Err(ReplannerError::ReplanNotApplicable("terminal Goal history is immutable".to_owned()));
+        return Err(ReplannerError::ReplanNotApplicable(
+            "terminal Goal history is immutable".to_owned(),
+        ));
     }
     if !matches!(goal.status(), GoalStatus::Running | GoalStatus::Replanning) {
-        return Err(ReplannerError::ReplanNotApplicable("Phase 7 replanning requires a RUNNING or REPLANNING Goal".to_owned()));
+        return Err(ReplannerError::ReplanNotApplicable(
+            "Phase 7 replanning requires a RUNNING or REPLANNING Goal".to_owned(),
+        ));
     }
     if !goal.has_task_status(TaskStatus::NeedsReplan) {
-        return Err(ReplannerError::ReplanNotApplicable("Phase 7 requires at least one NEEDS_REPLAN Task; BLOCKED alone is not replannable".to_owned()));
+        return Err(ReplannerError::ReplanNotApplicable(
+            "Phase 7 requires at least one NEEDS_REPLAN Task; BLOCKED alone is not replannable"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -416,93 +506,196 @@ fn parse_and_validate_proposal(
     goal_root: &std::path::Path,
 ) -> Result<ValidatedReplan, ReplannerError> {
     let raw: serde_json::Value = serde_json::from_slice(output).map_err(|error| {
-        ReplannerError::ReplannerOutputInvalid(format!("malformed JSON at line {}, column {}", error.line(), error.column()))
+        ReplannerError::ReplannerOutputInvalid(format!(
+            "malformed JSON at line {}, column {}",
+            error.line(),
+            error.column()
+        ))
     })?;
     let proposal: ReplanProposal = serde_json::from_value(raw).map_err(|_| {
-        ReplannerError::ReplannerSchemaViolation("proposal shape does not match the strict Phase 7 schema".to_owned())
+        ReplannerError::ReplannerSchemaViolation(
+            "proposal shape does not match the strict Phase 7 schema".to_owned(),
+        )
     })?;
 
     if proposal.goal_id != goal.id().as_str() {
-        return Err(ReplannerError::ReplannerSchemaViolation("proposal goal_id does not match the authoritative Goal".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "proposal goal_id does not match the authoritative Goal".to_owned(),
+        ));
     }
     if proposal.base_goal_revision != goal.revision() {
-        return Err(ReplannerError::RevisionConflict { expected: proposal.base_goal_revision, actual: goal.revision() });
+        return Err(ReplannerError::RevisionConflict {
+            expected: proposal.base_goal_revision,
+            actual: goal.revision(),
+        });
     }
     if proposal.base_plan_revision != goal.plan_revision() {
-        return Err(ReplannerError::PlanConflict { expected: proposal.base_plan_revision, actual: goal.plan_revision() });
+        return Err(ReplannerError::PlanConflict {
+            expected: proposal.base_plan_revision,
+            actual: goal.plan_revision(),
+        });
     }
-    planner::validate_text(&proposal.summary, planner::MAX_PLAN_SUMMARY_BYTES, "Replan summary").map_err(map_planner_validation_error)?;
+    planner::validate_text(
+        &proposal.summary,
+        planner::MAX_PLAN_SUMMARY_BYTES,
+        "Replan summary",
+    )
+    .map_err(map_planner_validation_error)?;
 
-    let change_count = proposal.add_tasks.len() + proposal.add_dependencies.len() + proposal.strengthen_verification.len() + proposal.strengthen_mandatory.len() + proposal.strengthen_criterion_bindings.len() + proposal.resolve_needs_replan.len();
+    let change_count = proposal.add_tasks.len()
+        + proposal.add_dependencies.len()
+        + proposal.strengthen_verification.len()
+        + proposal.strengthen_mandatory.len()
+        + proposal.strengthen_criterion_bindings.len()
+        + proposal.resolve_needs_replan.len();
     if change_count == 0 {
-        return Err(ReplannerError::ReplannerSchemaViolation("replan must contain at least one monotonic change".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "replan must contain at least one monotonic change".to_owned(),
+        ));
     }
     if goal.tasks().len().saturating_add(proposal.add_tasks.len()) > planner::MAX_PLAN_TASKS {
-        return Err(ReplannerError::ReplannerSchemaViolation("candidate plan exceeds the 128 Task host limit".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 128 Task host limit".to_owned(),
+        ));
     }
 
-    let existing_dependency_edges = goal.tasks().values().map(|task| task.dependencies().len()).sum::<usize>();
-    let proposed_dependency_edges = proposal.add_tasks.iter().map(|task| task.dependencies.len()).sum::<usize>().saturating_add(proposal.add_dependencies.len());
-    if existing_dependency_edges.saturating_add(proposed_dependency_edges) > planner::MAX_PLAN_DEPENDENCY_EDGES {
-        return Err(ReplannerError::ReplannerSchemaViolation("candidate plan exceeds the 1024 dependency-edge limit".to_owned()));
+    let existing_dependency_edges = goal
+        .tasks()
+        .values()
+        .map(|task| task.dependencies().len())
+        .sum::<usize>();
+    let proposed_dependency_edges = proposal
+        .add_tasks
+        .iter()
+        .map(|task| task.dependencies.len())
+        .sum::<usize>()
+        .saturating_add(proposal.add_dependencies.len());
+    if existing_dependency_edges.saturating_add(proposed_dependency_edges)
+        > planner::MAX_PLAN_DEPENDENCY_EDGES
+    {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 1024 dependency-edge limit".to_owned(),
+        ));
     }
 
-    let existing_scope_paths = goal.tasks().values().map(|task| task.scope().allowed_paths().len() + task.scope().forbidden_paths().len()).sum::<usize>();
-    let new_scope_paths = proposal.add_tasks.iter().map(|task| task.scope.allowed_paths.len() + task.scope.forbidden_paths.len()).sum::<usize>();
+    let existing_scope_paths = goal
+        .tasks()
+        .values()
+        .map(|task| task.scope().allowed_paths().len() + task.scope().forbidden_paths().len())
+        .sum::<usize>();
+    let new_scope_paths = proposal
+        .add_tasks
+        .iter()
+        .map(|task| task.scope.allowed_paths.len() + task.scope.forbidden_paths.len())
+        .sum::<usize>();
     if existing_scope_paths.saturating_add(new_scope_paths) > planner::MAX_SCOPE_PATHS_TOTAL {
-        return Err(ReplannerError::ReplannerSchemaViolation("candidate plan exceeds the 1024 scope-path limit".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 1024 scope-path limit".to_owned(),
+        ));
     }
 
-    let existing_verification = goal.tasks().values().map(|task| task.verification_specs().len()).sum::<usize>();
-    let new_verification = proposal.add_tasks.iter().map(|task| task.verification.len()).sum::<usize>().saturating_add(proposal.strengthen_verification.iter().map(|entry| entry.add.len()).sum::<usize>());
+    let existing_verification = goal
+        .tasks()
+        .values()
+        .map(|task| task.verification_specs().len())
+        .sum::<usize>();
+    let new_verification = proposal
+        .add_tasks
+        .iter()
+        .map(|task| task.verification.len())
+        .sum::<usize>()
+        .saturating_add(
+            proposal
+                .strengthen_verification
+                .iter()
+                .map(|entry| entry.add.len())
+                .sum::<usize>(),
+        );
     if existing_verification.saturating_add(new_verification) > planner::MAX_VERIFICATION_TOTAL {
-        return Err(ReplannerError::ReplannerSchemaViolation("candidate plan exceeds the 1024 verification-entry limit".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 1024 verification-entry limit".to_owned(),
+        ));
     }
 
     let mut local_ids = BTreeSet::new();
     for task in &proposal.add_tasks {
         planner::validate_proposal_id(&task.proposal_id).map_err(map_planner_validation_error)?;
         if !local_ids.insert(task.proposal_id.clone()) {
-            return Err(ReplannerError::ReplannerSchemaViolation("duplicate proposal-local Task identity".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "duplicate proposal-local Task identity".to_owned(),
+            ));
         }
-        if goal.tasks().keys().any(|existing| existing.as_str() == task.proposal_id) {
-            return Err(ReplannerError::ReplannerSchemaViolation("proposal-local Task identity collides with an existing Task ID".to_owned()));
+        if goal
+            .tasks()
+            .keys()
+            .any(|existing| existing.as_str() == task.proposal_id)
+        {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "proposal-local Task identity collides with an existing Task ID".to_owned(),
+            ));
         }
     }
     let mut validated_new_tasks = Vec::with_capacity(proposal.add_tasks.len());
     for task in proposal.add_tasks {
-        planner::validate_text(&task.title, planner::MAX_PLAN_TITLE_BYTES, "Task title").map_err(map_planner_validation_error)?;
-        planner::validate_text(&task.objective, planner::MAX_PLAN_OBJECTIVE_BYTES, "Task objective").map_err(map_planner_validation_error)?;
+        planner::validate_text(&task.title, planner::MAX_PLAN_TITLE_BYTES, "Task title")
+            .map_err(map_planner_validation_error)?;
+        planner::validate_text(
+            &task.objective,
+            planner::MAX_PLAN_OBJECTIVE_BYTES,
+            "Task objective",
+        )
+        .map_err(map_planner_validation_error)?;
+        if !worker_capability::is_production_plannable(task.worker) {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "new Task worker is not production-plannable".to_owned(),
+            ));
+        }
         if task.dependencies.len() > planner::MAX_DEPENDENCIES_PER_TASK {
-            return Err(ReplannerError::ReplannerSchemaViolation("a new Task has too many dependencies".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "a new Task has too many dependencies".to_owned(),
+            ));
         }
         let mut seen_dependencies = BTreeSet::new();
         let mut dependencies = Vec::with_capacity(task.dependencies.len());
         for dependency in task.dependencies {
             let validated = validate_task_ref(dependency, goal, &local_ids)?;
             if validated == ValidatedTaskRef::New(task.proposal_id.clone()) {
-                return Err(ReplannerError::ReplannerSchemaViolation("new Task cannot depend on itself".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "new Task cannot depend on itself".to_owned(),
+                ));
             }
             if !seen_dependencies.insert(validated.clone()) {
-                return Err(ReplannerError::ReplannerSchemaViolation("duplicate dependency edge".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "duplicate dependency edge".to_owned(),
+                ));
             }
             dependencies.push(validated);
         }
-        let scope = planner::validate_and_normalize_scope(&task.scope, task.worker, goal_root).map_err(map_planner_validation_error)?;
-        if task.verification.is_empty() || task.verification.len() > planner::MAX_VERIFICATION_PER_TASK {
-            return Err(ReplannerError::ReplannerSchemaViolation("each new Task requires 1..=32 verification specifications".to_owned()));
+        let scope = planner::validate_and_normalize_scope(&task.scope, task.worker, goal_root)
+            .map_err(map_planner_validation_error)?;
+        if task.verification.is_empty()
+            || task.verification.len() > planner::MAX_VERIFICATION_PER_TASK
+        {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "each new Task requires 1..=32 verification specifications".to_owned(),
+            ));
         }
         let mut verification = Vec::with_capacity(task.verification.len());
         for spec in task.verification {
-            let normalized = planner::validate_and_normalize_verification(spec, goal_root).map_err(map_planner_validation_error)?;
+            let normalized = planner::validate_and_normalize_verification(spec, goal_root)
+                .map_err(map_planner_validation_error)?;
             if verification.contains(&normalized) {
-                return Err(ReplannerError::ReplannerSchemaViolation("new Task contains duplicate verification requirements".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "new Task contains duplicate verification requirements".to_owned(),
+                ));
             }
             verification.push(normalized);
         }
         let max_attempts = match scope.operation_kind() {
             TaskOperationKind::ReadOnly => planner::READ_ONLY_MAX_ATTEMPTS,
-            TaskOperationKind::LocalMutation | TaskOperationKind::HostNativeApproved => planner::EFFECTFUL_MAX_ATTEMPTS,
+            TaskOperationKind::LocalMutation | TaskOperationKind::HostNativeApproved => {
+                planner::EFFECTFUL_MAX_ATTEMPTS
+            }
         };
         validated_new_tasks.push(ValidatedNewTask {
             proposal_id: task.proposal_id,
@@ -517,11 +710,16 @@ fn parse_and_validate_proposal(
         });
     }
 
-    let new_by_id = validated_new_tasks.iter().map(|task| (task.proposal_id.clone(), task)).collect::<BTreeMap<_, _>>();
+    let new_by_id = validated_new_tasks
+        .iter()
+        .map(|task| (task.proposal_id.clone(), task))
+        .collect::<BTreeMap<_, _>>();
     for task in &validated_new_tasks {
         for dependency in &task.dependencies {
             if task.mandatory && !task_ref_is_mandatory(dependency, goal, &new_by_id)? {
-                return Err(ReplannerError::ReplannerSchemaViolation("mandatory Task cannot depend on an optional Task".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "mandatory Task cannot depend on an optional Task".to_owned(),
+                ));
             }
         }
     }
@@ -533,18 +731,29 @@ fn parse_and_validate_proposal(
         let target = validate_task_ref(edge.task, goal, &local_ids)?;
         let dependency = validate_task_ref(edge.dependency, goal, &local_ids)?;
         if target == dependency {
-            return Err(ReplannerError::ReplannerSchemaViolation("Task cannot depend on itself".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "Task cannot depend on itself".to_owned(),
+            ));
         }
         if !seen_edges.insert((target.clone(), dependency.clone())) {
-            return Err(ReplannerError::ReplannerSchemaViolation("duplicate dependency addition".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "duplicate dependency addition".to_owned(),
+            ));
         }
         if dependency_already_present(&target, &dependency, goal, &new_by_id)? {
-            return Err(ReplannerError::ReplannerSchemaViolation("replan cannot re-add an existing dependency edge".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "replan cannot re-add an existing dependency edge".to_owned(),
+            ));
         }
         if let ValidatedTaskRef::Existing(task_id) = &target {
             let task = &goal.tasks()[task_id];
-            if !matches!(task.status(), TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan) {
-                return Err(ReplannerError::ReplanAuthorityViolation("dependencies cannot change for active or terminal Tasks".to_owned()));
+            if !matches!(
+                task.status(),
+                TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan
+            ) {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "dependencies cannot change for active or terminal Tasks".to_owned(),
+                ));
             }
         }
         *added_count_by_target.entry(target.clone()).or_default() += 1;
@@ -556,7 +765,9 @@ fn parse_and_validate_proposal(
             ValidatedTaskRef::New(id) => new_by_id[id].dependencies.len(),
         };
         if base.saturating_add(*added) > planner::MAX_DEPENDENCIES_PER_TASK {
-            return Err(ReplannerError::ReplannerSchemaViolation("a Task exceeds the 64 dependency limit after replan".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "a Task exceeds the 64 dependency limit after replan".to_owned(),
+            ));
         }
     }
 
@@ -565,20 +776,39 @@ fn parse_and_validate_proposal(
     for strengthening in proposal.strengthen_verification {
         let task_id = parse_existing_task_id(&strengthening.task_id, goal)?;
         if !seen_verification_targets.insert(task_id.clone()) {
-            return Err(ReplannerError::ReplannerSchemaViolation("verification strengthening must be grouped once per Task".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "verification strengthening must be grouped once per Task".to_owned(),
+            ));
         }
         let task = &goal.tasks()[&task_id];
-        if !matches!(task.status(), TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan) {
-            return Err(ReplannerError::ReplanAuthorityViolation("verification cannot change for active or terminal Tasks".to_owned()));
+        if !matches!(
+            task.status(),
+            TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan
+        ) {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "verification cannot change for active or terminal Tasks".to_owned(),
+            ));
         }
-        if strengthening.add.is_empty() || task.verification_specs().len().saturating_add(strengthening.add.len()) > planner::MAX_VERIFICATION_PER_TASK {
-            return Err(ReplannerError::ReplannerSchemaViolation("verification strengthening must add 1..=32 bounded requirements".to_owned()));
+        if strengthening.add.is_empty()
+            || task
+                .verification_specs()
+                .len()
+                .saturating_add(strengthening.add.len())
+                > planner::MAX_VERIFICATION_PER_TASK
+        {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "verification strengthening must add 1..=32 bounded requirements".to_owned(),
+            ));
         }
         let mut additions = Vec::with_capacity(strengthening.add.len());
         for spec in strengthening.add {
-            let normalized = planner::validate_and_normalize_verification(spec, goal_root).map_err(map_planner_validation_error)?;
+            let normalized = planner::validate_and_normalize_verification(spec, goal_root)
+                .map_err(map_planner_validation_error)?;
             if task.verification_specs().contains(&normalized) || additions.contains(&normalized) {
-                return Err(ReplannerError::ReplannerSchemaViolation("verification strengthening cannot duplicate an existing requirement".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "verification strengthening cannot duplicate an existing requirement"
+                        .to_owned(),
+                ));
             }
             additions.push(normalized);
         }
@@ -590,43 +820,77 @@ fn parse_and_validate_proposal(
     for strengthening in proposal.strengthen_mandatory {
         let task_id = parse_existing_task_id(&strengthening.task_id, goal)?;
         if !seen_mandatory.insert(task_id.clone()) {
-            return Err(ReplannerError::ReplannerSchemaViolation("duplicate mandatory strengthening".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "duplicate mandatory strengthening".to_owned(),
+            ));
         }
         let task = &goal.tasks()[&task_id];
         if task.is_terminal() {
-            return Err(ReplannerError::ReplanAuthorityViolation("terminal Task mandatory authority is immutable".to_owned()));
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "terminal Task mandatory authority is immutable".to_owned(),
+            ));
         }
         if task.mandatory() {
-            return Err(ReplannerError::ReplannerSchemaViolation("strengthen_mandatory may target only optional Tasks".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "strengthen_mandatory may target only optional Tasks".to_owned(),
+            ));
         }
         validated_mandatory.push(task_id);
     }
 
-    let criterion_by_id = goal.completion_criteria().iter()
+    let criterion_by_id = goal
+        .completion_criteria()
+        .iter()
         .map(|criterion| (criterion.id().as_str(), criterion))
         .collect::<BTreeMap<_, _>>();
-    let current_spec = goal.final_verification_spec().ok_or_else(|| ReplannerError::ReplanAuthorityViolation(
-        "schema-2 replan requires an existing Goal final-verification contract".to_owned()
-    ))?;
+    let current_spec = goal.final_verification_spec().ok_or_else(|| {
+        ReplannerError::ReplanAuthorityViolation(
+            "schema-2 replan requires an existing Goal final-verification contract".to_owned(),
+        )
+    })?;
     let mut seen_criterion_strengthenings = BTreeSet::new();
-    let mut validated_criterion_requirements = Vec::with_capacity(proposal.strengthen_criterion_bindings.len());
+    let mut validated_criterion_requirements =
+        Vec::with_capacity(proposal.strengthen_criterion_bindings.len());
     for strengthening in proposal.strengthen_criterion_bindings {
-        let criterion = criterion_by_id.get(strengthening.criterion_id.as_str()).ok_or_else(|| {
-            ReplannerError::ReplannerSchemaViolation("criterion strengthening references an unknown CompletionCriterionId".to_owned())
-        })?;
-        if !seen_criterion_strengthenings.insert(strengthening.criterion_id.clone()) || strengthening.add_task_refs.is_empty() {
-            return Err(ReplannerError::ReplannerSchemaViolation("criterion strengthening must be non-empty and grouped once per criterion".to_owned()));
+        let criterion = criterion_by_id
+            .get(strengthening.criterion_id.as_str())
+            .ok_or_else(|| {
+                ReplannerError::ReplannerSchemaViolation(
+                    "criterion strengthening references an unknown CompletionCriterionId"
+                        .to_owned(),
+                )
+            })?;
+        if !seen_criterion_strengthenings.insert(strengthening.criterion_id.clone())
+            || strengthening.add_task_refs.is_empty()
+        {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "criterion strengthening must be non-empty and grouped once per criterion"
+                    .to_owned(),
+            ));
         }
-        let current_binding = current_spec.criterion_bindings().iter().find(|binding| binding.criterion_id() == criterion.id()).ok_or_else(|| {
-            ReplannerError::ReplanAuthorityViolation("replan cannot repair missing initial criterion coverage by replacement".to_owned())
-        })?;
-        let current_task_ids = current_binding.requirements().iter().map(|requirement| requirement.task_id().clone()).collect::<BTreeSet<_>>();
+        let current_binding = current_spec
+            .criterion_bindings()
+            .iter()
+            .find(|binding| binding.criterion_id() == criterion.id())
+            .ok_or_else(|| {
+                ReplannerError::ReplanAuthorityViolation(
+                    "replan cannot repair missing initial criterion coverage by replacement"
+                        .to_owned(),
+                )
+            })?;
+        let current_task_ids = current_binding
+            .requirements()
+            .iter()
+            .map(|requirement| requirement.task_id().clone())
+            .collect::<BTreeSet<_>>();
         let mut additions = Vec::new();
         let mut seen_refs = BTreeSet::new();
         for reference in strengthening.add_task_refs {
             let validated_ref = validate_task_ref(reference, goal, &local_ids)?;
             if !seen_refs.insert(validated_ref.clone()) {
-                return Err(ReplannerError::ReplannerSchemaViolation("criterion strengthening contains duplicate Task reference".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "criterion strengthening contains duplicate Task reference".to_owned(),
+                ));
             }
             match &validated_ref {
                 ValidatedTaskRef::Existing(task_id) => {
@@ -639,7 +903,11 @@ fn parse_and_validate_proposal(
                     }
                 }
                 ValidatedTaskRef::New(proposal_id) => {
-                    let task = new_by_id.get(proposal_id).ok_or_else(|| ReplannerError::ReplannerSchemaViolation("criterion strengthening new Task disappeared".to_owned()))?;
+                    let task = new_by_id.get(proposal_id).ok_or_else(|| {
+                        ReplannerError::ReplannerSchemaViolation(
+                            "criterion strengthening new Task disappeared".to_owned(),
+                        )
+                    })?;
                     if !task.mandatory || task.verification.is_empty() {
                         return Err(ReplannerError::ReplanAuthorityViolation("TaskVerified strengthening requires a mandatory new Task with mechanical Task verification".to_owned()));
                     }
@@ -650,23 +918,34 @@ fn parse_and_validate_proposal(
         validated_criterion_requirements.push((criterion.id().clone(), additions));
     }
 
-    let dependency_targets = validated_add_dependencies.iter().map(|(target, _)| target.clone()).collect::<BTreeSet<_>>();
+    let dependency_targets = validated_add_dependencies
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect::<BTreeSet<_>>();
     let mut validated_resolution = Vec::with_capacity(proposal.resolve_needs_replan.len());
     let mut seen_resolution = BTreeSet::new();
     for task_id in proposal.resolve_needs_replan {
         let task_id = parse_existing_task_id(&task_id, goal)?;
         if !seen_resolution.insert(task_id.clone()) {
-            return Err(ReplannerError::ReplannerSchemaViolation("duplicate NEEDS_REPLAN resolution".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "duplicate NEEDS_REPLAN resolution".to_owned(),
+            ));
         }
         let task = &goal.tasks()[&task_id];
         if task.status() != TaskStatus::NeedsReplan {
-            return Err(ReplannerError::ReplanAuthorityViolation("only NEEDS_REPLAN Tasks may be resolved".to_owned()));
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "only NEEDS_REPLAN Tasks may be resolved".to_owned(),
+            ));
         }
         if task.has_unknown_side_effect() {
-            return Err(ReplannerError::NoSafeReplan("UNKNOWN side-effect state must remain blocked for reconciliation".to_owned()));
+            return Err(ReplannerError::NoSafeReplan(
+                "UNKNOWN side-effect state must remain blocked for reconciliation".to_owned(),
+            ));
         }
         if !dependency_targets.contains(&ValidatedTaskRef::Existing(task_id.clone())) {
-            return Err(ReplannerError::ReplannerSchemaViolation("resolving NEEDS_REPLAN requires a committed new hard dependency".to_owned()));
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "resolving NEEDS_REPLAN requires a committed new hard dependency".to_owned(),
+            ));
         }
         validated_resolution.push(task_id);
     }
@@ -687,11 +966,15 @@ fn validate_task_ref(
     local_ids: &BTreeSet<String>,
 ) -> Result<ValidatedTaskRef, ReplannerError> {
     match reference {
-        TaskRefProposal::Existing { task_id } => Ok(ValidatedTaskRef::Existing(parse_existing_task_id(&task_id, goal)?)),
+        TaskRefProposal::Existing { task_id } => Ok(ValidatedTaskRef::Existing(
+            parse_existing_task_id(&task_id, goal)?,
+        )),
         TaskRefProposal::New { proposal_id } => {
             planner::validate_proposal_id(&proposal_id).map_err(map_planner_validation_error)?;
             if !local_ids.contains(&proposal_id) {
-                return Err(ReplannerError::ReplannerSchemaViolation("dependency references an unknown proposal-local Task".to_owned()));
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "dependency references an unknown proposal-local Task".to_owned(),
+                ));
             }
             Ok(ValidatedTaskRef::New(proposal_id))
         }
@@ -699,9 +982,13 @@ fn validate_task_ref(
 }
 
 fn parse_existing_task_id(value: &str, goal: &Goal) -> Result<TaskId, ReplannerError> {
-    let task_id = TaskId::parse(value).map_err(|_| ReplannerError::ReplannerSchemaViolation("existing Task reference is malformed".to_owned()))?;
+    let task_id = TaskId::parse(value).map_err(|_| {
+        ReplannerError::ReplannerSchemaViolation("existing Task reference is malformed".to_owned())
+    })?;
     if !goal.tasks().contains_key(&task_id) {
-        return Err(ReplannerError::ReplannerSchemaViolation("existing Task reference is missing".to_owned()));
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "existing Task reference is missing".to_owned(),
+        ));
     }
     Ok(task_id)
 }
@@ -713,7 +1000,13 @@ fn task_ref_is_mandatory(
 ) -> Result<bool, ReplannerError> {
     match reference {
         ValidatedTaskRef::Existing(id) => Ok(goal.tasks()[id].mandatory()),
-        ValidatedTaskRef::New(id) => new_by_id.get(id).map(|task| task.mandatory).ok_or_else(|| ReplannerError::ReplannerSchemaViolation("proposal-local dependency disappeared during validation".to_owned())),
+        ValidatedTaskRef::New(id) => {
+            new_by_id.get(id).map(|task| task.mandatory).ok_or_else(|| {
+                ReplannerError::ReplannerSchemaViolation(
+                    "proposal-local dependency disappeared during validation".to_owned(),
+                )
+            })
+        }
     }
 }
 
@@ -725,10 +1018,20 @@ fn dependency_already_present(
 ) -> Result<bool, ReplannerError> {
     match target {
         ValidatedTaskRef::Existing(id) => match dependency {
-            ValidatedTaskRef::Existing(dependency_id) => Ok(goal.tasks()[id].dependencies().iter().any(|candidate| candidate.task_id() == dependency_id)),
+            ValidatedTaskRef::Existing(dependency_id) => Ok(goal.tasks()[id]
+                .dependencies()
+                .iter()
+                .any(|candidate| candidate.task_id() == dependency_id)),
             ValidatedTaskRef::New(_) => Ok(false),
         },
-        ValidatedTaskRef::New(id) => new_by_id.get(id).map(|task| task.dependencies.contains(dependency)).ok_or_else(|| ReplannerError::ReplannerSchemaViolation("proposal-local Task disappeared during validation".to_owned())),
+        ValidatedTaskRef::New(id) => new_by_id
+            .get(id)
+            .map(|task| task.dependencies.contains(dependency))
+            .ok_or_else(|| {
+                ReplannerError::ReplannerSchemaViolation(
+                    "proposal-local Task disappeared during validation".to_owned(),
+                )
+            }),
     }
 }
 fn materialize_validated_replan(
@@ -736,7 +1039,10 @@ fn materialize_validated_replan(
     validated: ValidatedReplan,
     now: &str,
 ) -> Result<(), OrchestratorError> {
-    let next_plan_revision = goal.plan_revision().checked_add(1).ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
+    let next_plan_revision = goal
+        .plan_revision()
+        .checked_add(1)
+        .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
 
     let mut materialized = Vec::with_capacity(validated.new_tasks.len());
     let mut local_to_id = BTreeMap::<String, TaskId>::new();
@@ -760,13 +1066,27 @@ fn materialize_validated_replan(
     let resolve_reference = |reference: &ValidatedTaskRef| -> Result<TaskId, OrchestratorError> {
         match reference {
             ValidatedTaskRef::Existing(id) => Ok(id.clone()),
-            ValidatedTaskRef::New(local) => local_to_id.get(local).cloned().ok_or_else(|| OrchestratorError::InvalidDag("validated proposal-local Task identity disappeared".to_owned())),
+            ValidatedTaskRef::New(local) => local_to_id.get(local).cloned().ok_or_else(|| {
+                OrchestratorError::InvalidDag(
+                    "validated proposal-local Task identity disappeared".to_owned(),
+                )
+            }),
         }
     };
 
-    let completed = goal.tasks().iter().filter_map(|(id, task)| (task.status() == TaskStatus::Completed).then_some(id.clone())).collect::<BTreeSet<_>>();
+    let completed = goal
+        .tasks()
+        .iter()
+        .filter_map(|(id, task)| (task.status() == TaskStatus::Completed).then_some(id.clone()))
+        .collect::<BTreeSet<_>>();
     for (_, dependencies, task) in &mut materialized {
-        let dependencies = dependencies.iter().map(&resolve_reference).collect::<Result<Vec<_>, _>>()?.into_iter().map(crate::task::TaskDependency::completed).collect::<Vec<_>>();
+        let dependencies = dependencies
+            .iter()
+            .map(&resolve_reference)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(crate::task::TaskDependency::completed)
+            .collect::<Vec<_>>();
         task.strengthen_dependencies(dependencies, &completed)?;
     }
 
@@ -775,26 +1095,46 @@ fn materialize_validated_replan(
     for (target, dependency) in validated.add_dependencies {
         let dependency_id = resolve_reference(&dependency)?;
         match target {
-            ValidatedTaskRef::Existing(id) => existing_additions.entry(id).or_default().push(dependency_id),
-            ValidatedTaskRef::New(local) => new_additions.entry(local).or_default().push(dependency_id),
+            ValidatedTaskRef::Existing(id) => existing_additions
+                .entry(id)
+                .or_default()
+                .push(dependency_id),
+            ValidatedTaskRef::New(local) => {
+                new_additions.entry(local).or_default().push(dependency_id)
+            }
         }
     }
 
     for (local, additions) in new_additions {
-        let (_, _, task) = materialized.iter_mut().find(|(proposal_id, _, _)| proposal_id == &local).ok_or_else(|| OrchestratorError::InvalidDag("new dependency target disappeared".to_owned()))?;
+        let (_, _, task) = materialized
+            .iter_mut()
+            .find(|(proposal_id, _, _)| proposal_id == &local)
+            .ok_or_else(|| {
+                OrchestratorError::InvalidDag("new dependency target disappeared".to_owned())
+            })?;
         let mut dependencies = task.dependencies().to_vec();
-        dependencies.extend(additions.into_iter().map(crate::task::TaskDependency::completed));
+        dependencies.extend(
+            additions
+                .into_iter()
+                .map(crate::task::TaskDependency::completed),
+        );
         task.strengthen_dependencies(dependencies, &completed)?;
     }
 
-    let criterion_additions = validated.add_criterion_requirements.into_iter().map(|(criterion_id, refs)| {
-        let requirements = refs.iter().map(&resolve_reference)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|task_id| GoalVerificationRequirement::TaskVerified { task_id })
-            .collect();
-        Ok((criterion_id, requirements))
-    }).collect::<Result<Vec<_>, OrchestratorError>>()?;
+    let criterion_additions = validated
+        .add_criterion_requirements
+        .into_iter()
+        .map(|(criterion_id, refs)| {
+            let requirements = refs
+                .iter()
+                .map(&resolve_reference)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|task_id| GoalVerificationRequirement::TaskVerified { task_id })
+                .collect();
+            Ok((criterion_id, requirements))
+        })
+        .collect::<Result<Vec<_>, OrchestratorError>>()?;
 
     goal.apply_replan_mutation(
         ReplanMutation {
@@ -810,9 +1150,14 @@ fn materialize_validated_replan(
 }
 
 fn validate_writer_serialization(goal: &Goal) -> Result<(), OrchestratorError> {
-    let writers = goal.tasks().iter().filter_map(|(id, task)| {
-        (!task.is_terminal() && task.scope().operation_kind() != TaskOperationKind::ReadOnly).then_some(id.clone())
-    }).collect::<Vec<_>>();
+    let writers = goal
+        .tasks()
+        .iter()
+        .filter_map(|(id, task)| {
+            (!task.is_terminal() && task.scope().operation_kind() != TaskOperationKind::ReadOnly)
+                .then_some(id.clone())
+        })
+        .collect::<Vec<_>>();
     for left in 0..writers.len() {
         for right in left + 1..writers.len() {
             let a = &writers[left];
@@ -847,11 +1192,19 @@ fn task_depends_on(goal: &Goal, start: &TaskId, target: &TaskId) -> bool {
 
 fn map_planner_validation_error(error: PlannerError) -> ReplannerError {
     match error {
-        PlannerError::PlannerOutputInvalid(reason) => ReplannerError::ReplannerOutputInvalid(reason),
-        PlannerError::PlannerSchemaViolation(reason) => ReplannerError::ReplannerSchemaViolation(reason),
-        PlannerError::PlanAuthorityViolation(reason) => ReplannerError::ReplanAuthorityViolation(reason),
+        PlannerError::PlannerOutputInvalid(reason) => {
+            ReplannerError::ReplannerOutputInvalid(reason)
+        }
+        PlannerError::PlannerSchemaViolation(reason) => {
+            ReplannerError::ReplannerSchemaViolation(reason)
+        }
+        PlannerError::PlanAuthorityViolation(reason) => {
+            ReplannerError::ReplanAuthorityViolation(reason)
+        }
         PlannerError::PlanNotApplicable(reason) => ReplannerError::ReplanNotApplicable(reason),
-        PlannerError::PlanConflict { expected, actual } => ReplannerError::RevisionConflict { expected, actual },
+        PlannerError::PlanConflict { expected, actual } => {
+            ReplannerError::RevisionConflict { expected, actual }
+        }
         PlannerError::PlannerUnavailable => ReplannerError::ReplannerUnavailable,
         PlannerError::Model(error) => ReplannerError::Model(error),
         PlannerError::Store(error) => ReplannerError::Store(error),
@@ -860,7 +1213,9 @@ fn map_planner_validation_error(error: PlannerError) -> ReplannerError {
 
 fn map_store_error(error: OrchestratorError) -> ReplannerError {
     match error {
-        OrchestratorError::RevisionConflict { expected, actual } => ReplannerError::RevisionConflict { expected, actual },
+        OrchestratorError::RevisionConflict { expected, actual } => {
+            ReplannerError::RevisionConflict { expected, actual }
+        }
         other => ReplannerError::Store(other),
     }
 }
@@ -1049,7 +1404,13 @@ mod tests {
     }
 
     fn read_only_task(id: &str, dependencies: Vec<Value>) -> Value {
-        new_task_value(id, "CODEX_READONLY", "READ_ONLY", "SAFE_READ_ONLY", dependencies)
+        new_task_value(
+            id,
+            "CODEX_READONLY",
+            "READ_ONLY",
+            "SAFE_READ_ONLY",
+            dependencies,
+        )
     }
 
     fn writer_task(id: &str, dependencies: Vec<Value>) -> Value {
@@ -1125,8 +1486,18 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["goal_revision"], 1);
         assert_eq!(value["plan_revision"], 1);
-        assert_eq!(value["eligible_needs_replan_task_ids"][0], fixture.trigger_id.as_str());
-        assert_eq!(value["tasks"][0]["attempts"][0]["operation_id"], "op-phase7");
+        assert_eq!(
+            value["allowed_worker_kinds"],
+            json!(["CODEX_READONLY", "CODEX_WRITER"])
+        );
+        assert_eq!(
+            value["eligible_needs_replan_task_ids"][0],
+            fixture.trigger_id.as_str()
+        );
+        assert_eq!(
+            value["tasks"][0]["attempts"][0]["operation_id"],
+            "op-phase7"
+        );
         assert_eq!(value["tasks"][0]["evidence"].as_array().unwrap().len(), 1);
         for forbidden in [
             "state_root",
@@ -1137,7 +1508,10 @@ mod tests {
             "credentials",
             "yolo",
         ] {
-            assert!(value.get(forbidden).is_none(), "unexpected authority field {forbidden}");
+            assert!(
+                value.get(forbidden).is_none(),
+                "unexpected authority field {forbidden}"
+            );
         }
     }
 
@@ -1161,17 +1535,39 @@ mod tests {
         assert_eq!(trigger.status(), TaskStatus::Pending);
         assert_eq!(trigger.attempts(), old_task.attempts());
         assert_eq!(trigger.evidence(), old_task.evidence());
-        assert_eq!(trigger.verification_results(), old_task.verification_results());
+        assert_eq!(
+            trigger.verification_results(),
+            old_task.verification_results()
+        );
         assert_eq!(trigger.scope(), old_task.scope());
         assert_eq!(trigger.max_attempts(), old_task.max_attempts());
-        assert_eq!(trigger.latest_attempt().unwrap().remaining_attempt_budget(), Some(1));
-        assert_eq!(trigger.latest_attempt().unwrap().remaining_side_effect_budget(), Some(0));
-        let repair = result.tasks().values().find(|task| task.title() == "Task repair").unwrap();
+        assert_eq!(
+            trigger.latest_attempt().unwrap().remaining_attempt_budget(),
+            Some(1)
+        );
+        assert_eq!(
+            trigger
+                .latest_attempt()
+                .unwrap()
+                .remaining_side_effect_budget(),
+            Some(0)
+        );
+        let repair = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task repair")
+            .unwrap();
         assert_eq!(repair.status(), TaskStatus::Ready);
         assert!(repair.attempts().is_empty());
         assert_eq!(repair.created_plan_revision(), 2);
-        assert_eq!(result.checkpoints().last().unwrap().reason(), CheckpointReason::ReplanCommitted);
-        assert_eq!(fs::read(fixture.repo.join("sentinel.txt")).unwrap(), sentinel);
+        assert_eq!(
+            result.checkpoints().last().unwrap().reason(),
+            CheckpointReason::ReplanCommitted
+        );
+        assert_eq!(
+            fs::read(fixture.repo.join("sentinel.txt")).unwrap(),
+            sentinel
+        );
     }
 
     struct StaticBackend {
@@ -1194,11 +1590,20 @@ mod tests {
             output: proposal_bytes(&fixture),
             calls: Cell::new(0),
         };
-        let result = replan_goal(&fixture.store, &fixture.session, &fixture.goal_id, &backend).unwrap();
+        let result =
+            replan_goal(&fixture.store, &fixture.session, &fixture.goal_id, &backend).unwrap();
         assert_eq!(backend.calls.get(), 1);
         assert_eq!(result.revision(), 2);
-        assert_eq!(fs::read(fixture.repo.join("sentinel.txt")).unwrap(), sentinel);
-        assert!(result.tasks().values().all(|task| task.status() != TaskStatus::Running));
+        assert_eq!(
+            fs::read(fixture.repo.join("sentinel.txt")).unwrap(),
+            sentinel
+        );
+        assert!(
+            result
+                .tasks()
+                .values()
+                .all(|task| task.status() != TaskStatus::Running)
+        );
     }
 
     #[test]
@@ -1221,23 +1626,49 @@ mod tests {
             let fixture = fixture();
             let before = bytes(&fixture);
             let mut value = proposal_value(&fixture);
-            value.as_object_mut().unwrap().insert(field.to_owned(), json!([]));
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), json!([]));
             let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-            assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))), "field {field}: {result:?}");
-            assert_eq!(bytes(&fixture), before, "field {field} changed durable bytes");
+            assert!(
+                matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))),
+                "field {field}: {result:?}"
+            );
+            assert_eq!(
+                bytes(&fixture),
+                before,
+                "field {field} changed durable bytes"
+            );
         }
     }
 
     #[test]
     fn task_state_attempt_budget_and_verification_result_injection_are_rejected() {
-        for field in ["status", "attempts", "max_attempts", "verification_results", "evidence"] {
+        for field in [
+            "status",
+            "attempts",
+            "max_attempts",
+            "verification_results",
+            "evidence",
+        ] {
             let fixture = fixture();
             let before = bytes(&fixture);
             let mut value = proposal_value(&fixture);
             let task = value["add_tasks"][0].as_object_mut().unwrap();
-            task.insert(field.to_owned(), json!(if field == "status" { "COMPLETED" } else { "injected" }));
+            task.insert(
+                field.to_owned(),
+                json!(if field == "status" {
+                    "COMPLETED"
+                } else {
+                    "injected"
+                }),
+            );
             let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-            assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))), "field {field}: {result:?}");
+            assert!(
+                matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))),
+                "field {field}: {result:?}"
+            );
             assert_eq!(bytes(&fixture), before);
         }
     }
@@ -1248,7 +1679,10 @@ mod tests {
         let mut value = proposal_value(&fixture);
         value["add_tasks"][0]["scope"]["allowed_paths"] = json!(["../outside"]);
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplanAuthorityViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
@@ -1259,8 +1693,27 @@ mod tests {
         let mut value = proposal_value(&fixture);
         value["add_tasks"][0]["worker"] = json!("ROOT_SHELL");
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&fixture), before);
+    }
+
+    #[test]
+    fn known_but_non_plannable_workers_cannot_be_introduced_by_replanner() {
+        for worker in ["LOCAL_OPERATION", "CODEX_REVIEWER", "VERIFIER"] {
+            let fixture = fixture();
+            let before = bytes(&fixture);
+            let mut value = proposal_value(&fixture);
+            value["add_tasks"][0]["worker"] = json!(worker);
+            let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
+            assert!(matches!(
+                result,
+                Err(ReplannerError::ReplannerSchemaViolation(_))
+            ));
+            assert_eq!(bytes(&fixture), before);
+        }
     }
 
     #[test]
@@ -1271,7 +1724,10 @@ mod tests {
         let mut value = proposal_value(&fixture);
         value["add_dependencies"][0]["dependency"] = existing_ref(&missing);
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
@@ -1281,9 +1737,15 @@ mod tests {
         let before = bytes(&fixture);
         let mut value = proposal_value(&fixture);
         let duplicate = value["add_dependencies"][0].clone();
-        value["add_dependencies"].as_array_mut().unwrap().push(duplicate);
+        value["add_dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
@@ -1295,7 +1757,10 @@ mod tests {
         value["add_tasks"][0]["proposal_id"] = json!(fixture.trigger_id.as_str());
         value["add_dependencies"][0]["dependency"] = new_ref(fixture.trigger_id.as_str());
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
@@ -1353,7 +1818,8 @@ mod tests {
                 &BTreeSet::new(),
             )
             .unwrap();
-        goal.materialize_initial_plan(vec![trigger, follower], NOW).unwrap();
+        goal.materialize_initial_plan(vec![trigger, follower], NOW)
+            .unwrap();
         goal.transition_task(
             &trigger_id,
             TaskStatus::Running,
@@ -1407,7 +1873,10 @@ mod tests {
             "resolve_needs_replan": [fixture.trigger_id.as_str()]
         });
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::Store(OrchestratorError::InvalidDag(_)))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::Store(OrchestratorError::InvalidDag(_)))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
@@ -1422,7 +1891,10 @@ mod tests {
             writer_task("writer-b", vec![])
         ]);
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::Store(OrchestratorError::InvalidDag(_)))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::Store(OrchestratorError::InvalidDag(_)))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
@@ -1452,7 +1924,10 @@ mod tests {
             original.plan_revision(),
             &stale,
         );
-        assert!(matches!(result, Err(ReplannerError::RevisionConflict { .. })));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::RevisionConflict { .. })
+        ));
         assert_eq!(bytes(&fixture), authoritative);
         assert_eq!(
             fixture
@@ -1509,9 +1984,19 @@ mod tests {
             base.plan_revision(),
             &proposal,
         );
-        assert!(matches!(second, Err(ReplannerError::RevisionConflict { .. })));
+        assert!(matches!(
+            second,
+            Err(ReplannerError::RevisionConflict { .. })
+        ));
         assert_eq!(bytes(&fixture), bytes_after_first);
-        assert_eq!(first.tasks().values().filter(|task| task.title() == "Task repair").count(), 1);
+        assert_eq!(
+            first
+                .tasks()
+                .values()
+                .filter(|task| task.title() == "Task repair")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1531,7 +2016,10 @@ mod tests {
             base.plan_revision(),
             &proposal_bytes(&fixture),
         );
-        assert!(matches!(result, Err(ReplannerError::Store(OrchestratorError::PersistenceIo(_)))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::Store(OrchestratorError::PersistenceIo(_)))
+        ));
         assert_eq!(bytes(&fixture), before);
         let reloaded = fixture
             .store
@@ -1541,7 +2029,13 @@ mod tests {
         assert_eq!(reloaded.plan_revision(), base.plan_revision());
         assert_eq!(reloaded.tasks().len(), base.tasks().len());
         let dir = goal_path(&fixture).parent().unwrap().to_path_buf();
-        assert!(fs::read_dir(dir).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(fs::read_dir(dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     #[test]
@@ -1565,10 +2059,14 @@ mod tests {
             .unwrap();
         let task = &reloaded.tasks()[&fixture.trigger_id];
         assert_eq!(task.status(), TaskStatus::NeedsReplan);
-        assert_eq!(task.latest_attempt().unwrap().side_effect_state(), Some(SideEffectState::Unknown));
+        assert_eq!(
+            task.latest_attempt().unwrap().side_effect_state(),
+            Some(SideEffectState::Unknown)
+        );
     }
     fn completed_history_fixture() -> (Fixture, TaskId) {
-        let root = std::env::temp_dir().join(format!("local-mcp-phase7-completed-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("local-mcp-phase7-completed-{}", Uuid::new_v4()));
         let repo = root.join("repo");
         let state = root.join("state");
         fs::create_dir_all(&repo).unwrap();
@@ -1615,9 +2113,16 @@ mod tests {
         )
         .unwrap();
         let trigger_id = trigger.id().clone();
-        goal.materialize_initial_plan(vec![completed, trigger], NOW).unwrap();
+        goal.materialize_initial_plan(vec![completed, trigger], NOW)
+            .unwrap();
 
-        goal.transition_task(&completed_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &completed_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         goal.task_add_evidence(
             &completed_id,
             TaskEvidence::StructuredObservation {
@@ -1628,7 +2133,13 @@ mod tests {
             },
         )
         .unwrap();
-        goal.transition_task(&completed_id, TaskStatus::Verifying, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &completed_id,
+            TaskStatus::Verifying,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         goal.task_record_verification_result(
             &completed_id,
             VerificationResult::new(
@@ -1639,10 +2150,28 @@ mod tests {
             ),
         )
         .unwrap();
-        goal.transition_task(&completed_id, TaskStatus::Completed, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &completed_id,
+            TaskStatus::Completed,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
 
-        goal.transition_task(&trigger_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&trigger_id, TaskStatus::NeedsReplan, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         let goal_id = goal.id().clone();
         store.create_goal(&goal).unwrap();
         (
@@ -1671,7 +2200,10 @@ mod tests {
         value["add_tasks"][0]["dependencies"] = json!([existing_ref(&completed_id)]);
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(result.tasks()[&completed_id], completed_before);
-        assert_eq!(result.tasks()[&completed_id].status(), TaskStatus::Completed);
+        assert_eq!(
+            result.tasks()[&completed_id].status(),
+            TaskStatus::Completed
+        );
     }
 
     #[test]
@@ -1679,18 +2211,25 @@ mod tests {
         let (fixture, completed_id) = completed_history_fixture();
         let before = bytes(&fixture);
         let mut value = proposal_value(&fixture);
-        value["add_dependencies"].as_array_mut().unwrap().push(json!({
-            "task": existing_ref(&completed_id),
-            "dependency": new_ref("repair")
-        }));
+        value["add_dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "task": existing_ref(&completed_id),
+                "dependency": new_ref("repair")
+            }));
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplanAuthorityViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
         assert_eq!(bytes(&fixture), before);
     }
 
     #[test]
     fn verification_can_only_be_strengthened_and_optional_can_become_mandatory() {
-        let root = std::env::temp_dir().join(format!("local-mcp-phase7-strengthen-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("local-mcp-phase7-strengthen-{}", Uuid::new_v4()));
         let repo = root.join("repo");
         let state = root.join("state");
         fs::create_dir_all(&repo).unwrap();
@@ -1700,7 +2239,16 @@ mod tests {
             permitted_directories: vec![repo.clone()],
         };
         let store = TaskStore::with_state_root(state.clone());
-        let mut goal = Goal::new(session.id.clone(), repo.clone(), "strengthen", None, vec![], vec![], NOW).unwrap();
+        let mut goal = Goal::new(
+            session.id.clone(),
+            repo.clone(),
+            "strengthen",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
         let anchor = Task::new(
             "anchor",
             "mandatory anchor",
@@ -1726,13 +2274,37 @@ mod tests {
         )
         .unwrap();
         let target_id = target.id().clone();
-        goal.materialize_initial_plan(vec![anchor, target], NOW).unwrap();
-        goal.transition_task(&target_id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&target_id, TaskStatus::NeedsReplan, TaskTransitionContext::default(), NOW).unwrap();
+        goal.materialize_initial_plan(vec![anchor, target], NOW)
+            .unwrap();
+        goal.transition_task(
+            &target_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &target_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         let goal_id = goal.id().clone();
         store.create_goal(&goal).unwrap();
-        let fixture = Fixture { root, state, repo, session, store, goal_id, trigger_id: target_id.clone() };
-        let current = fixture.store.load_goal(&fixture.session.id, &fixture.goal_id).unwrap();
+        let fixture = Fixture {
+            root,
+            state,
+            repo,
+            session,
+            store,
+            goal_id,
+            trigger_id: target_id.clone(),
+        };
+        let current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
         let value = json!({
             "goal_id": fixture.goal_id.as_str(),
             "base_goal_revision": current.revision(),
@@ -1765,19 +2337,32 @@ mod tests {
             writer_task("future-writer", vec![])
         ]);
         let result = apply(&fixture, &serde_json::to_vec(&value).unwrap()).unwrap();
-        let writer = result.tasks().values().find(|task| task.title() == "Task future-writer").unwrap();
+        let writer = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task future-writer")
+            .unwrap();
         assert_eq!(writer.status(), TaskStatus::Ready);
         assert!(writer.attempts().is_empty());
         assert_eq!(writer.evidence_count(), 0);
-        assert!(result.tasks().values().all(|task| task.status() != TaskStatus::Running));
+        assert!(
+            result
+                .tasks()
+                .values()
+                .all(|task| task.status() != TaskStatus::Running)
+        );
         assert_eq!(result.status(), GoalStatus::Running);
         assert_ne!(result.status(), GoalStatus::Completed);
-        assert_eq!(fs::read(fixture.repo.join("sentinel.txt")).unwrap(), sentinel);
+        assert_eq!(
+            fs::read(fixture.repo.join("sentinel.txt")).unwrap(),
+            sentinel
+        );
     }
 
     #[test]
     fn blocked_task_without_needs_replan_is_not_replanner_eligible() {
-        let root = std::env::temp_dir().join(format!("local-mcp-phase7-blocked-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("local-mcp-phase7-blocked-{}", Uuid::new_v4()));
         let repo = root.join("repo");
         let state = root.join("state");
         fs::create_dir_all(&repo).unwrap();
@@ -1787,7 +2372,16 @@ mod tests {
             permitted_directories: vec![repo.clone()],
         };
         let _store = TaskStore::with_state_root(state);
-        let mut goal = Goal::new(session.id.clone(), repo.clone(), "blocked", None, vec![], vec![], NOW).unwrap();
+        let mut goal = Goal::new(
+            session.id.clone(),
+            repo.clone(),
+            "blocked",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
         let task = Task::new(
             "blocked",
             "blocked",
@@ -1802,8 +2396,20 @@ mod tests {
         .unwrap();
         let id = task.id().clone();
         goal.materialize_initial_plan(vec![task], NOW).unwrap();
-        goal.transition_task(&id, TaskStatus::Running, TaskTransitionContext::default(), NOW).unwrap();
-        goal.transition_task(&id, TaskStatus::Blocked, TaskTransitionContext::default(), NOW).unwrap();
+        goal.transition_task(
+            &id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         assert!(matches!(
             replanner_request_for_goal(&goal, &session),
             Err(ReplannerError::ReplanNotApplicable(_))
@@ -1813,16 +2419,25 @@ mod tests {
     #[test]
     fn no_verifier_bypass_or_goal_completion_surface_exists_in_strict_schema() {
         for (field, injected) in [
-            ("task_state_resolution_hints", json!([{"task_id":"x","status":"COMPLETED"}])),
+            (
+                "task_state_resolution_hints",
+                json!([{"task_id":"x","status":"COMPLETED"}]),
+            ),
             ("verification_results", json!([{"outcome":"PASSED"}])),
             ("goal_status", json!("COMPLETED")),
         ] {
             let fixture = fixture();
             let before = bytes(&fixture);
             let mut value = proposal_value(&fixture);
-            value.as_object_mut().unwrap().insert(field.to_owned(), injected);
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), injected);
             let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
-            assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+            assert!(matches!(
+                result,
+                Err(ReplannerError::ReplannerSchemaViolation(_))
+            ));
             assert_eq!(bytes(&fixture), before);
         }
     }
@@ -1833,7 +2448,10 @@ mod tests {
         let before = bytes(&first);
         let oversized = vec![b' '; planner::MAX_PLAN_PROPOSAL_BYTES + 1];
         let result = apply(&first, &oversized);
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&first), before);
 
         let task_limit = fixture();
@@ -1845,7 +2463,10 @@ mod tests {
                 .collect(),
         );
         let result = apply(&task_limit, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&task_limit), before);
 
         let second = fixture();
@@ -1857,7 +2478,10 @@ mod tests {
                 .collect(),
         );
         let result = apply(&second, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&second), before);
     }
 
@@ -1866,9 +2490,13 @@ mod tests {
         let malformed = fixture();
         let before = bytes(&malformed);
         let mut value = proposal_value(&malformed);
-        value["add_dependencies"][0]["task"] = json!({"ref_kind":"EXISTING", "task_id":"not-a-uuid"});
+        value["add_dependencies"][0]["task"] =
+            json!({"ref_kind":"EXISTING", "task_id":"not-a-uuid"});
         let result = apply(&malformed, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&malformed), before);
 
         let nested = fixture();
@@ -1876,7 +2504,10 @@ mod tests {
         let mut value = proposal_value(&nested);
         value["add_dependencies"][0]["task"]["authority"] = json!("injected");
         let result = apply(&nested, &serde_json::to_vec(&value).unwrap());
-        assert!(matches!(result, Err(ReplannerError::ReplannerSchemaViolation(_))));
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
         assert_eq!(bytes(&nested), before);
     }
 }

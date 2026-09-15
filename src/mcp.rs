@@ -16,8 +16,8 @@ use crate::execution::ExecutionPolicy;
 use crate::goal::{GoalId, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
 use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
-use crate::{approvals, config, execution, fallback, goal_api, sandbox};
 use crate::task_store::TaskStore;
+use crate::{approvals, config, execution, fallback, goal_api, sandbox};
 
 struct Job {
     session_id: String,
@@ -402,13 +402,7 @@ async fn store_execution_job(
     session: &config::Session,
     job: execution::BackgroundExecution,
 ) -> Result<Value> {
-    store_job(
-        session,
-        job.rendered_command,
-        job.handle,
-        job.activity,
-    )
-    .await
+    store_job(session, job.rendered_command, job.handle, job.activity).await
 }
 
 async fn execution_outcome(
@@ -577,8 +571,7 @@ async fn goal_run(args: &Value, session: &config::Session) -> Result<Value> {
         goal_id.as_str() == request.goal_id,
         "goal_id must be a canonical lowercase UUID"
     );
-    let limits = GoalRunLimits::new(request.max_steps)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let limits = GoalRunLimits::new(request.max_steps).map_err(|error| anyhow::anyhow!(error))?;
     let store = TaskStore::new().map_err(|error| anyhow::anyhow!(error))?;
     store
         .load_goal(&session.id, &goal_id)
@@ -591,6 +584,7 @@ async fn goal_run(args: &Value, session: &config::Session) -> Result<Value> {
         &goal_id,
         limits,
         backends.planner(),
+        backends.readonly(),
         backends.writer(),
         backends.reviewer(),
         backends.replanner(),
@@ -656,7 +650,9 @@ fn stop_reason_name(reason: &GoalRunStopReason) -> String {
         GoalRunStopReason::Failed => "FAILED".into(),
         GoalRunStopReason::Cancelled => "CANCELLED".into(),
         GoalRunStopReason::Paused => "PAUSED".into(),
-        GoalRunStopReason::ControlState(status) => format!("CONTROL_STATE_{}", goal_status_name(*status)),
+        GoalRunStopReason::ControlState(status) => {
+            format!("CONTROL_STATE_{}", goal_status_name(*status))
+        }
         GoalRunStopReason::Blocked => "BLOCKED".into(),
         GoalRunStopReason::NoAction(_) => "NO_ACTION".into(),
         GoalRunStopReason::UnsupportedWorker(_) => "UNSUPPORTED_WORKER".into(),
@@ -675,6 +671,7 @@ fn trace_action_name(action: &goal_runner::GoalRunTraceAction) -> &'static str {
             crate::scheduler::SchedulerAction::VerifyTask => "VERIFY_TASK",
             crate::scheduler::SchedulerAction::VerifyGoal => "VERIFY_GOAL",
             crate::scheduler::SchedulerAction::Replan => "REPLAN",
+            crate::scheduler::SchedulerAction::RunReadonly => "RUN_READONLY",
             crate::scheduler::SchedulerAction::RunWriter => "RUN_WRITER",
             crate::scheduler::SchedulerAction::UnsupportedWorker => "UNSUPPORTED_WORKER",
             crate::scheduler::SchedulerAction::NoAction => "NO_ACTION",

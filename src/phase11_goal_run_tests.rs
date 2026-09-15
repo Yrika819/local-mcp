@@ -1,12 +1,12 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent::{AgentError, ModelInvocation, ModelInvocationOutput, ModelTransport};
+use crate::agent::{AgentError, ModelInvocation, ModelInvocationOutput, ModelRole, ModelTransport};
 use crate::config;
 use crate::goal::{GoalId, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
@@ -15,7 +15,7 @@ use crate::goal_runner::{
     GoalRunLimits, GoalRunResult, GoalRunStopReason, GoalRunTraceAction, GoalRunTraceEntry,
     GoalRunTraceOutcome, GoalRunnerAuthority,
 };
-use crate::scheduler::SchedulerNoActionReason;
+use crate::scheduler::{SchedulerAction, SchedulerNoActionReason};
 use crate::task::WorkerKind;
 use crate::task_store::TaskStore;
 
@@ -134,7 +134,10 @@ fn goal_run_serialization_is_safe_and_trace_is_bounded_by_the_runner_limit() {
         "stop_reason",
         "trace",
     ] {
-        assert!(value.get(field).is_some(), "missing safe result field {field}");
+        assert!(
+            value.get(field).is_some(),
+            "missing safe result field {field}"
+        );
     }
     let serialized = serde_json::to_string(&value).unwrap();
     for forbidden in ["prompt", "stderr", "provider", "model", "without_sandbox"] {
@@ -194,7 +197,10 @@ fn goal_run_preserves_all_phase10_stop_reason_categories() {
             },
             "LOWER_AUTHORITY_ERROR",
         ),
-        (GoalRunStopReason::StepBudgetExhausted, "STEP_BUDGET_EXHAUSTED"),
+        (
+            GoalRunStopReason::StepBudgetExhausted,
+            "STEP_BUDGET_EXHAUSTED",
+        ),
         (
             GoalRunStopReason::NoProgress {
                 action: GoalRunTraceAction::Scheduler(None),
@@ -277,6 +283,7 @@ async fn terminal_goal_uses_real_production_composition_without_model_invocation
         &goal_id,
         GoalRunLimits::new(1).unwrap(),
         backends.planner(),
+        backends.readonly(),
         backends.writer(),
         backends.reviewer(),
         backends.replanner(),
@@ -300,6 +307,7 @@ async fn max_steps_one_dispatches_at_most_one_production_model_action() {
         &goal_id,
         GoalRunLimits::new(1).unwrap(),
         backends.planner(),
+        backends.readonly(),
         backends.writer(),
         backends.reviewer(),
         backends.replanner(),
@@ -320,7 +328,10 @@ async fn max_steps_one_dispatches_at_most_one_production_model_action() {
 #[test]
 fn goal_run_is_the_only_public_runner_call_site_and_has_no_background_path() {
     let source = include_str!("mcp.rs");
-    assert_eq!(source.matches("goal_runner::run_goal_foreground").count(), 1);
+    assert_eq!(
+        source.matches("goal_runner::run_goal_foreground").count(),
+        1
+    );
     let body = source
         .split("async fn goal_run")
         .nth(1)
@@ -338,4 +349,136 @@ fn goal_run_is_the_only_public_runner_call_site_and_has_no_background_path() {
     ] {
         assert!(!body.contains(forbidden), "goal_run contains {forbidden}");
     }
+}
+
+#[derive(Default)]
+struct ScriptedReadonlyGoalModel {
+    calls: Mutex<Vec<ModelRole>>,
+}
+
+impl ModelTransport for ScriptedReadonlyGoalModel {
+    fn invoke(&self, request: &ModelInvocation) -> Result<ModelInvocationOutput, AgentError> {
+        self.calls.lock().unwrap().push(request.role());
+        let data = request
+            .prompt()
+            .split("DATA_BEGIN\n")
+            .nth(1)
+            .and_then(|tail| tail.split("\nDATA_END").next())
+            .ok_or(AgentError::InvalidConfiguration)?;
+        let value: serde_json::Value =
+            serde_json::from_str(data).map_err(|_| AgentError::InvalidConfiguration)?;
+        let response = match request.role() {
+            ModelRole::Planner => {
+                let bindings = value["completion_criteria"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|criterion| {
+                        json!({
+                            "criterion_id": criterion["criterion_id"],
+                            "task_refs": ["readonly"]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "goal_id": value["goal_id"],
+                    "goal_revision": value["goal_revision"],
+                    "summary": "one mandatory readonly investigation",
+                    "tasks": [{
+                        "proposal_id": "readonly",
+                        "title": "readonly investigation",
+                        "objective": "inspect without mutation",
+                        "mandatory": true,
+                        "worker": "CODEX_READONLY",
+                        "dependencies": [],
+                        "scope": {
+                            "allowed_paths": ["."],
+                            "forbidden_paths": [],
+                            "operation_kind": "READ_ONLY",
+                            "replay_safety": "SAFE_READ_ONLY"
+                        },
+                        "verification": [{"kind":"STRUCTURED_EVIDENCE","requirement_id":"proof"}]
+                    }],
+                    "criterion_bindings": bindings
+                })
+            }
+            ModelRole::Readonly => json!({
+                "goal_id": value["goal_id"],
+                "task_id": value["task_id"],
+                "attempt_id": value["attempt_id"],
+                "goal_revision": value["goal_revision"],
+                "plan_revision": value["plan_revision"],
+                "status": "candidate_complete",
+                "summary": "readonly observation captured",
+                "evidence": [{"kind":"proof","value":"bounded deterministic evidence"}]
+            }),
+            _ => return Err(AgentError::InvalidConfiguration),
+        };
+        Ok(ModelInvocationOutput::new(
+            response.to_string().into_bytes(),
+            String::new(),
+            0,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn production_runner_readonly_path_is_bounded_sequential_and_keeps_all_completion_authorities_separate()
+ {
+    let (root, session, store, goal_id) = phase11_fixture();
+    let sentinel = root.join("readonly-sentinel.txt");
+    std::fs::write(&sentinel, b"unchanged\n").unwrap();
+    let model = Arc::new(ScriptedReadonlyGoalModel::default());
+    let backends = ProductionGoalBackends::with_transport(&session, model.clone());
+    let result = crate::goal_runner::run_goal_foreground(
+        &store,
+        &session,
+        &goal_id,
+        GoalRunLimits::new(5).unwrap(),
+        backends.planner(),
+        backends.readonly(),
+        backends.writer(),
+        backends.reviewer(),
+        backends.replanner(),
+    )
+    .await;
+    assert_eq!(result.stop_reason, GoalRunStopReason::Completed);
+    assert_eq!(result.steps_attempted, 5);
+    assert_eq!(result.steps_applied, 5);
+    assert_eq!(
+        result
+            .trace
+            .iter()
+            .map(|entry| entry.action.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            GoalRunTraceAction::Scheduler(Some(SchedulerAction::PlanInitial)),
+            GoalRunTraceAction::Scheduler(Some(SchedulerAction::RunReadonly)),
+            GoalRunTraceAction::Scheduler(Some(SchedulerAction::VerifyTask)),
+            GoalRunTraceAction::Scheduler(Some(SchedulerAction::VerifyGoal)),
+            GoalRunTraceAction::Finalizer,
+        ]
+    );
+    assert_eq!(
+        *model.calls.lock().unwrap(),
+        vec![ModelRole::Planner, ModelRole::Readonly]
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
+    let durable = store.load_goal(&session.id, &goal_id).unwrap();
+    assert_eq!(durable.status(), GoalStatus::Completed);
+    let task = durable.tasks().values().next().unwrap();
+    assert_eq!(task.status(), crate::task::TaskStatus::Completed);
+    assert_eq!(task.worker(), WorkerKind::CodexReadonly);
+    let attempt = task.latest_attempt().unwrap();
+    assert_eq!(
+        attempt.side_effect_class(),
+        Some(crate::fallback::SideEffectClass::None)
+    );
+    assert_eq!(
+        attempt.side_effect_state(),
+        Some(crate::fallback::SideEffectState::ConfirmedNotPerformed)
+    );
+    assert!(attempt.operation_id().is_none());
+    assert!(!crate::writer::holds_workspace_mutation_lease(task));
+    let _ = std::fs::remove_dir_all(root);
 }
