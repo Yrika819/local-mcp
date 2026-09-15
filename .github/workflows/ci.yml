@@ -21,6 +21,36 @@ jobs:
       - name: Install Linux sandbox runtime
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Diagnose Linux user namespaces before repair
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uname -a
+          sysctl kernel.unprivileged_userns_clone || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sysctl user.max_user_namespaces || true
+          which bwrap
+          bwrap --version
+          set +e
+          bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user /bin/true
+          status=$?
+          set -e
+          echo "pre_fix_bwrap_status=${status}"
+      - name: Enable Linux sandbox user namespaces on CI runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Verify Linux user namespaces after repair
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sysctl kernel.unprivileged_userns_clone || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sysctl user.max_user_namespaces || true
+          bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user /bin/true
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
         run: cargo build --locked --bin codex-linux-sandbox
