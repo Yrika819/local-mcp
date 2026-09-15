@@ -155,6 +155,17 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
             .contains("Every Task requires at least one verification entry")
     );
     assert!(calls[1].prompt().contains("read-only investigator"));
+    assert!(
+        calls[1]
+            .prompt()
+            .contains("read-only shell/inspection capability")
+    );
+    assert!(
+        calls[1]
+            .prompt()
+            .contains("future host-owned Verifier checks")
+    );
+    assert!(calls[1].prompt().contains("needs_replan"));
     assert!(calls[1].prompt().contains("no writes"));
     assert!(calls[2].prompt().contains("You are read-only"));
     assert!(

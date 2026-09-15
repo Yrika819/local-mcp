@@ -6,9 +6,13 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::config;
+use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{CheckpointReason, Goal, GoalId, GoalStatus};
 use crate::orchestrator_error::OrchestratorError;
-use crate::task::{TaskStatus, VerificationOutcome};
+use crate::task::{
+    ReplaySafety, TaskOperationKind, TaskStatus, TaskTransitionContext, VerificationOutcome,
+    WorkerKind,
+};
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
 #[derive(Clone, Debug, Serialize)]
@@ -90,7 +94,9 @@ impl GoalApiError {
             ),
             OrchestratorError::SchemaUpgradeRequired(version) => (
                 "SCHEMA_UPGRADE_REQUIRED",
-                format!("goal schema version {version} requires explicit structured authority upgrade"),
+                format!(
+                    "goal schema version {version} requires explicit structured authority upgrade"
+                ),
             ),
             OrchestratorError::UnsafeIdentifier(kind) => {
                 ("INVALID_ARGUMENT", format!("unsafe {kind} identifier"))
@@ -574,6 +580,7 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     }
 
     goal.recover_stale_running(now)?;
+    reconcile_safe_readonly_blocked_tasks(goal, now)?;
 
     match goal.status() {
         GoalStatus::Paused => resume_from_paused(goal, now)?,
@@ -596,6 +603,50 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
         | GoalStatus::Verifying
         | GoalStatus::Cancelling => {}
         GoalStatus::Completed | GoalStatus::Failed | GoalStatus::Cancelled => unreachable!(),
+    }
+    Ok(())
+}
+
+fn reconcile_safe_readonly_blocked_tasks(
+    goal: &mut Goal,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    let task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            let attempt = task.latest_attempt()?;
+            let only_readonly_blockers = !task.blockers().is_empty()
+                && task
+                    .blockers()
+                    .iter()
+                    .all(|blocker| blocker.code() == "READONLY_BLOCKED");
+            let safe_scope = task.worker() == WorkerKind::CodexReadonly
+                && task.scope().operation_kind() == TaskOperationKind::ReadOnly
+                && task.scope().replay_safety() == ReplaySafety::SafeReadOnly;
+            let no_mutation_authority = attempt.operation_id().is_none()
+                && attempt.scope_identity().is_none()
+                && attempt.side_effect_class() == Some(SideEffectClass::None)
+                && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed);
+            let budget_remains = task.attempts().len() < task.max_attempts() as usize
+                && attempt.remaining_attempt_budget().unwrap_or(0) > 0;
+            (task.status() == TaskStatus::Blocked
+                && only_readonly_blockers
+                && safe_scope
+                && no_mutation_authority
+                && budget_remains)
+                .then(|| task_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for task_id in task_ids {
+        goal.task_clear_blockers(&task_id)?;
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            now,
+        )?;
     }
     Ok(())
 }
@@ -814,7 +865,11 @@ fn verification_summary(goal: &Goal) -> VerificationSummaryView {
         return VerificationSummaryView {
             final_outcome: Some(result.outcome()),
             final_verification_id: Some(result.id().as_str().to_owned()),
-            final_check_count: result.criterion_results().iter().map(|criterion| criterion.observations().len()).sum(),
+            final_check_count: result
+                .criterion_results()
+                .iter()
+                .map(|criterion| criterion.observations().len())
+                .sum(),
             final_started_at: Some(result.started_at().to_owned()),
             final_finished_at: Some(result.finished_at().to_owned()),
             task_verification_results,
@@ -1841,6 +1896,104 @@ mod tests {
         let durable = store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(durable.status(), GoalStatus::Running);
         assert_eq!(durable.revision(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn resume_retries_only_mechanically_safe_readonly_worker_blocker() {
+        let (root, session, store) = fixture("ro-block-safe");
+        let (mut goal, task_id) =
+            running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(1),
+            Some(0),
+        )
+        .unwrap();
+        goal.task_add_blocker(
+            &task_id,
+            crate::task::TaskBlocker::new("READONLY_BLOCKED", "worker could not investigate", true),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        pause_goal(&mut goal, NOW).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+
+        let resumed = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(resumed.status, GoalStatus::Running);
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        let task = &durable.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Ready);
+        assert!(task.blockers().is_empty());
+        assert_eq!(task.attempts().len(), 1);
+        assert_eq!(
+            task.latest_attempt().unwrap().side_effect_state(),
+            Some(SideEffectState::ConfirmedNotPerformed)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_preserves_readonly_blocker_without_mechanical_retry_proof() {
+        let (root, session, store) = fixture("ro-block-keep");
+        let (mut goal, task_id) =
+            running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(1),
+            Some(0),
+        )
+        .unwrap();
+        goal.task_add_blocker(
+            &task_id,
+            crate::task::TaskBlocker::new("TOOL_MISSING", "external prerequisite", true),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        pause_goal(&mut goal, NOW).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+
+        let resumed = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(resumed.status, GoalStatus::Blocked);
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(durable.tasks()[&task_id].status(), TaskStatus::Blocked);
+        assert_eq!(
+            durable.tasks()[&task_id].blockers()[0].code(),
+            "TOOL_MISSING"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
