@@ -299,6 +299,32 @@ impl WorkerReport {
             changed_files,
         }
     }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
+pub(crate) const MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK: u32 = 3;
+const LEGACY_READONLY_TIMEOUT_REPORT: &str =
+    "READONLY_BACKEND_ERROR: readonly model invocation failed: model invocation timed out";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum ReadonlyTransportInterruptionKind {
+    ModelTimeout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum ReadonlyTransportRecoveryKind {
+    LegacyTimeoutTerminalization,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum ReadonlyTransportRecoveryAuthorityKind {
+    GoalResume,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +383,10 @@ impl TaskAttempt {
 
     pub(crate) fn id(&self) -> &AttemptId {
         &self.id
+    }
+
+    pub(crate) fn number(&self) -> u32 {
+        self.number
     }
 
     pub(crate) fn side_effect_class(&self) -> Option<SideEffectClass> {
@@ -422,6 +452,17 @@ pub(crate) enum TaskEvidence {
     },
     RecoveryReconciliation {
         summary: String,
+        side_effect_state: SideEffectState,
+        postcondition_proven: bool,
+    },
+    ReadonlyTransportInterruption {
+        attempt_id: AttemptId,
+        interruption: ReadonlyTransportInterruptionKind,
+    },
+    ReadonlyTransportRecovery {
+        attempt_id: AttemptId,
+        classification: ReadonlyTransportRecoveryKind,
+        authority: ReadonlyTransportRecoveryAuthorityKind,
         side_effect_state: SideEffectState,
         postcondition_proven: bool,
     },
@@ -607,6 +648,55 @@ impl Task {
         self.max_attempts
     }
 
+    pub(crate) fn semantic_attempts_consumed(&self) -> u32 {
+        self.attempts
+            .iter()
+            .filter(|attempt| !self.is_readonly_transport_attempt(attempt.id()))
+            .count() as u32
+    }
+
+    pub(crate) fn semantic_attempts_remaining(&self) -> u32 {
+        self.max_attempts
+            .saturating_sub(self.semantic_attempts_consumed())
+    }
+
+    pub(crate) fn readonly_transport_interruptions(&self) -> u32 {
+        let mut attempt_ids = BTreeSet::new();
+        for evidence in &self.evidence {
+            match evidence {
+                TaskEvidence::ReadonlyTransportInterruption { attempt_id, .. }
+                | TaskEvidence::ReadonlyTransportRecovery { attempt_id, .. } => {
+                    attempt_ids.insert(attempt_id.clone());
+                }
+                _ => {}
+            }
+        }
+        attempt_ids.len() as u32
+    }
+
+    pub(crate) fn readonly_transport_retry_available(&self) -> bool {
+        self.readonly_transport_interruptions() < MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK
+    }
+
+    pub(crate) fn latest_is_readonly_transport_interruption(&self) -> bool {
+        self.latest_attempt()
+            .is_some_and(|attempt| self.is_readonly_transport_attempt(attempt.id()))
+    }
+
+    fn is_readonly_transport_attempt(&self, attempt_id: &AttemptId) -> bool {
+        self.evidence.iter().any(|evidence| match evidence {
+            TaskEvidence::ReadonlyTransportInterruption {
+                attempt_id: evidence_attempt_id,
+                ..
+            }
+            | TaskEvidence::ReadonlyTransportRecovery {
+                attempt_id: evidence_attempt_id,
+                ..
+            } => evidence_attempt_id == attempt_id,
+            _ => false,
+        })
+    }
+
     pub(crate) fn created_plan_revision(&self) -> u32 {
         self.created_plan_revision
     }
@@ -673,6 +763,77 @@ impl Task {
                         attempt.remaining_side_effect_budget,
                     ),
                 );
+            }
+        }
+        let mut transport_evidence_attempts = BTreeSet::new();
+        for evidence in &self.evidence {
+            let (attempt_id, requires_failed_legacy) = match evidence {
+                TaskEvidence::ReadonlyTransportInterruption { attempt_id, interruption } => {
+                    if *interruption != ReadonlyTransportInterruptionKind::ModelTimeout {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "unsupported readonly transport interruption kind".to_owned(),
+                        ));
+                    }
+                    (attempt_id, false)
+                }
+                TaskEvidence::ReadonlyTransportRecovery {
+                    attempt_id,
+                    classification,
+                    authority,
+                    side_effect_state,
+                    postcondition_proven,
+                } => {
+                    if *classification
+                        != ReadonlyTransportRecoveryKind::LegacyTimeoutTerminalization
+                        || *authority != ReadonlyTransportRecoveryAuthorityKind::GoalResume
+                        || *side_effect_state != SideEffectState::ConfirmedNotPerformed
+                        || !*postcondition_proven
+                    {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "invalid readonly transport recovery evidence".to_owned(),
+                        ));
+                    }
+                    (attempt_id, true)
+                }
+                _ => continue,
+            };
+            if !transport_evidence_attempts.insert(attempt_id.clone()) {
+                return Err(OrchestratorError::CorruptGoal(
+                    "duplicate readonly transport evidence for one attempt".to_owned(),
+                ));
+            }
+            let attempt = self
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id() == attempt_id)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "readonly transport evidence references a missing attempt".to_owned(),
+                    )
+                })?;
+            if attempt.worker != WorkerKind::CodexReadonly
+                || attempt.operation_id.is_some()
+                || attempt.scope_identity.is_some()
+                || attempt.side_effect_class != Some(SideEffectClass::None)
+                || attempt.side_effect_state != Some(SideEffectState::ConfirmedNotPerformed)
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "readonly transport evidence requires conclusively non-mutating CODEX_READONLY metadata"
+                        .to_owned(),
+                ));
+            }
+            if requires_failed_legacy {
+                if attempt.outcome != Some(AttemptOutcome::Failed) {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "legacy readonly transport recovery must preserve the historical FAILED outcome"
+                            .to_owned(),
+                    ));
+                }
+            } else if attempt.outcome != Some(AttemptOutcome::Interrupted) {
+                return Err(OrchestratorError::CorruptGoal(
+                    "readonly transport interruption evidence requires INTERRUPTED outcome"
+                        .to_owned(),
+                ));
             }
         }
         if self.status == TaskStatus::Running && self.attempts.is_empty() {
@@ -793,14 +954,14 @@ impl Task {
                     "hard dependencies are incomplete",
                 ));
             }
-            let number = self.attempts.len() as u32 + 1;
-            if number > self.max_attempts {
+            if self.semantic_attempts_remaining() == 0 {
                 return Err(invalid_task_transition(
                     from,
                     next,
-                    "task attempt budget is exhausted",
+                    "task semantic attempt budget is exhausted",
                 ));
             }
+            let number = self.attempts.len() as u32 + 1;
             self.attempts
                 .push(TaskAttempt::new(number, self.worker, now));
         }
@@ -966,6 +1127,30 @@ impl Task {
 
         candidate.validate_local()?;
         *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn mark_latest_attempt_interrupted(
+        &mut self,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.status != TaskStatus::Running {
+            return Err(invalid_task_transition(
+                self.status,
+                self.status,
+                "attempt interruption may only be recorded while RUNNING",
+            ));
+        }
+        let attempt = self.attempts.last_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal("RUNNING task lacks durable attempt".to_owned())
+        })?;
+        if attempt.outcome.is_some() {
+            return Err(OrchestratorError::InvalidDag(
+                "attempt outcome cannot be rewritten as interrupted".to_owned(),
+            ));
+        }
+        attempt.finished_at.get_or_insert_with(|| now.to_owned());
+        attempt.outcome = Some(AttemptOutcome::Interrupted);
         Ok(())
     }
 
@@ -1137,7 +1322,7 @@ impl Task {
             attempt.finished_at.get_or_insert_with(|| now.to_owned());
             attempt.outcome.get_or_insert(AttemptOutcome::Interrupted);
         }
-        let can_retry_attempt = self.attempts.len() < self.max_attempts as usize;
+        let can_retry_attempt = self.semantic_attempts_remaining() > 0;
         let proposal_only_worker = matches!(
             self.worker,
             WorkerKind::CodexReadonly | WorkerKind::CodexWriter | WorkerKind::CodexReviewer
@@ -1212,6 +1397,88 @@ impl Task {
         Ok(())
     }
 
+    pub(crate) fn recover_legacy_readonly_timeout(
+        &mut self,
+        _authority: &crate::goal_api::ReadonlyTransportRecoveryAuthority,
+        now: &str,
+    ) -> Result<bool, OrchestratorError> {
+        if self.status != TaskStatus::Failed
+            || self.worker != WorkerKind::CodexReadonly
+            || self.scope.operation_kind != TaskOperationKind::ReadOnly
+            || self.scope.replay_safety != ReplaySafety::SafeReadOnly
+            || !self.blockers.is_empty()
+            || !self.verification_results.is_empty()
+        {
+            return Ok(false);
+        }
+        if self.readonly_transport_interruptions()
+            >= MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK
+        {
+            return Ok(false);
+        }
+        let Some(latest) = self.latest_attempt() else {
+            return Ok(false);
+        };
+        if latest.worker != WorkerKind::CodexReadonly
+            || latest.outcome != Some(AttemptOutcome::Failed)
+            || latest.operation_id.is_some()
+            || latest.scope_identity.is_some()
+            || latest.side_effect_class != Some(SideEffectClass::None)
+            || latest.side_effect_state != Some(SideEffectState::ConfirmedNotPerformed)
+            || latest.remaining_attempt_budget != Some(0)
+            || latest
+                .worker_report
+                .as_ref()
+                .map(WorkerReport::summary)
+                != Some(LEGACY_READONLY_TIMEOUT_REPORT)
+        {
+            return Ok(false);
+        }
+        if self.attempts.iter().any(|attempt| {
+            attempt.worker != WorkerKind::CodexReadonly
+                || attempt.operation_id.is_some()
+                || attempt.scope_identity.is_some()
+                || attempt.side_effect_class != Some(SideEffectClass::None)
+                || attempt.side_effect_state != Some(SideEffectState::ConfirmedNotPerformed)
+        }) {
+            return Ok(false);
+        }
+        if self.evidence.iter().any(|evidence| match evidence {
+            TaskEvidence::RecoveryReconciliation {
+                side_effect_state: SideEffectState::ConfirmedPerformed | SideEffectState::Unknown,
+                ..
+            } => true,
+            TaskEvidence::GitSnapshot {
+                changed_paths,
+                staged_paths,
+                ..
+            } => !changed_paths.is_empty() || !staged_paths.is_empty(),
+            _ => false,
+        }) {
+            return Ok(false);
+        }
+        let attempt_id = latest.id.clone();
+        let consumed_after_recovery = self
+            .semantic_attempts_consumed()
+            .checked_sub(1)
+            .ok_or_else(|| OrchestratorError::CorruptGoal(
+                "legacy timeout recovery semantic budget underflow".to_owned(),
+            ))?;
+        if consumed_after_recovery >= self.max_attempts {
+            return Ok(false);
+        }
+        self.evidence.push(TaskEvidence::ReadonlyTransportRecovery {
+            attempt_id,
+            classification: ReadonlyTransportRecoveryKind::LegacyTimeoutTerminalization,
+            authority: ReadonlyTransportRecoveryAuthorityKind::GoalResume,
+            side_effect_state: SideEffectState::ConfirmedNotPerformed,
+            postcondition_proven: true,
+        });
+        self.status = TaskStatus::Retryable;
+        self.updated_at = now.to_owned();
+        Ok(true)
+    }
+
     fn latest_verification_passed(&self) -> bool {
         self.verification_results
             .last()
@@ -1223,7 +1490,7 @@ impl Task {
     }
 
     fn retry_allowed(&self) -> bool {
-        if self.attempts.len() >= self.max_attempts as usize {
+        if self.semantic_attempts_remaining() == 0 {
             return false;
         }
         if matches!(

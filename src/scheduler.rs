@@ -262,13 +262,18 @@ pub(crate) fn select_next_action(goal: &Goal) -> Result<SchedulerDecision, Sched
                 reason: SchedulerNoActionReason::WaitingForDependencies,
             });
         }
-        if !task.blockers().is_empty() || task.attempts().len() >= task.max_attempts() as usize {
+        if !task.blockers().is_empty() || task.semantic_attempts_remaining() == 0 {
             return Ok(SchedulerDecision::NoAction {
                 reason: SchedulerNoActionReason::BlockedTasks,
             });
         }
         match worker_capability::ready_worker_route(task.worker()) {
             Some(ReadyWorkerRoute::Readonly) => {
+                if !task.readonly_transport_retry_available() {
+                    return Ok(SchedulerDecision::NoAction {
+                        reason: SchedulerNoActionReason::BlockedTasks,
+                    });
+                }
                 return Ok(SchedulerDecision::RunReadonly {
                     task_id: task_id.clone(),
                 });
@@ -678,8 +683,8 @@ mod tests {
     use crate::planner::PlannerRequest;
     use crate::replanner::ReplannerRequest;
     use crate::task::{
-        ReplaySafety, TaskDependency, TaskOperationKind, TaskScope, TaskTransitionContext,
-        VerificationSpec,
+        AttemptOutcome, MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK, ReplaySafety, TaskDependency,
+        TaskOperationKind, TaskScope, TaskTransitionContext, VerificationSpec,
     };
     use crate::writer::{ReviewerRequest, WriterRequest};
 
@@ -856,6 +861,75 @@ mod tests {
             Err(ReadonlyError::Backend(
                 "synthetic readonly transport failure".to_owned(),
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct TimeoutReadonly {
+        calls: Cell<usize>,
+    }
+
+    impl ReadonlyBackend for TimeoutReadonly {
+        fn investigate(
+            &self,
+            _request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(ReadonlyError::Model(crate::agent::AgentError::Timeout))
+        }
+    }
+
+    struct AgentFailureReadonly {
+        error: crate::agent::AgentError,
+        calls: Cell<usize>,
+    }
+
+    impl ReadonlyBackend for AgentFailureReadonly {
+        fn investigate(
+            &self,
+            _request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(ReadonlyError::Model(self.error))
+        }
+    }
+
+    struct StaticStatusReadonly {
+        status: &'static str,
+    }
+
+    impl ReadonlyBackend for StaticStatusReadonly {
+        fn investigate(
+            &self,
+            request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            Ok(json!({
+                "goal_id": request.goal_id(),
+                "task_id": request.task_id(),
+                "attempt_id": request.attempt_id(),
+                "goal_revision": request.goal_revision(),
+                "plan_revision": request.plan_revision(),
+                "status": self.status,
+                "summary": "semantic readonly result",
+                "evidence": [{"kind":"semantic","value":"bounded result"}]
+            })
+            .to_string()
+            .into_bytes())
+        }
+    }
+
+    #[derive(Default)]
+    struct InvalidOutputReadonly {
+        calls: Cell<usize>,
+    }
+
+    impl ReadonlyBackend for InvalidOutputReadonly {
+        fn investigate(
+            &self,
+            _request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(b"not-json".to_vec())
         }
     }
 
@@ -1885,6 +1959,331 @@ mod tests {
                 task_id: readonly_id
             }
         );
+    }
+
+    #[tokio::test]
+    async fn readonly_model_timeout_is_interrupted_and_preserves_semantic_budget() {
+        let fixture = fixture();
+        let readonly = task(
+            &fixture,
+            "readonly-timeout",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        let backend = TimeoutReadonly::default();
+
+        let result = scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &backend,
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            SchedulerStepOutcome::LowerAuthorityError {
+                authority: SchedulerAuthority::Readonly,
+                ..
+            }
+        ));
+        let interrupted = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
+        let task = &interrupted.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Retryable);
+        assert_eq!(task.attempts().len(), 1);
+        assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Interrupted));
+        assert_eq!(
+            task.attempts()[0].side_effect_class(),
+            Some(crate::fallback::SideEffectClass::None)
+        );
+        assert_eq!(
+            task.attempts()[0].side_effect_state(),
+            Some(crate::fallback::SideEffectState::ConfirmedNotPerformed)
+        );
+        assert_eq!(task.semantic_attempts_consumed(), 0);
+        assert_eq!(task.semantic_attempts_remaining(), 2);
+        assert_eq!(task.readonly_transport_interruptions(), 1);
+        assert_eq!(task.max_attempts(), 2);
+    }
+
+    #[tokio::test]
+    async fn readonly_timeout_history_is_bounded_separately_from_semantic_attempts() {
+        let fixture = fixture();
+        let readonly = task(
+            &fixture,
+            "readonly-timeout-bound",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        let backend = TimeoutReadonly::default();
+        let mut revision = goal.revision();
+
+        for expected_number in 1..=MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK {
+            scheduler_step(
+                &fixture.store,
+                &fixture.session,
+                &goal_id,
+                revision,
+                &NeverPlanner::default(),
+                &backend,
+                &NeverWriter::default(),
+                &NeverReviewer::default(),
+                &NeverReplanner::default(),
+            )
+            .await
+            .unwrap();
+            let current = fixture
+                .store
+                .load_goal(&fixture.session.id, &goal_id)
+                .unwrap();
+            let task = &current.tasks()[&task_id];
+            assert_eq!(task.attempts().len(), expected_number as usize);
+            assert_eq!(task.attempts().last().unwrap().outcome(), Some(AttemptOutcome::Interrupted));
+            assert_eq!(task.attempts().last().unwrap().number(), expected_number);
+            assert_eq!(task.semantic_attempts_consumed(), 0);
+            assert_eq!(task.max_attempts(), 2);
+            if expected_number < MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK {
+                assert_eq!(task.status(), TaskStatus::Retryable);
+                let current_revision = current.revision();
+                fixture
+                    .store
+                    .mutate_goal_snapshot(
+                        &fixture.session.id,
+                        &goal_id,
+                        current_revision,
+                        |goal, now| {
+                            goal.transition_task(
+                                &task_id,
+                                TaskStatus::Ready,
+                                TaskTransitionContext::default(),
+                                now,
+                            )
+                        },
+                    )
+                    .unwrap();
+                revision = fixture
+                    .store
+                    .load_goal(&fixture.session.id, &goal_id)
+                    .unwrap()
+                    .revision();
+            } else {
+                assert_eq!(task.status(), TaskStatus::Blocked);
+                assert_eq!(task.readonly_transport_interruptions(), MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK);
+                assert_eq!(task.blockers()[0].code(), "READONLY_TRANSPORT_UNAVAILABLE");
+            }
+        }
+        assert_eq!(backend.calls.get(), MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK as usize);
+    }
+
+    #[tokio::test]
+    async fn interrupted_timeout_allows_later_semantic_attempt_with_new_number() {
+        let fixture = fixture();
+        let readonly = task(
+            &fixture,
+            "readonly-timeout-then-success",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &TimeoutReadonly::default(),
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        let interrupted = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let first_id = interrupted.tasks()[&task_id].attempts()[0].id().clone();
+        fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &goal_id,
+                interrupted.revision(),
+                |goal, now| {
+                    goal.transition_task(
+                        &task_id,
+                        TaskStatus::Ready,
+                        TaskTransitionContext::default(),
+                        now,
+                    )
+                },
+            )
+            .unwrap();
+        let ready = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            ready.revision(),
+            &NeverPlanner::default(),
+            &SuccessfulReadonly::default(),
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        let verifying = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let task = &verifying.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Verifying);
+        assert_eq!(task.attempts().len(), 2);
+        assert_ne!(task.attempts()[1].id(), &first_id);
+        assert_eq!(task.attempts()[1].number(), 2);
+        assert_eq!(task.semantic_attempts_consumed(), 1);
+        assert_eq!(task.semantic_attempts_remaining(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_agent_timeout_gets_free_transport_classification() {
+        use crate::agent::AgentError;
+        for error in [
+            AgentError::ApprovalDenied,
+            AgentError::ExecutableUnavailable,
+            AgentError::SpawnFailed,
+            AgentError::NonZeroExit,
+            AgentError::EmptyResponse,
+            AgentError::ResponseTooLarge,
+            AgentError::TransportFailure,
+            AgentError::Cancelled,
+            AgentError::InvalidConfiguration,
+        ] {
+            let fixture = fixture();
+            let readonly = task(
+                &fixture,
+                "readonly-agent-error",
+                true,
+                WorkerKind::CodexReadonly,
+                vec![],
+            );
+            let task_id = readonly.id().clone();
+            let goal = running_goal(&fixture, vec![readonly]);
+            let goal_id = persist(&fixture, &goal);
+            let backend = AgentFailureReadonly {
+                error,
+                calls: Cell::new(0),
+            };
+            scheduler_step(
+                &fixture.store,
+                &fixture.session,
+                &goal_id,
+                goal.revision(),
+                &NeverPlanner::default(),
+                &backend,
+                &NeverWriter::default(),
+                &NeverReviewer::default(),
+                &NeverReplanner::default(),
+            )
+            .await
+            .unwrap();
+            let durable = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+            let task = &durable.tasks()[&task_id];
+            assert_eq!(task.semantic_attempts_consumed(), 1, "error={error:?}");
+            assert_eq!(task.semantic_attempts_remaining(), 1, "error={error:?}");
+            assert_eq!(task.readonly_transport_interruptions(), 0, "error={error:?}");
+            assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Retryable), "error={error:?}");
+            assert_eq!(backend.calls.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_readonly_statuses_keep_existing_authority_semantics() {
+        for (status, expected) in [
+            ("blocked", TaskStatus::Blocked),
+            ("needs_replan", TaskStatus::NeedsReplan),
+            ("failed", TaskStatus::Failed),
+        ] {
+            let fixture = fixture();
+            let readonly = task(
+                &fixture,
+                "readonly-semantic-status",
+                true,
+                WorkerKind::CodexReadonly,
+                vec![],
+            );
+            let task_id = readonly.id().clone();
+            let goal = running_goal(&fixture, vec![readonly]);
+            let goal_id = persist(&fixture, &goal);
+            scheduler_step(
+                &fixture.store,
+                &fixture.session,
+                &goal_id,
+                goal.revision(),
+                &NeverPlanner::default(),
+                &StaticStatusReadonly { status },
+                &NeverWriter::default(),
+                &NeverReviewer::default(),
+                &NeverReplanner::default(),
+            )
+            .await
+            .unwrap();
+            let durable = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+            let task = &durable.tasks()[&task_id];
+            assert_eq!(task.status(), expected, "status={status}");
+            assert_eq!(task.semantic_attempts_consumed(), 1, "status={status}");
+            assert_eq!(task.readonly_transport_interruptions(), 0, "status={status}");
+            assert_ne!(task.attempts()[0].outcome(), Some(AttemptOutcome::Interrupted));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_readonly_output_consumes_semantic_budget_not_transport_budget() {
+        let fixture = fixture();
+        let readonly = task(
+            &fixture,
+            "readonly-invalid-output",
+            true,
+            WorkerKind::CodexReadonly,
+            vec![],
+        );
+        let task_id = readonly.id().clone();
+        let goal = running_goal(&fixture, vec![readonly]);
+        let goal_id = persist(&fixture, &goal);
+        scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            goal.revision(),
+            &NeverPlanner::default(),
+            &InvalidOutputReadonly::default(),
+            &NeverWriter::default(),
+            &NeverReviewer::default(),
+            &NeverReplanner::default(),
+        )
+        .await
+        .unwrap();
+        let durable = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let task = &durable.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Retryable);
+        assert_eq!(task.semantic_attempts_consumed(), 1);
+        assert_eq!(task.semantic_attempts_remaining(), 1);
+        assert_eq!(task.readonly_transport_interruptions(), 0);
+        assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Retryable));
     }
 
     #[tokio::test]

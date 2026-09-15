@@ -1114,6 +1114,26 @@ impl Goal {
         Ok(())
     }
 
+    pub(crate) fn recover_legacy_readonly_timeout_task(
+        &mut self,
+        task_id: &TaskId,
+        authority: &crate::goal_api::ReadonlyTransportRecoveryAuthority,
+        now: &str,
+    ) -> Result<bool, OrchestratorError> {
+        let mut candidate = self.clone();
+        let recovered = candidate
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .recover_legacy_readonly_timeout(authority, now)?;
+        if !recovered {
+            return Ok(false);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(true)
+    }
+
     pub(crate) fn complete_task_from_verifier(
         &mut self,
         task_id: &TaskId,
@@ -1177,6 +1197,17 @@ impl Goal {
                 remaining_attempt_budget,
                 remaining_side_effect_budget,
             )
+    }
+
+    pub(crate) fn task_mark_latest_attempt_interrupted(
+        &mut self,
+        task_id: &TaskId,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .mark_latest_attempt_interrupted(now)
     }
 
     pub(crate) fn task_record_latest_worker_report(

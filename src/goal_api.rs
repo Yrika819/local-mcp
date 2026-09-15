@@ -15,6 +15,16 @@ use crate::task::{
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
+pub(crate) struct ReadonlyTransportRecoveryAuthority {
+    _private: (),
+}
+
+impl ReadonlyTransportRecoveryAuthority {
+    fn for_goal_resume() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct GoalIdentityView {
     goal_id: String,
@@ -580,7 +590,9 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     }
 
     goal.recover_stale_running(now)?;
+    reconcile_legacy_readonly_timeout_failures(goal, now)?;
     reconcile_safe_readonly_blocked_tasks(goal, now)?;
+    reconcile_readonly_transport_retryable_tasks(goal, now)?;
 
     match goal.status() {
         GoalStatus::Paused => resume_from_paused(goal, now)?,
@@ -607,6 +619,62 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     Ok(())
 }
 
+fn reconcile_legacy_readonly_timeout_failures(
+    goal: &mut Goal,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    let task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            (task.status() == TaskStatus::Failed).then(|| task_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let authority = ReadonlyTransportRecoveryAuthority::for_goal_resume();
+    for task_id in task_ids {
+        let _ = goal.recover_legacy_readonly_timeout_task(&task_id, &authority, now)?;
+    }
+    Ok(())
+}
+
+fn reconcile_readonly_transport_retryable_tasks(
+    goal: &mut Goal,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    let task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            let attempt = task.latest_attempt()?;
+            let safe_scope = task.worker() == WorkerKind::CodexReadonly
+                && task.scope().operation_kind() == TaskOperationKind::ReadOnly
+                && task.scope().replay_safety() == ReplaySafety::SafeReadOnly;
+            let safe_attempt = attempt.operation_id().is_none()
+                && attempt.scope_identity().is_none()
+                && attempt.side_effect_class() == Some(SideEffectClass::None)
+                && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed);
+            (task.status() == TaskStatus::Retryable
+                && task.blockers().is_empty()
+                && safe_scope
+                && safe_attempt
+                && task.latest_is_readonly_transport_interruption()
+                && task.semantic_attempts_remaining() > 0
+                && task.readonly_transport_retry_available())
+            .then(|| task_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for task_id in task_ids {
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 fn reconcile_safe_readonly_blocked_tasks(
     goal: &mut Goal,
     now: &str,
@@ -628,8 +696,9 @@ fn reconcile_safe_readonly_blocked_tasks(
                 && attempt.scope_identity().is_none()
                 && attempt.side_effect_class() == Some(SideEffectClass::None)
                 && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed);
-            let budget_remains = task.attempts().len() < task.max_attempts() as usize
-                && attempt.remaining_attempt_budget().unwrap_or(0) > 0;
+            let budget_remains = task.semantic_attempts_remaining() > 0
+                && attempt.remaining_attempt_budget().unwrap_or(0) > 0
+                && task.readonly_transport_retry_available();
             (task.status() == TaskStatus::Blocked
                 && only_readonly_blockers
                 && safe_scope
@@ -977,8 +1046,9 @@ mod tests {
     use crate::fallback::{SideEffectClass, SideEffectState};
     use crate::goal::CheckpointReason;
     use crate::task::{
+        AttemptOutcome, ReadonlyTransportRecoveryAuthorityKind, ReadonlyTransportRecoveryKind,
         ReplaySafety, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
-        TaskTransitionContext, VerificationResult, WorkerKind,
+        TaskTransitionContext, VerificationResult, WorkerKind, WorkerReport,
     };
     use crate::task_store::FaultPoint;
 
@@ -1996,4 +2066,277 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn resume_recovers_legacy_readonly_timeout_append_only_and_allows_attempt_three() {
+        let (root, session, store) = fixture("lto");
+        let mut goal = Goal::new(
+            session.id.clone(),
+            session.cwd.clone(),
+            "legacy timeout recovery",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
+        let task_id = goal
+            .add_task(
+                "readonly",
+                "inspect",
+                true,
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                vec![],
+                2,
+                NOW,
+            )
+            .unwrap();
+        goal.transition_to(GoalStatus::Running, NOW).unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(1),
+            Some(0),
+        )
+        .unwrap();
+        goal.task_record_latest_worker_report(
+            &task_id,
+            WorkerReport::new("first semantic readonly blocker", Vec::new()),
+        )
+        .unwrap();
+        goal.task_add_blocker(
+            &task_id,
+            crate::task::TaskBlocker::new("READONLY_BLOCKED", "first blocker", true),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let attempt_1_id = goal.tasks()[&task_id].attempts()[0].id().clone();
+        goal.task_clear_blockers(&task_id).unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(0),
+            Some(0),
+        )
+        .unwrap();
+        goal.task_record_latest_worker_report(
+            &task_id,
+            WorkerReport::new(
+                "READONLY_BACKEND_ERROR: readonly model invocation failed: model invocation timed out",
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Failed,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let attempt_2_id = goal.tasks()[&task_id].attempts()[1].id().clone();
+        assert!(
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Ready,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .is_err()
+        );
+        pause_goal(&mut goal, NOW).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let revision_before = goal.revision();
+
+        let resumed = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(resumed.status, GoalStatus::Running);
+        let recovered = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(recovered.id(), &goal_id);
+        assert!(recovered.revision() > revision_before);
+        let task = &recovered.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Ready);
+        assert_eq!(task.max_attempts(), 2);
+        assert_eq!(task.attempts().len(), 2);
+        assert_eq!(task.attempts()[0].id(), &attempt_1_id);
+        assert_eq!(task.attempts()[1].id(), &attempt_2_id);
+        assert_eq!(task.attempts()[0].number(), 1);
+        assert_eq!(task.attempts()[1].number(), 2);
+        assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Blocked));
+        assert_eq!(task.attempts()[1].outcome(), Some(AttemptOutcome::Failed));
+        assert_eq!(task.semantic_attempts_consumed(), 1);
+        assert_eq!(task.semantic_attempts_remaining(), 1);
+        assert_eq!(task.readonly_transport_interruptions(), 1);
+        assert!(task.evidence().iter().any(|evidence| matches!(
+            evidence,
+            TaskEvidence::ReadonlyTransportRecovery {
+                attempt_id,
+                classification: ReadonlyTransportRecoveryKind::LegacyTimeoutTerminalization,
+                authority: ReadonlyTransportRecoveryAuthorityKind::GoalResume,
+                side_effect_state: SideEffectState::ConfirmedNotPerformed,
+                postcondition_proven: true,
+            } if attempt_id == &attempt_2_id
+        )));
+
+        store
+            .mutate_goal_snapshot(
+                &session.id,
+                &goal_id,
+                recovered.revision(),
+                |goal, now| {
+                    goal.transition_task(
+                        &task_id,
+                        TaskStatus::Running,
+                        TaskTransitionContext::default(),
+                        now,
+                    )
+                },
+            )
+            .unwrap();
+        let attempt_three = store.load_goal(&session.id, &goal_id).unwrap();
+        let task = &attempt_three.tasks()[&task_id];
+        assert_eq!(task.attempts().len(), 3);
+        assert_eq!(task.attempts()[2].number(), 3);
+        assert_ne!(task.attempts()[2].id(), &attempt_1_id);
+        assert_ne!(task.attempts()[2].id(), &attempt_2_id);
+        assert_eq!(task.max_attempts(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sealed_legacy_recovery_rejects_writer_and_unsafe_side_effects() {
+        let (root, session, _store) = fixture("lrr");
+        for (worker, scope, class, state) in [
+            (
+                WorkerKind::CodexWriter,
+                mutation_scope(),
+                SideEffectClass::None,
+                SideEffectState::ConfirmedNotPerformed,
+            ),
+            (
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                SideEffectClass::None,
+                SideEffectState::Unknown,
+            ),
+            (
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                SideEffectClass::None,
+                SideEffectState::ConfirmedPerformed,
+            ),
+        ] {
+            let mut goal = Goal::new(
+                session.id.clone(),
+                session.cwd.clone(),
+                "reject unsafe recovery",
+                None,
+                vec![],
+                vec![],
+                NOW,
+            )
+            .unwrap();
+            let task_id = goal
+                .add_task("task", "task", true, worker, scope, vec![], 2, NOW)
+                .unwrap();
+            goal.transition_to(GoalStatus::Running, NOW).unwrap();
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Ready,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Running,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            goal.task_bind_latest_attempt_execution(
+                &task_id,
+                None,
+                None,
+                None,
+                Some(class),
+                Some(state),
+                Some(0),
+                Some(0),
+            )
+            .unwrap();
+            goal.task_record_latest_worker_report(
+                &task_id,
+                WorkerReport::new(
+                    "READONLY_BACKEND_ERROR: readonly model invocation failed: model invocation timed out",
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Failed,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            let before = goal.clone();
+            let authority = ReadonlyTransportRecoveryAuthority::for_goal_resume();
+            assert!(!goal
+                .recover_legacy_readonly_timeout_task(&task_id, &authority, NOW)
+                .unwrap());
+            assert_eq!(goal, before);
+            assert_eq!(goal.tasks()[&task_id].status(), TaskStatus::Failed);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

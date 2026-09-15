@@ -10,8 +10,9 @@ use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
-    ReplaySafety, TaskBlocker, TaskEvidence, TaskId, TaskOperationKind, TaskStatus,
-    TaskTransitionContext, VerificationSpec, WorkerKind, WorkerReport,
+    MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK, ReadonlyTransportInterruptionKind, ReplaySafety,
+    TaskBlocker, TaskEvidence, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
+    VerificationSpec, WorkerKind, WorkerReport,
 };
 use crate::task_store::TaskStore;
 
@@ -168,9 +169,14 @@ pub(crate) fn begin_readonly_attempt(
                     "CODEX_READONLY requires READ_ONLY + SAFE_READ_ONLY scope".to_owned(),
                 ));
             }
-            if task.attempts().len() >= task.max_attempts() as usize {
+            if task.semantic_attempts_remaining() == 0 {
                 return Err(OrchestratorError::InvalidDag(
-                    "readonly Task attempt budget is exhausted".to_owned(),
+                    "readonly Task semantic attempt budget is exhausted".to_owned(),
+                ));
+            }
+            if !task.readonly_transport_retry_available() {
+                return Err(OrchestratorError::InvalidDag(
+                    "readonly Task transport interruption budget is exhausted".to_owned(),
                 ));
             }
             goal.transition_task(
@@ -195,15 +201,27 @@ pub(crate) fn run_readonly_attempt<B: ReadonlyBackend>(
     let raw = match backend.investigate(&request) {
         Ok(raw) => raw,
         Err(error) => {
-            persist_retryable_failure(
-                store,
-                session,
-                goal_id,
-                task_id,
-                &request,
-                "READONLY_BACKEND_ERROR",
-                &error.to_string(),
-            )?;
+            if matches!(&error, ReadonlyError::Model(AgentError::Timeout)) {
+                persist_transport_interruption(
+                    store,
+                    session,
+                    goal_id,
+                    task_id,
+                    &request,
+                    "READONLY_BACKEND_ERROR",
+                    &error.to_string(),
+                )?;
+            } else {
+                persist_retryable_failure(
+                    store,
+                    session,
+                    goal_id,
+                    task_id,
+                    &request,
+                    "READONLY_BACKEND_ERROR",
+                    &error.to_string(),
+                )?;
+            }
             return Err(error);
         }
     };
@@ -335,7 +353,7 @@ fn persist_valid_result(
     store
         .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
             ensure_active_attempt(goal, task_id, request)?;
-            record_non_mutating_metadata(goal, task_id)?;
+            record_non_mutating_metadata(goal, task_id, false)?;
             goal.task_record_latest_worker_report(
                 task_id,
                 WorkerReport::new(result.summary.clone(), Vec::new()),
@@ -400,6 +418,69 @@ fn persist_valid_result(
         .map_err(ReadonlyError::from)
 }
 
+fn persist_transport_interruption(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    request: &ReadonlyRequest,
+    code: &str,
+    detail: &str,
+) -> Result<Goal, ReadonlyError> {
+    store
+        .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
+            ensure_active_attempt(goal, task_id, request)?;
+            goal.task_record_latest_worker_report(
+                task_id,
+                WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
+            )?;
+            record_non_mutating_metadata(goal, task_id, true)?;
+            goal.task_mark_latest_attempt_interrupted(task_id, now)?;
+            let attempt_id = goal.tasks()[task_id]
+                .latest_attempt()
+                .expect("active attempt checked")
+                .id()
+                .clone();
+            goal.task_add_evidence(
+                task_id,
+                TaskEvidence::ReadonlyTransportInterruption {
+                    attempt_id,
+                    interruption: ReadonlyTransportInterruptionKind::ModelTimeout,
+                },
+            )?;
+            let transport_interruptions =
+                goal.tasks()[task_id].readonly_transport_interruptions();
+            if transport_interruptions < MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK
+                && goal.tasks()[task_id].semantic_attempts_remaining() > 0
+            {
+                goal.transition_task(
+                    task_id,
+                    TaskStatus::Retryable,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            } else {
+                goal.task_add_blocker(
+                    task_id,
+                    TaskBlocker::new(
+                        "READONLY_TRANSPORT_UNAVAILABLE",
+                        format!(
+                            "readonly model transport interruption budget exhausted ({transport_interruptions}/{MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK})"
+                        ),
+                        true,
+                    ),
+                )?;
+                goal.transition_task(
+                    task_id,
+                    TaskStatus::Blocked,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            }
+        })
+        .map_err(ReadonlyError::from)
+}
+
 fn persist_retryable_failure(
     store: &TaskStore,
     session: &config::Session,
@@ -412,14 +493,12 @@ fn persist_retryable_failure(
     store
         .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
             ensure_active_attempt(goal, task_id, request)?;
-            record_non_mutating_metadata(goal, task_id)?;
+            record_non_mutating_metadata(goal, task_id, false)?;
             goal.task_record_latest_worker_report(
                 task_id,
                 WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
             )?;
-            let next = if goal.tasks()[task_id].attempts().len()
-                < goal.tasks()[task_id].max_attempts() as usize
-            {
+            let next = if goal.tasks()[task_id].semantic_attempts_remaining() > 0 {
                 TaskStatus::Retryable
             } else {
                 TaskStatus::Failed
@@ -432,11 +511,17 @@ fn persist_retryable_failure(
 fn record_non_mutating_metadata(
     goal: &mut Goal,
     task_id: &TaskId,
+    transport_interruption: bool,
 ) -> Result<(), OrchestratorError> {
     let remaining = {
         let task = &goal.tasks()[task_id];
-        task.max_attempts()
-            .saturating_sub(task.attempts().len() as u32)
+        let consumed = task.semantic_attempts_consumed();
+        let consumed = if transport_interruption {
+            consumed.saturating_sub(1)
+        } else {
+            consumed
+        };
+        task.max_attempts().saturating_sub(consumed)
     };
     goal.task_bind_latest_attempt_execution(
         task_id,
