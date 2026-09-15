@@ -418,9 +418,16 @@ fn run_bounded_process(
         kill_and_join(&mut child, stdout, stderr);
         return Err(AgentError::SpawnFailed);
     };
-    if stdin.write_all(prompt).is_err() {
-        kill_and_join(&mut child, stdout, stderr);
-        return Err(AgentError::TransportFailure);
+    if let Err(error) = stdin.write_all(prompt) {
+        // A child may exit successfully without reading stdin (for example, a
+        // model shim that intentionally returns no response). On Unix that can
+        // race with this write and surface as BrokenPipe. Preserve the child
+        // exit/output mapping in that case instead of misclassifying it as a
+        // transport failure. Other stdin I/O failures remain transport errors.
+        if error.kind() != ErrorKind::BrokenPipe {
+            kill_and_join(&mut child, stdout, stderr);
+            return Err(AgentError::TransportFailure);
+        }
     }
     drop(stdin);
 
