@@ -916,6 +916,11 @@ impl Goal {
         validate_replan_history_immutability(&before, &candidate)?;
         candidate.validate_dag()?;
         candidate.validate_final_verification_contract()?;
+        if candidate.status == GoalStatus::Replanning
+            && !candidate.has_task_status(TaskStatus::NeedsReplan)
+        {
+            candidate.transition_to(GoalStatus::Running, now)?;
+        }
         candidate.add_checkpoint(CheckpointReason::ReplanCommitted, now)?;
         candidate.validate()?;
         *self = candidate;

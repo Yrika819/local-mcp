@@ -615,11 +615,11 @@ fn replan_is_additive_preserves_old_pass_and_invalidates_applicability() {
                     },
                     now,
                 )?;
-                g.transition_to(GoalStatus::Running, now)?;
                 Ok(())
             },
         )
         .unwrap();
+    assert_eq!(changed.status(), GoalStatus::Running);
     assert_eq!(changed.final_verifications().len(), 1);
     assert_eq!(changed.final_verifications()[0], old);
     assert!(changed.latest_applicable_final_verification().is_none());
@@ -933,12 +933,12 @@ fn finalizer_requires_latest_applicable_passed_record() {
                     },
                     now,
                 )?;
-                g.transition_to(GoalStatus::Running, now)?;
                 Ok(())
             },
         )
         .unwrap();
     let changed = f.store.load_goal(&f.session.id, goal.id()).unwrap();
+    assert_eq!(changed.status(), GoalStatus::Running);
     assert!(changed.latest_applicable_final_verification().is_none());
     let snap =
         goal_finalizer::prepare_goal_finalization(&f.store, &f.session.id, goal.id()).unwrap();

@@ -1677,6 +1677,66 @@ mod tests {
     }
 
     #[test]
+    fn successful_replan_from_replanning_returns_to_running_when_trigger_is_resolved() {
+        let fixture = fixture();
+        let current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let replanning = fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &fixture.goal_id,
+                current.revision(),
+                |goal, now| goal.transition_to(GoalStatus::Replanning, now),
+            )
+            .unwrap();
+        assert_eq!(replanning.status(), GoalStatus::Replanning);
+        assert!(replanning.has_task_status(TaskStatus::NeedsReplan));
+
+        let result = apply(&fixture, &proposal_bytes(&fixture)).unwrap();
+        assert_eq!(result.status(), GoalStatus::Running);
+        assert!(!result.has_task_status(TaskStatus::NeedsReplan));
+        assert_eq!(
+            result.checkpoints().last().unwrap().reason(),
+            CheckpointReason::ReplanCommitted
+        );
+        assert_eq!(
+            result.checkpoints().last().unwrap().goal_status(),
+            GoalStatus::Running
+        );
+        assert!(result.tasks().values().any(|task| task.status() == TaskStatus::Ready));
+    }
+
+    #[test]
+    fn successful_replan_from_replanning_stays_replanning_while_trigger_remains() {
+        let fixture = fixture();
+        let current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &fixture.goal_id,
+                current.revision(),
+                |goal, now| goal.transition_to(GoalStatus::Replanning, now),
+            )
+            .unwrap();
+        let mut value = proposal_value(&fixture);
+        value["resolve_needs_replan"] = json!([]);
+        let result = apply(&fixture, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(result.status(), GoalStatus::Replanning);
+        assert!(result.has_task_status(TaskStatus::NeedsReplan));
+        assert_eq!(
+            result.checkpoints().last().unwrap().goal_status(),
+            GoalStatus::Replanning
+        );
+    }
+
+    #[test]
     fn valid_replan_commits_once_and_preserves_existing_history_and_budgets() {
         let fixture = fixture();
         let before = fixture
