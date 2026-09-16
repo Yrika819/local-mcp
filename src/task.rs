@@ -303,6 +303,10 @@ impl WorkerReport {
     pub(crate) fn summary(&self) -> &str {
         &self.summary
     }
+
+    pub(crate) fn changed_files(&self) -> &[PathBuf] {
+        &self.changed_files
+    }
 }
 
 pub(crate) const MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK: u32 = 3;
@@ -332,6 +336,15 @@ pub(crate) enum ReadonlyTransportRecoveryAuthorityKind {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ReadonlyReplanRecoveryAuthorityKind {
     Replanner,
+}
+
+pub(crate) const LEGACY_WRITER_PRE_MUTATION_RECONCILIATION: &str =
+    "LEGACY_WRITER_PRE_MUTATION_RECONCILIATION";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum LegacyWriterReconciliationAuthorityKind {
+    GoalResume,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +472,13 @@ pub(crate) enum TaskEvidence {
     },
     RecoveryReconciliation {
         summary: String,
+        side_effect_state: SideEffectState,
+        postcondition_proven: bool,
+    },
+    LegacyWriterPreMutationReconciliation {
+        attempt_id: AttemptId,
+        authority: LegacyWriterReconciliationAuthorityKind,
+        reason: String,
         side_effect_state: SideEffectState,
         postcondition_proven: bool,
     },
@@ -753,6 +773,17 @@ impl Task {
     fn is_semantic_budget_exempt_attempt(&self, attempt_id: &AttemptId) -> bool {
         self.is_readonly_transport_attempt(attempt_id)
             || self.is_readonly_replan_reconciled_attempt(attempt_id)
+            || self.is_legacy_writer_reconciled_attempt(attempt_id)
+    }
+
+    fn is_legacy_writer_reconciled_attempt(&self, attempt_id: &AttemptId) -> bool {
+        self.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaskEvidence::LegacyWriterPreMutationReconciliation {
+                attempt_id: evidence_attempt_id,
+                ..
+            } if evidence_attempt_id == attempt_id
+        ))
     }
 
     pub(crate) fn created_plan_revision(&self) -> u32 {
@@ -951,6 +982,64 @@ impl Task {
         {
             return Err(OrchestratorError::CorruptGoal(
                 "readonly replan recovery budget exceeded".to_owned(),
+            ));
+        }
+        let mut legacy_writer_recovery_attempts = BTreeSet::new();
+        for evidence in &self.evidence {
+            let TaskEvidence::LegacyWriterPreMutationReconciliation {
+                attempt_id,
+                authority,
+                reason,
+                side_effect_state,
+                postcondition_proven,
+            } = evidence
+            else {
+                continue;
+            };
+            if *authority != LegacyWriterReconciliationAuthorityKind::GoalResume
+                || reason != LEGACY_WRITER_PRE_MUTATION_RECONCILIATION
+                || *side_effect_state != SideEffectState::ConfirmedNotPerformed
+                || !*postcondition_proven
+                || !legacy_writer_recovery_attempts.insert(attempt_id.clone())
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "invalid legacy writer pre-mutation reconciliation evidence".to_owned(),
+                ));
+            }
+            let attempt = self
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id() == attempt_id)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "legacy writer reconciliation references a missing attempt".to_owned(),
+                    )
+                })?;
+            let report_is_empty = attempt
+                .worker_report
+                .as_ref()
+                .is_some_and(|report| report.changed_files().is_empty());
+            if self.worker != WorkerKind::CodexWriter
+                || self.scope.operation_kind == TaskOperationKind::ReadOnly
+                || self.scope.replay_safety != ReplaySafety::VerifyBeforeRetry
+                || attempt.worker != WorkerKind::CodexWriter
+                || attempt.outcome != Some(AttemptOutcome::Blocked)
+                || !attempt.low_level_request_ids.is_empty()
+                || attempt.operation_id.is_some()
+                || attempt.scope_identity.is_some()
+                || attempt.side_effect_class.is_some()
+                || attempt.side_effect_state.is_some()
+                || !report_is_empty
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "legacy writer reconciliation requires an untouched pre-mutation attempt"
+                        .to_owned(),
+                ));
+            }
+        }
+        if legacy_writer_recovery_attempts.len() > 1 {
+            return Err(OrchestratorError::CorruptGoal(
+                "multiple legacy writer reconciliation records are not allowed".to_owned(),
             ));
         }
         if self.status == TaskStatus::Running && self.attempts.is_empty() {
@@ -1320,6 +1409,72 @@ impl Task {
         }
         self.evidence.push(evidence);
         Ok(())
+    }
+
+    pub(crate) fn can_reconcile_legacy_writer_pre_mutation(&self) -> bool {
+        if self.status != TaskStatus::Blocked
+            || self.worker != WorkerKind::CodexWriter
+            || self.scope.operation_kind == TaskOperationKind::ReadOnly
+            || self.scope.replay_safety != ReplaySafety::VerifyBeforeRetry
+            || self.attempts.len() != 1
+            || self.blockers.len() != 1
+            || self.blockers[0].code() != "WRITER_BLOCKED"
+            || self.semantic_attempts_remaining() != 0
+        {
+            return false;
+        }
+        let Some(attempt) = self.latest_attempt() else {
+            return false;
+        };
+        let Some(report) = attempt.worker_report.as_ref() else {
+            return false;
+        };
+        !self.is_legacy_writer_reconciled_attempt(attempt.id())
+            && attempt.worker == WorkerKind::CodexWriter
+            && attempt.outcome == Some(AttemptOutcome::Blocked)
+            && attempt.low_level_request_ids.is_empty()
+            && attempt.operation_id.is_none()
+            && attempt.scope_identity.is_none()
+            && attempt.side_effect_class.is_none()
+            && attempt.side_effect_state.is_none()
+            && report.changed_files().is_empty()
+            && self.evidence.iter().all(|evidence| {
+                matches!(
+                    evidence,
+                    TaskEvidence::WorkerReport { attempt_id, .. }
+                        if attempt_id == attempt.id()
+                )
+            })
+    }
+
+    pub(crate) fn reconcile_legacy_writer_pre_mutation(
+        &mut self,
+        _authority: &crate::goal_api::LegacyWriterPreMutationReconciliationAuthority,
+        now: &str,
+    ) -> Result<bool, OrchestratorError> {
+        if !self.can_reconcile_legacy_writer_pre_mutation() {
+            return Ok(false);
+        }
+        let attempt_id = self
+            .latest_attempt()
+            .expect("eligible legacy writer has an attempt")
+            .id
+            .clone();
+        self.evidence.push(TaskEvidence::LegacyWriterPreMutationReconciliation {
+            attempt_id,
+            authority: LegacyWriterReconciliationAuthorityKind::GoalResume,
+            reason: LEGACY_WRITER_PRE_MUTATION_RECONCILIATION.to_owned(),
+            side_effect_state: SideEffectState::ConfirmedNotPerformed,
+            postcondition_proven: true,
+        });
+        self.updated_at = now.to_owned();
+        if self.semantic_attempts_remaining() == 0 {
+            return Err(OrchestratorError::CorruptGoal(
+                "legacy writer reconciliation failed to restore one bounded semantic attempt"
+                    .to_owned(),
+            ));
+        }
+        Ok(true)
     }
 
     pub(crate) fn add_blocker(&mut self, blocker: TaskBlocker) -> Result<(), OrchestratorError> {

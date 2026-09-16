@@ -25,6 +25,16 @@ impl ReadonlyTransportRecoveryAuthority {
     }
 }
 
+pub(crate) struct LegacyWriterPreMutationReconciliationAuthority {
+    _private: (),
+}
+
+impl LegacyWriterPreMutationReconciliationAuthority {
+    fn for_goal_resume() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct GoalIdentityView {
     goal_id: String,
@@ -592,8 +602,12 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     goal.recover_stale_running(now)?;
     reconcile_legacy_readonly_timeout_failures(goal, now)?;
     reconcile_safe_readonly_blocked_tasks(goal, now)?;
+    let legacy_writer_reconciled = reconcile_legacy_writer_blocked_tasks(goal, now)?;
     reconcile_safe_writer_blocked_tasks(goal, now)?;
     reconcile_readonly_transport_retryable_tasks(goal, now)?;
+    if legacy_writer_reconciled {
+        goal.add_checkpoint(CheckpointReason::Recovery, now)?;
+    }
 
     match goal.status() {
         GoalStatus::Paused => resume_from_paused(goal, now)?,
@@ -774,6 +788,35 @@ fn reconcile_safe_writer_blocked_tasks(
         )?;
     }
     Ok(())
+}
+
+fn reconcile_legacy_writer_blocked_tasks(
+    goal: &mut Goal,
+    now: &str,
+) -> Result<bool, OrchestratorError> {
+    let task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            task.can_reconcile_legacy_writer_pre_mutation()
+                .then_some(task_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let authority = LegacyWriterPreMutationReconciliationAuthority::for_goal_resume();
+    let mut reconciled = false;
+    for task_id in task_ids {
+        if goal.reconcile_legacy_writer_pre_mutation_task(&task_id, &authority, now)? {
+            goal.task_clear_blockers(&task_id)?;
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Ready,
+                TaskTransitionContext::default(),
+                now,
+            )?;
+            reconciled = true;
+        }
+    }
+    Ok(reconciled)
 }
 
 fn resume_from_paused(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
@@ -1209,6 +1252,96 @@ mod tests {
             .unwrap();
         }
         (goal, task_id)
+    }
+
+    fn legacy_writer_goal(
+        session: &config::Session,
+    ) -> (Goal, crate::task::TaskId) {
+        legacy_writer_goal_with_changed_files(session, vec![])
+    }
+
+    fn legacy_writer_goal_with_changed_files(
+        session: &config::Session,
+        changed_files: Vec<PathBuf>,
+    ) -> (Goal, crate::task::TaskId) {
+        let mut goal = Goal::new(
+            session.id.clone(),
+            session.cwd.clone(),
+            "legacy writer objective",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
+        let task_id = goal
+            .add_task(
+                "legacy writer",
+                "legacy writer objective",
+                true,
+                WorkerKind::CodexWriter,
+                mutation_scope(),
+                vec![],
+                1,
+                NOW,
+            )
+            .unwrap();
+        goal.transition_to(GoalStatus::Running, NOW).unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let attempt_id = goal.tasks()[&task_id].latest_attempt().unwrap().id().clone();
+        goal.task_record_latest_worker_report(
+            &task_id,
+            WorkerReport::new("legacy writer was blocked before mutation", changed_files),
+        )
+        .unwrap();
+        goal.task_add_evidence(
+            &task_id,
+            TaskEvidence::WorkerReport {
+                attempt_id,
+                report_digest: "legacy-report".to_owned(),
+            },
+        )
+        .unwrap();
+        (goal, task_id)
+    }
+
+    fn blocked_legacy_writer_goal(
+        session: &config::Session,
+        changed_files: Vec<PathBuf>,
+        blocker_code: &str,
+    ) -> (Goal, crate::task::TaskId) {
+        let (mut goal, task_id) = legacy_writer_goal_with_changed_files(session, changed_files);
+        block_writer_goal(&mut goal, &task_id, blocker_code);
+        (goal, task_id)
+    }
+
+    fn block_writer_goal(goal: &mut Goal, task_id: &crate::task::TaskId, blocker_code: &str) {
+        goal.task_add_blocker(
+            task_id,
+            crate::task::TaskBlocker::new(blocker_code, "historical writer blocker", true),
+        )
+        .unwrap();
+        goal.transition_task(
+            task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_to(GoalStatus::Blocked, NOW).unwrap();
     }
 
     fn completed_goal(session: &config::Session) -> Goal {
@@ -2174,6 +2307,275 @@ mod tests {
             task.latest_attempt().unwrap().side_effect_state(),
             Some(SideEffectState::ConfirmedNotPerformed)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_reconciles_legacy_writer_pre_mutation_attempt() {
+        let (root, session, store) = fixture("legacy-writer");
+        let (mut goal, task_id) = legacy_writer_goal(&session);
+        goal.task_add_blocker(
+            &task_id,
+            crate::task::TaskBlocker::new(
+                "WRITER_BLOCKED",
+                "Cannot inspect or modify the approved file in this read-only writer context.",
+                true,
+            ),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_to(GoalStatus::Blocked, NOW).unwrap();
+        let goal_id = goal.id().clone();
+        let historical_attempt = goal.tasks()[&task_id].attempts()[0].clone();
+        store.create_goal(&goal).unwrap();
+
+        let resumed = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(resumed.status, GoalStatus::Running);
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        let task = &durable.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Ready);
+        assert!(task.blockers().is_empty());
+        assert_eq!(task.attempts()[0], historical_attempt);
+        assert_eq!(task.evidence().len(), 2);
+        assert_eq!(task.semantic_attempts_consumed(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_writer_reconciliation_rejects_ambiguous_or_unrelated_state() {
+        let (root, session, _store) = fixture("legacy-writer-reject");
+
+        let (mut operation_goal, operation_task) = legacy_writer_goal(&session);
+        operation_goal
+            .task_bind_latest_attempt_execution(
+                &operation_task,
+                Some("operation".to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        block_writer_goal(&mut operation_goal, &operation_task, "WRITER_BLOCKED");
+        assert!(!operation_goal.tasks()[&operation_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut scope_goal, scope_task) = legacy_writer_goal(&session);
+        scope_goal
+            .task_bind_latest_attempt_execution(
+                &scope_task,
+                None,
+                Some("scope".to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        block_writer_goal(&mut scope_goal, &scope_task, "WRITER_BLOCKED");
+        assert!(!scope_goal.tasks()[&scope_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut request_goal, request_task) = legacy_writer_goal(&session);
+        request_goal
+            .task_bind_latest_attempt_execution(
+                &request_task,
+                None,
+                None,
+                Some("request".to_owned()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        block_writer_goal(&mut request_goal, &request_task, "WRITER_BLOCKED");
+        assert!(!request_goal.tasks()[&request_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (changed_goal, changed_task) =
+            blocked_legacy_writer_goal(&session, vec![PathBuf::from("changed.py")], "WRITER_BLOCKED");
+        assert!(!changed_goal.tasks()[&changed_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut snapshot_goal, snapshot_task) = legacy_writer_goal(&session);
+        snapshot_goal
+            .task_add_evidence(
+                &snapshot_task,
+                TaskEvidence::FileSnapshot {
+                    path: PathBuf::from("changed.py"),
+                    exists: true,
+                    size: Some(1),
+                    sha256: Some("digest".to_owned()),
+                },
+            )
+            .unwrap();
+        block_writer_goal(&mut snapshot_goal, &snapshot_task, "WRITER_BLOCKED");
+        assert!(!snapshot_goal.tasks()[&snapshot_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut review_goal, review_task) = legacy_writer_goal(&session);
+        review_goal
+            .task_add_evidence(
+                &review_task,
+                TaskEvidence::ReviewResult {
+                    summary: "reviewer ran after mutation".to_owned(),
+                    blocking_findings: 0,
+                },
+            )
+            .unwrap();
+        block_writer_goal(&mut review_goal, &review_task, "WRITER_BLOCKED");
+        assert!(!review_goal.tasks()[&review_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut performed_goal, performed_task) = legacy_writer_goal(&session);
+        performed_goal
+            .task_bind_latest_attempt_execution(
+                &performed_task,
+                Some("operation".to_owned()),
+                Some("scope".to_owned()),
+                Some("request".to_owned()),
+                Some(SideEffectClass::LocalMutation),
+                Some(SideEffectState::ConfirmedPerformed),
+                None,
+                None,
+            )
+            .unwrap();
+        block_writer_goal(&mut performed_goal, &performed_task, "WRITER_BLOCKED");
+        assert!(!performed_goal.tasks()[&performed_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut unknown_goal, unknown_task) = legacy_writer_goal(&session);
+        unknown_goal
+            .task_bind_latest_attempt_execution(
+                &unknown_task,
+                Some("operation".to_owned()),
+                Some("scope".to_owned()),
+                None,
+                Some(SideEffectClass::LocalMutation),
+                Some(SideEffectState::Unknown),
+                None,
+                None,
+            )
+            .unwrap();
+        block_writer_goal(&mut unknown_goal, &unknown_task, "WRITER_BLOCKED");
+        assert!(!unknown_goal.tasks()[&unknown_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (post_mutation_goal, post_mutation_task) =
+            blocked_legacy_writer_goal(&session, vec![], "WRITER_MUTATION_FAILED");
+        assert!(!post_mutation_goal.tasks()[&post_mutation_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (unrelated_goal, unrelated_task) =
+            blocked_legacy_writer_goal(&session, vec![], "TOOL_MISSING");
+        assert!(!unrelated_goal.tasks()[&unrelated_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        let (mut readonly_goal, readonly_task) =
+            running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
+        block_writer_goal(&mut readonly_goal, &readonly_task, "WRITER_BLOCKED");
+        assert!(!readonly_goal.tasks()[&readonly_task]
+            .can_reconcile_legacy_writer_pre_mutation());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_writer_reconciliation_is_append_only_and_idempotent() {
+        let (root, session, store) = fixture("legacy-idem");
+        let (goal, task_id) = blocked_legacy_writer_goal(&session, vec![], "WRITER_BLOCKED");
+        let goal_id = goal.id().clone();
+        let historical_attempt = goal.tasks()[&task_id].attempts()[0].clone();
+        store.create_goal(&goal).unwrap();
+
+        let first = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        let after_first = store.load_goal(&session.id, &goal_id).unwrap();
+        let bytes_after_first = read_goal_bytes(&root, &session, goal_id.as_str());
+        assert_eq!(first.status, GoalStatus::Running);
+        assert_eq!(after_first.tasks()[&task_id].attempts()[0], historical_attempt);
+        assert!(after_first.tasks()[&task_id].evidence().iter().any(|evidence| {
+            matches!(
+                evidence,
+                TaskEvidence::LegacyWriterPreMutationReconciliation { reason, .. }
+                    if reason == crate::task::LEGACY_WRITER_PRE_MUTATION_RECONCILIATION
+            )
+        }));
+        assert!(after_first
+            .checkpoints()
+            .iter()
+            .any(|checkpoint| checkpoint.reason() == CheckpointReason::Recovery));
+
+        let second = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        let after_second = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(second.status, GoalStatus::Running);
+        assert_eq!(after_second.revision(), after_first.revision());
+        assert_eq!(after_second.tasks()[&task_id].evidence().len(), after_first.tasks()[&task_id].evidence().len());
+        assert_eq!(bytes_after_first, read_goal_bytes(&root, &session, goal_id.as_str()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciled_writer_reaches_running_once_under_scheduler_budget() {
+        let (root, session, store) = fixture("legacy-running");
+        let (goal, task_id) = blocked_legacy_writer_goal(&session, vec![], "WRITER_BLOCKED");
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+
+        let ready = store.load_goal(&session.id, &goal_id).unwrap();
+        assert!(matches!(
+            crate::scheduler::select_next_action(&ready).unwrap(),
+            crate::scheduler::SchedulerDecision::RunWriter { task_id: selected }
+                if selected == task_id
+        ));
+
+        let request = crate::writer::begin_writer_attempt(
+            &store,
+            &session,
+            &goal_id,
+            &task_id,
+            ready.revision(),
+        )
+        .unwrap();
+        let running = store.load_goal(&session.id, &goal_id).unwrap();
+        let task = &running.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Running);
+        assert_eq!(task.attempts().len(), 2);
+        assert_eq!(task.semantic_attempts_consumed(), 1);
+        assert_eq!(task.semantic_attempts_remaining(), 0);
+        assert_eq!(task.max_attempts(), 1);
+        assert_eq!(request.attempt_id(), task.latest_attempt().unwrap().id().as_str());
         std::fs::remove_dir_all(root).unwrap();
     }
 

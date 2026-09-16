@@ -345,7 +345,7 @@ pub(crate) fn begin_writer_attempt(
                     "writer mutation requires a mutating TaskScope".to_owned(),
                 ));
             }
-            if task.attempts().len() >= task.max_attempts() as usize {
+            if task.semantic_attempts_remaining() == 0 {
                 return Err(OrchestratorError::InvalidDag(
                     "writer Task attempt budget is exhausted".to_owned(),
                 ));

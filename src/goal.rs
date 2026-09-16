@@ -1119,6 +1119,26 @@ impl Goal {
         Ok(())
     }
 
+    pub(crate) fn reconcile_legacy_writer_pre_mutation_task(
+        &mut self,
+        task_id: &TaskId,
+        authority: &crate::goal_api::LegacyWriterPreMutationReconciliationAuthority,
+        now: &str,
+    ) -> Result<bool, OrchestratorError> {
+        let mut candidate = self.clone();
+        let reconciled = candidate
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .reconcile_legacy_writer_pre_mutation(authority, now)?;
+        if !reconciled {
+            return Ok(false);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(true)
+    }
+
     pub(crate) fn recover_legacy_readonly_timeout_task(
         &mut self,
         task_id: &TaskId,
