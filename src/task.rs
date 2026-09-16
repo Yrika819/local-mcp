@@ -2882,6 +2882,7 @@ mod tests {
 
     #[test]
     fn active_writer_can_attach_only_a_prepared_host_intent() {
+        let target_path = std::env::temp_dir().join("local-mcp-mutation-target.txt");
         let mut task = task(WorkerKind::CodexWriter);
         task.scope = TaskScope::new(
             vec![],
@@ -2898,7 +2899,7 @@ mod tests {
             "scope-1".to_owned(),
             vec![crate::mutation::MutationOperationIntent::new(
                 0,
-                PathBuf::from("/tmp/target.txt"),
+                target_path,
                 crate::mutation::MutationPreimage::Absent,
                 crate::mutation::FileObservation::absent(),
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),

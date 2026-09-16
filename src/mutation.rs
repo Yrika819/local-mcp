@@ -409,12 +409,13 @@ mod tests {
 
     #[test]
     fn prepared_intent_round_trips_without_replacement_contents() {
+        let target_path = std::env::temp_dir().join("local-mcp-mutation-target.txt");
         let intent = MutationIntent::new(
             "operation-1".to_owned(),
             "scope-1".to_owned(),
             vec![MutationOperationIntent::new(
                 0,
-                "/tmp/target.txt".into(),
+                target_path,
                 MutationPreimage::Absent,
                 FileObservation::absent(),
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -431,6 +432,8 @@ mod tests {
 
     #[test]
     fn malformed_and_duplicate_intents_are_rejected() {
+        let path_a = std::env::temp_dir().join("local-mcp-mutation-a");
+        let path_b = std::env::temp_dir().join("local-mcp-mutation-b");
         let duplicate = serde_json::json!({
             "operation_id": "operation-1",
             "scope_identity": "scope-1",
@@ -439,8 +442,8 @@ mod tests {
             "state": "PREPARED",
             "reviewer": {"invocation_id": null, "state": "NOT_STARTED"},
             "operations": [
-                {"index": 0, "path": "/tmp/a", "expected_preimage": "ABSENT", "observed_before": {"exists": false, "size": null, "sha256": null}, "intended_after_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "request_id": "r1", "state": "PREPARED"},
-                {"index": 0, "path": "/tmp/b", "expected_preimage": "ABSENT", "observed_before": {"exists": false, "size": null, "sha256": null}, "intended_after_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_id": "r2", "state": "PREPARED"}
+                {"index": 0, "path": path_a.to_string_lossy(), "expected_preimage": "ABSENT", "observed_before": {"exists": false, "size": null, "sha256": null}, "intended_after_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "request_id": "r1", "state": "PREPARED"},
+                {"index": 0, "path": path_b.to_string_lossy(), "expected_preimage": "ABSENT", "observed_before": {"exists": false, "size": null, "sha256": null}, "intended_after_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_id": "r2", "state": "PREPARED"}
             ]
         });
         let decoded = serde_json::from_value::<MutationIntent>(duplicate).unwrap();
