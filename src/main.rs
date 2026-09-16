@@ -27,6 +27,8 @@ mod agent_tests;
 #[cfg(test)]
 mod goal_backends_tests;
 #[cfg(test)]
+mod goal_hardening_tests;
+#[cfg(test)]
 mod goal_finalizer_tests;
 #[cfg(test)]
 mod goal_runner_tests;

@@ -168,6 +168,13 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     assert!(calls[1].prompt().contains("needs_replan"));
     assert!(calls[1].prompt().contains("no writes"));
     assert!(calls[2].prompt().contains("You are read-only"));
+    assert!(calls[2].prompt().contains("inspect approved workspace source"));
+    assert!(calls[2].prompt().contains("read files and search the repository"));
+    assert!(calls[2].prompt().contains("inspect Git state"));
+    assert!(calls[2].prompt().contains("strictly read-only commands"));
+    assert!(calls[2].prompt().contains("the host remains solely responsible for scope validation"));
+    assert!(calls[2].prompt().contains("postimage validation"));
+    assert!(calls[2].prompt().contains("WRITE_UTF8"));
     assert!(
         calls[3]
             .prompt()

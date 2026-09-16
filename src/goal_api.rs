@@ -592,6 +592,7 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     goal.recover_stale_running(now)?;
     reconcile_legacy_readonly_timeout_failures(goal, now)?;
     reconcile_safe_readonly_blocked_tasks(goal, now)?;
+    reconcile_safe_writer_blocked_tasks(goal, now)?;
     reconcile_readonly_transport_retryable_tasks(goal, now)?;
 
     match goal.status() {
@@ -705,6 +706,61 @@ fn reconcile_safe_readonly_blocked_tasks(
                 && no_mutation_authority
                 && budget_remains)
                 .then(|| task_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for task_id in task_ids {
+        goal.task_clear_blockers(&task_id)?;
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+fn reconcile_safe_writer_blocked_tasks(
+    goal: &mut Goal,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    let task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            let latest = task.latest_attempt()?;
+            let pre_mutation_blockers = !task.blockers().is_empty()
+                && task.blockers().iter().all(|blocker| {
+                    matches!(
+                        blocker.code(),
+                        "WRITER_BLOCKED"
+                            | "WRITER_BACKEND_ERROR"
+                            | "WRITER_OUTPUT_REJECTED"
+                            | "WRITER_OPERATION_REJECTED"
+                    )
+                });
+            let safe_attempt_history = task.attempts().iter().all(|attempt| {
+                attempt.operation_id().is_none()
+                    && attempt.scope_identity().is_none()
+                    && attempt.side_effect_class() == Some(SideEffectClass::None)
+                    && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed)
+            });
+            let safe_scope = task.worker() == WorkerKind::CodexWriter
+                && task.scope().operation_kind() != TaskOperationKind::ReadOnly
+                && task.scope().replay_safety() == ReplaySafety::VerifyBeforeRetry;
+            (task.status() == TaskStatus::Blocked
+                && pre_mutation_blockers
+                && safe_scope
+                && safe_attempt_history
+                && latest.operation_id().is_none()
+                && latest.scope_identity().is_none()
+                && latest.side_effect_class() == Some(SideEffectClass::None)
+                && latest.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed)
+                && latest.remaining_attempt_budget().unwrap_or(0) > 0
+                && latest.remaining_side_effect_budget().unwrap_or(0) > 0
+                && task.semantic_attempts_remaining() > 0)
+                .then_some(task_id.clone())
         })
         .collect::<Vec<_>>();
 
@@ -2064,6 +2120,88 @@ mod tests {
             durable.tasks()[&task_id].blockers()[0].code(),
             "TOOL_MISSING"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_retries_only_mechanically_safe_writer_blocker_before_mutation() {
+        let (root, session, store) = fixture("writer-block-safe");
+        let (mut goal, task_id) =
+            running_goal(&session, mutation_scope(), WorkerKind::CodexWriter, true);
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(2),
+            Some(1),
+        )
+        .unwrap();
+        goal.task_add_blocker(
+            &task_id,
+            crate::task::TaskBlocker::new("WRITER_BLOCKED", "writer could not inspect source", true),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        pause_goal(&mut goal, NOW).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let attempt_id = goal.tasks()[&task_id].attempts()[0].id().clone();
+
+        let resumed = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(resumed.status, GoalStatus::Running);
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        let task = &durable.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Ready);
+        assert!(task.blockers().is_empty());
+        assert_eq!(task.attempts().len(), 1);
+        assert_eq!(task.attempts()[0].id(), &attempt_id);
+        assert_eq!(task.latest_attempt().unwrap().operation_id(), None);
+        assert_eq!(
+            task.latest_attempt().unwrap().side_effect_state(),
+            Some(SideEffectState::ConfirmedNotPerformed)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_writer_after_mutation_blocks_replay_until_reconciled() {
+        let (root, session, _store) = fixture("wsam");
+        let (mut goal, task_id) =
+            running_goal(&session, mutation_scope(), WorkerKind::CodexWriter, true);
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            Some("writer-operation".into()),
+            Some("writer-scope".into()),
+            Some("write-request".into()),
+            Some(SideEffectClass::LocalMutation),
+            Some(SideEffectState::ConfirmedPerformed),
+            Some(2),
+            Some(1),
+        )
+        .unwrap();
+
+        goal.recover_stale_running(NOW).unwrap();
+
+        let task = &goal.tasks()[&task_id];
+        assert_eq!(task.status(), TaskStatus::Blocked);
+        assert!(task.blockers().iter().any(|blocker| {
+            blocker.code() == "RECOVERY_RECONCILIATION_REQUIRED"
+                && blocker.detail().contains("writer")
+        }));
         std::fs::remove_dir_all(root).unwrap();
     }
 

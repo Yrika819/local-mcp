@@ -1440,6 +1440,44 @@ impl Task {
             attempt.outcome.get_or_insert(AttemptOutcome::Interrupted);
         }
         let can_retry_attempt = self.semantic_attempts_remaining() > 0;
+        let reconciled_postcondition = self
+            .evidence
+            .iter()
+            .rev()
+            .find_map(|evidence| match evidence {
+                TaskEvidence::RecoveryReconciliation {
+                    side_effect_state,
+                    postcondition_proven,
+                    ..
+                } => Some((*side_effect_state, *postcondition_proven)),
+                _ => None,
+            });
+        if matches!(
+            reconciled_postcondition,
+            Some((SideEffectState::ConfirmedPerformed, true))
+        ) {
+            self.status = TaskStatus::Verifying;
+            self.updated_at = now.to_owned();
+            return Ok(());
+        }
+
+        let latest_side_effect_state = self
+            .latest_attempt()
+            .and_then(|attempt| attempt.side_effect_state);
+        if self.worker == WorkerKind::CodexWriter
+            && matches!(
+                latest_side_effect_state,
+                Some(SideEffectState::ConfirmedPerformed | SideEffectState::Unknown)
+            )
+        {
+            self.status = TaskStatus::Blocked;
+            self.blockers.push(TaskBlocker::recovery(
+                "stale writer attempt has side effects requiring reconciliation",
+            ));
+            self.updated_at = now.to_owned();
+            return Ok(());
+        }
+
         let proposal_only_worker = matches!(
             self.worker,
             WorkerKind::CodexReadonly | WorkerKind::CodexWriter | WorkerKind::CodexReviewer
@@ -1467,27 +1505,6 @@ impl Task {
                     "stale read-only operation exhausted its task attempt budget",
                 ));
             }
-            self.updated_at = now.to_owned();
-            return Ok(());
-        }
-
-        let reconciled_postcondition =
-            self.evidence
-                .iter()
-                .rev()
-                .find_map(|evidence| match evidence {
-                    TaskEvidence::RecoveryReconciliation {
-                        side_effect_state,
-                        postcondition_proven,
-                        ..
-                    } => Some((*side_effect_state, *postcondition_proven)),
-                    _ => None,
-                });
-        if matches!(
-            reconciled_postcondition,
-            Some((SideEffectState::ConfirmedPerformed, true))
-        ) {
-            self.status = TaskStatus::Verifying;
             self.updated_at = now.to_owned();
             return Ok(());
         }

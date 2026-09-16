@@ -156,8 +156,11 @@ async fn initialize_contract_is_frozen() {
 #[tokio::test]
 async fn job_running_completion_and_completed_poll_are_frozen() {
     let (session, cwd) = phase0_session();
-    let handle = tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(60)).await;
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let handle = tokio::task::spawn_blocking(move || {
+        release_receiver
+            .recv()
+            .expect("test must release the background job");
         Ok("{\"exit_code\":0,\"stdout\":\"done\",\"stderr\":\"\"}".to_owned())
     });
     let started = store_job(&session, "phase0-job".into(), handle, "Started")
@@ -170,7 +173,8 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
     let running: Value = serde_json::from_str(text(&running)).unwrap();
     assert_eq!(running["status"], "running");
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    release_sender.send(()).unwrap();
+    tokio::task::yield_now().await;
     let completed = poll_job(&args, &session).await.unwrap();
     let completed: Value = serde_json::from_str(text(&completed)).unwrap();
     assert_eq!(completed["exit_code"], 0);
