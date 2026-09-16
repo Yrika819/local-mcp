@@ -7,6 +7,8 @@ use crate::config;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
+use crate::mutation::{FileObservation, MutationIntent, MutationOperationIntent, MutationPreimage, MutationIntentState};
+use crate::mutation_recovery;
 use crate::planner::{PlannerBackend, planner_request_for_goal};
 use crate::readonly_worker::{ReadonlyBackend, ReadonlyError, readonly_request_for_model_backend_test};
 use crate::scheduler::{SchedulerDecision, select_next_action};
@@ -193,6 +195,45 @@ fn crash_reload_with_unknown_writer_side_effect_is_blocked_and_not_replayed() {
     let reloaded = store.load_goal(&session.id, goal.id()).unwrap();
     assert_eq!(reloaded, recovered);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_writer_reconciliation_records_confirmed_not_performed_after_reload() {
+    let root = std::env::temp_dir().join(format!("local-mcp-reconcile-{}", uuid::Uuid::new_v4()));
+    let (session, store, goal, task_id) = synthetic_goal(&root, WorkerKind::CodexWriter);
+    store.create_goal(&goal).unwrap();
+    let prepared = store
+        .mutate_goal_snapshot(&session.id, goal.id(), goal.revision(), |goal, now| {
+            goal.transition_task(&task_id, TaskStatus::Running, TaskTransitionContext::default(), now)?;
+            let target = std::fs::canonicalize(&session.cwd).unwrap().join("reconcile.txt");
+            let intent = MutationIntent::new(
+                "operation-reload".to_owned(),
+                "scope-reload".to_owned(),
+                vec![MutationOperationIntent::new(
+                    0,
+                    target,
+                    MutationPreimage::Absent,
+                    FileObservation::absent(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    "request-reload".to_owned(),
+                )],
+            )
+            .unwrap();
+            goal.task_prepare_latest_mutation_intent(&task_id, intent)
+        })
+        .unwrap();
+    let mut reloaded = store.load_goal(&session.id, prepared.id()).unwrap();
+    assert!(mutation_recovery::reconcile_goal_mutations(&mut reloaded, NOW).unwrap());
+    let task = reloaded.tasks().get(&task_id).unwrap();
+    assert_eq!(
+        task.latest_attempt().unwrap().mutation_intent().unwrap().state(),
+        MutationIntentState::ReconciledNotPerformed
+    );
+    assert!(task.evidence().iter().any(|evidence| matches!(
+        evidence,
+        crate::task::TaskEvidence::MutationReconciliation { .. }
+    )));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

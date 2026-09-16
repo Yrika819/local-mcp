@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::config;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{CheckpointReason, Goal, GoalId, GoalStatus};
+use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
     ReplaySafety, TaskOperationKind, TaskStatus, TaskTransitionContext, VerificationOutcome,
@@ -599,13 +600,14 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
         ));
     }
 
+    let mutation_reconciled = mutation_recovery::reconcile_goal_mutations(goal, now)?;
     goal.recover_stale_running(now)?;
     reconcile_legacy_readonly_timeout_failures(goal, now)?;
     reconcile_safe_readonly_blocked_tasks(goal, now)?;
     let legacy_writer_reconciled = reconcile_legacy_writer_blocked_tasks(goal, now)?;
     reconcile_safe_writer_blocked_tasks(goal, now)?;
     reconcile_readonly_transport_retryable_tasks(goal, now)?;
-    if legacy_writer_reconciled {
+    if mutation_reconciled || legacy_writer_reconciled {
         goal.add_checkpoint(CheckpointReason::Recovery, now)?;
     }
 
@@ -1144,6 +1146,7 @@ mod tests {
 
     use crate::fallback::{SideEffectClass, SideEffectState};
     use crate::goal::CheckpointReason;
+    use crate::mutation::{MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage};
     use crate::task::{
         AttemptOutcome, ReadonlyTransportRecoveryAuthorityKind, ReadonlyTransportRecoveryKind,
         ReplaySafety, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
@@ -1761,6 +1764,90 @@ mod tests {
         let durable = store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(durable.tasks()[&task_id].status(), TaskStatus::Verifying);
         assert_ne!(durable.tasks()[&task_id].status(), TaskStatus::Completed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_reconciles_writer_afterimage_and_is_idempotent_before_reviewer() {
+        use sha2::{Digest, Sha256};
+
+        let (root, session, store) = fixture("rw-after");
+        let target_dir = session.cwd.join("src");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("recovered.txt");
+        let content = b"recovered\n";
+        let digest = Sha256::digest(content)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (mut goal, task_id) = running_goal(
+            &session,
+            mutation_scope(),
+            WorkerKind::CodexWriter,
+            true,
+        );
+        let intent = MutationIntent::new(
+            "generic-writer-recovery".to_owned(),
+            "generic-writer-scope".to_owned(),
+            vec![MutationOperationIntent::new(
+                0,
+                target.clone(),
+                MutationPreimage::Absent,
+                crate::mutation::FileObservation::absent(),
+                digest,
+                "request-1".to_owned(),
+            )],
+        )
+        .unwrap();
+        goal.task_prepare_latest_mutation_intent(&task_id, intent).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let prepared = store.load_goal(&session.id, &goal_id).unwrap();
+        store
+            .mutate_goal_snapshot(&session.id, &goal_id, prepared.revision(), |goal, _| {
+                goal.task_advance_latest_mutation_intent(
+                    &task_id,
+                    "generic-writer-recovery",
+                    crate::mutation::MutationIntentUpdate::BeginOperation { index: 0 },
+                )
+            })
+            .unwrap();
+        std::fs::write(&target, content).unwrap();
+
+        let first = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        let after_first = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(first.status, GoalStatus::Running);
+        assert_eq!(after_first.tasks()[&task_id].status(), TaskStatus::Running);
+        assert_eq!(
+            after_first.tasks()[&task_id]
+                .latest_attempt()
+                .unwrap()
+                .mutation_intent()
+                .unwrap()
+                .state(),
+            MutationIntentState::ReconciledPerformed
+        );
+        assert!(after_first.tasks()[&task_id].needs_reviewer_recovery());
+        let revision_after_first = after_first.revision();
+
+        let second = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        let after_second = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(second.status, GoalStatus::Running);
+        assert_eq!(after_second.revision(), revision_after_first);
+        assert_eq!(
+            after_second.tasks()[&task_id].evidence().len(),
+            after_first.tasks()[&task_id].evidence().len()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

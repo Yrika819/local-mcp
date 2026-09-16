@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fallback::{SideEffectClass, SideEffectState};
+use crate::mutation::{MutationIntent, MutationIntentUpdate, MutationIntentState};
 use crate::orchestrator_error::OrchestratorError;
 
 macro_rules! durable_id {
@@ -377,6 +378,8 @@ pub(crate) struct TaskAttempt {
     remaining_side_effect_budget: Option<u32>,
     worker_report: Option<WorkerReport>,
     outcome: Option<AttemptOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mutation_intent: Option<MutationIntent>,
 }
 
 impl TaskAttempt {
@@ -398,6 +401,7 @@ impl TaskAttempt {
             remaining_side_effect_budget: None,
             worker_report: None,
             outcome: None,
+            mutation_intent: None,
         }
     }
 
@@ -440,6 +444,15 @@ impl TaskAttempt {
     pub(crate) fn remaining_side_effect_budget(&self) -> Option<u32> {
         self.remaining_side_effect_budget
     }
+
+    pub(crate) fn mutation_intent(&self) -> Option<&MutationIntent> {
+        self.mutation_intent.as_ref()
+    }
+
+    pub(crate) fn worker_report(&self) -> Option<&WorkerReport> {
+        self.worker_report.as_ref()
+    }
+
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,6 +482,13 @@ pub(crate) enum TaskEvidence {
     ReviewResult {
         summary: String,
         blocking_findings: u32,
+    },
+    MutationReconciliation {
+        attempt_id: AttemptId,
+        operation_id: String,
+        state: MutationIntentState,
+        side_effect_state: SideEffectState,
+        summary: String,
     },
     RecoveryReconciliation {
         summary: String,
@@ -656,6 +676,18 @@ impl Task {
 
     pub(crate) fn attempts(&self) -> &[TaskAttempt] {
         &self.attempts
+    }
+
+    pub(crate) fn needs_reviewer_recovery(&self) -> bool {
+        self.status == TaskStatus::Running
+            && self.worker == WorkerKind::CodexWriter
+            && self.latest_attempt().is_some_and(|attempt| {
+                attempt.mutation_intent().is_some_and(|intent| {
+                    intent.state() == MutationIntentState::ReconciledPerformed
+                        && intent.reviewer_state()
+                            == crate::mutation::ReviewerInvocationState::NotStarted
+                })
+            })
     }
 
     pub(crate) fn blockers(&self) -> &[TaskBlocker] {
@@ -852,6 +884,72 @@ impl Task {
                         attempt.remaining_side_effect_budget,
                     ),
                 );
+            }
+            if let Some(intent) = attempt.mutation_intent.as_ref() {
+                intent.validate()?;
+                if attempt.operation_id.as_deref() != Some(intent.operation_id()) {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "MutationIntent operation identity is not bound to its attempt".to_owned(),
+                    ));
+                }
+                if attempt.scope_identity.is_none()
+                    || attempt.side_effect_class != Some(SideEffectClass::LocalMutation)
+                {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "MutationIntent attempt metadata is incomplete".to_owned(),
+                    ));
+                }
+            }
+        }
+        let mut mutation_reconciliation_attempts = BTreeSet::new();
+        for evidence in &self.evidence {
+            let TaskEvidence::MutationReconciliation {
+                attempt_id,
+                operation_id,
+                state,
+                side_effect_state,
+                summary,
+            } = evidence
+            else {
+                continue;
+            };
+            if summary.is_empty()
+                || summary.len() > 16 * 1024
+                || !mutation_reconciliation_attempts.insert(attempt_id.clone())
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "invalid or duplicate MutationIntent reconciliation evidence".to_owned(),
+                ));
+            }
+            let attempt = self
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id() == attempt_id)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "MutationIntent reconciliation references a missing attempt".to_owned(),
+                    )
+                })?;
+            let intent = attempt.mutation_intent.as_ref().ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "MutationIntent reconciliation references an attempt without intent".to_owned(),
+                )
+            })?;
+            if intent.operation_id() != operation_id || intent.state() != *state {
+                return Err(OrchestratorError::CorruptGoal(
+                    "MutationIntent reconciliation evidence is not bound to intent state".to_owned(),
+                ));
+            }
+            let expected_side_effect = match state {
+                MutationIntentState::ReconciledNotPerformed => SideEffectState::ConfirmedNotPerformed,
+                MutationIntentState::ReconciledPerformed => SideEffectState::ConfirmedPerformed,
+                MutationIntentState::Partial | MutationIntentState::Unknown => SideEffectState::Unknown,
+                _ => return Err(OrchestratorError::CorruptGoal("invalid MutationIntent reconciliation state".to_owned())),
+            };
+            if *side_effect_state != expected_side_effect {
+                return Err(OrchestratorError::CorruptGoal(
+                    "MutationIntent reconciliation side-effect state is invalid".to_owned(),
+                ));
             }
         }
         let mut transport_evidence_attempts = BTreeSet::new();
@@ -1336,6 +1434,145 @@ impl Task {
         Ok(())
     }
 
+    pub(crate) fn prepare_latest_mutation_intent(
+        &mut self,
+        intent: MutationIntent,
+    ) -> Result<(), OrchestratorError> {
+        if self.status != TaskStatus::Running || self.worker != WorkerKind::CodexWriter {
+            return Err(OrchestratorError::InvalidDag(
+                "MutationIntent requires an active CODEX_WRITER attempt".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone();
+        let attempt = candidate.attempts.last_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal("active writer task lacks durable attempt".to_owned())
+        })?;
+        if attempt.mutation_intent.is_some() {
+            return Err(OrchestratorError::InvalidDag(
+                "MutationIntent cannot be replaced within an attempt".to_owned(),
+            ));
+        }
+        if intent.state() != crate::mutation::MutationIntentState::Prepared {
+            return Err(OrchestratorError::InvalidDag(
+                "new MutationIntent must begin in PREPARED".to_owned(),
+            ));
+        }
+        intent.validate()?;
+        attempt.operation_id = Some(intent.operation_id().to_owned());
+        attempt.scope_identity = Some(intent.scope_identity().to_owned());
+        attempt.side_effect_class = Some(SideEffectClass::LocalMutation);
+        attempt.mutation_intent = Some(intent);
+        candidate.validate_local()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn advance_latest_mutation_intent(
+        &mut self,
+        expected_operation_id: &str,
+        update: MutationIntentUpdate,
+    ) -> Result<(), OrchestratorError> {
+        if self.status != TaskStatus::Running || self.worker != WorkerKind::CodexWriter {
+            return Err(OrchestratorError::InvalidDag(
+                "MutationIntent updates require an active CODEX_WRITER attempt".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone();
+        let attempt = candidate.attempts.last_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal("active writer task lacks durable attempt".to_owned())
+        })?;
+        let intent = attempt.mutation_intent.as_mut().ok_or_else(|| {
+            OrchestratorError::InvalidDag("MutationIntent is not prepared".to_owned())
+        })?;
+        if intent.operation_id() != expected_operation_id {
+            return Err(OrchestratorError::InvalidDag(
+                "MutationIntent operation identity does not match the active attempt".to_owned(),
+            ));
+        }
+        intent.apply_update(update)?;
+        if intent.state() == MutationIntentState::Applied {
+            attempt.side_effect_state = Some(SideEffectState::ConfirmedPerformed);
+        }
+        candidate.validate_local()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_latest_mutation_intent(
+        &mut self,
+        expected_operation_id: &str,
+        state: MutationIntentState,
+        summary: String,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.is_terminal() {
+            return Err(invalid_task_transition(
+                self.status,
+                self.status,
+                "MutationIntent reconciliation cannot mutate a terminal task",
+            ));
+        }
+        if summary.is_empty() || summary.len() > 16 * 1024 {
+            return Err(OrchestratorError::CorruptGoal(
+                "MutationIntent reconciliation summary is out of bounds".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone();
+        let attempt = candidate.attempts.last_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal("MutationIntent task lacks durable attempt".to_owned())
+        })?;
+        let attempt_id = attempt.id.clone();
+        let intent = attempt.mutation_intent.as_mut().ok_or_else(|| {
+            OrchestratorError::InvalidDag("MutationIntent is not present".to_owned())
+        })?;
+        if intent.operation_id() != expected_operation_id {
+            return Err(OrchestratorError::InvalidDag(
+                "MutationIntent operation identity does not match reconciliation".to_owned(),
+            ));
+        }
+        let side_effect_state = match state {
+            MutationIntentState::ReconciledNotPerformed => SideEffectState::ConfirmedNotPerformed,
+            MutationIntentState::ReconciledPerformed => SideEffectState::ConfirmedPerformed,
+            MutationIntentState::Partial | MutationIntentState::Unknown => SideEffectState::Unknown,
+            _ => {
+                return Err(OrchestratorError::InvalidDag(
+                    "invalid MutationIntent reconciliation state".to_owned(),
+                ));
+            }
+        };
+        if let Some(existing) = candidate.evidence.iter().find_map(|evidence| match evidence {
+            TaskEvidence::MutationReconciliation {
+                attempt_id: existing_attempt,
+                operation_id,
+                state: existing_state,
+                ..
+            } if existing_attempt == &attempt_id && operation_id == expected_operation_id => {
+                Some(*existing_state)
+            }
+            _ => None,
+        }) {
+            if existing != state {
+                return Err(OrchestratorError::CorruptGoal(
+                    "MutationIntent reconciliation outcome cannot be rewritten".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        intent.apply_update(MutationIntentUpdate::Reconcile { state })?;
+        attempt.side_effect_state = Some(side_effect_state);
+        candidate.evidence.push(TaskEvidence::MutationReconciliation {
+            attempt_id,
+            operation_id: expected_operation_id.to_owned(),
+            state,
+            side_effect_state,
+            summary,
+        });
+        candidate.updated_at = now.to_owned();
+        candidate.validate_local()?;
+        *self = candidate;
+        Ok(())
+    }
+
     pub(crate) fn mark_latest_attempt_interrupted(
         &mut self,
         now: &str,
@@ -1590,9 +1827,16 @@ impl Task {
         if self.status != TaskStatus::Running {
             return Ok(());
         }
+        let mut attempt_changed = false;
         if let Some(attempt) = self.attempts.last_mut() {
-            attempt.finished_at.get_or_insert_with(|| now.to_owned());
-            attempt.outcome.get_or_insert(AttemptOutcome::Interrupted);
+            if attempt.finished_at.is_none() {
+                attempt.finished_at = Some(now.to_owned());
+                attempt_changed = true;
+            }
+            if attempt.outcome.is_none() {
+                attempt.outcome = Some(AttemptOutcome::Interrupted);
+                attempt_changed = true;
+            }
         }
         let can_retry_attempt = self.semantic_attempts_remaining() > 0;
         let reconciled_postcondition = self
@@ -1605,12 +1849,23 @@ impl Task {
                     postcondition_proven,
                     ..
                 } => Some((*side_effect_state, *postcondition_proven)),
+                TaskEvidence::MutationReconciliation {
+                    state: MutationIntentState::ReconciledPerformed,
+                    side_effect_state,
+                    ..
+                } => Some((*side_effect_state, true)),
                 _ => None,
             });
         if matches!(
             reconciled_postcondition,
             Some((SideEffectState::ConfirmedPerformed, true))
         ) {
+            if self.needs_reviewer_recovery() {
+                if attempt_changed {
+                    self.updated_at = now.to_owned();
+                }
+                return Ok(());
+            }
             self.status = TaskStatus::Verifying;
             self.updated_at = now.to_owned();
             return Ok(());
@@ -2586,5 +2841,75 @@ mod tests {
             },
         ])
         .unwrap();
+    }
+
+    #[test]
+    fn task_attempt_without_mutation_intent_remains_historically_absent() {
+        let mut task = task(WorkerKind::CodexWriter);
+        task.scope = TaskScope::new(
+            vec![],
+            vec![],
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        );
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&task).unwrap();
+        value["attempts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("mutation_intent");
+        let decoded: Task = serde_json::from_value(value).unwrap();
+        assert!(decoded.latest_attempt().unwrap().mutation_intent().is_none());
+        assert!(
+            serde_json::to_value(&decoded).unwrap()["attempts"][0]
+                .get("mutation_intent")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn active_writer_can_attach_only_a_prepared_host_intent() {
+        let mut task = task(WorkerKind::CodexWriter);
+        task.scope = TaskScope::new(
+            vec![],
+            vec![],
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        );
+        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW)
+            .unwrap();
+        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW)
+            .unwrap();
+        let intent = crate::mutation::MutationIntent::new(
+            "operation-1".to_owned(),
+            "scope-1".to_owned(),
+            vec![crate::mutation::MutationOperationIntent::new(
+                0,
+                PathBuf::from("/tmp/target.txt"),
+                crate::mutation::MutationPreimage::Absent,
+                crate::mutation::FileObservation::absent(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "request-1".to_owned(),
+            )],
+        )
+        .unwrap();
+        task.prepare_latest_mutation_intent(intent).unwrap();
+        assert_eq!(
+            task.latest_attempt().unwrap().mutation_intent().unwrap().state(),
+            crate::mutation::MutationIntentState::Prepared
+        );
     }
 }

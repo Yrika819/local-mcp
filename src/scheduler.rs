@@ -48,6 +48,7 @@ pub(crate) enum SchedulerDecision {
     Replan { trigger_task_id: TaskId },
     RunReadonly { task_id: TaskId },
     RunWriter { task_id: TaskId },
+    RunReviewer { task_id: TaskId },
     UnsupportedWorker { task_id: TaskId, worker: WorkerKind },
     NoAction { reason: SchedulerNoActionReason },
 }
@@ -61,6 +62,7 @@ impl SchedulerDecision {
             }
             | Self::RunReadonly { task_id }
             | Self::RunWriter { task_id }
+            | Self::RunReviewer { task_id }
             | Self::UnsupportedWorker { task_id, .. } => Some(task_id),
             Self::PlanInitial | Self::VerifyGoal | Self::NoAction { .. } => None,
         }
@@ -75,6 +77,7 @@ pub(crate) enum SchedulerAction {
     Replan,
     RunReadonly,
     RunWriter,
+    RunReviewer,
     UnsupportedWorker,
     NoAction,
 }
@@ -192,6 +195,17 @@ pub(crate) fn select_next_action(goal: &Goal) -> Result<SchedulerDecision, Sched
             });
         }
         GoalStatus::Planning | GoalStatus::Running | GoalStatus::Replanning => {}
+    }
+
+    if let Some((task_id, _)) = goal
+        .tasks()
+        .iter()
+        .filter(|(_, task)| task.needs_reviewer_recovery())
+        .min_by_key(|(task_id, task)| task_order_key(task_id, task))
+    {
+        return Ok(SchedulerDecision::RunReviewer {
+            task_id: task_id.clone(),
+        });
     }
 
     if let Some((task_id, _)) = ordered_tasks(goal, TaskStatus::Verifying).next() {
@@ -492,6 +506,21 @@ where
                 Err(error) => map_writer_error(&error),
             }
         }
+        SchedulerDecision::RunReviewer { task_id } => {
+            match writer::resume_writer_reviewer(
+                store,
+                session,
+                goal_id,
+                task_id,
+                revision_before,
+                reviewer_backend,
+            )
+            .await
+            {
+                Ok(_) => SchedulerStepOutcome::Applied,
+                Err(error) => map_writer_error(&error),
+            }
+        }
         SchedulerDecision::UnsupportedWorker { worker, .. } => {
             SchedulerStepOutcome::UnsupportedWorker(*worker)
         }
@@ -521,6 +550,7 @@ fn action_for_decision(decision: &SchedulerDecision) -> SchedulerAction {
         SchedulerDecision::Replan { .. } => SchedulerAction::Replan,
         SchedulerDecision::RunReadonly { .. } => SchedulerAction::RunReadonly,
         SchedulerDecision::RunWriter { .. } => SchedulerAction::RunWriter,
+        SchedulerDecision::RunReviewer { .. } => SchedulerAction::RunReviewer,
         SchedulerDecision::UnsupportedWorker { .. } => SchedulerAction::UnsupportedWorker,
         SchedulerDecision::NoAction { .. } => SchedulerAction::NoAction,
     }

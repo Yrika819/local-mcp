@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config;
+use crate::mutation::{MutationIntent, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
     ReplaySafety, Task, TaskDependency, TaskId, TaskOperationKind, TaskScope, TaskStatus,
@@ -1119,6 +1120,58 @@ impl Goal {
         Ok(())
     }
 
+    pub(crate) fn task_prepare_latest_mutation_intent(
+        &mut self,
+        task_id: &TaskId,
+        intent: MutationIntent,
+    ) -> Result<(), OrchestratorError> {
+        let mut candidate = self.clone();
+        candidate
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .prepare_latest_mutation_intent(intent)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn task_advance_latest_mutation_intent(
+        &mut self,
+        task_id: &TaskId,
+        expected_operation_id: &str,
+        update: MutationIntentUpdate,
+    ) -> Result<(), OrchestratorError> {
+        let mut candidate = self.clone();
+        candidate
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .advance_latest_mutation_intent(expected_operation_id, update)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn task_reconcile_latest_mutation_intent(
+        &mut self,
+        task_id: &TaskId,
+        expected_operation_id: &str,
+        state: crate::mutation::MutationIntentState,
+        summary: String,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        let mut candidate = self.clone();
+        candidate
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .reconcile_latest_mutation_intent(expected_operation_id, state, summary, now)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
     pub(crate) fn reconcile_legacy_writer_pre_mutation_task(
         &mut self,
         task_id: &TaskId,
@@ -1620,8 +1673,9 @@ impl Goal {
         let mut changed = false;
         for task in candidate.tasks.values_mut() {
             if task.status() == TaskStatus::Running {
+                let before = task.clone();
                 task.recover_stale_running(now)?;
-                changed = true;
+                changed |= *task != before;
             }
         }
         if changed

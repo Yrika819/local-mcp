@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,7 +15,12 @@ use crate::agent::AgentError;
 use crate::execution;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalId, GoalStatus};
+use crate::mutation::{
+    FileObservation, MutationIntent, MutationIntentUpdate, MutationOperationIntent,
+    MutationPreimage,
+};
 use crate::orchestrator_error::OrchestratorError;
+use crate::sandbox;
 use crate::task::{
     TaskBlocker, TaskEvidence, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
     VerificationSpec, WorkerKind, WorkerReport,
@@ -75,6 +82,28 @@ pub(crate) trait WriterBackend {
 
 pub(crate) trait ReviewerBackend {
     fn review(&self, request: &ReviewerRequest) -> Result<Vec<u8>, WriterError>;
+}
+
+pub(crate) trait WriteBoundary {
+    fn write<'a>(
+        &'a self,
+        absolute: &'a Path,
+        parent: &'a Path,
+        content: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + 'a>>;
+}
+
+struct ExecutionWriteBoundary;
+
+impl WriteBoundary for ExecutionWriteBoundary {
+    fn write<'a>(
+        &'a self,
+        absolute: &'a Path,
+        parent: &'a Path,
+        content: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + 'a>> {
+        Box::pin(execution::write_file_content(absolute, parent, content))
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -305,13 +334,6 @@ struct MaterializedWrite {
     before: FileState,
 }
 
-#[derive(Debug)]
-struct ApplyFailure {
-    message: String,
-    request_ids: Vec<String>,
-    causality_unknown: bool,
-}
-
 pub(crate) fn begin_writer_attempt(
     store: &TaskStore,
     session: &config::Session,
@@ -375,6 +397,27 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
     expected_revision: u64,
     writer: &W,
     reviewer: &R,
+) -> Result<Goal, WriterError> {
+    let boundary = ExecutionWriteBoundary;
+    run_writer_attempt_with_boundary(
+        store, session, goal_id, task_id, expected_revision, writer, reviewer, &boundary,
+    )
+    .await
+}
+
+pub(crate) async fn run_writer_attempt_with_boundary<
+    W: WriterBackend,
+    R: ReviewerBackend,
+    B: WriteBoundary,
+>(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    expected_revision: u64,
+    writer: &W,
+    reviewer: &R,
+    boundary: &B,
 ) -> Result<Goal, WriterError> {
     let request = begin_writer_attempt(store, session, goal_id, task_id, expected_revision)?;
 
@@ -481,55 +524,107 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
     );
     let operation_id = format!("phase5-writer:{}", request.attempt_id);
 
-    let request_ids = match apply_operations(&operations).await {
-        Ok(request_ids) => request_ids,
-        Err(failure) => {
-            let persisted = persist_mutation_failure(
-                store,
-                session,
-                goal_id,
-                task_id,
-                &request,
-                &result.summary,
-                &report_digest,
-                &operation_id,
-                &scope_identity,
-                &operations,
-                &failure,
-            )?;
-            let _ = persisted;
-            return Err(WriterError::MutationFailed(failure.message));
+    let request_ids = operations
+        .iter()
+        .map(|_| Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    let intent = MutationIntent::new(
+        operation_id.clone(),
+        scope_identity.clone(),
+        operations
+            .iter()
+            .zip(&request_ids)
+            .enumerate()
+            .map(|(index, (operation, request_id))| {
+                MutationOperationIntent::new(
+                    index as u32,
+                    operation.path.clone(),
+                    mutation_preimage(&operation.expected_preimage),
+                    mutation_observation(&operation.before),
+                    sha256_hex(operation.content.as_bytes()),
+                    request_id.clone(),
+                )
+            })
+            .collect(),
+    )
+    .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
+    let mut durable = store.mutate_goal_snapshot(
+        &session.id,
+        goal_id,
+        request.goal_revision,
+        |goal, _now| {
+            ensure_active_attempt_store(goal, task_id, &request)?;
+            goal.task_prepare_latest_mutation_intent(task_id, intent.clone())?;
+            for request_id in &request_ids {
+                goal.task_bind_latest_attempt_execution(
+                    task_id,
+                    None,
+                    None,
+                    Some(request_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+
+    for (index, (operation, request_id)) in operations.iter().zip(&request_ids).enumerate() {
+        durable = store.mutate_goal_snapshot(
+            &session.id,
+            goal_id,
+            durable.revision(),
+            |goal, _now| {
+                ensure_active_attempt_store(goal, task_id, &request)?;
+                goal.task_advance_latest_mutation_intent(
+                    task_id,
+                    &operation_id,
+                    MutationIntentUpdate::BeginOperation {
+                        index: index as u32,
+                    },
+                )?;
+                Ok(())
+            },
+        )?;
+        let output = boundary
+            .write(&operation.path, &operation.parent, &operation.content)
+            .await
+            .map_err(|error| WriterError::MutationFailed(error.to_string()))?;
+        execution::render_output(output)
+            .map_err(|error| WriterError::MutationFailed(error.to_string()))?;
+        let post = observe_file_state(&operation.path)?;
+        let expected_digest = sha256_hex(operation.content.as_bytes());
+        if !post.exists || post.sha256.as_deref() != Some(expected_digest.as_str()) {
+            return Err(WriterError::MutationFailed(format!(
+                "postimage mismatch for {}",
+                operation.path.display()
+            )));
         }
-    };
+        durable = store.mutate_goal_snapshot(
+            &session.id,
+            goal_id,
+            durable.revision(),
+            |goal, _now| {
+                ensure_active_attempt_store(goal, task_id, &request)?;
+                goal.task_advance_latest_mutation_intent(
+                    task_id,
+                    &operation_id,
+                    MutationIntentUpdate::CompleteOperation {
+                        index: index as u32,
+                    },
+                )?;
+                Ok(())
+            },
+        )?;
+        let _ = request_id;
+    }
 
     let post_states = operations
         .iter()
         .map(|operation| observe_file_state(&operation.path))
         .collect::<Result<Vec<_>, _>>()?;
-    for (operation, post) in operations.iter().zip(&post_states) {
-        let expected_digest = sha256_hex(operation.content.as_bytes());
-        if !post.exists || post.sha256.as_deref() != Some(expected_digest.as_str()) {
-            let failure = ApplyFailure {
-                message: format!("postimage mismatch for {}", operation.path.display()),
-                request_ids: request_ids.clone(),
-                causality_unknown: true,
-            };
-            persist_mutation_failure(
-                store,
-                session,
-                goal_id,
-                task_id,
-                &request,
-                &result.summary,
-                &report_digest,
-                &operation_id,
-                &scope_identity,
-                &operations,
-                &failure,
-            )?;
-            return Err(WriterError::MutationFailed(failure.message));
-        }
-    }
 
     let changed_paths = operations
         .iter()
@@ -540,7 +635,7 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
         .collect::<Vec<_>>();
 
     let post_snapshot =
-        store.mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, _now| {
+        store.mutate_goal_snapshot(&session.id, goal_id, durable.revision(), |goal, _now| {
             ensure_active_attempt_store(goal, task_id, &request)?;
             goal.task_record_latest_worker_report(
                 task_id,
@@ -580,7 +675,7 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
             Ok(())
         })?;
 
-    let reviewer_request = ReviewerRequest {
+    let mut reviewer_request = ReviewerRequest {
         goal_id: post_snapshot.id().as_str().to_owned(),
         task_id: task_id.as_str().to_owned(),
         attempt_id: request.attempt_id.clone(),
@@ -596,8 +691,27 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
                 after_sha256: post.sha256.clone(),
                 size: post.size,
             })
-            .collect(),
+        .collect(),
     };
+
+    let reviewer_invocation_id = format!("reviewer:{}", request.attempt_id);
+    let reviewer_snapshot = store.mutate_goal_snapshot(
+        &session.id,
+        goal_id,
+        post_snapshot.revision(),
+        |goal, _now| {
+            ensure_active_attempt_store(goal, task_id, &request)?;
+            goal.task_advance_latest_mutation_intent(
+                task_id,
+                &operation_id,
+                MutationIntentUpdate::BeginReviewer {
+                    invocation_id: reviewer_invocation_id.clone(),
+                },
+            )?;
+            Ok(())
+        },
+    )?;
+    reviewer_request.goal_revision = reviewer_snapshot.revision();
 
     let review_raw = match reviewer.review(&reviewer_request) {
         Ok(raw) => raw,
@@ -656,6 +770,11 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
                         blocking_findings: review.blocking_findings,
                     },
                 )?;
+                goal.task_advance_latest_mutation_intent(
+                    task_id,
+                    &operation_id,
+                    MutationIntentUpdate::CompleteReviewer,
+                )?;
                 if gate_exceeded {
                     goal.task_add_blocker(
                         task_id,
@@ -685,6 +804,177 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
                 Ok(())
             },
         )
+        .map_err(WriterError::from)
+}
+
+/// Continue the reviewer leg of a Writer attempt whose filesystem mutation was
+/// durably reconciled as performed. This route never calls the Writer backend
+/// and never creates a second attempt or replays a filesystem operation.
+pub(crate) async fn resume_writer_reviewer<R: ReviewerBackend>(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    expected_revision: u64,
+    reviewer: &R,
+) -> Result<Goal, WriterError> {
+    let snapshot = store.load_goal(&session.id, goal_id)?;
+    if snapshot.revision() != expected_revision {
+        return Err(WriterError::Store(OrchestratorError::RevisionConflict {
+            expected: expected_revision,
+            actual: snapshot.revision(),
+        }));
+    }
+    validate_goal_session_binding(&snapshot, session).map_err(WriterError::from)?;
+    let task = snapshot
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| WriterError::AuthorityViolation("reviewer Task is missing".to_owned()))?;
+    if !task.needs_reviewer_recovery() {
+        return Err(WriterError::AuthorityViolation(
+            "reviewer recovery requires a reconciled performed Writer attempt".to_owned(),
+        ));
+    }
+    let attempt = task
+        .latest_attempt()
+        .ok_or_else(|| WriterError::AuthorityViolation("reviewer Task lacks an Attempt".to_owned()))?;
+    let intent = attempt
+        .mutation_intent()
+        .ok_or_else(|| WriterError::AuthorityViolation("reviewer recovery lacks MutationIntent".to_owned()))?;
+    let writer_summary = attempt
+        .worker_report()
+        .map(|report| report.summary().to_owned())
+        .unwrap_or_else(|| "recovered host-observed Writer mutation".to_owned());
+    let files = intent
+        .operations()
+        .iter()
+        .map(|operation| {
+            let current = observe_file_state(operation.path())?;
+            Ok(ReviewFileEvidence {
+                path: operation.path().to_path_buf(),
+                before_sha256: match operation.expected_preimage() {
+                    crate::mutation::MutationPreimage::Absent => None,
+                    crate::mutation::MutationPreimage::Sha256 { sha256 } => Some(sha256.clone()),
+                },
+                after_sha256: current.sha256.clone(),
+                size: current.size,
+            })
+        })
+        .collect::<Result<Vec<_>, WriterError>>()?;
+    let operation_id = intent.operation_id().to_owned();
+    let attempt_id = attempt.id().as_str().to_owned();
+    let mut request = ReviewerRequest {
+        goal_id: snapshot.id().as_str().to_owned(),
+        task_id: task_id.as_str().to_owned(),
+        attempt_id: attempt_id.clone(),
+        goal_revision: snapshot.revision(),
+        plan_revision: snapshot.plan_revision(),
+        writer_summary,
+        files,
+    };
+    let invocation_id = format!("reviewer:{attempt_id}");
+    let reviewer_snapshot = store.mutate_goal_snapshot(
+        &session.id,
+        goal_id,
+        snapshot.revision(),
+        |goal, _now| {
+            ensure_reviewer_context_store(goal, task_id, &request)?;
+            goal.task_advance_latest_mutation_intent(
+                task_id,
+                &operation_id,
+                MutationIntentUpdate::BeginReviewer { invocation_id: invocation_id.clone() },
+            )?;
+            Ok(())
+        },
+    )?;
+    request.goal_revision = reviewer_snapshot.revision();
+
+    let review_raw = match reviewer.review(&request) {
+        Ok(raw) => raw,
+        Err(error) => {
+            let detail = error.to_string();
+            block_after_mutation(
+                store,
+                session,
+                goal_id,
+                task_id,
+                &request,
+                "REVIEWER_BACKEND_ERROR",
+                &detail,
+            )?;
+            return Err(error);
+        }
+    };
+    let review = match parse_and_validate_reviewer_result(&review_raw, &request) {
+        Ok(review) => review,
+        Err(error) => {
+            let detail = error.to_string();
+            block_after_mutation(
+                store,
+                session,
+                goal_id,
+                task_id,
+                &request,
+                "REVIEWER_OUTPUT_REJECTED",
+                &detail,
+            )?;
+            return Err(error);
+        }
+    };
+
+    store
+        .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
+            ensure_reviewer_context_store(goal, task_id, &request)?;
+            let gate_exceeded = goal.tasks()[task_id]
+                .verification_specs()
+                .iter()
+                .any(|spec| {
+                    matches!(
+                        spec,
+                        VerificationSpec::ReviewGate { max_blocking_findings }
+                            if review.blocking_findings > *max_blocking_findings
+                    )
+                });
+            goal.task_add_evidence(
+                task_id,
+                TaskEvidence::ReviewResult {
+                    summary: review.summary.clone(),
+                    blocking_findings: review.blocking_findings,
+                },
+            )?;
+            goal.task_advance_latest_mutation_intent(
+                task_id,
+                &operation_id,
+                MutationIntentUpdate::CompleteReviewer,
+            )?;
+            if gate_exceeded {
+                goal.task_add_blocker(
+                    task_id,
+                    TaskBlocker::new(
+                        "REVIEW_GATE_BLOCKED",
+                        format!(
+                            "reviewer reported {} blocking finding(s)",
+                            review.blocking_findings
+                        ),
+                        true,
+                    ),
+                )?;
+                goal.transition_task(
+                    task_id,
+                    TaskStatus::Blocked,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+            } else {
+                goal.transition_task(
+                    task_id,
+                    TaskStatus::Verifying,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+            }
+            Ok(())
+        })
         .map_err(WriterError::from)
 }
 
@@ -1175,43 +1465,6 @@ fn preimage_matches(state: &FileState, expectation: &PreimageExpectation) -> boo
     }
 }
 
-async fn apply_operations(operations: &[MaterializedWrite]) -> Result<Vec<String>, ApplyFailure> {
-    let mut request_ids = Vec::with_capacity(operations.len());
-    for operation in operations {
-        let current = observe_file_state(&operation.path).map_err(|error| ApplyFailure {
-            message: error.to_string(),
-            request_ids: request_ids.clone(),
-            causality_unknown: true,
-        })?;
-        if !preimage_matches(&current, &operation.expected_preimage) {
-            return Err(ApplyFailure {
-                message: format!(
-                    "preimage changed after validation for {}",
-                    operation.path.display()
-                ),
-                request_ids,
-                causality_unknown: true,
-            });
-        }
-        let request_id = Uuid::new_v4().to_string();
-        request_ids.push(request_id);
-        let output =
-            execution::write_file_content(&operation.path, &operation.parent, &operation.content)
-                .await
-                .map_err(|error| ApplyFailure {
-                    message: error.to_string(),
-                    request_ids: request_ids.clone(),
-                    causality_unknown: false,
-                })?;
-        execution::render_output(output).map_err(|error| ApplyFailure {
-            message: error.to_string(),
-            request_ids: request_ids.clone(),
-            causality_unknown: false,
-        })?;
-    }
-    Ok(request_ids)
-}
-
 fn finish_valid_non_mutating_result(
     store: &TaskStore,
     session: &config::Session,
@@ -1276,99 +1529,6 @@ fn block_before_mutation(
             goal.task_add_blocker(
                 task_id,
                 TaskBlocker::new(code.to_owned(), detail.to_owned(), true),
-            )?;
-            goal.transition_task(
-                task_id,
-                TaskStatus::Blocked,
-                TaskTransitionContext::default(),
-                now,
-            )
-        })
-        .map_err(WriterError::from)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn persist_mutation_failure(
-    store: &TaskStore,
-    session: &config::Session,
-    goal_id: &GoalId,
-    task_id: &TaskId,
-    request: &WriterRequest,
-    summary: &str,
-    report_digest: &str,
-    operation_id: &str,
-    scope_identity: &str,
-    operations: &[MaterializedWrite],
-    failure: &ApplyFailure,
-) -> Result<Goal, WriterError> {
-    let mut states = Vec::with_capacity(operations.len());
-    let mut observation_failed = false;
-    let mut changed_paths = Vec::new();
-    for operation in operations {
-        match observe_file_state(&operation.path) {
-            Ok(state) => {
-                if state != operation.before {
-                    changed_paths.push(operation.path.clone());
-                }
-                states.push(Some(state));
-            }
-            Err(_) => {
-                observation_failed = true;
-                states.push(None);
-            }
-        }
-    }
-    let side_effect_state = if failure.causality_unknown || observation_failed {
-        SideEffectState::Unknown
-    } else if changed_paths.is_empty() {
-        SideEffectState::ConfirmedNotPerformed
-    } else {
-        SideEffectState::ConfirmedPerformed
-    };
-
-    store
-        .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
-            ensure_active_attempt_store(goal, task_id, request)?;
-            goal.task_record_latest_worker_report(
-                task_id,
-                WorkerReport::new(summary.to_owned(), changed_paths.clone()),
-            )?;
-            let attempt_id = goal.tasks()[task_id]
-                .latest_attempt()
-                .expect("active attempt checked")
-                .id()
-                .clone();
-            goal.task_add_evidence(
-                task_id,
-                TaskEvidence::WorkerReport {
-                    attempt_id,
-                    report_digest: report_digest.to_owned(),
-                },
-            )?;
-            bind_execution_metadata(
-                goal,
-                task_id,
-                operation_id,
-                scope_identity,
-                &failure.request_ids,
-                side_effect_state,
-            )?;
-            for (operation, state) in operations.iter().zip(&states) {
-                if let Some(state) = state {
-                    goal.task_add_evidence(
-                        task_id,
-                        TaskEvidence::FileSnapshot {
-                            path: operation.path.clone(),
-                            exists: state.exists,
-                            size: state.size,
-                            sha256: state.sha256.clone(),
-                        },
-                    )?;
-                }
-            }
-            goal.task_add_blocker(
-                task_id,
-                TaskBlocker::new("WRITER_MUTATION_FAILED", failure.message.clone(), true),
             )?;
             goal.transition_task(
                 task_id,
@@ -1517,6 +1677,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
+    match preimage {
+        PreimageExpectation::Absent => MutationPreimage::Absent,
+        PreimageExpectation::Sha256 { sha256 } => MutationPreimage::Sha256 {
+            sha256: sha256.clone(),
+        },
+    }
+}
+
+fn mutation_observation(state: &FileState) -> FileObservation {
+    if state.exists {
+        FileObservation::exists(
+            state.size.unwrap_or(0),
+            state.sha256.clone().unwrap_or_default(),
+        )
+    } else {
+        FileObservation::absent()
+    }
+}
+
 #[cfg(test)]
 fn parse_writer_result_for_test(raw: &[u8]) -> Result<WriterResult, String> {
     serde_json::from_slice(raw).map_err(|error| error.to_string())
@@ -1525,6 +1705,7 @@ fn parse_writer_result_for_test(raw: &[u8]) -> Result<WriterResult, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox;
 
     #[test]
     fn writer_status_completed_is_not_in_the_host_defined_set() {
@@ -1781,6 +1962,174 @@ mod tests {
         .unwrap_err();
         assert!(lease_error.to_string().contains("WORKSPACE_MUTATION"));
 
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    struct InspectingWriteBoundary<'a> {
+        store: &'a TaskStore,
+        session: &'a crate::config::Session,
+        goal_id: &'a crate::goal::GoalId,
+        task_id: &'a crate::task::TaskId,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WriteBoundary for InspectingWriteBoundary<'_> {
+        fn write<'a>(
+            &'a self,
+            _absolute: &'a std::path::Path,
+            _parent: &'a std::path::Path,
+            _content: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + 'a>>
+        {
+            Box::pin(async move {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let goal = self.store.load_goal(&self.session.id, self.goal_id).unwrap();
+                let task = goal.tasks().get(self.task_id).unwrap();
+                assert_eq!(
+                    task.latest_attempt()
+                        .unwrap()
+                        .mutation_intent()
+                        .unwrap()
+                        .state(),
+                    crate::mutation::MutationIntentState::Applying
+                );
+                anyhow::bail!("injected write boundary failure")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_enters_write_boundary_only_after_durable_prepare() {
+        let fixture = lease_fixture();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let boundary = InspectingWriteBoundary {
+            store: &fixture.store,
+            session: &fixture.session,
+            goal_id: &fixture.goal_id,
+            task_id: &fixture.first,
+            calls: calls.clone(),
+        };
+        let _ = run_writer_attempt_with_boundary(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            fixture.revision,
+            &AbsentFileWriter,
+            &PassingReviewer,
+            &boundary,
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    struct WriteThenFailBoundary;
+
+    impl WriteBoundary for WriteThenFailBoundary {
+        fn write<'a>(
+            &'a self,
+            absolute: &'a std::path::Path,
+            _parent: &'a std::path::Path,
+            content: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + 'a>>
+        {
+            Box::pin(async move {
+                std::fs::write(absolute, content)?;
+                anyhow::bail!("injected crash after successful filesystem write")
+            })
+        }
+    }
+
+    struct RecoveredReviewer;
+
+    impl ReviewerBackend for RecoveredReviewer {
+        fn review(&self, request: &ReviewerRequest) -> Result<Vec<u8>, WriterError> {
+            Ok(serde_json::json!({
+                "goal_id": request.goal_id(),
+                "task_id": request.task_id(),
+                "attempt_id": request.attempt_id(),
+                "goal_revision": request.goal_revision(),
+                "plan_revision": request.plan_revision(),
+                "summary": "recovered review completed",
+                "blocking_findings": 0,
+                "evidence": [{"kind":"recovery","value":"existing mutation reviewed"}]
+            })
+            .to_string()
+            .into_bytes())
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_write_before_checkpoint_reconciles_as_performed() {
+        let fixture = lease_fixture();
+        let error = run_writer_attempt_with_boundary(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            fixture.revision,
+            &AbsentFileWriter,
+            &PassingReviewer,
+            &WriteThenFailBoundary,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("successful filesystem write"));
+        let mut recovered = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert!(crate::mutation_recovery::reconcile_goal_mutations(&mut recovered, "2026-09-16T00:00:01Z").unwrap());
+        recovered.recover_stale_running("2026-09-16T00:00:02Z").unwrap();
+        let stored_revision = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap()
+            .revision();
+        recovered = fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &fixture.goal_id,
+                stored_revision,
+                |goal, _| {
+                    *goal = recovered.clone();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let task = recovered.tasks().get(&fixture.first).unwrap();
+        assert_eq!(task.status(), TaskStatus::Running);
+        assert!(task.needs_reviewer_recovery());
+        assert_eq!(task.latest_attempt().unwrap().side_effect_state(), Some(SideEffectState::ConfirmedPerformed));
+        assert_eq!(
+            crate::scheduler::select_next_action(&recovered).unwrap(),
+            crate::scheduler::SchedulerDecision::RunReviewer {
+                task_id: fixture.first.clone()
+            }
+        );
+        let reviewed = resume_writer_reviewer(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            recovered.revision(),
+            &RecoveredReviewer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reviewed.tasks()[&fixture.first].status(), TaskStatus::Verifying);
+        assert_eq!(
+            reviewed.tasks()[&fixture.first]
+                .latest_attempt()
+                .unwrap()
+                .mutation_intent()
+                .unwrap()
+                .reviewer_state(),
+            crate::mutation::ReviewerInvocationState::Persisted
+        );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

@@ -10,6 +10,8 @@ mod goal_finalizer;
 mod goal_runner;
 mod goal_verifier;
 mod mcp;
+mod mutation;
+mod mutation_recovery;
 mod orchestrator_error;
 mod planner;
 mod readonly_worker;

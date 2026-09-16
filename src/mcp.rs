@@ -673,6 +673,7 @@ fn trace_action_name(action: &goal_runner::GoalRunTraceAction) -> &'static str {
             crate::scheduler::SchedulerAction::Replan => "REPLAN",
             crate::scheduler::SchedulerAction::RunReadonly => "RUN_READONLY",
             crate::scheduler::SchedulerAction::RunWriter => "RUN_WRITER",
+            crate::scheduler::SchedulerAction::RunReviewer => "RUN_REVIEWER",
             crate::scheduler::SchedulerAction::UnsupportedWorker => "UNSUPPORTED_WORKER",
             crate::scheduler::SchedulerAction::NoAction => "NO_ACTION",
         },
