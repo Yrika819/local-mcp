@@ -174,9 +174,18 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
     assert_eq!(running["status"], "running");
 
     release_sender.send(()).unwrap();
-    tokio::task::yield_now().await;
-    let completed = poll_job(&args, &session).await.unwrap();
-    let completed: Value = serde_json::from_str(text(&completed)).unwrap();
+    let mut completed = None;
+    for _ in 0..100 {
+        let polled = poll_job(&args, &session).await.unwrap();
+        let value: Value = serde_json::from_str(text(&polled)).unwrap();
+        if value["status"] == "running" {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        completed = Some(value);
+        break;
+    }
+    let completed = completed.expect("released background job must complete within the bounded poll");
     assert_eq!(completed["exit_code"], 0);
     assert_eq!(completed["stdout"], "done");
     assert!(
