@@ -1,0 +1,59 @@
+{
+  "schema": "goal-orchestrator-v1-transition-matrix",
+  "source_commit": "118f740318890af71d107541d7c97b1876bc5bab",
+  "authority_rule": "model output is advisory; durable mutation is host-owned",
+  "goal_statuses": [
+    "PLANNING", "RUNNING", "REPLANNING", "PAUSING", "PAUSED", "BLOCKED",
+    "VERIFYING", "CANCELLING", "COMPLETED", "FAILED", "CANCELLED"
+  ],
+  "task_statuses": [
+    "PENDING", "READY", "RUNNING", "BLOCKED", "RETRYABLE", "NEEDS_REPLAN",
+    "VERIFYING", "COMPLETED", "FAILED", "CANCELLED"
+  ],
+  "worker_kinds": [
+    "LOCAL_OPERATION", "CODEX_READONLY", "CODEX_WRITER", "CODEX_REVIEWER", "VERIFIER"
+  ],
+  "scheduler_decisions": [
+    "PLAN_INITIAL", "VERIFY_TASK", "VERIFY_GOAL", "REPLAN", "RUN_READONLY",
+    "RUN_WRITER", "UNSUPPORTED_WORKER", "NO_ACTION"
+  ],
+  "goal_transitions": [
+    {"from":"PLANNING","to":["RUNNING","BLOCKED","CANCELLING","FAILED"],"authority":"Planner/Goal API"},
+    {"from":"RUNNING","to":["REPLANNING","PAUSING","BLOCKED","CANCELLING","FAILED"],"authority":"host scheduler/API"},
+    {"from":"REPLANNING","to":["RUNNING","BLOCKED","PAUSING","CANCELLING","FAILED"],"authority":"Replanner/host API"},
+    {"from":"PAUSING","to":["PAUSED","BLOCKED","CANCELLING"],"authority":"Goal API/recovery"},
+    {"from":"PAUSED","to":["RUNNING","REPLANNING","BLOCKED","CANCELLING"],"authority":"Goal API"},
+    {"from":"BLOCKED","to":["RUNNING","REPLANNING","PAUSED","CANCELLING","FAILED"],"authority":"Goal API/recovery/replanner"},
+    {"from":"VERIFYING","to":["REPLANNING","BLOCKED","PAUSING","CANCELLING","FAILED"],"authority":"Goal verifier/finalizer/API"},
+    {"from":"CANCELLING","to":["CANCELLED","BLOCKED"],"authority":"Goal API"},
+    {"from":"COMPLETED","to":[],"authority":"terminal"},
+    {"from":"FAILED","to":[],"authority":"terminal"},
+    {"from":"CANCELLED","to":[],"authority":"terminal"}
+  ],
+  "task_transitions": [
+    {"from":"PENDING","to":["READY","CANCELLED","FAILED"],"authority":"planner/readiness propagation"},
+    {"from":"READY","to":["RUNNING","CANCELLED","FAILED"],"authority":"scheduler + worker begin"},
+    {"from":"RUNNING","to":["VERIFYING","RETRYABLE","BLOCKED","NEEDS_REPLAN","FAILED","CANCELLED"],"authority":"worker/host recovery"},
+    {"from":"BLOCKED","to":["READY","NEEDS_REPLAN","FAILED","CANCELLED"],"authority":"typed recovery/replanner/API"},
+    {"from":"RETRYABLE","to":["READY","FAILED","CANCELLED"],"authority":"resume/scheduler policy"},
+    {"from":"NEEDS_REPLAN","to":["PENDING","BLOCKED","FAILED","CANCELLED"],"authority":"Replanner"},
+    {"from":"VERIFYING","to":["COMPLETED","RETRYABLE","BLOCKED","NEEDS_REPLAN","FAILED","CANCELLED"],"authority":"host Verifier only for COMPLETED"},
+    {"from":"COMPLETED","to":[],"authority":"terminal"},
+    {"from":"FAILED","to":[],"authority":"terminal"},
+    {"from":"CANCELLED","to":[],"authority":"terminal"}
+  ],
+  "scheduler_routes": [
+    {"decision":"PLAN_INITIAL","source_goal":"PLANNING","target_goal":"RUNNING|BLOCKED|FAILED","public_calls":["goal_run"],"model_role":"PLANNER","mutation":true,"budgets":["semantic"],"restart":"durable"},
+    {"decision":"RUN_READONLY","source_goal":"RUNNING","source_task":"READY","target_task":"RUNNING|VERIFYING|RETRYABLE|BLOCKED|NEEDS_REPLAN|FAILED","public_calls":["goal_run"],"model_role":"READONLY","mutation":false,"budgets":["semantic unless transport-only"],"restart":"durable"},
+    {"decision":"RUN_WRITER","source_goal":"RUNNING","source_task":"READY","target_task":"RUNNING|VERIFYING|BLOCKED|NEEDS_REPLAN|FAILED","public_calls":["goal_run"],"model_role":"WRITER+REVIEWER","mutation":"host-only proposal application","budgets":["semantic","side-effect when applicable"],"restart":"durable"},
+    {"decision":"VERIFY_TASK","source_goal":"RUNNING","source_task":"VERIFYING","target_task":"COMPLETED|RETRYABLE|BLOCKED|NEEDS_REPLAN|FAILED","public_calls":["goal_run"],"model_role":"none","mutation":false,"budgets":["semantic only when retry transition is legal"],"restart":"durable"},
+    {"decision":"REPLAN","source_goal":"RUNNING|REPLANNING","source_task":"NEEDS_REPLAN","target_goal":"REPLANNING|RUNNING|BLOCKED|FAILED","public_calls":["goal_run"],"model_role":"REPLANNER","mutation":"monotonic DAG additions only","budgets":["replan recovery bounded"],"restart":"durable"},
+    {"decision":"VERIFY_GOAL","source_goal":"RUNNING","source_task":"all mandatory COMPLETED","target_goal":"VERIFYING|REPLANNING|BLOCKED|FAILED","public_calls":["goal_run"],"model_role":"none","mutation":false,"budgets":[],"restart":"durable"},
+    {"decision":"NO_ACTION","source_goal":"any nonterminal","source_task":"no executable route or typed control/blocker","target_goal":"unchanged","public_calls":["goal_run"],"model_role":"none","mutation":false,"budgets":[],"restart":"durable typed reason required"}
+  ],
+  "completion_authorities": {
+    "task_completed": "host VerifierCompletionAuthority after passing every VerificationSpec",
+    "goal_completed": "GoalFinalizerAuthority after authoritative Goal verification and final-verification checkpoint",
+    "model_claims": "never authoritative"
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "schema": "goal-orchestrator-v1-worker-contract-matrix",
+  "workers": [
+    {
+      "worker":"CODEX_READONLY",
+      "model_role":"READONLY",
+      "request":"goal/task/attempt identity, revisions, cwd, objective, scope, verification",
+      "allowed":"read files, search, inspect Git, strictly read-only commands",
+      "forbidden":"writes, mutations, completion claims, budget/revision changes",
+      "output":"candidate_complete|blocked|needs_replan|failed plus bounded evidence",
+      "host_authority":"parse identity, persist evidence, transition, invoke Verifier",
+      "transport_retry":"non-mutating transport interruption is transport budget only",
+      "side_effect":"ConfirmedNotPerformed before any operation identity",
+      "restart":"resume reconciliation required"
+    },
+    {
+      "worker":"CODEX_WRITER",
+      "model_role":"WRITER",
+      "request":"identity/revisions, cwd, objective, allowed/forbidden paths",
+      "allowed":"read files, search, inspect Git, strictly read-only commands, propose exact WRITE_UTF8 operations",
+      "forbidden":"direct writes, mutating commands, host mutation claims, Task/Goal completion claims",
+      "output":"candidate_complete|blocked|needs_replan|failed plus bounded evidence and exact preimage-bound WRITE_UTF8 proposals",
+      "host_authority":"scope/preimage validation, mutation, postimage/evidence, Reviewer, Verifier",
+      "transport_retry":"only before mutation with conclusively absent side effects",
+      "side_effect":"before mutation None/ConfirmedNotPerformed; after mutation ConfirmedPerformed or Unknown",
+      "restart":"never replay unknown side effects; verify performed mutations before continuation"
+    },
+    {
+      "worker":"CODEX_REVIEWER",
+      "model_role":"REVIEWER",
+      "request":"identity/revisions, host-observed writer summary and file snapshots",
+      "allowed":"review supplied host evidence",
+      "forbidden":"workspace mutation, unrequested inspection, completion authority",
+      "output":"identity/revisions, summary, scalar blocking_findings, bounded evidence",
+      "host_authority":"parse review, enforce ReviewGate, transition to VERIFYING/BLOCKED"
+    },
+    {
+      "worker":"REPLANNER",
+      "model_role":"REPLANNER",
+      "request":"full durable Goal/task/evidence/blocker snapshot and eligible NEEDS_REPLAN IDs",
+      "allowed":"monotonic task/dependency/verification/mandatory/criterion additions and direct prerequisite resolution",
+      "forbidden":"deletion, history rewrite, weakening, budget replenishment, execution/publication",
+      "output":"strict additive proposal with exact EXISTING/NEW refs",
+      "host_authority":"schema/identity/DAG/revision/plan revision validation and durable commit"
+    },
+    {
+      "worker":"VERIFIER",
+      "model_role":"none",
+      "request":"durable Task snapshot and VerificationSpec",
+      "allowed":"host deterministic observation",
+      "forbidden":"model or worker completion authority, evidence invention",
+      "output":"host VerificationResult and typed Pass/Retryable/Blocked/NeedsReplan/Failed",
+      "host_authority":"all verification and task completion"
+    }
+  ]
+}
