@@ -495,27 +495,14 @@ pub(crate) fn goal_resume(
         );
         match result {
             Ok(durable) => return Ok(status_view(&durable)),
-            Err(error @ OrchestratorError::RevisionConflict { .. }) => {
-                let latest = resolve_goal(store, &session.id, Some(goal_id.as_str()))?;
-                if let Some(existing) = latest.find_pre_execution_plan_rejection(&rejection.request_id) {
-                    if existing.matches(
-                        &rejection.request_id,
-                        rejection.expected_goal_revision,
-                        rejection.expected_plan_revision,
-                        &trigger_task_id,
-                        &rejection.reason,
-                    ) {
-                        return Ok(status_view(&latest));
-                    }
-                    return Err(GoalApiError::pre_execution_rejection_conflict(&latest));
-                }
-                if latest.has_pre_execution_plan_rejection_for_plan(
-                    rejection.expected_plan_revision,
-                ) {
-                    return Err(GoalApiError::pre_execution_rejection_conflict(&latest));
-                }
-                return Err(GoalApiError::from_orchestrator(error));
-            }
+            Err(error @ OrchestratorError::RevisionConflict { .. }) => return recover_rejection_after_cas_conflict(
+                store,
+                session,
+                &goal_id,
+                &rejection,
+                &trigger_task_id,
+                error,
+            ),
             Err(error) => return Err(GoalApiError::from_orchestrator(error)),
         }
     }
@@ -554,6 +541,33 @@ fn validate_pre_execution_plan_rejection(
         ));
     }
     Ok(task_id)
+}
+
+fn recover_rejection_after_cas_conflict(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    rejection: &PreExecutionPlanRejectionRequest,
+    trigger_task_id: &crate::task::TaskId,
+    error: OrchestratorError,
+) -> Result<GoalStatusView, GoalApiError> {
+    let latest = resolve_goal(store, &session.id, Some(goal_id.as_str()))?;
+    if let Some(existing) = latest.find_pre_execution_plan_rejection(&rejection.request_id) {
+        if existing.matches(
+            &rejection.request_id,
+            rejection.expected_goal_revision,
+            rejection.expected_plan_revision,
+            trigger_task_id,
+            &rejection.reason,
+        ) {
+            return Ok(status_view(&latest));
+        }
+        return Err(GoalApiError::pre_execution_rejection_conflict(&latest));
+    }
+    if latest.has_pre_execution_plan_rejection_for_plan(rejection.expected_plan_revision) {
+        return Err(GoalApiError::pre_execution_rejection_conflict(&latest));
+    }
+    Err(GoalApiError::from_orchestrator(error))
 }
 
 pub(crate) fn goal_cancel(
@@ -1331,14 +1345,100 @@ mod tests {
     use crate::fallback::{SideEffectClass, SideEffectState};
     use crate::goal::CheckpointReason;
     use crate::mutation::{MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage};
+    use crate::planner::{PlannerBackend, PlannerError, PlannerRequest};
+    use crate::readonly_worker::{ReadonlyBackend, ReadonlyError};
+    use crate::replanner::{ReplannerBackend, ReplannerError, ReplannerRequest};
     use crate::task::{
         AttemptOutcome, ReadonlyTransportRecoveryAuthorityKind, ReadonlyTransportRecoveryKind,
         ReplaySafety, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
         TaskTransitionContext, VerificationResult, WorkerKind, WorkerReport,
     };
     use crate::task_store::FaultPoint;
+    use crate::writer::{ReviewerBackend, ReviewerRequest, WriterBackend, WriterError, WriterRequest};
 
     const NOW: &str = "2026-01-01T00:00:00Z";
+
+    struct UnusedPlanner;
+
+    impl PlannerBackend for UnusedPlanner {
+        fn propose_initial_plan(&self, _request: &PlannerRequest) -> Result<Vec<u8>, PlannerError> {
+            panic!("initial planner must not run during pre-execution rejection replan")
+        }
+    }
+
+    struct UnusedReadonly;
+
+    impl ReadonlyBackend for UnusedReadonly {
+        fn investigate(
+            &self,
+            _request: &crate::readonly_worker::ReadonlyRequest,
+        ) -> Result<Vec<u8>, ReadonlyError> {
+            panic!("readonly worker must not run before the Replanner")
+        }
+    }
+
+    struct UnusedWriter {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl WriterBackend for UnusedWriter {
+        fn propose(&self, _request: &WriterRequest) -> Result<Vec<u8>, WriterError> {
+            self.calls.set(self.calls.get() + 1);
+            panic!("Writer must not run before the Replanner")
+        }
+    }
+
+    struct UnusedReviewer;
+
+    impl ReviewerBackend for UnusedReviewer {
+        fn review(&self, _request: &ReviewerRequest) -> Result<Vec<u8>, WriterError> {
+            panic!("Reviewer must not run during pre-execution rejection replan")
+        }
+    }
+
+    struct ResolvingReplanner {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ReplannerBackend for ResolvingReplanner {
+        fn propose_replan(&self, request: &ReplannerRequest) -> Result<Vec<u8>, ReplannerError> {
+            self.calls.set(self.calls.get() + 1);
+            let request: Value = serde_json::to_value(request).unwrap();
+            Ok(serde_json::to_vec(&serde_json::json!({
+                "goal_id": request["goal_id"],
+                "base_goal_revision": request["goal_revision"],
+                "base_plan_revision": request["plan_revision"],
+                "summary": "resolve the rejected plan trigger",
+                "add_tasks": [{
+                    "proposal_id": "repair",
+                    "title": "repair prerequisite",
+                    "objective": "provide a safe replanning prerequisite",
+                    "mandatory": true,
+                    "worker": "CODEX_READONLY",
+                    "dependencies": [],
+                    "scope": {
+                        "allowed_paths": ["."],
+                        "forbidden_paths": [],
+                        "operation_kind": "READ_ONLY",
+                        "replay_safety": "SAFE_READ_ONLY"
+                    },
+                    "verification": [{
+                        "kind": "STRUCTURED_EVIDENCE",
+                        "requirement_id": "repair.evidence"
+                    }]
+                }],
+                "add_dependencies": [{
+                    "task": {"ref_kind": "EXISTING", "task_id": request["eligible_needs_replan_task_ids"][0]},
+                    "dependency": {"ref_kind": "NEW", "proposal_id": "repair"}
+                }],
+                "strengthen_verification": [],
+                "strengthen_mandatory": [],
+                "strengthen_criterion_bindings": [],
+                "resolve_needs_replan": [request["eligible_needs_replan_task_ids"][0]]
+            }))
+            .unwrap())
+        }
+    }
 
     fn fixture(name: &str) -> (PathBuf, config::Session, TaskStore) {
         let root = std::env::temp_dir().join(format!("local-mcp-phase3-{name}-{}", Uuid::new_v4()));
@@ -2021,6 +2121,65 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn pre_execution_plan_rejection_enters_replanner_without_worker_and_reloads() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-replan");
+        std::fs::write(session.cwd.join("sentinel.txt"), "unchanged").unwrap();
+        let request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-replan",
+            "replanner must repair this accepted plan",
+        );
+        goal_resume(&request, &session, &store).unwrap();
+
+        let reloaded_store = TaskStore::with_state_root(root.join("state"));
+        let rejected = reloaded_store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(rejected.status(), GoalStatus::Replanning);
+        assert_eq!(rejected.revision(), 2);
+        let replanner = ResolvingReplanner {
+            calls: std::cell::Cell::new(0),
+        };
+        let writer = UnusedWriter {
+            calls: std::cell::Cell::new(0),
+        };
+        let result = crate::scheduler::scheduler_step(
+            &reloaded_store,
+            &session,
+            &goal_id,
+            rejected.revision(),
+            &UnusedPlanner,
+            &UnusedReadonly,
+            &writer,
+            &UnusedReviewer,
+            &replanner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.action, crate::scheduler::SchedulerAction::Replan);
+        assert_eq!(result.outcome, crate::scheduler::SchedulerStepOutcome::Applied);
+        assert_eq!(replanner.calls.get(), 1);
+        assert_eq!(writer.calls.get(), 0);
+
+        let repaired = reloaded_store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(repaired.status(), GoalStatus::Running);
+        assert_eq!(repaired.plan_revision(), 3);
+        assert_eq!(repaired.tasks()[&trigger_task].status(), TaskStatus::Pending);
+        assert!(repaired
+            .tasks()
+            .values()
+            .any(|task| task.title() == "repair prerequisite" && task.status() == TaskStatus::Ready));
+        assert_eq!(repaired.pre_execution_plan_rejections().len(), 1);
+        assert!(repaired.tasks()[&trigger_task].attempts().is_empty());
+        assert!(repaired.tasks()[&trigger_task].evidence().is_empty());
+        assert_eq!(std::fs::read_to_string(session.cwd.join("sentinel.txt")).unwrap(), "unchanged");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn pre_execution_plan_rejection_is_idempotent_and_conflicts_are_non_mutating() {
         let (root, session, store, goal_id, _preserved_task, trigger_task) =
@@ -2071,6 +2230,46 @@ mod tests {
                 .code(),
             "IDEMPOTENCY_CONFLICT"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_cas_loser_reloads_identical_commit() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-cas-loser");
+        let args = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-cas-loser",
+            "the winning concurrent request committed this rejection",
+        );
+        goal_resume(&args, &session, &store).unwrap();
+        let before = read_goal_bytes(&root, &session, goal_id.as_str());
+        let rejection = PreExecutionPlanRejectionRequest {
+            request_id: "reject-plan-cas-loser".to_owned(),
+            expected_goal_revision: 1,
+            expected_plan_revision: 2,
+            trigger_task_id: trigger_task.as_str().to_owned(),
+            reason: "the winning concurrent request committed this rejection".to_owned(),
+        };
+        let replay = recover_rejection_after_cas_conflict(
+            &store,
+            &session,
+            &goal_id,
+            &rejection,
+            &trigger_task,
+            OrchestratorError::RevisionConflict {
+                expected: 1,
+                actual: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(replay.status, GoalStatus::Replanning);
+        assert_eq!(replay.revision, 2);
+        assert_eq!(before, read_goal_bytes(&root, &session, goal_id.as_str()));
         std::fs::remove_dir_all(root).unwrap();
     }
 
