@@ -135,6 +135,7 @@ fn goal_tool_catalog_is_exactly_additive() {
         ])
     );
     assert_eq!(rejection["properties"]["request_id"]["maxLength"], 128);
+    assert_eq!(rejection["properties"]["trigger_task_id"]["maxLength"], 36);
     assert_eq!(rejection["properties"]["reason"]["maxLength"], 8192);
     let result = tools
         .iter()

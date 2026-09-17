@@ -288,7 +288,9 @@ pub(crate) enum PreExecutionPlanRejectionAuthorityKind {
 pub(crate) struct PreExecutionPlanRejection {
     request_id: String,
     expected_goal_revision: u64,
+    observed_goal_revision: u64,
     rejected_plan_revision: u32,
+    observed_plan_revision: u32,
     trigger_task_id: TaskId,
     reason: String,
     authority: PreExecutionPlanRejectionAuthorityKind,
@@ -1258,7 +1260,9 @@ impl Goal {
             .push(PreExecutionPlanRejection {
                 request_id,
                 expected_goal_revision,
+                observed_goal_revision: expected_goal_revision,
                 rejected_plan_revision: expected_plan_revision,
+                observed_plan_revision: expected_plan_revision,
                 trigger_task_id,
                 reason,
                 authority: PreExecutionPlanRejectionAuthorityKind::GoalResume,
@@ -1922,8 +1926,10 @@ impl Goal {
                 || rejection.request_id.chars().count() > 128
                 || rejection.expected_goal_revision == 0
                 || rejection.expected_goal_revision > self.revision
+                || rejection.observed_goal_revision != rejection.expected_goal_revision
                 || rejection.rejected_plan_revision == 0
                 || rejection.rejected_plan_revision > self.plan_revision
+                || rejection.observed_plan_revision != rejection.rejected_plan_revision
                 || rejection.reason.trim().is_empty()
                 || rejection.reason.chars().count() > 8_192
                 || rejection.authority != PreExecutionPlanRejectionAuthorityKind::GoalResume

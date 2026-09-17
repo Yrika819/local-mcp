@@ -478,19 +478,46 @@ pub(crate) fn goal_resume(
                 rejection.expected_plan_revision,
             ));
         }
-        let durable = store
-            .mutate_goal_snapshot(&session.id, &goal_id, current.revision(), |goal, now| {
+        let result = store.mutate_goal_snapshot(
+            &session.id,
+            &goal_id,
+            current.revision(),
+            |goal, now| {
                 goal.reject_pre_execution_plan(
-                    rejection.request_id,
+                    rejection.request_id.clone(),
                     rejection.expected_goal_revision,
                     rejection.expected_plan_revision,
-                    trigger_task_id,
-                    rejection.reason,
+                    trigger_task_id.clone(),
+                    rejection.reason.clone(),
                     now,
                 )
-            })
-            .map_err(GoalApiError::from_orchestrator)?;
-        return Ok(status_view(&durable));
+            },
+        );
+        match result {
+            Ok(durable) => return Ok(status_view(&durable)),
+            Err(error @ OrchestratorError::RevisionConflict { .. }) => {
+                let latest = resolve_goal(store, &session.id, Some(goal_id.as_str()))?;
+                if let Some(existing) = latest.find_pre_execution_plan_rejection(&rejection.request_id) {
+                    if existing.matches(
+                        &rejection.request_id,
+                        rejection.expected_goal_revision,
+                        rejection.expected_plan_revision,
+                        &trigger_task_id,
+                        &rejection.reason,
+                    ) {
+                        return Ok(status_view(&latest));
+                    }
+                    return Err(GoalApiError::pre_execution_rejection_conflict(&latest));
+                }
+                if latest.has_pre_execution_plan_rejection_for_plan(
+                    rejection.expected_plan_revision,
+                ) {
+                    return Err(GoalApiError::pre_execution_rejection_conflict(&latest));
+                }
+                return Err(GoalApiError::from_orchestrator(error));
+            }
+            Err(error) => return Err(GoalApiError::from_orchestrator(error)),
+        }
     }
 
     let expected_revision = current.revision();
@@ -518,6 +545,7 @@ fn validate_pre_execution_plan_rejection(
         return Err(GoalApiError::invalid("reason must not be empty"));
     }
     ensure_max_chars("reason", &request.reason, 8_192)?;
+    ensure_max_chars("trigger_task_id", &request.trigger_task_id, 36)?;
     let task_id = crate::task::TaskId::parse(&request.trigger_task_id)
         .map_err(GoalApiError::from_orchestrator)?;
     if task_id.as_str() != request.trigger_task_id {
@@ -1956,6 +1984,8 @@ mod tests {
         assert_eq!(record["trigger_task_id"], trigger_task.as_str());
         assert_eq!(record["authority"], "GOAL_RESUME");
         assert_eq!(record["expected_goal_revision"], 1);
+        assert_eq!(record["observed_goal_revision"], 1);
+        assert_eq!(record["observed_plan_revision"], 2);
         assert_eq!(record["reason"], "host rejected the accepted plan before execution");
         assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
         let serialized = String::from_utf8(bytes).unwrap();
