@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config;
-use crate::mutation::{MutationIntent, MutationIntentUpdate};
+use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
     ReplaySafety, Task, TaskDependency, TaskId, TaskOperationKind, TaskScope, TaskStatus,
@@ -271,9 +271,48 @@ impl GoalBlocker {
 pub(crate) enum CheckpointReason {
     PlanCommitted,
     ReplanCommitted,
+    PreExecutionPlanRejected,
     Pause,
     Recovery,
     FinalVerification,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PreExecutionPlanRejectionAuthorityKind {
+    GoalResume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreExecutionPlanRejection {
+    request_id: String,
+    expected_goal_revision: u64,
+    rejected_plan_revision: u32,
+    trigger_task_id: TaskId,
+    reason: String,
+    authority: PreExecutionPlanRejectionAuthorityKind,
+    rejected_at: String,
+}
+
+impl PreExecutionPlanRejection {
+    pub(crate) fn matches(
+        &self,
+        request_id: &str,
+        expected_goal_revision: u64,
+        expected_plan_revision: u32,
+        trigger_task_id: &TaskId,
+        reason: &str,
+    ) -> bool {
+        self.request_id == request_id
+            && self.expected_goal_revision == expected_goal_revision
+            && self.rejected_plan_revision == expected_plan_revision
+            && self.trigger_task_id == *trigger_task_id
+            && self.reason == reason
+    }
+
+    pub(crate) fn request_id(&self) -> &str { &self.request_id }
+    pub(crate) fn rejected_plan_revision(&self) -> u32 { self.rejected_plan_revision }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +409,8 @@ pub(crate) struct Goal {
     legacy_completion_criteria: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_final_verification: Option<VerificationResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pre_execution_plan_rejections: Vec<PreExecutionPlanRejection>,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -446,6 +487,7 @@ impl Goal {
             final_verifications: Vec::new(),
             legacy_completion_criteria: Vec::new(),
             legacy_final_verification: None,
+            pre_execution_plan_rejections: Vec::new(),
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -544,6 +586,28 @@ impl Goal {
 
     pub(crate) fn checkpoints(&self) -> &[GoalCheckpoint] {
         &self.checkpoints
+    }
+
+    pub(crate) fn pre_execution_plan_rejections(&self) -> &[PreExecutionPlanRejection] {
+        &self.pre_execution_plan_rejections
+    }
+
+    pub(crate) fn find_pre_execution_plan_rejection(
+        &self,
+        request_id: &str,
+    ) -> Option<&PreExecutionPlanRejection> {
+        self.pre_execution_plan_rejections
+            .iter()
+            .find(|record| record.request_id() == request_id)
+    }
+
+    pub(crate) fn has_pre_execution_plan_rejection_for_plan(
+        &self,
+        plan_revision: u32,
+    ) -> bool {
+        self.pre_execution_plan_rejections
+            .iter()
+            .any(|record| record.rejected_plan_revision() == plan_revision)
     }
 
     pub(crate) fn created_at(&self) -> &str {
@@ -1115,6 +1179,93 @@ impl Goal {
             .get_mut(task_id)
             .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
             .transition_to(next, dependencies_satisfied, context, now)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn reject_pre_execution_plan(
+        &mut self,
+        request_id: String,
+        expected_goal_revision: u64,
+        expected_plan_revision: u32,
+        trigger_task_id: TaskId,
+        reason: String,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.revision != expected_goal_revision {
+            return Err(OrchestratorError::RevisionConflict {
+                expected: expected_goal_revision,
+                actual: self.revision,
+            });
+        }
+        if self.plan_revision != expected_plan_revision {
+            return Err(OrchestratorError::InvalidDag(
+                "pre-execution plan rejection plan revision is stale".to_owned(),
+            ));
+        }
+        if !matches!(self.status, GoalStatus::Running) || self.status.is_terminal() {
+            return Err(OrchestratorError::InvalidDag(
+                "pre-execution plan rejection requires a non-terminal RUNNING Goal".to_owned(),
+            ));
+        }
+        if !self.blockers.is_empty()
+            || self.has_active_tasks()
+            || self.has_unknown_side_effects()
+            || self.tasks.values().any(|task| {
+                task.needs_reviewer_recovery()
+                    || task.attempts().iter().any(|attempt| {
+                        attempt.mutation_intent().is_some_and(|intent| {
+                            !matches!(
+                                intent.state(),
+                                MutationIntentState::ReconciledNotPerformed
+                                    | MutationIntentState::ReconciledPerformed
+                            )
+                        })
+                    })
+                    || (task.scope().operation_kind() != TaskOperationKind::ReadOnly
+                        && task.latest_attempt().is_some_and(|attempt| {
+                            attempt.side_effect_state()
+                                == Some(crate::fallback::SideEffectState::ConfirmedPerformed)
+                        }))
+                    || crate::writer::holds_workspace_mutation_lease(task)
+            })
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "pre-execution plan rejection requires no active recovery, mutation, lease, blocker, or side effect state".to_owned(),
+            ));
+        }
+
+        let task = self.tasks.get(&trigger_task_id).ok_or_else(|| {
+            OrchestratorError::InvalidDag(
+                "pre-execution plan rejection trigger Task is missing".to_owned(),
+            )
+        })?;
+        if task.created_plan_revision() != expected_plan_revision {
+            return Err(OrchestratorError::InvalidDag(
+                "pre-execution plan rejection trigger Task is not in the rejected plan".to_owned(),
+            ));
+        }
+
+        let mut candidate = self.clone();
+        candidate
+            .tasks
+            .get_mut(&trigger_task_id)
+            .expect("trigger Task was checked above")
+            .reject_pre_execution_plan(now)?;
+        candidate
+            .pre_execution_plan_rejections
+            .push(PreExecutionPlanRejection {
+                request_id,
+                expected_goal_revision,
+                rejected_plan_revision: expected_plan_revision,
+                trigger_task_id,
+                reason,
+                authority: PreExecutionPlanRejectionAuthorityKind::GoalResume,
+                rejected_at: now.to_owned(),
+            });
+        candidate.transition_to(GoalStatus::Replanning, now)?;
+        candidate.add_checkpoint(CheckpointReason::PreExecutionPlanRejected, now)?;
         candidate.validate()?;
         *self = candidate;
         Ok(())
@@ -1762,6 +1913,34 @@ impl Goal {
             {
                 return Err(OrchestratorError::CorruptGoal(
                     "Goal final-verification history contains an invalid authority binding".to_owned(),
+                ));
+            }
+        }
+        let mut rejection_request_ids = BTreeSet::new();
+        for rejection in &self.pre_execution_plan_rejections {
+            if rejection.request_id.trim().is_empty()
+                || rejection.request_id.chars().count() > 128
+                || rejection.expected_goal_revision == 0
+                || rejection.expected_goal_revision > self.revision
+                || rejection.rejected_plan_revision == 0
+                || rejection.rejected_plan_revision > self.plan_revision
+                || rejection.reason.trim().is_empty()
+                || rejection.reason.chars().count() > 8_192
+                || rejection.authority != PreExecutionPlanRejectionAuthorityKind::GoalResume
+                || !rejection_request_ids.insert(rejection.request_id.clone())
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "Goal pre-execution plan rejection history contains an invalid or duplicate record".to_owned(),
+                ));
+            }
+            let task = self.tasks.get(&rejection.trigger_task_id).ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "pre-execution plan rejection references a missing trigger Task".to_owned(),
+                )
+            })?;
+            if task.created_plan_revision() != rejection.rejected_plan_revision {
+                return Err(OrchestratorError::CorruptGoal(
+                    "pre-execution plan rejection trigger Task is not bound to its rejected plan".to_owned(),
                 ));
             }
         }

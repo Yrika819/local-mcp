@@ -1330,6 +1330,27 @@ impl Task {
         Ok(())
     }
 
+    pub(crate) fn reject_pre_execution_plan(&mut self, now: &str) -> Result<(), OrchestratorError> {
+        if self.status != TaskStatus::Ready {
+            return Err(OrchestratorError::InvalidDag(
+                "pre-execution plan rejection requires a READY trigger Task".to_owned(),
+            ));
+        }
+        if !self.attempts.is_empty()
+            || !self.evidence.is_empty()
+            || !self.verification_results.is_empty()
+            || !self.blockers.is_empty()
+            || self.has_unknown_side_effect()
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "pre-execution plan rejection requires a pristine trigger Task".to_owned(),
+            ));
+        }
+        self.status = TaskStatus::NeedsReplan;
+        self.updated_at = now.to_owned();
+        Ok(())
+    }
+
     pub(crate) fn complete_from_verifier(
         &mut self,
         _authority: &crate::verifier::VerifierCompletionAuthority,

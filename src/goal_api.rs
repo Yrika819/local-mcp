@@ -76,6 +76,26 @@ impl GoalApiError {
         }
     }
 
+    fn pre_execution_rejection_conflict(goal: &Goal) -> Self {
+        Self {
+            code: "IDEMPOTENCY_CONFLICT",
+            message: "pre-execution plan rejection request conflicts with durable history"
+                .to_owned(),
+            active_goal: Some(identity_view(goal)),
+        }
+    }
+
+    fn pre_execution_plan_revision_conflict(goal: &Goal, expected: u32) -> Self {
+        Self {
+            code: "REVISION_CONFLICT",
+            message: format!(
+                "expected plan revision {expected}, current plan revision is {}",
+                goal.plan_revision()
+            ),
+            active_goal: Some(identity_view(goal)),
+        }
+    }
+
     pub(crate) fn from_orchestrator(error: OrchestratorError) -> Self {
         Self::from_orchestrator_with_active(error, None)
     }
@@ -167,6 +187,26 @@ struct GoalLookupRequest {
     session_id: String,
     #[serde(default)]
     goal_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalResumeRequest {
+    session_id: String,
+    #[serde(default)]
+    goal_id: Option<String>,
+    #[serde(default)]
+    pre_execution_plan_rejection: Option<PreExecutionPlanRejectionRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreExecutionPlanRejectionRequest {
+    request_id: String,
+    expected_goal_revision: u64,
+    expected_plan_revision: u32,
+    trigger_task_id: String,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,10 +442,57 @@ pub(crate) fn goal_resume(
     session: &config::Session,
     store: &TaskStore,
 ) -> Result<GoalStatusView, GoalApiError> {
-    let request: GoalLookupRequest = parse_request(args)?;
+    let request: GoalResumeRequest = parse_request(args)?;
     validate_session_binding(&request.session_id, session)?;
     let current = resolve_goal(store, &session.id, request.goal_id.as_deref())?;
     let goal_id = current.id().clone();
+
+    if let Some(rejection) = request.pre_execution_plan_rejection {
+        let trigger_task_id = validate_pre_execution_plan_rejection(&rejection)?;
+        if let Some(existing) = current.find_pre_execution_plan_rejection(&rejection.request_id) {
+            if existing.matches(
+                &rejection.request_id,
+                rejection.expected_goal_revision,
+                rejection.expected_plan_revision,
+                &trigger_task_id,
+                &rejection.reason,
+            ) {
+                return Ok(status_view(&current));
+            }
+            return Err(GoalApiError::pre_execution_rejection_conflict(&current));
+        }
+        if current.has_pre_execution_plan_rejection_for_plan(rejection.expected_plan_revision) {
+            return Err(GoalApiError::pre_execution_rejection_conflict(&current));
+        }
+        if current.revision() != rejection.expected_goal_revision {
+            return Err(GoalApiError::from_orchestrator(
+                OrchestratorError::RevisionConflict {
+                    expected: rejection.expected_goal_revision,
+                    actual: current.revision(),
+                },
+            ));
+        }
+        if current.plan_revision() != rejection.expected_plan_revision {
+            return Err(GoalApiError::pre_execution_plan_revision_conflict(
+                &current,
+                rejection.expected_plan_revision,
+            ));
+        }
+        let durable = store
+            .mutate_goal_snapshot(&session.id, &goal_id, current.revision(), |goal, now| {
+                goal.reject_pre_execution_plan(
+                    rejection.request_id,
+                    rejection.expected_goal_revision,
+                    rejection.expected_plan_revision,
+                    trigger_task_id,
+                    rejection.reason,
+                    now,
+                )
+            })
+            .map_err(GoalApiError::from_orchestrator)?;
+        return Ok(status_view(&durable));
+    }
+
     let expected_revision = current.revision();
     let durable = store
         .mutate_goal_snapshot(&session.id, &goal_id, expected_revision, |goal, now| {
@@ -413,6 +500,32 @@ pub(crate) fn goal_resume(
         })
         .map_err(GoalApiError::from_orchestrator)?;
     Ok(status_view(&durable))
+}
+
+fn validate_pre_execution_plan_rejection(
+    request: &PreExecutionPlanRejectionRequest,
+) -> Result<crate::task::TaskId, GoalApiError> {
+    if request.expected_goal_revision == 0 || request.expected_plan_revision == 0 {
+        return Err(GoalApiError::invalid(
+            "expected Goal and plan revisions must be positive",
+        ));
+    }
+    if request.request_id.trim().is_empty() {
+        return Err(GoalApiError::invalid("request_id must not be empty"));
+    }
+    ensure_max_chars("request_id", &request.request_id, 128)?;
+    if request.reason.trim().is_empty() {
+        return Err(GoalApiError::invalid("reason must not be empty"));
+    }
+    ensure_max_chars("reason", &request.reason, 8_192)?;
+    let task_id = crate::task::TaskId::parse(&request.trigger_task_id)
+        .map_err(GoalApiError::from_orchestrator)?;
+    if task_id.as_str() != request.trigger_task_id {
+        return Err(GoalApiError::invalid(
+            "trigger_task_id must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(task_id)
 }
 
 pub(crate) fn goal_cancel(
@@ -1300,6 +1413,86 @@ mod tests {
         (goal, task_id)
     }
 
+    fn pre_execution_goal(
+        name: &str,
+    ) -> (PathBuf, config::Session, TaskStore, GoalId, crate::task::TaskId, crate::task::TaskId) {
+        let (root, session, store) = fixture(name);
+        let mut goal = Goal::new(
+            session.id.clone(),
+            session.cwd.clone(),
+            "reject an accepted plan before execution",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
+        let preserved_task = goal
+            .add_task(
+                "preserved task",
+                "preserve the old task history",
+                true,
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                vec![],
+                1,
+                NOW,
+            )
+            .unwrap();
+        let trigger_task = goal
+            .add_task(
+                "rejected task",
+                "the accepted plan is invalid",
+                true,
+                WorkerKind::CodexWriter,
+                mutation_scope(),
+                vec![],
+                1,
+                NOW,
+            )
+            .unwrap();
+        goal.transition_to(GoalStatus::Running, NOW).unwrap();
+        goal.transition_task(
+            &preserved_task,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &trigger_task,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        (root, session, store, goal_id, preserved_task, trigger_task)
+    }
+
+    fn pre_execution_rejection_args(
+        session: &config::Session,
+        goal_id: &GoalId,
+        expected_goal_revision: u64,
+        expected_plan_revision: u32,
+        trigger_task_id: &crate::task::TaskId,
+        request_id: &str,
+        reason: &str,
+    ) -> Value {
+        serde_json::json!({
+            "session_id": session.id,
+            "goal_id": goal_id.as_str(),
+            "pre_execution_plan_rejection": {
+                "request_id": request_id,
+                "expected_goal_revision": expected_goal_revision,
+                "expected_plan_revision": expected_plan_revision,
+                "trigger_task_id": trigger_task_id.as_str(),
+                "reason": reason
+            }
+        })
+    }
+
     fn legacy_writer_goal(
         session: &config::Session,
     ) -> (Goal, crate::task::TaskId) {
@@ -1662,6 +1855,429 @@ mod tests {
         let durable = store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(durable.tasks()[&task_id].status(), TaskStatus::Pending);
         assert!(durable.tasks()[&task_id].attempts().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_moves_explicit_pristine_trigger_to_replanning() {
+        let (root, session, store) = fixture("preplan-reject");
+        let sentinel = session.cwd.join("sentinel.txt");
+        std::fs::write(&sentinel, "unchanged").unwrap();
+        let mut goal = Goal::new(
+            session.id.clone(),
+            session.cwd.clone(),
+            "reject the accepted plan before execution",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
+        let earlier_task = goal
+            .add_task(
+                "earlier read",
+                "preserve earlier plan history",
+                true,
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                vec![],
+                1,
+                NOW,
+            )
+            .unwrap();
+        let trigger_task = goal
+            .add_task(
+                "rejected writer",
+                "this accepted writer plan is invalid",
+                true,
+                WorkerKind::CodexWriter,
+                mutation_scope(),
+                vec![],
+                1,
+                NOW,
+            )
+            .unwrap();
+        goal.transition_to(GoalStatus::Running, NOW).unwrap();
+        goal.transition_task(
+            &earlier_task,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &trigger_task,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(goal.plan_revision(), 2);
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+
+        let status = goal_resume(
+            &serde_json::json!({
+                "session_id": session.id,
+                "goal_id": goal_id.as_str(),
+                "pre_execution_plan_rejection": {
+                    "request_id": "reject-plan-1",
+                    "expected_goal_revision": 1,
+                    "expected_plan_revision": 2,
+                    "trigger_task_id": trigger_task.as_str(),
+                    "reason": "host rejected the accepted plan before execution"
+                }
+            }),
+            &session,
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(status.status, GoalStatus::Replanning);
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(durable.plan_revision(), 2);
+        assert_eq!(durable.tasks()[&earlier_task].status(), TaskStatus::Ready);
+        assert_eq!(durable.tasks()[&trigger_task].status(), TaskStatus::NeedsReplan);
+        assert!(durable.tasks()[&trigger_task].attempts().is_empty());
+        let selection = crate::scheduler::select_scheduler_action(&durable).unwrap();
+        assert!(matches!(
+            selection.decision(),
+            crate::scheduler::SchedulerDecision::Replan { trigger_task_id }
+                if trigger_task_id == &trigger_task
+        ));
+        assert_eq!(
+            durable.checkpoints().last().unwrap().reason(),
+            CheckpointReason::PreExecutionPlanRejected
+        );
+        let bytes = read_goal_bytes(&root, &session, goal_id.as_str());
+        let persisted: Value = serde_json::from_slice(&bytes).unwrap();
+        let record = &persisted["pre_execution_plan_rejections"][0];
+        assert_eq!(record["rejected_plan_revision"], 2);
+        assert_eq!(record["trigger_task_id"], trigger_task.as_str());
+        assert_eq!(record["authority"], "GOAL_RESUME");
+        assert_eq!(record["expected_goal_revision"], 1);
+        assert_eq!(record["reason"], "host rejected the accepted plan before execution");
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
+        let serialized = String::from_utf8(bytes).unwrap();
+        assert!(serialized.contains("PRE_EXECUTION_PLAN_REJECTED"));
+        assert!(serialized.contains("reject-plan-1"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_persistence_failure_is_non_mutating() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-pfail");
+        let before = read_goal_bytes(&root, &session, goal_id.as_str());
+        let faulty_store = TaskStore::with_fault(root.join("state"), FaultPoint::BeforeReplace);
+        let request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-persistence-failure",
+            "the durable write must fail safely",
+        );
+
+        let error = goal_resume(&request, &session, &faulty_store).unwrap_err();
+        assert_eq!(error.code(), "GOAL_PERSISTENCE_ERROR");
+        assert_eq!(before, read_goal_bytes(&root, &session, goal_id.as_str()));
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(durable.status(), GoalStatus::Running);
+        assert_eq!(durable.revision(), 1);
+        assert_eq!(durable.tasks()[&trigger_task].status(), TaskStatus::Ready);
+        assert!(durable.pre_execution_plan_rejections().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_is_idempotent_and_conflicts_are_non_mutating() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-idempotency");
+        let args = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-1",
+            "host rejected this plan",
+        );
+        let first = goal_resume(&args, &session, &store).unwrap();
+        let first_bytes = read_goal_bytes(&root, &session, goal_id.as_str());
+        assert_eq!(first.revision, 2);
+        assert_eq!(store.load_goal(&session.id, &goal_id).unwrap().pre_execution_plan_rejections().len(), 1);
+
+        let replay = goal_resume(&args, &session, &store).unwrap();
+        assert_eq!(replay.revision, first.revision);
+        assert_eq!(read_goal_bytes(&root, &session, goal_id.as_str()), first_bytes);
+
+        let changed_reason = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-1",
+            "different host reason",
+        );
+        let conflict = goal_resume(&changed_reason, &session, &store).unwrap_err();
+        assert_eq!(conflict.code(), "IDEMPOTENCY_CONFLICT");
+        assert_eq!(read_goal_bytes(&root, &session, goal_id.as_str()), first_bytes);
+
+        let other_request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-2",
+            "another host reason",
+        );
+        assert_eq!(
+            goal_resume(&other_request, &session, &store)
+                .unwrap_err()
+                .code(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_requires_current_revisions_and_pristine_explicit_trigger() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-validation");
+        let stale_plan = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            1,
+            &trigger_task,
+            "reject-plan-stale-plan",
+            "stale plan",
+        );
+        assert_eq!(goal_resume(&stale_plan, &session, &store).unwrap_err().code(), "REVISION_CONFLICT");
+
+        let stale_goal = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            2,
+            2,
+            &trigger_task,
+            "reject-plan-stale-goal",
+            "stale goal",
+        );
+        assert_eq!(goal_resume(&stale_goal, &session, &store).unwrap_err().code(), "REVISION_CONFLICT");
+
+        let missing_trigger = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &crate::task::TaskId::new(),
+            "reject-plan-missing-trigger",
+            "missing trigger",
+        );
+        assert_eq!(goal_resume(&missing_trigger, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+
+        let noncanonical = serde_json::json!({
+            "session_id": session.id,
+            "goal_id": goal_id.as_str(),
+            "pre_execution_plan_rejection": {
+                "request_id": "reject-plan-invalid-reason",
+                "expected_goal_revision": 1,
+                "expected_plan_revision": 2,
+                "trigger_task_id": trigger_task.as_str(),
+                "reason": " "
+            }
+        });
+        assert_eq!(goal_resume(&noncanonical, &session, &store).unwrap_err().code(), "INVALID_ARGUMENT");
+
+        let before = read_goal_bytes(&root, &session, goal_id.as_str());
+        store
+            .mutate_goal_snapshot(&session.id, &goal_id, 1, |goal, now| {
+                goal.transition_task(
+                    &trigger_task,
+                    TaskStatus::Running,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            })
+            .unwrap();
+        let current = store.load_goal(&session.id, &goal_id).unwrap();
+        let nonpristine = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            current.revision(),
+            2,
+            &trigger_task,
+            "reject-plan-nonpristine",
+            "non-pristine trigger",
+        );
+        assert_eq!(goal_resume(&nonpristine, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_ne!(read_goal_bytes(&root, &session, goal_id.as_str()), before);
+        assert_eq!(
+            store.load_goal(&session.id, &goal_id).unwrap().tasks()[&trigger_task].attempts().len(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_denies_running_verifying_and_recovery_states() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-running");
+        store
+            .mutate_goal_snapshot(&session.id, &goal_id, 1, |goal, now| {
+                goal.transition_task(
+                    &trigger_task,
+                    TaskStatus::Running,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            })
+            .unwrap();
+        let current = store.load_goal(&session.id, &goal_id).unwrap();
+        let request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            current.revision(),
+            2,
+            &trigger_task,
+            "reject-plan-running",
+            "running task must be denied",
+        );
+        assert_eq!(goal_resume(&request, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+
+        let (root_verify, session_verify, store_verify, goal_verify, _preserved, trigger_verify) =
+            pre_execution_goal("preplan-verifying");
+        store_verify
+            .mutate_goal_snapshot(&session_verify.id, &goal_verify, 1, |goal, now| {
+                goal.transition_task(
+                    &trigger_verify,
+                    TaskStatus::Running,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+                goal.transition_task(
+                    &trigger_verify,
+                    TaskStatus::Verifying,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            })
+            .unwrap();
+        let current_verify = store_verify.load_goal(&session_verify.id, &goal_verify).unwrap();
+        let verifying = pre_execution_rejection_args(
+            &session_verify,
+            &goal_verify,
+            current_verify.revision(),
+            2,
+            &trigger_verify,
+            "reject-plan-verifying",
+            "verifying task must be denied",
+        );
+        assert_eq!(goal_resume(&verifying, &session_verify, &store_verify).unwrap_err().code(), "INVALID_GOAL_STATE");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(root_verify).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_denies_active_mutation_intent_and_unknown_side_effects() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("preplan-intent");
+        store
+            .mutate_goal_snapshot(&session.id, &goal_id, 1, |goal, now| {
+                goal.transition_task(
+                    &trigger_task,
+                    TaskStatus::Running,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+                let intent = MutationIntent::new(
+                    "operation-preplan".to_owned(),
+                    "scope-preplan".to_owned(),
+                    vec![MutationOperationIntent::new(
+                        0,
+                        session.cwd.join("target.txt"),
+                        MutationPreimage::Absent,
+                        crate::mutation::FileObservation::absent(),
+                        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+                        "request-preplan".to_owned(),
+                    )],
+                )?;
+                goal.task_prepare_latest_mutation_intent(&trigger_task, intent)
+            })
+            .unwrap();
+        let current = store.load_goal(&session.id, &goal_id).unwrap();
+        let request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            current.revision(),
+            2,
+            &trigger_task,
+            "reject-plan-intent",
+            "active intent must be denied",
+        );
+        assert_eq!(goal_resume(&request, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (root_unknown, session_unknown, store_unknown, goal_unknown, _preserved, trigger_unknown) =
+            pre_execution_goal("preplan-unknown");
+        store_unknown
+            .mutate_goal_snapshot(&session_unknown.id, &goal_unknown, 1, |goal, now| {
+                goal.transition_task(
+                    &trigger_unknown,
+                    TaskStatus::Running,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+                goal.task_bind_latest_attempt_execution(
+                    &trigger_unknown,
+                    Some("unknown-operation".to_owned()),
+                    Some("unknown-scope".to_owned()),
+                    None,
+                    Some(SideEffectClass::LocalMutation),
+                    Some(SideEffectState::Unknown),
+                    Some(1),
+                    Some(1),
+                )
+            })
+            .unwrap();
+        let current_unknown = store_unknown.load_goal(&session_unknown.id, &goal_unknown).unwrap();
+        let unknown = pre_execution_rejection_args(
+            &session_unknown,
+            &goal_unknown,
+            current_unknown.revision(),
+            2,
+            &trigger_unknown,
+            "reject-plan-unknown",
+            "unknown side effect must be denied",
+        );
+        assert_eq!(goal_resume(&unknown, &session_unknown, &store_unknown).unwrap_err().code(), "INVALID_GOAL_STATE");
+        std::fs::remove_dir_all(root_unknown).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_denies_terminal_goal_without_mutating_history() {
+        let (root, session, store) = fixture("preplan-terminal");
+        let goal = completed_goal(&session);
+        let goal_id = goal.id().clone();
+        let trigger_task = goal.tasks().keys().next().unwrap().clone();
+        store.create_goal(&goal).unwrap();
+        let before = read_goal_bytes(&root, &session, goal_id.as_str());
+        let request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            goal.revision(),
+            goal.plan_revision(),
+            &trigger_task,
+            "reject-plan-terminal",
+            "terminal goal must be denied",
+        );
+        assert_eq!(goal_resume(&request, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(read_goal_bytes(&root, &session, goal_id.as_str()), before);
         std::fs::remove_dir_all(root).unwrap();
     }
 
