@@ -16,6 +16,9 @@ use crate::task::{
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
+const READONLY_RESPONSE_LIMIT_REPORT: &str =
+    "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
+
 pub(crate) struct ReadonlyTransportRecoveryAuthority {
     _private: (),
 }
@@ -607,7 +610,8 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     let legacy_writer_reconciled = reconcile_legacy_writer_blocked_tasks(goal, now)?;
     reconcile_safe_writer_blocked_tasks(goal, now)?;
     reconcile_readonly_transport_retryable_tasks(goal, now)?;
-    if mutation_reconciled || legacy_writer_reconciled {
+    let readonly_plan_reconciled = reconcile_readonly_plan_contract_failures(goal, now)?;
+    if mutation_reconciled || legacy_writer_reconciled || readonly_plan_reconciled {
         goal.add_checkpoint(CheckpointReason::Recovery, now)?;
     }
 
@@ -690,6 +694,45 @@ fn reconcile_readonly_transport_retryable_tasks(
         )?;
     }
     Ok(())
+}
+
+fn reconcile_readonly_plan_contract_failures(
+    goal: &mut Goal,
+    now: &str,
+) -> Result<bool, OrchestratorError> {
+    let task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            let attempt = task.latest_attempt()?;
+            let safe_scope = task.worker() == WorkerKind::CodexReadonly
+                && task.scope().operation_kind() == TaskOperationKind::ReadOnly
+                && task.scope().replay_safety() == ReplaySafety::SafeReadOnly;
+            let safe_attempt = attempt.operation_id().is_none()
+                && attempt.scope_identity().is_none()
+                && attempt.side_effect_class() == Some(SideEffectClass::None)
+                && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed);
+            let response_limit = attempt
+                .worker_report()
+                .is_some_and(|report| report.summary() == READONLY_RESPONSE_LIMIT_REPORT);
+            (task.status() == TaskStatus::Retryable
+                && task.blockers().is_empty()
+                && safe_scope
+                && safe_attempt
+                && response_limit)
+                .then(|| task_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for task_id in &task_ids {
+        goal.transition_task(
+            task_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            now,
+        )?;
+    }
+    Ok(!task_ids.is_empty())
 }
 
 fn reconcile_safe_readonly_blocked_tasks(
@@ -1693,6 +1736,107 @@ mod tests {
         let durable = store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(durable.tasks()[&task_id].status(), TaskStatus::Retryable);
         assert_ne!(durable.tasks()[&task_id].status(), TaskStatus::Completed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_reconciles_safe_readonly_response_limit_for_replan() {
+        const RESPONSE_LIMIT_REPORT: &str =
+            "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
+        let (root, session, store) = fixture("resume-resp-limit");
+        let (mut goal, task_id) =
+            running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
+        goal.task_record_latest_worker_report(
+            &task_id,
+            WorkerReport::new(RESPONSE_LIMIT_REPORT, Vec::new()),
+        )
+        .unwrap();
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(1),
+            Some(0),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Retryable,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let attempt_id = goal.tasks()[&task_id].latest_attempt().unwrap().id().clone();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let before_attempt = store
+            .load_goal(&session.id, &goal_id)
+            .unwrap()
+            .tasks()[&task_id]
+            .latest_attempt()
+            .unwrap()
+            .clone();
+
+        let resumed = goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        let task = &durable.tasks()[&task_id];
+        assert_eq!(resumed.status, GoalStatus::Running);
+        assert_eq!(task.status(), TaskStatus::NeedsReplan);
+        assert_eq!(task.attempts().len(), 1);
+        assert_eq!(task.attempts()[0], before_attempt);
+        assert_eq!(task.latest_attempt().unwrap().id(), &attempt_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_does_not_replan_unrelated_readonly_retryable_failure() {
+        let (root, session, store) = fixture("resume-unrelated");
+        let (mut goal, task_id) =
+            running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
+        goal.task_record_latest_worker_report(
+            &task_id,
+            WorkerReport::new("READONLY_BACKEND_ERROR: unrelated failure", Vec::new()),
+        )
+        .unwrap();
+        goal.task_bind_latest_attempt_execution(
+            &task_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(1),
+            Some(0),
+        )
+        .unwrap();
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Retryable,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+
+        goal_resume(
+            &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            store.load_goal(&session.id, &goal_id).unwrap().tasks()[&task_id].status(),
+            TaskStatus::Retryable
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

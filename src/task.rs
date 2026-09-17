@@ -1197,7 +1197,10 @@ impl Task {
                     | TaskStatus::Cancelled
             ) | (
                 TaskStatus::Retryable,
-                TaskStatus::Ready | TaskStatus::Failed | TaskStatus::Cancelled
+                TaskStatus::Ready
+                    | TaskStatus::NeedsReplan
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
             ) | (
                 TaskStatus::Blocked,
                 TaskStatus::Ready
