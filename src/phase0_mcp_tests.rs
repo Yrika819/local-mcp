@@ -120,7 +120,10 @@ fn goal_tool_catalog_is_exactly_additive() {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert_eq!(tool["inputSchema"]["required"], json!(["session_id"]));
     }
-    let resume = tools.iter().find(|tool| tool["name"] == "goal_resume").unwrap();
+    let resume = tools
+        .iter()
+        .find(|tool| tool["name"] == "goal_resume")
+        .unwrap();
     let rejection = &resume["inputSchema"]["properties"]["pre_execution_plan_rejection"];
     assert_eq!(rejection["type"], "object");
     assert_eq!(rejection["additionalProperties"], false);
