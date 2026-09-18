@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::agent::AgentError;
 use crate::config;
 use crate::goal::{
-    CompletionCriterionId, Goal, GoalId, GoalStatus, GoalVerificationRequirement, ReplanMutation,
+    CheckpointReason, CompletionCriterionId, Goal, GoalId, GoalStatus, GoalVerificationRequirement,
+    PreExecutionPlanReplanPolicy, ReplanMutation,
 };
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::{self, PlannerError};
@@ -30,11 +31,26 @@ pub(crate) struct ReplannerRequest {
     criterion_bindings: Vec<ReplannerCriterionBindingSnapshot>,
     cwd: PathBuf,
     tasks: Vec<ReplannerTaskSnapshot>,
+    pre_execution_plan_rejections: Vec<ReplannerPreExecutionPlanRejectionSnapshot>,
+    consecutive_pre_execution_plan_rejection_count: usize,
     goal_blockers: Vec<ReplannerBlocker>,
     eligible_needs_replan_task_ids: Vec<String>,
     allowed_worker_kinds: Vec<WorkerKind>,
     allowed_operation_kinds: Vec<TaskOperationKind>,
     prohibited_operations: Vec<&'static str>,
+}
+
+const REPLANNER_PRE_EXECUTION_REJECTION_HISTORY_LIMIT: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ReplannerPreExecutionPlanRejectionSnapshot {
+    request_id: String,
+    rejected_plan_revision: u32,
+    trigger_task_id: String,
+    reason: String,
+    observed_goal_revision: u64,
+    at: String,
+    replan_policy: PreExecutionPlanReplanPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -111,6 +127,8 @@ pub(crate) fn replanner_request_for_model_backend_test(cwd: PathBuf) -> Replanne
         criterion_bindings: Vec::new(),
         cwd,
         tasks: Vec::new(),
+        pre_execution_plan_rejections: Vec::new(),
+        consecutive_pre_execution_plan_rejection_count: 0,
         goal_blockers: Vec::new(),
         eligible_needs_replan_task_ids: Vec::new(),
         allowed_worker_kinds: Vec::new(),
@@ -354,6 +372,38 @@ pub(crate) fn replanner_request_for_goal(
         })
         .collect();
 
+    let mut pre_execution_plan_rejections = goal
+        .pre_execution_plan_rejections()
+        .iter()
+        .rev()
+        .take(REPLANNER_PRE_EXECUTION_REJECTION_HISTORY_LIMIT)
+        .map(|rejection| ReplannerPreExecutionPlanRejectionSnapshot {
+            request_id: rejection.request_id().to_owned(),
+            rejected_plan_revision: rejection.rejected_plan_revision(),
+            trigger_task_id: rejection.trigger_task_id().as_str().to_owned(),
+            reason: rejection.reason().to_owned(),
+            observed_goal_revision: rejection.observed_goal_revision(),
+            at: rejection.rejected_at().to_owned(),
+            replan_policy: rejection.replan_policy(),
+        })
+        .collect::<Vec<_>>();
+    pre_execution_plan_rejections.reverse();
+    let latest_committed_replan_revision = goal
+        .checkpoints()
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.reason() == CheckpointReason::ReplanCommitted)
+        .map(|checkpoint| checkpoint.plan_revision());
+    let consecutive_pre_execution_plan_rejection_count = goal
+        .pre_execution_plan_rejections()
+        .iter()
+        .filter(|rejection| {
+            latest_committed_replan_revision.map_or(true, |revision| {
+                rejection.rejected_plan_revision() >= revision
+            })
+        })
+        .count();
+
     Ok(ReplannerRequest {
         goal_id: goal.id().as_str().to_owned(),
         goal_revision: goal.revision(),
@@ -388,6 +438,8 @@ pub(crate) fn replanner_request_for_goal(
             .unwrap_or_default(),
         cwd: goal_root,
         tasks,
+        pre_execution_plan_rejections,
+        consecutive_pre_execution_plan_rejection_count,
         goal_blockers: goal
             .blockers()
             .iter()
@@ -970,6 +1022,13 @@ fn parse_and_validate_proposal(
         validated_resolution.push(task_id);
     }
 
+    validate_readonly_reassessment_barrier(
+        goal,
+        &validated_new_tasks,
+        &validated_add_dependencies,
+        &validated_resolution,
+    )?;
+
     Ok(ValidatedReplan {
         new_tasks: validated_new_tasks,
         add_dependencies: validated_add_dependencies,
@@ -979,6 +1038,136 @@ fn parse_and_validate_proposal(
         resolve_needs_replan: validated_resolution,
         reconcile_exhausted_readonly,
     })
+}
+
+fn validate_readonly_reassessment_barrier(
+    goal: &Goal,
+    new_tasks: &[ValidatedNewTask],
+    added_dependencies: &[(ValidatedTaskRef, ValidatedTaskRef)],
+    resolved_task_ids: &[TaskId],
+) -> Result<(), ReplannerError> {
+    let mut dependency_graph = BTreeMap::<ValidatedTaskRef, BTreeSet<ValidatedTaskRef>>::new();
+    for (task_id, task) in goal.tasks() {
+        dependency_graph.insert(
+            ValidatedTaskRef::Existing(task_id.clone()),
+            task.dependencies()
+                .iter()
+                .map(|dependency| ValidatedTaskRef::Existing(dependency.task_id().clone()))
+                .collect(),
+        );
+    }
+    for task in new_tasks {
+        dependency_graph.insert(
+            ValidatedTaskRef::New(task.proposal_id.clone()),
+            task.dependencies.iter().cloned().collect(),
+        );
+    }
+    for (target, dependency) in added_dependencies {
+        dependency_graph
+            .entry(target.clone())
+            .or_default()
+            .insert(dependency.clone());
+    }
+
+    let new_readonly_refs = new_tasks
+        .iter()
+        .filter(|task| {
+            task.worker == WorkerKind::CodexReadonly
+                && task.scope.operation_kind() == TaskOperationKind::ReadOnly
+                && task.scope.replay_safety() == crate::task::ReplaySafety::SafeReadOnly
+        })
+        .map(|task| ValidatedTaskRef::New(task.proposal_id.clone()))
+        .collect::<Vec<_>>();
+
+    for rejection in goal.pre_execution_plan_rejections() {
+        if rejection.replan_policy() != PreExecutionPlanReplanPolicy::RequireReadonlyReassessment
+            || !resolved_task_ids.contains(rejection.trigger_task_id())
+        {
+            continue;
+        }
+        let trigger_ref = ValidatedTaskRef::Existing(rejection.trigger_task_id().clone());
+        let current_or_proposed_completed_readonly = dependency_graph_reaches(
+            &dependency_graph,
+            &trigger_ref,
+            |candidate| match candidate {
+                ValidatedTaskRef::Existing(task_id) => {
+                    goal.tasks().get(task_id).is_some_and(|task| {
+                        task.created_plan_revision() > rejection.rejected_plan_revision()
+                            && task.worker() == WorkerKind::CodexReadonly
+                            && task.scope().operation_kind() == TaskOperationKind::ReadOnly
+                            && task.status() == TaskStatus::Completed
+                            && task.blockers().is_empty()
+                            && task.evidence_count() > 0
+                            && !task.has_unknown_side_effect()
+                            && task.verification_results().last().is_some_and(|result| {
+                                result.outcome() == crate::task::VerificationOutcome::Passed
+                            })
+                    })
+                }
+                ValidatedTaskRef::New(_) => false,
+            },
+        );
+        if current_or_proposed_completed_readonly {
+            continue;
+        }
+
+        let qualifying_new_readonly = new_readonly_refs
+            .iter()
+            .filter(|candidate| {
+                dependency_graph_reaches(&dependency_graph, &trigger_ref, |node| node == *candidate)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if qualifying_new_readonly.is_empty() {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "REQUIRE_READONLY_REASSESSMENT requires a new READ_ONLY prerequisite in the rejected trigger dependency chain".to_owned(),
+            ));
+        }
+
+        for task in new_tasks
+            .iter()
+            .filter(|task| task.scope.operation_kind() != TaskOperationKind::ReadOnly)
+        {
+            let task_ref = ValidatedTaskRef::New(task.proposal_id.clone());
+            if !qualifying_new_readonly.iter().any(|readonly| {
+                dependency_graph_reaches(&dependency_graph, &task_ref, |node| node == readonly)
+            }) {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "REQUIRE_READONLY_REASSESSMENT requires every new mutation Task to depend on the new READ_ONLY prerequisite".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dependency_graph_reaches<F>(
+    graph: &BTreeMap<ValidatedTaskRef, BTreeSet<ValidatedTaskRef>>,
+    start: &ValidatedTaskRef,
+    mut predicate: F,
+) -> bool
+where
+    F: FnMut(&ValidatedTaskRef) -> bool,
+{
+    let mut stack = graph
+        .get(start)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if predicate(&node) {
+            return true;
+        }
+        if let Some(dependencies) = graph.get(&node) {
+            stack.extend(dependencies.iter().cloned());
+        }
+    }
+    false
 }
 
 fn validate_task_ref(
@@ -1267,7 +1456,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::fallback::{SideEffectClass, SideEffectState};
-    use crate::goal::{CheckpointReason, GoalBlocker};
+    use crate::goal::{CheckpointReason, GoalBlocker, PreExecutionPlanReplanPolicy};
     use crate::task::{
         ReadonlyReplanRecoveryAuthorityKind, ReplaySafety, TaskDependency, TaskEvidence, TaskScope,
         TaskTransitionContext, VerificationCheckResult, VerificationOutcome,
@@ -1403,6 +1592,73 @@ mod tests {
 
     fn fixture() -> Fixture {
         base_fixture(false)
+    }
+
+    fn pre_execution_rejection_fixture_with_policy(replan_policy: &str) -> Fixture {
+        let root =
+            std::env::temp_dir().join(format!("local-mcp-phase7-pre-rejection-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let state = root.join("state");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("sentinel.txt"), b"unchanged\n").unwrap();
+        let session = config::Session {
+            id: format!("phase7-pre-rejection-{}", Uuid::new_v4()),
+            cwd: repo.clone(),
+            permitted_directories: vec![repo.clone()],
+        };
+        let store = TaskStore::with_state_root(state.clone());
+        let mut goal = Goal::new(
+            session.id.clone(),
+            repo.clone(),
+            "replan a rejected accepted plan",
+            None,
+            vec![],
+            vec![],
+            NOW,
+        )
+        .unwrap();
+        let trigger = Task::new(
+            "trigger",
+            "the accepted plan needs reassessment",
+            true,
+            WorkerKind::CodexWriter,
+            scope(&repo, TaskOperationKind::LocalMutation),
+            verification("trigger.rejection"),
+            2,
+            1,
+            NOW,
+        )
+        .unwrap();
+        let trigger_id = trigger.id().clone();
+        goal.materialize_initial_plan(vec![trigger], NOW).unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let rejection_args = json!({
+            "session_id": session.id,
+            "goal_id": goal_id.as_str(),
+            "pre_execution_plan_rejection": {
+                "request_id": "rejection-feedback-1",
+                "expected_goal_revision": 1,
+                "expected_plan_revision": 1,
+                "trigger_task_id": trigger_id.as_str(),
+                "reason": "the repository contract is not established",
+                "replan_policy": replan_policy
+            }
+        });
+        crate::goal_api::goal_resume(&rejection_args, &session, &store).unwrap();
+        Fixture {
+            root,
+            state,
+            repo,
+            session,
+            store,
+            goal_id,
+            trigger_id,
+        }
+    }
+
+    fn pre_execution_rejection_fixture() -> Fixture {
+        pre_execution_rejection_fixture_with_policy("REQUIRE_READONLY_REASSESSMENT")
     }
 
     fn exhaust_trigger_with_second_needs_replan(
@@ -1615,10 +1871,7 @@ mod tests {
             .unwrap();
         assert_eq!(repair.worker(), WorkerKind::CodexWriter);
         assert_eq!(repair.status(), TaskStatus::Ready);
-        assert!(task
-            .dependencies()
-            .iter()
-            .any(|dependency| dependency.task_id() == repair.id()));
+        assert!(task.dependencies().iter().any(|dependency| dependency.task_id() == repair.id()));
     }
 
     #[test]
@@ -1674,6 +1927,370 @@ mod tests {
                 "unexpected authority field {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn replanner_request_contains_pre_execution_rejection_feedback() {
+        let fixture = pre_execution_rejection_fixture();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let request = replanner_request_for_goal(&goal, &fixture.session).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value["pre_execution_plan_rejections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            value["pre_execution_plan_rejections"][0]["request_id"],
+            json!("rejection-feedback-1")
+        );
+        assert_eq!(
+            value["pre_execution_plan_rejections"][0]["rejected_plan_revision"],
+            json!(1)
+        );
+        assert_eq!(
+            value["pre_execution_plan_rejections"][0]["replan_policy"],
+            json!("REQUIRE_READONLY_REASSESSMENT")
+        );
+        assert_eq!(
+            value["consecutive_pre_execution_plan_rejection_count"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn replanner_request_bounds_pre_execution_rejection_history() {
+        let fixture = pre_execution_rejection_fixture();
+        let mut goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let mut trigger_id = fixture.trigger_id.clone();
+
+        for index in 1..9 {
+            let expected_plan_revision = goal.plan_revision();
+
+            let next_trigger = Task::new(
+                format!("next-trigger-{index}"),
+                "synthetic next trigger",
+                true,
+                WorkerKind::CodexReadonly,
+                scope(&fixture.repo, TaskOperationKind::ReadOnly),
+                verification(&format!("next-trigger-{index}")),
+                1,
+                expected_plan_revision + 1,
+                NOW,
+            )
+            .unwrap();
+            let next_trigger_id = next_trigger.id().clone();
+            goal.apply_replan_mutation(
+                ReplanMutation {
+                    new_tasks: vec![next_trigger],
+                    add_dependencies: vec![(trigger_id.clone(), vec![next_trigger_id.clone()])],
+                    add_verification: vec![],
+                    strengthen_mandatory: vec![],
+                    resolve_needs_replan: vec![trigger_id.clone()],
+                    add_criterion_requirements: vec![],
+                },
+                NOW,
+            )
+            .unwrap();
+            trigger_id = next_trigger_id;
+
+            let expected_goal_revision = goal.revision();
+            let expected_plan_revision = goal.plan_revision();
+            goal.reject_pre_execution_plan(
+                format!("bounded-rejection-{index}"),
+                expected_goal_revision,
+                expected_plan_revision,
+                trigger_id.clone(),
+                format!("synthetic rejection {index}"),
+                PreExecutionPlanReplanPolicy::Normal,
+                NOW,
+            )
+            .unwrap();
+        }
+
+        let request = replanner_request_for_goal(&goal, &fixture.session).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        let history = value["pre_execution_plan_rejections"].as_array().unwrap();
+        assert_eq!(history.len(), 8);
+        assert_eq!(history[0]["request_id"], json!("bounded-rejection-1"));
+        assert_eq!(history[7]["request_id"], json!("bounded-rejection-8"));
+        assert_eq!(
+            value["consecutive_pre_execution_plan_rejection_count"],
+            json!(1)
+        );
+    }
+
+    fn writer_first_proposal_value(fixture: &Fixture) -> Value {
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        json!({
+            "goal_id": fixture.goal_id.as_str(),
+            "base_goal_revision": goal.revision(),
+            "base_plan_revision": goal.plan_revision(),
+            "summary": "add a mutation before establishing the repository contract",
+            "add_tasks": [writer_task("repair", vec![])],
+            "add_dependencies": [{
+                "task": existing_ref(&fixture.trigger_id),
+                "dependency": new_ref("repair")
+            }],
+            "strengthen_verification": [],
+            "strengthen_mandatory": [],
+            "strengthen_criterion_bindings": [],
+            "resolve_needs_replan": [fixture.trigger_id.as_str()]
+        })
+    }
+
+    #[test]
+    fn require_readonly_reassessment_rejects_writer_first_before_materialization() {
+        let fixture = pre_execution_rejection_fixture();
+        let before = bytes(&fixture);
+        let result = apply(
+            &fixture,
+            &serde_json::to_vec(&writer_first_proposal_value(&fixture)).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
+        let after = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(after.plan_revision(), 1);
+        assert_eq!(bytes(&fixture), before);
+        assert_eq!(
+            fs::read(fixture.repo.join("sentinel.txt")).unwrap(),
+            b"unchanged\n"
+        );
+    }
+
+    #[test]
+    fn require_readonly_reassessment_accepts_new_readonly_prerequisite() {
+        let fixture = pre_execution_rejection_fixture();
+        let mut proposal = writer_first_proposal_value(&fixture);
+        proposal["summary"] = json!("establish the repository contract before mutation");
+        proposal["add_tasks"] = json!([read_only_task("inspect", vec![])]);
+        proposal["add_dependencies"] = json!([{
+            "task": existing_ref(&fixture.trigger_id),
+            "dependency": new_ref("inspect")
+        }]);
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), 2);
+        assert_eq!(
+            result.tasks()[&fixture.trigger_id].status(),
+            TaskStatus::Pending
+        );
+        let inspection = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task inspect")
+            .unwrap();
+        assert_eq!(inspection.worker(), WorkerKind::CodexReadonly);
+        assert_eq!(
+            inspection.scope().operation_kind(),
+            TaskOperationKind::ReadOnly
+        );
+        assert_eq!(inspection.status(), TaskStatus::Ready);
+        assert!(inspection.attempts().is_empty());
+        assert_eq!(
+            fs::read(fixture.repo.join("sentinel.txt")).unwrap(),
+            b"unchanged\n"
+        );
+    }
+
+    #[test]
+    fn completed_readonly_reassessment_allows_later_scoped_writer_remediation() {
+        let fixture = pre_execution_rejection_fixture();
+        let mut first = writer_first_proposal_value(&fixture);
+        first["summary"] = json!("establish the repository contract before remediation");
+        first["add_tasks"] = json!([read_only_task("inspect", vec![])]);
+        first["add_dependencies"] = json!([{
+            "task": existing_ref(&fixture.trigger_id),
+            "dependency": new_ref("inspect")
+        }]);
+        apply(&fixture, &serde_json::to_vec(&first).unwrap()).unwrap();
+
+        let after_first = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let inspection_id = after_first
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task inspect")
+            .unwrap()
+            .id()
+            .clone();
+        let trigger_id = fixture.trigger_id.clone();
+        fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &fixture.goal_id,
+                after_first.revision(),
+                |goal, now| {
+                    goal.transition_task(
+                        &inspection_id,
+                        TaskStatus::Running,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.task_add_evidence(
+                        &inspection_id,
+                        TaskEvidence::StructuredObservation {
+                            requirement_id: "evidence.inspect".to_owned(),
+                            source: "synthetic-readonly".to_owned(),
+                            passed: true,
+                            detail: "repository contract established".to_owned(),
+                        },
+                    )?;
+                    goal.transition_task(
+                        &inspection_id,
+                        TaskStatus::Verifying,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.task_record_verification_result(
+                        &inspection_id,
+                        VerificationResult::new(
+                            VerificationOutcome::Passed,
+                            vec![VerificationCheckResult::new(0, true, Some("ok".to_owned()))],
+                            now,
+                            now,
+                        ),
+                    )?;
+                    goal.transition_task(
+                        &inspection_id,
+                        TaskStatus::Completed,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.transition_task(
+                        &trigger_id,
+                        TaskStatus::Ready,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.transition_task(
+                        &trigger_id,
+                        TaskStatus::Running,
+                        TaskTransitionContext::default(),
+                        now,
+                    )?;
+                    goal.transition_task(
+                        &trigger_id,
+                        TaskStatus::NeedsReplan,
+                        TaskTransitionContext::default(),
+                        now,
+                    )
+                },
+            )
+            .unwrap();
+
+        let before_writer = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let mut writer = writer_first_proposal_value(&fixture);
+        writer["summary"] = json!("apply only the scoped remediation established by inspection");
+        writer["add_tasks"] = json!([writer_task("repair", vec![existing_ref(&inspection_id)])]);
+        let result = apply(&fixture, &serde_json::to_vec(&writer).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), before_writer.plan_revision() + 1);
+        let repair = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task repair")
+            .unwrap();
+        assert_eq!(repair.status(), TaskStatus::Ready);
+        assert!(
+            repair
+                .dependencies()
+                .iter()
+                .any(|dependency| dependency.task_id() == &inspection_id)
+        );
+    }
+
+    #[test]
+    fn normal_policy_does_not_infer_reassessment_from_rejection_reason() {
+        let fixture = pre_execution_rejection_fixture_with_policy("NORMAL");
+        let mut proposal = writer_first_proposal_value(&fixture);
+        proposal["summary"] =
+            json!("the rejection reason mentions a readonly reassessment, but policy is normal");
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), 2);
+        assert_eq!(
+            result.tasks()[&fixture.trigger_id].status(),
+            TaskStatus::Pending
+        );
+        assert!(result.tasks().values().any(|task| {
+            task.title() == "Task repair" && task.worker() == WorkerKind::CodexWriter
+        }));
+    }
+
+    #[test]
+    fn readonly_barrier_rejects_indirect_writer_before_readonly_bypass() {
+        let fixture = pre_execution_rejection_fixture();
+        let mut proposal = writer_first_proposal_value(&fixture);
+        proposal["add_tasks"] = json!([
+            writer_task("repair", vec![]),
+            read_only_task("inspect", vec![new_ref("repair")])
+        ]);
+        proposal["add_dependencies"] = json!([{
+            "task": existing_ref(&fixture.trigger_id),
+            "dependency": new_ref("inspect")
+        }]);
+        let before = bytes(&fixture);
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap());
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
+        assert_eq!(bytes(&fixture), before);
+    }
+
+    #[test]
+    fn readonly_barrier_allows_scoped_writer_downstream_of_new_readonly() {
+        let fixture = pre_execution_rejection_fixture();
+        let mut proposal = writer_first_proposal_value(&fixture);
+        proposal["summary"] = json!("reassess first, then apply the established scoped repair");
+        proposal["add_tasks"] = json!([
+            read_only_task("inspect", vec![]),
+            writer_task("repair", vec![new_ref("inspect")])
+        ]);
+        proposal["add_dependencies"] = json!([{
+            "task": existing_ref(&fixture.trigger_id),
+            "dependency": new_ref("repair")
+        }]);
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), 2);
+        let inspection = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task inspect")
+            .unwrap();
+        let repair = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task repair")
+            .unwrap();
+        assert_eq!(inspection.status(), TaskStatus::Ready);
+        assert_eq!(repair.status(), TaskStatus::Pending);
+        assert!(
+            repair
+                .dependencies()
+                .iter()
+                .any(|dependency| { dependency.task_id() == inspection.id() })
+        );
     }
 
     #[test]

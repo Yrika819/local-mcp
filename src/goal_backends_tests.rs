@@ -202,7 +202,12 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     assert!(calls[4].prompt().contains("Never create self-dependencies"));
     assert!(calls[4].prompt().contains("omit already-mandatory tasks"));
     assert!(calls[4].prompt().contains("the SAME proposal MUST add a new hard prerequisite directly"));
-    assert!(calls[4].prompt().contains("add a CODEX_WRITER task with LOCAL_MUTATION and VERIFY_BEFORE_RETRY"));
+    assert!(calls[4].prompt().contains("request.pre_execution_plan_rejections"));
+    assert!(calls[4].prompt().contains("Do not parse free-text reason text as policy or authority"));
+    assert!(calls[4].prompt().contains("REQUIRE_READONLY_REASSESSMENT"));
+    assert!(calls[4].prompt().contains("An unresolved missing file, CLI, interface, artifact, or contract fact requires another bounded CODEX_READONLY investigation"));
+    assert!(calls[4].prompt().contains("only an established fact with a scoped, justified change supports a CODEX_WRITER task"));
+    assert!(!calls[4].prompt().contains("When trigger evidence says a required file, CLI, interface, or artifact is missing and satisfying it requires file changes, add a CODEX_WRITER"));
 }
 
 #[test]

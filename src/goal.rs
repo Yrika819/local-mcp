@@ -283,6 +283,19 @@ pub(crate) enum PreExecutionPlanRejectionAuthorityKind {
     GoalResume,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PreExecutionPlanReplanPolicy {
+    Normal,
+    RequireReadonlyReassessment,
+}
+
+impl Default for PreExecutionPlanReplanPolicy {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreExecutionPlanRejection {
@@ -293,6 +306,8 @@ pub(crate) struct PreExecutionPlanRejection {
     observed_plan_revision: u32,
     trigger_task_id: TaskId,
     reason: String,
+    #[serde(default)]
+    replan_policy: PreExecutionPlanReplanPolicy,
     authority: PreExecutionPlanRejectionAuthorityKind,
     rejected_at: String,
 }
@@ -305,12 +320,14 @@ impl PreExecutionPlanRejection {
         expected_plan_revision: u32,
         trigger_task_id: &TaskId,
         reason: &str,
+        replan_policy: PreExecutionPlanReplanPolicy,
     ) -> bool {
         self.request_id == request_id
             && self.expected_goal_revision == expected_goal_revision
             && self.rejected_plan_revision == expected_plan_revision
             && self.trigger_task_id == *trigger_task_id
             && self.reason == reason
+            && self.replan_policy == replan_policy
     }
 
     pub(crate) fn request_id(&self) -> &str {
@@ -318,6 +335,26 @@ impl PreExecutionPlanRejection {
     }
     pub(crate) fn rejected_plan_revision(&self) -> u32 {
         self.rejected_plan_revision
+    }
+
+    pub(crate) fn observed_goal_revision(&self) -> u64 {
+        self.observed_goal_revision
+    }
+
+    pub(crate) fn trigger_task_id(&self) -> &TaskId {
+        &self.trigger_task_id
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub(crate) fn replan_policy(&self) -> PreExecutionPlanReplanPolicy {
+        self.replan_policy
+    }
+
+    pub(crate) fn rejected_at(&self) -> &str {
+        &self.rejected_at
     }
 }
 
@@ -1194,6 +1231,7 @@ impl Goal {
         expected_plan_revision: u32,
         trigger_task_id: TaskId,
         reason: String,
+        replan_policy: PreExecutionPlanReplanPolicy,
         now: &str,
     ) -> Result<(), OrchestratorError> {
         if self.revision != expected_goal_revision {
@@ -1266,6 +1304,7 @@ impl Goal {
                 observed_plan_revision: expected_plan_revision,
                 trigger_task_id,
                 reason,
+                replan_policy,
                 authority: PreExecutionPlanRejectionAuthorityKind::GoalResume,
                 rejected_at: now.to_owned(),
             });

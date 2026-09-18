@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::config;
 use crate::fallback::{SideEffectClass, SideEffectState};
-use crate::goal::{CheckpointReason, Goal, GoalId, GoalStatus};
+use crate::goal::{CheckpointReason, Goal, GoalId, GoalStatus, PreExecutionPlanReplanPolicy};
 use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -207,6 +207,8 @@ struct PreExecutionPlanRejectionRequest {
     expected_plan_revision: u32,
     trigger_task_id: String,
     reason: String,
+    #[serde(default)]
+    replan_policy: PreExecutionPlanReplanPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +458,7 @@ pub(crate) fn goal_resume(
                 rejection.expected_plan_revision,
                 &trigger_task_id,
                 &rejection.reason,
+                rejection.replan_policy,
             ) {
                 return Ok(status_view(&current));
             }
@@ -486,6 +489,7 @@ pub(crate) fn goal_resume(
                     rejection.expected_plan_revision,
                     trigger_task_id.clone(),
                     rejection.reason.clone(),
+                    rejection.replan_policy,
                     now,
                 )
             });
@@ -557,6 +561,7 @@ fn recover_rejection_after_cas_conflict(
             rejection.expected_plan_revision,
             trigger_task_id,
             &rejection.reason,
+            rejection.replan_policy,
         ) {
             return Ok(status_view(&latest));
         }
@@ -1340,6 +1345,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    use serde_json::json;
+
     use crate::fallback::{SideEffectClass, SideEffectState};
     use crate::goal::CheckpointReason;
     use crate::mutation::{MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage};
@@ -1626,6 +1633,29 @@ mod tests {
                 "reason": reason
             }
         })
+    }
+
+    fn pre_execution_rejection_args_with_policy(
+        session: &config::Session,
+        goal_id: &GoalId,
+        expected_goal_revision: u64,
+        expected_plan_revision: u32,
+        trigger_task_id: &crate::task::TaskId,
+        request_id: &str,
+        reason: &str,
+        replan_policy: &str,
+    ) -> Value {
+        let mut args = pre_execution_rejection_args(
+            session,
+            goal_id,
+            expected_goal_revision,
+            expected_plan_revision,
+            trigger_task_id,
+            request_id,
+            reason,
+        );
+        args["pre_execution_plan_rejection"]["replan_policy"] = json!(replan_policy);
+        args
     }
 
     fn legacy_writer_goal(
@@ -2108,6 +2138,81 @@ mod tests {
     }
 
     #[test]
+    fn pre_execution_plan_rejection_omitted_policy_is_persisted_as_normal() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("defpol");
+        let request = pre_execution_rejection_args(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-default-policy",
+            "the accepted plan needs reassessment",
+        );
+        goal_resume(&request, &session, &store).unwrap();
+        let persisted = read_goal_bytes(&root, &session, goal_id.as_str());
+        let value: Value = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(
+            value["pre_execution_plan_rejections"][0]["replan_policy"],
+            json!("NORMAL")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_execution_plan_rejection_persists_typed_policy_and_replays_idempotently() {
+        let (root, session, store, goal_id, _preserved_task, trigger_task) =
+            pre_execution_goal("typedpol");
+        let request = pre_execution_rejection_args_with_policy(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-typed-policy",
+            "the repository contract is not established",
+            "REQUIRE_READONLY_REASSESSMENT",
+        );
+        let first = goal_resume(&request, &session, &store).unwrap();
+        let durable = store.load_goal(&session.id, &goal_id).unwrap();
+        assert_eq!(first.revision, 2);
+        assert_eq!(
+            durable.pre_execution_plan_rejections()[0].replan_policy(),
+            PreExecutionPlanReplanPolicy::RequireReadonlyReassessment
+        );
+        let before_replay = read_goal_bytes(&root, &session, goal_id.as_str());
+        let replay = goal_resume(&request, &session, &store).unwrap();
+        assert_eq!(replay.revision, first.revision);
+        assert_eq!(
+            read_goal_bytes(&root, &session, goal_id.as_str()),
+            before_replay
+        );
+
+        let conflicting_policy = pre_execution_rejection_args_with_policy(
+            &session,
+            &goal_id,
+            1,
+            2,
+            &trigger_task,
+            "reject-plan-typed-policy",
+            "the repository contract is not established",
+            "NORMAL",
+        );
+        assert_eq!(
+            goal_resume(&conflicting_policy, &session, &store)
+                .unwrap_err()
+                .code(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        assert_eq!(
+            read_goal_bytes(&root, &session, goal_id.as_str()),
+            before_replay
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pre_execution_plan_rejection_persistence_failure_is_non_mutating() {
         let (root, session, store, goal_id, _preserved_task, trigger_task) =
             pre_execution_goal("preplan-pfail");
@@ -2288,6 +2393,7 @@ mod tests {
             expected_plan_revision: 2,
             trigger_task_id: trigger_task.as_str().to_owned(),
             reason: "the winning concurrent request committed this rejection".to_owned(),
+            replan_policy: PreExecutionPlanReplanPolicy::Normal,
         };
         let replay = recover_rejection_after_cas_conflict(
             &store,
