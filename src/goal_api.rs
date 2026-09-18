@@ -478,11 +478,8 @@ pub(crate) fn goal_resume(
                 rejection.expected_plan_revision,
             ));
         }
-        let result = store.mutate_goal_snapshot(
-            &session.id,
-            &goal_id,
-            current.revision(),
-            |goal, now| {
+        let result =
+            store.mutate_goal_snapshot(&session.id, &goal_id, current.revision(), |goal, now| {
                 goal.reject_pre_execution_plan(
                     rejection.request_id.clone(),
                     rejection.expected_goal_revision,
@@ -491,18 +488,19 @@ pub(crate) fn goal_resume(
                     rejection.reason.clone(),
                     now,
                 )
-            },
-        );
+            });
         match result {
             Ok(durable) => return Ok(status_view(&durable)),
-            Err(error @ OrchestratorError::RevisionConflict { .. }) => return recover_rejection_after_cas_conflict(
-                store,
-                session,
-                &goal_id,
-                &rejection,
-                &trigger_task_id,
-                error,
-            ),
+            Err(error @ OrchestratorError::RevisionConflict { .. }) => {
+                return recover_rejection_after_cas_conflict(
+                    store,
+                    session,
+                    &goal_id,
+                    &rejection,
+                    &trigger_task_id,
+                    error,
+                );
+            }
             Err(error) => return Err(GoalApiError::from_orchestrator(error)),
         }
     }
@@ -1354,7 +1352,9 @@ mod tests {
         TaskTransitionContext, VerificationResult, WorkerKind, WorkerReport,
     };
     use crate::task_store::FaultPoint;
-    use crate::writer::{ReviewerBackend, ReviewerRequest, WriterBackend, WriterError, WriterRequest};
+    use crate::writer::{
+        ReviewerBackend, ReviewerRequest, WriterBackend, WriterError, WriterRequest,
+    };
 
     const NOW: &str = "2026-01-01T00:00:00Z";
 
@@ -1543,7 +1543,14 @@ mod tests {
 
     fn pre_execution_goal(
         name: &str,
-    ) -> (PathBuf, config::Session, TaskStore, GoalId, crate::task::TaskId, crate::task::TaskId) {
+    ) -> (
+        PathBuf,
+        config::Session,
+        TaskStore,
+        GoalId,
+        crate::task::TaskId,
+        crate::task::TaskId,
+    ) {
         let (root, session, store) = fixture(name);
         let mut goal = Goal::new(
             session.id.clone(),
@@ -2065,7 +2072,10 @@ mod tests {
         let durable = store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(durable.plan_revision(), 2);
         assert_eq!(durable.tasks()[&earlier_task].status(), TaskStatus::Ready);
-        assert_eq!(durable.tasks()[&trigger_task].status(), TaskStatus::NeedsReplan);
+        assert_eq!(
+            durable.tasks()[&trigger_task].status(),
+            TaskStatus::NeedsReplan
+        );
         assert!(durable.tasks()[&trigger_task].attempts().is_empty());
         let selection = crate::scheduler::select_scheduler_action(&durable).unwrap();
         assert!(matches!(
@@ -2086,7 +2096,10 @@ mod tests {
         assert_eq!(record["expected_goal_revision"], 1);
         assert_eq!(record["observed_goal_revision"], 1);
         assert_eq!(record["observed_plan_revision"], 2);
-        assert_eq!(record["reason"], "host rejected the accepted plan before execution");
+        assert_eq!(
+            record["reason"],
+            "host rejected the accepted plan before execution"
+        );
         assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
         let serialized = String::from_utf8(bytes).unwrap();
         assert!(serialized.contains("PRE_EXECUTION_PLAN_REJECTED"));
@@ -2161,22 +2174,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.action, crate::scheduler::SchedulerAction::Replan);
-        assert_eq!(result.outcome, crate::scheduler::SchedulerStepOutcome::Applied);
+        assert_eq!(
+            result.outcome,
+            crate::scheduler::SchedulerStepOutcome::Applied
+        );
         assert_eq!(replanner.calls.get(), 1);
         assert_eq!(writer.calls.get(), 0);
 
         let repaired = reloaded_store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(repaired.status(), GoalStatus::Running);
         assert_eq!(repaired.plan_revision(), 3);
-        assert_eq!(repaired.tasks()[&trigger_task].status(), TaskStatus::Pending);
-        assert!(repaired
-            .tasks()
-            .values()
-            .any(|task| task.title() == "repair prerequisite" && task.status() == TaskStatus::Ready));
+        assert_eq!(
+            repaired.tasks()[&trigger_task].status(),
+            TaskStatus::Pending
+        );
+        assert!(repaired.tasks().values().any(
+            |task| task.title() == "repair prerequisite" && task.status() == TaskStatus::Ready
+        ));
         assert_eq!(repaired.pre_execution_plan_rejections().len(), 1);
         assert!(repaired.tasks()[&trigger_task].attempts().is_empty());
         assert!(repaired.tasks()[&trigger_task].evidence().is_empty());
-        assert_eq!(std::fs::read_to_string(session.cwd.join("sentinel.txt")).unwrap(), "unchanged");
+        assert_eq!(
+            std::fs::read_to_string(session.cwd.join("sentinel.txt")).unwrap(),
+            "unchanged"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2196,11 +2217,21 @@ mod tests {
         let first = goal_resume(&args, &session, &store).unwrap();
         let first_bytes = read_goal_bytes(&root, &session, goal_id.as_str());
         assert_eq!(first.revision, 2);
-        assert_eq!(store.load_goal(&session.id, &goal_id).unwrap().pre_execution_plan_rejections().len(), 1);
+        assert_eq!(
+            store
+                .load_goal(&session.id, &goal_id)
+                .unwrap()
+                .pre_execution_plan_rejections()
+                .len(),
+            1
+        );
 
         let replay = goal_resume(&args, &session, &store).unwrap();
         assert_eq!(replay.revision, first.revision);
-        assert_eq!(read_goal_bytes(&root, &session, goal_id.as_str()), first_bytes);
+        assert_eq!(
+            read_goal_bytes(&root, &session, goal_id.as_str()),
+            first_bytes
+        );
 
         let changed_reason = pre_execution_rejection_args(
             &session,
@@ -2213,7 +2244,10 @@ mod tests {
         );
         let conflict = goal_resume(&changed_reason, &session, &store).unwrap_err();
         assert_eq!(conflict.code(), "IDEMPOTENCY_CONFLICT");
-        assert_eq!(read_goal_bytes(&root, &session, goal_id.as_str()), first_bytes);
+        assert_eq!(
+            read_goal_bytes(&root, &session, goal_id.as_str()),
+            first_bytes
+        );
 
         let other_request = pre_execution_rejection_args(
             &session,
@@ -2286,7 +2320,12 @@ mod tests {
             "reject-plan-stale-plan",
             "stale plan",
         );
-        assert_eq!(goal_resume(&stale_plan, &session, &store).unwrap_err().code(), "REVISION_CONFLICT");
+        assert_eq!(
+            goal_resume(&stale_plan, &session, &store)
+                .unwrap_err()
+                .code(),
+            "REVISION_CONFLICT"
+        );
 
         let stale_goal = pre_execution_rejection_args(
             &session,
@@ -2297,7 +2336,12 @@ mod tests {
             "reject-plan-stale-goal",
             "stale goal",
         );
-        assert_eq!(goal_resume(&stale_goal, &session, &store).unwrap_err().code(), "REVISION_CONFLICT");
+        assert_eq!(
+            goal_resume(&stale_goal, &session, &store)
+                .unwrap_err()
+                .code(),
+            "REVISION_CONFLICT"
+        );
 
         let missing_trigger = pre_execution_rejection_args(
             &session,
@@ -2308,7 +2352,12 @@ mod tests {
             "reject-plan-missing-trigger",
             "missing trigger",
         );
-        assert_eq!(goal_resume(&missing_trigger, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&missing_trigger, &session, &store)
+                .unwrap_err()
+                .code(),
+            "INVALID_GOAL_STATE"
+        );
 
         let noncanonical = serde_json::json!({
             "session_id": session.id,
@@ -2321,7 +2370,12 @@ mod tests {
                 "reason": " "
             }
         });
-        assert_eq!(goal_resume(&noncanonical, &session, &store).unwrap_err().code(), "INVALID_ARGUMENT");
+        assert_eq!(
+            goal_resume(&noncanonical, &session, &store)
+                .unwrap_err()
+                .code(),
+            "INVALID_ARGUMENT"
+        );
 
         let before = read_goal_bytes(&root, &session, goal_id.as_str());
         store
@@ -2344,10 +2398,17 @@ mod tests {
             "reject-plan-nonpristine",
             "non-pristine trigger",
         );
-        assert_eq!(goal_resume(&nonpristine, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&nonpristine, &session, &store)
+                .unwrap_err()
+                .code(),
+            "INVALID_GOAL_STATE"
+        );
         assert_ne!(read_goal_bytes(&root, &session, goal_id.as_str()), before);
         assert_eq!(
-            store.load_goal(&session.id, &goal_id).unwrap().tasks()[&trigger_task].attempts().len(),
+            store.load_goal(&session.id, &goal_id).unwrap().tasks()[&trigger_task]
+                .attempts()
+                .len(),
             1
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -2377,7 +2438,10 @@ mod tests {
             "reject-plan-running",
             "running task must be denied",
         );
-        assert_eq!(goal_resume(&request, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&request, &session, &store).unwrap_err().code(),
+            "INVALID_GOAL_STATE"
+        );
 
         let (root_verify, session_verify, store_verify, goal_verify, _preserved, trigger_verify) =
             pre_execution_goal("preplan-verifying");
@@ -2397,7 +2461,9 @@ mod tests {
                 )
             })
             .unwrap();
-        let current_verify = store_verify.load_goal(&session_verify.id, &goal_verify).unwrap();
+        let current_verify = store_verify
+            .load_goal(&session_verify.id, &goal_verify)
+            .unwrap();
         let verifying = pre_execution_rejection_args(
             &session_verify,
             &goal_verify,
@@ -2407,7 +2473,12 @@ mod tests {
             "reject-plan-verifying",
             "verifying task must be denied",
         );
-        assert_eq!(goal_resume(&verifying, &session_verify, &store_verify).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&verifying, &session_verify, &store_verify)
+                .unwrap_err()
+                .code(),
+            "INVALID_GOAL_STATE"
+        );
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(root_verify).unwrap();
     }
@@ -2432,7 +2503,8 @@ mod tests {
                         session.cwd.join("target.txt"),
                         MutationPreimage::Absent,
                         crate::mutation::FileObservation::absent(),
-                        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+                        "0000000000000000000000000000000000000000000000000000000000000000"
+                            .to_owned(),
                         "request-preplan".to_owned(),
                     )],
                 )?;
@@ -2449,11 +2521,20 @@ mod tests {
             "reject-plan-intent",
             "active intent must be denied",
         );
-        assert_eq!(goal_resume(&request, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&request, &session, &store).unwrap_err().code(),
+            "INVALID_GOAL_STATE"
+        );
         std::fs::remove_dir_all(root).unwrap();
 
-        let (root_unknown, session_unknown, store_unknown, goal_unknown, _preserved, trigger_unknown) =
-            pre_execution_goal("preplan-unknown");
+        let (
+            root_unknown,
+            session_unknown,
+            store_unknown,
+            goal_unknown,
+            _preserved,
+            trigger_unknown,
+        ) = pre_execution_goal("preplan-unknown");
         store_unknown
             .mutate_goal_snapshot(&session_unknown.id, &goal_unknown, 1, |goal, now| {
                 goal.transition_task(
@@ -2474,7 +2555,9 @@ mod tests {
                 )
             })
             .unwrap();
-        let current_unknown = store_unknown.load_goal(&session_unknown.id, &goal_unknown).unwrap();
+        let current_unknown = store_unknown
+            .load_goal(&session_unknown.id, &goal_unknown)
+            .unwrap();
         let unknown = pre_execution_rejection_args(
             &session_unknown,
             &goal_unknown,
@@ -2484,7 +2567,12 @@ mod tests {
             "reject-plan-unknown",
             "unknown side effect must be denied",
         );
-        assert_eq!(goal_resume(&unknown, &session_unknown, &store_unknown).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&unknown, &session_unknown, &store_unknown)
+                .unwrap_err()
+                .code(),
+            "INVALID_GOAL_STATE"
+        );
         std::fs::remove_dir_all(root_unknown).unwrap();
     }
 
@@ -2505,7 +2593,10 @@ mod tests {
             "reject-plan-terminal",
             "terminal goal must be denied",
         );
-        assert_eq!(goal_resume(&request, &session, &store).unwrap_err().code(), "INVALID_GOAL_STATE");
+        assert_eq!(
+            goal_resume(&request, &session, &store).unwrap_err().code(),
+            "INVALID_GOAL_STATE"
+        );
         assert_eq!(read_goal_bytes(&root, &session, goal_id.as_str()), before);
         std::fs::remove_dir_all(root).unwrap();
     }

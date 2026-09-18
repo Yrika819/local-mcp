@@ -313,8 +313,12 @@ impl PreExecutionPlanRejection {
             && self.reason == reason
     }
 
-    pub(crate) fn request_id(&self) -> &str { &self.request_id }
-    pub(crate) fn rejected_plan_revision(&self) -> u32 { self.rejected_plan_revision }
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub(crate) fn rejected_plan_revision(&self) -> u32 {
+        self.rejected_plan_revision
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,10 +607,7 @@ impl Goal {
             .find(|record| record.request_id() == request_id)
     }
 
-    pub(crate) fn has_pre_execution_plan_rejection_for_plan(
-        &self,
-        plan_revision: u32,
-    ) -> bool {
+    pub(crate) fn has_pre_execution_plan_rejection_for_plan(&self, plan_revision: u32) -> bool {
         self.pre_execution_plan_rejections
             .iter()
             .any(|record| record.rejected_plan_revision() == plan_revision)
@@ -1946,7 +1947,8 @@ impl Goal {
             })?;
             if task.created_plan_revision() != rejection.rejected_plan_revision {
                 return Err(OrchestratorError::CorruptGoal(
-                    "pre-execution plan rejection trigger Task is not bound to its rejected plan".to_owned(),
+                    "pre-execution plan rejection trigger Task is not bound to its rejected plan"
+                        .to_owned(),
                 ));
             }
         }
