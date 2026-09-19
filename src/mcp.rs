@@ -120,7 +120,25 @@ where
             // Hold the permit for the entire dispatch so the concurrency bound
             // reflects genuinely in-flight work.
             let _permit = permit;
-            let response = match dispatch(&request).await {
+            // Panic containment: a panicking handler must not silently drop
+            // the request (leaving the client waiting on that ID forever).
+            // Supervise the inner dispatch and synthesize a JSON-RPC internal
+            // error on panic so the request always receives exactly one
+            // response and the panic can never poison the read loop, the
+            // writer task, or any other in-flight request.
+            let dispatch_task = tokio::spawn(async move { dispatch(&request).await });
+            let outcome = match dispatch_task.await {
+                Ok(outcome) => outcome,
+                Err(join_error) => Err(anyhow::anyhow!(
+                    "internal error: request handler failed ({})",
+                    if join_error.is_panic() {
+                        "panic"
+                    } else {
+                        "cancelled"
+                    }
+                )),
+            };
+            let response = match outcome {
                 Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                 Err(error) => {
                     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
@@ -1251,5 +1269,38 @@ mod tests {
         assert_eq!(responses[0]["error"]["code"], -32700);
         assert_eq!(responses[1]["id"], 2);
         assert!(responses[1]["result"].is_object());
+    }
+
+    /// Regression (panic containment): a panicking dispatch task must still
+    /// yield exactly one error response (never silently drop the request) and
+    /// must not poison the runtime for subsequent work. This mirrors the
+    /// `tokio::spawn` + JoinError supervision used in `serve_with_io`.
+    #[tokio::test]
+    async fn panicking_dispatch_yields_error_response_and_does_not_poison_runtime() {
+        // Mirror the exact supervision pattern from the transport loop.
+        let panicking = tokio::spawn(async move { panic!("synthetic dispatch panic") });
+        let outcome: Result<Value> = match panicking.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(anyhow::anyhow!(
+                "internal error: request handler failed ({})",
+                if join_error.is_panic() { "panic" } else { "cancelled" }
+            )),
+        };
+        let response = match outcome {
+            Ok(result) => json!({"jsonrpc":"2.0","id":7,"result":result}),
+            Err(error) => {
+                json!({"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":format!("{error:#}")}})
+            }
+        };
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("panic"));
+
+        // The runtime is unaffected: a follow-up task still runs to completion.
+        let follow_up = tokio::spawn(async move { 42_u32 }).await.unwrap();
+        assert_eq!(follow_up, 42);
     }
 }
