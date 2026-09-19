@@ -213,10 +213,11 @@ pub(crate) fn reconcile_goal_mutations(
     }
     if changed
         && goal.status() != GoalStatus::Blocked
-        && goal
-            .tasks()
-            .values()
-            .any(|task| task.mandatory() && task.status() == crate::task::TaskStatus::Blocked)
+        && goal.tasks().values().any(|task| {
+            task.is_active_plan_authority()
+                && task.mandatory()
+                && task.status() == crate::task::TaskStatus::Blocked
+        })
     {
         goal.transition_to(GoalStatus::Blocked, now)?;
     }

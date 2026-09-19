@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::agent::AgentError;
 use crate::config;
@@ -219,6 +220,22 @@ struct ReplanProposal {
     strengthen_criterion_bindings: Vec<CriterionBindingStrengtheningProposal>,
     #[serde(default)]
     resolve_needs_replan: Vec<String>,
+    #[serde(default)]
+    pristine_plan_supersession: Option<PristinePlanSupersessionProposal>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PristinePlanSupersessionProposal {
+    rejection_request_id: String,
+    criterion_rebindings: Vec<CriterionReplacementProposal>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CriterionReplacementProposal {
+    criterion_id: String,
+    replacement_task_refs: Vec<TaskRefProposal>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -282,6 +299,16 @@ struct ValidatedReplan {
     add_criterion_requirements: Vec<(CompletionCriterionId, Vec<ValidatedTaskRef>)>,
     resolve_needs_replan: Vec<TaskId>,
     reconcile_exhausted_readonly: Vec<TaskId>,
+    pristine_plan_supersession: Option<ValidatedPristinePlanSupersession>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedPristinePlanSupersession {
+    rejection_request_id: String,
+    rejected_plan_revision: u32,
+    canonical_proposal_digest: String,
+    affected_task_ids: Vec<TaskId>,
+    criterion_rebindings: Vec<(CompletionCriterionId, Vec<ValidatedTaskRef>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -507,6 +534,32 @@ pub(crate) fn materialize_replan_output(
     let current = store
         .load_goal(&session.id, goal_id)
         .map_err(map_store_error)?;
+    let raw: serde_json::Value = serde_json::from_slice(output).map_err(|error| {
+        ReplannerError::ReplannerOutputInvalid(format!(
+            "malformed JSON at line {}, column {}",
+            error.line(),
+            error.column()
+        ))
+    })?;
+    let proposal: ReplanProposal = serde_json::from_value(raw.clone()).map_err(|_| {
+        ReplannerError::ReplannerSchemaViolation(
+            "proposal shape does not match the strict Phase 7 schema".to_owned(),
+        )
+    })?;
+    if let Some(supersession) = proposal.pristine_plan_supersession.as_ref() {
+        let digest = canonical_proposal_digest(&raw);
+        if let Some(record) =
+            current.find_pristine_plan_supersession(&supersession.rejection_request_id)
+        {
+            if record.canonical_proposal_digest() == digest {
+                return Ok(current);
+            }
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "replayed supersession rejection ID has a different effective proposal digest"
+                    .to_owned(),
+            ));
+        }
+    }
     if current.revision() != expected_goal_revision {
         return Err(ReplannerError::RevisionConflict {
             expected: expected_goal_revision,
@@ -543,6 +596,62 @@ pub(crate) fn materialize_replan_output(
         .map_err(map_store_error)
 }
 
+fn canonical_proposal_digest(value: &serde_json::Value) -> String {
+    let mut canonical = canonicalize_json(value);
+    if let serde_json::Value::Object(object) = &mut canonical {
+        object.remove("summary");
+    }
+    let bytes = serde_json::to_vec(&canonical).expect("canonical JSON is serializable");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    canonicalize_json_with_key(value, None)
+}
+
+fn canonicalize_json_with_key(value: &serde_json::Value, key: Option<&str>) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .map(|(child_key, value)| {
+                    (
+                        child_key.clone(),
+                        canonicalize_json_with_key(value, Some(child_key)),
+                    )
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            let mut values = values
+                .iter()
+                .map(|value| canonicalize_json_with_key(value, None))
+                .collect::<Vec<_>>();
+            if matches!(
+                key,
+                Some(
+                    "add_tasks"
+                        | "add_dependencies"
+                        | "strengthen_verification"
+                        | "strengthen_mandatory"
+                        | "strengthen_criterion_bindings"
+                        | "resolve_needs_replan"
+                        | "dependencies"
+                        | "verification"
+                        | "allowed_paths"
+                        | "forbidden_paths"
+                        | "criterion_rebindings"
+                        | "replacement_task_refs"
+                )
+            ) {
+                values.sort_by_key(|value| serde_json::to_string(value).expect("canonical JSON"));
+            }
+            serde_json::Value::Array(values)
+        }
+        other => other.clone(),
+    }
+}
+
 fn ensure_replan_eligible(goal: &Goal) -> Result<(), ReplannerError> {
     if goal.is_terminal() {
         return Err(ReplannerError::ReplanNotApplicable(
@@ -575,11 +684,12 @@ fn parse_and_validate_proposal(
             error.column()
         ))
     })?;
-    let proposal: ReplanProposal = serde_json::from_value(raw).map_err(|_| {
+    let proposal: ReplanProposal = serde_json::from_value(raw.clone()).map_err(|_| {
         ReplannerError::ReplannerSchemaViolation(
             "proposal shape does not match the strict Phase 7 schema".to_owned(),
         )
     })?;
+    let proposal_digest = canonical_proposal_digest(&raw);
 
     if proposal.goal_id != goal.id().as_str() {
         return Err(ReplannerError::ReplannerSchemaViolation(
@@ -605,12 +715,20 @@ fn parse_and_validate_proposal(
     )
     .map_err(map_planner_validation_error)?;
 
+    let pristine_plan_supersession = proposal.pristine_plan_supersession.clone();
+    let has_monotonic_changes = !proposal.add_dependencies.is_empty()
+        || !proposal.strengthen_verification.is_empty()
+        || !proposal.strengthen_mandatory.is_empty()
+        || !proposal.strengthen_criterion_bindings.is_empty()
+        || !proposal.resolve_needs_replan.is_empty();
+
     let change_count = proposal.add_tasks.len()
         + proposal.add_dependencies.len()
         + proposal.strengthen_verification.len()
         + proposal.strengthen_mandatory.len()
         + proposal.strengthen_criterion_bindings.len()
-        + proposal.resolve_needs_replan.len();
+        + proposal.resolve_needs_replan.len()
+        + usize::from(pristine_plan_supersession.is_some());
     if change_count == 0 {
         return Err(ReplannerError::ReplannerSchemaViolation(
             "replan must contain at least one monotonic change".to_owned(),
@@ -908,7 +1026,7 @@ fn parse_and_validate_proposal(
         .collect::<BTreeMap<_, _>>();
     let current_spec = goal.final_verification_spec().ok_or_else(|| {
         ReplannerError::ReplanAuthorityViolation(
-            "schema-2 replan requires an existing Goal final-verification contract".to_owned(),
+            "schema-3 replan requires an existing Goal final-verification contract".to_owned(),
         )
     })?;
     let mut seen_criterion_strengthenings = BTreeSet::new();
@@ -1029,6 +1147,26 @@ fn parse_and_validate_proposal(
         &validated_resolution,
     )?;
 
+    let pristine_plan_supersession = if let Some(supersession) = pristine_plan_supersession {
+        if has_monotonic_changes {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "pristine-plan supersession cannot be mixed with ordinary monotonic replan changes"
+                    .to_owned(),
+            ));
+        }
+        Some(validate_pristine_plan_supersession(
+            supersession,
+            goal,
+            &validated_new_tasks,
+            &new_by_id,
+            &validated_add_dependencies,
+            &validated_resolution,
+            proposal_digest,
+        )?)
+    } else {
+        None
+    };
+
     Ok(ValidatedReplan {
         new_tasks: validated_new_tasks,
         add_dependencies: validated_add_dependencies,
@@ -1037,6 +1175,200 @@ fn parse_and_validate_proposal(
         add_criterion_requirements: validated_criterion_requirements,
         resolve_needs_replan: validated_resolution,
         reconcile_exhausted_readonly,
+        pristine_plan_supersession,
+    })
+}
+
+fn validate_pristine_plan_supersession(
+    proposal: PristinePlanSupersessionProposal,
+    goal: &Goal,
+    new_tasks: &[ValidatedNewTask],
+    new_by_id: &BTreeMap<String, &ValidatedNewTask>,
+    added_dependencies: &[(ValidatedTaskRef, ValidatedTaskRef)],
+    resolved_task_ids: &[TaskId],
+    digest: String,
+) -> Result<ValidatedPristinePlanSupersession, ReplannerError> {
+    if !added_dependencies.is_empty() || !resolved_task_ids.is_empty() {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "pristine-plan supersession cannot add ordinary dependency or resolution mutations"
+                .to_owned(),
+        ));
+    }
+    let rejection = goal
+        .find_pre_execution_plan_rejection(&proposal.rejection_request_id)
+        .ok_or_else(|| {
+            ReplannerError::ReplanAuthorityViolation(
+                "pristine-plan supersession requires an existing pre-execution rejection authority"
+                    .to_owned(),
+            )
+        })?;
+    if rejection.rejected_plan_revision() != goal.plan_revision() {
+        return Err(ReplannerError::ReplanNotApplicable(
+            "the rejection does not target the current plan revision".to_owned(),
+        ));
+    }
+    let affected_task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(id, task)| {
+            (task.created_plan_revision() == goal.plan_revision()).then_some(id.clone())
+        })
+        .collect::<Vec<_>>();
+    if affected_task_ids.is_empty()
+        || !affected_task_ids
+            .iter()
+            .any(|id| id == rejection.trigger_task_id())
+    {
+        return Err(ReplannerError::ReplanAuthorityViolation(
+            "host-derived rejected plan set is empty or lacks the exact rejection trigger"
+                .to_owned(),
+        ));
+    }
+    for task_id in &affected_task_ids {
+        let task = &goal.tasks()[task_id];
+        if !task.attempts().is_empty()
+            || task.evidence_count() != 0
+            || !task.verification_results().is_empty()
+            || !task.blockers().is_empty()
+            || task.has_unknown_side_effect()
+            || (task.status() == TaskStatus::NeedsReplan && task_id != rejection.trigger_task_id())
+            || !matches!(
+                task.status(),
+                TaskStatus::Pending | TaskStatus::Ready | TaskStatus::NeedsReplan
+            )
+        {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "affected rejected-plan Tasks are not strictly pristine".to_owned(),
+            ));
+        }
+    }
+    let affected = affected_task_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let current_spec = goal.final_verification_spec().ok_or_else(|| {
+        ReplannerError::ReplanAuthorityViolation(
+            "supersession requires a structured final-verification contract".to_owned(),
+        )
+    })?;
+    let mut rebindings = BTreeMap::new();
+    for binding in current_spec.criterion_bindings() {
+        if binding
+            .requirements()
+            .iter()
+            .any(|requirement| affected.contains(requirement.task_id()))
+        {
+            let entry = proposal
+                .criterion_rebindings
+                .iter()
+                .find(|entry| entry.criterion_id == binding.criterion_id().as_str())
+                .ok_or_else(|| {
+                    ReplannerError::ReplanAuthorityViolation(
+                        "every affected criterion requires an explicit replacement binding"
+                            .to_owned(),
+                    )
+                })?;
+            let criterion_id = CompletionCriterionId::parse(&entry.criterion_id).map_err(|_| {
+                ReplannerError::ReplannerSchemaViolation("criterion ID is malformed".to_owned())
+            })?;
+            if rebindings
+                .insert(criterion_id.clone(), entry.replacement_task_refs.clone())
+                .is_some()
+            {
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "criterion replacement binding is duplicated".to_owned(),
+                ));
+            }
+        }
+    }
+    if rebindings.len() != proposal.criterion_rebindings.len() {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "criterion replacement bindings must cover exactly the affected criteria".to_owned(),
+        ));
+    }
+    let mut replacement_ids = BTreeSet::new();
+    let mut validated_rebindings = Vec::new();
+    for (criterion_id, refs) in rebindings {
+        let affected_count = current_spec
+            .criterion_bindings()
+            .iter()
+            .find(|binding| binding.criterion_id() == &criterion_id)
+            .unwrap()
+            .requirements()
+            .iter()
+            .filter(|requirement| affected.contains(requirement.task_id()))
+            .count();
+        if refs.len() < affected_count || refs.is_empty() {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "criterion replacement cardinality is lower than the affected proof coverage"
+                    .to_owned(),
+            ));
+        }
+        let mut validated_refs = Vec::new();
+        for reference in refs {
+            let validated = validate_task_ref(
+                reference,
+                goal,
+                &new_tasks
+                    .iter()
+                    .map(|task| task.proposal_id.clone())
+                    .collect::<BTreeSet<_>>(),
+            )?;
+            let ValidatedTaskRef::New(proposal_id) = &validated else {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "criterion replacement references must be new proposal Tasks".to_owned(),
+                ));
+            };
+            let task = new_by_id.get(proposal_id).ok_or_else(|| {
+                ReplannerError::ReplannerSchemaViolation(
+                    "criterion replacement Task is missing".to_owned(),
+                )
+            })?;
+            if !task.mandatory
+                || task.verification.is_empty()
+                || !replacement_ids.insert(proposal_id.clone())
+            {
+                return Err(ReplannerError::ReplanAuthorityViolation("criterion replacement requires distinct new mandatory mechanically verified Tasks".to_owned()));
+            }
+            validated_refs.push(validated);
+        }
+        validated_rebindings.push((criterion_id, validated_refs));
+    }
+    if replacement_ids.len() != new_tasks.len() {
+        return Err(ReplannerError::ReplanAuthorityViolation(
+            "every replacement Task must be bound to a required criterion exactly once".to_owned(),
+        ));
+    }
+    let readonly_refs = new_tasks
+        .iter()
+        .filter(|task| {
+            task.worker == WorkerKind::CodexReadonly
+                && task.scope.operation_kind() == TaskOperationKind::ReadOnly
+                && task.scope.replay_safety() == crate::task::ReplaySafety::SafeReadOnly
+        })
+        .map(|task| ValidatedTaskRef::New(task.proposal_id.clone()))
+        .collect::<BTreeSet<_>>();
+    if rejection.replan_policy() == PreExecutionPlanReplanPolicy::RequireReadonlyReassessment {
+        if readonly_refs.is_empty()
+            || new_tasks
+                .iter()
+                .filter(|task| task.scope.operation_kind() != TaskOperationKind::ReadOnly)
+                .any(|task| {
+                    !task
+                        .dependencies
+                        .iter()
+                        .any(|dependency| readonly_refs.contains(dependency))
+                })
+        {
+            return Err(ReplannerError::ReplanAuthorityViolation("REQUIRE_READONLY_REASSESSMENT requires replacement mutation Tasks to depend on a new safe READ_ONLY reassessment".to_owned()));
+        }
+    }
+    if new_tasks.iter().flat_map(|task| task.dependencies.iter()).any(|dependency| matches!(dependency, ValidatedTaskRef::Existing(id) if affected.contains(id))) {
+        return Err(ReplannerError::ReplanAuthorityViolation("replacement Tasks cannot depend on superseded rejected-plan Tasks".to_owned()));
+    }
+    Ok(ValidatedPristinePlanSupersession {
+        rejection_request_id: proposal.rejection_request_id,
+        rejected_plan_revision: goal.plan_revision(),
+        canonical_proposal_digest: digest,
+        affected_task_ids,
+        criterion_rebindings: validated_rebindings,
     })
 }
 
@@ -1254,6 +1586,7 @@ fn materialize_validated_replan(
         .checked_add(1)
         .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
     let reconcile_exhausted_readonly = validated.reconcile_exhausted_readonly.clone();
+    let pristine_plan_supersession = validated.pristine_plan_supersession.clone();
 
     let mut materialized = Vec::with_capacity(validated.new_tasks.len());
     let mut local_to_id = BTreeMap::<String, TaskId>::new();
@@ -1299,6 +1632,32 @@ fn materialize_validated_replan(
             .map(crate::task::TaskDependency::completed)
             .collect::<Vec<_>>();
         task.strengthen_dependencies(dependencies, &completed)?;
+    }
+
+    if let Some(supersession) = pristine_plan_supersession {
+        let criterion_rebindings = supersession
+            .criterion_rebindings
+            .into_iter()
+            .map(|(criterion_id, refs)| {
+                let ids = refs
+                    .iter()
+                    .map(&resolve_reference)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((criterion_id, ids))
+            })
+            .collect::<Result<Vec<_>, OrchestratorError>>()?;
+        return goal.apply_pristine_plan_supersession(
+            crate::goal::PristinePlanSupersessionMutation {
+                rejection_request_id: supersession.rejection_request_id,
+                rejected_plan_revision: supersession.rejected_plan_revision,
+                committed_plan_revision: next_plan_revision,
+                canonical_proposal_digest: supersession.canonical_proposal_digest,
+                affected_task_ids: supersession.affected_task_ids,
+                new_tasks: materialized.into_iter().map(|(_, _, task)| task).collect(),
+                criterion_rebindings,
+            },
+            now,
+        );
     }
 
     let mut existing_additions = BTreeMap::<TaskId, Vec<TaskId>>::new();
@@ -1828,6 +2187,199 @@ mod tests {
             current.plan_revision(),
             proposal,
         )
+    }
+
+    #[test]
+    fn pristine_plan_supersession_replaces_a_pre_execution_rejected_plan() {
+        let fixture = pre_execution_rejection_fixture();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["summary"] = json!("replace the rejected pristine plan");
+        proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-1",
+            "criterion_rebindings": [{
+                "criterion_id": criterion_id,
+                "replacement_task_refs": [new_ref("replacement")]
+            }]
+        });
+
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), 2);
+        assert_eq!(result.tasks().len(), 2);
+        assert_eq!(
+            result.tasks()[&fixture.trigger_id].status(),
+            TaskStatus::Superseded
+        );
+        let replacement = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task replacement")
+            .unwrap();
+        assert_eq!(replacement.status(), TaskStatus::Ready);
+        let durable = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(durable, result);
+
+        let replay = materialize_replan_output(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            goal.revision(),
+            goal.plan_revision(),
+            &serde_json::to_vec(&proposal).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, result);
+    }
+
+    #[test]
+    fn ordinary_task_transition_cannot_enter_superseded() {
+        let fixture = pre_execution_rejection_fixture();
+        let before = bytes(&fixture);
+        let current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let result = fixture.store.mutate_goal_snapshot(
+            &fixture.session.id,
+            &fixture.goal_id,
+            current.revision(),
+            |goal, now| {
+                goal.transition_task(
+                    &fixture.trigger_id,
+                    TaskStatus::Superseded,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+                .map(|_| ())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::InvalidTransition { .. })
+        ));
+        assert_eq!(bytes(&fixture), before);
+    }
+
+    #[test]
+    fn replay_with_same_rejection_id_but_different_effective_digest_is_rejected() {
+        let fixture = pre_execution_rejection_fixture();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
+        proposal["add_tasks"][0]["verification"] = json!([{
+            "kind": "COMMAND_EXIT",
+            "command": ["printf", "a"],
+            "cwd": null,
+            "accepted_exit_codes": [0]
+        }]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-1",
+            "criterion_rebindings": [{"criterion_id": criterion_id, "replacement_task_refs": [new_ref("replacement")]}]
+        });
+        apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        proposal["add_tasks"][0]["verification"][0]["command"] = json!(["a", "printf"]);
+        let before = bytes(&fixture);
+        let replay = materialize_replan_output(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            goal.revision(),
+            goal.plan_revision(),
+            &serde_json::to_vec(&proposal).unwrap(),
+        );
+        assert!(matches!(
+            replay,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
+        assert_eq!(bytes(&fixture), before);
+    }
+
+    #[test]
+    fn pristine_supersession_persistence_failure_preserves_history() {
+        let fixture = pre_execution_rejection_fixture();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-1",
+            "criterion_rebindings": [{"criterion_id": criterion_id, "replacement_task_refs": [new_ref("replacement")]}]
+        });
+        let before = bytes(&fixture);
+        let fault_store = TaskStore::with_fault(fixture.state.clone(), FaultPoint::BeforeReplace);
+        let result = materialize_replan_output(
+            &fault_store,
+            &fixture.session,
+            &fixture.goal_id,
+            goal.revision(),
+            goal.plan_revision(),
+            &serde_json::to_vec(&proposal).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(ReplannerError::Store(OrchestratorError::PersistenceIo(_)))
+        ));
+        assert_eq!(bytes(&fixture), before);
+        let reloaded = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(reloaded.plan_revision(), goal.plan_revision());
+        assert!(
+            reloaded
+                .find_pristine_plan_supersession("rejection-feedback-1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tampered_supersession_history_is_rejected_on_reload() {
+        let fixture = pre_execution_rejection_fixture();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-1",
+            "criterion_rebindings": [{"criterion_id": criterion_id, "replacement_task_refs": [new_ref("replacement")]}]
+        });
+        apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let path = goal_path(&fixture);
+        let mut durable: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        durable["pristine_plan_supersessions"][0]["affected_task_ids"] = json!([]);
+        fs::write(&path, serde_json::to_vec_pretty(&durable).unwrap()).unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id),
+            Err(OrchestratorError::CorruptGoal(_))
+        ));
     }
 
     #[test]

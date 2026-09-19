@@ -459,7 +459,7 @@ fn goal_start_preserves_input_and_host_owns_criterion_ids() {
     )
     .unwrap();
     let goal = f.store.load_active_goal(&f.session.id).unwrap().unwrap();
-    assert_eq!(goal.schema_version(), 2);
+    assert_eq!(goal.schema_version(), GOAL_SCHEMA_VERSION);
     assert_eq!(
         goal.completion_criterion_descriptions(),
         vec!["criterion one", "criterion two"]

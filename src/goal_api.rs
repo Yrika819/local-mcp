@@ -1121,7 +1121,7 @@ fn status_view(goal: &Goal) -> GoalStatusView {
 fn result_view(goal: &Goal) -> GoalResultView {
     let mandatory_task_outcomes = task_views(goal)
         .into_iter()
-        .filter(|task| task.mandatory)
+        .filter(|task| task.mandatory && task.status != TaskStatus::Superseded)
         .collect();
     let evidence_items = goal
         .tasks()
@@ -1184,6 +1184,7 @@ fn task_counts(goal: &Goal) -> BTreeMap<&'static str, usize> {
         TaskStatus::Completed,
         TaskStatus::Failed,
         TaskStatus::Cancelled,
+        TaskStatus::Superseded,
     ] {
         counts.insert(
             task_status_name(status),
@@ -1337,6 +1338,7 @@ fn task_status_name(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "COMPLETED",
         TaskStatus::Failed => "FAILED",
         TaskStatus::Cancelled => "CANCELLED",
+        TaskStatus::Superseded => "SUPERSEDED",
     }
 }
 

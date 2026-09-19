@@ -143,7 +143,20 @@ pub(crate) fn evaluate_goal_finalization(snapshot: &GoalFinalizationSnapshot) ->
 fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorError> {
     goal.validate()?;
     goal.validate_dag()?;
-    let mandatory_task_states = goal.tasks().iter().filter(|(_, task)| task.mandatory()).map(|(id, task)| (id.clone(), task.status(), task.verification_results().last().map(|result| result.outcome()))).collect::<Vec<_>>();
+    let mandatory_task_states = goal
+        .tasks()
+        .iter()
+        .filter(|(_, task)| task.is_active_plan_authority() && task.mandatory())
+        .map(|(id, task)| {
+            (
+                id.clone(),
+                task.status(),
+                task.verification_results()
+                    .last()
+                    .map(|result| result.outcome()),
+            )
+        })
+        .collect::<Vec<_>>();
     let unknown_side_effect_tasks = goal.tasks().iter().filter_map(|(id, task)| task.has_unknown_side_effect().then_some(id.clone())).collect::<Vec<_>>();
     let evidence = GoalFinalizationEvidence {
         goal_revision: goal.revision(), plan_revision: goal.plan_revision(), goal_status: goal.status(), mandatory_task_states,
@@ -164,17 +177,25 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
         blockers.push(GoalFinalizationBlocker::new("GOAL_NOT_VERIFYING", None, format!("eligible state is VERIFYING, found {:?}", goal.status())));
     }
     for (task_id, task) in goal.tasks() {
-        if task.mandatory() && task.status() != TaskStatus::Completed {
+        if task.is_active_plan_authority()
+            && task.mandatory()
+            && task.status() != TaskStatus::Completed
+        {
             blockers.push(GoalFinalizationBlocker::new("MANDATORY_TASK_NOT_COMPLETED", Some(task_id.clone()), format!("mandatory Task is {:?}", task.status())));
         }
-        if task.mandatory() && task.status() == TaskStatus::Completed && task.verification_results().last().map(|r| r.outcome()) != Some(VerificationOutcome::Passed) {
+        if task.is_active_plan_authority()
+            && task.mandatory()
+            && task.status() == TaskStatus::Completed
+            && task.verification_results().last().map(|r| r.outcome())
+                != Some(VerificationOutcome::Passed)
+        {
             blockers.push(GoalFinalizationBlocker::new("MANDATORY_TASK_VERIFICATION_NOT_PASSED", Some(task_id.clone()), "latest verification is not PASSED"));
         }
         if matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying | TaskStatus::NeedsReplan) {
             blockers.push(GoalFinalizationBlocker::new("TASK_STATE_UNSETTLED_FOR_FINALIZATION", Some(task_id.clone()), format!("Task state {:?} is unsettled", task.status())));
         }
         for blocker in task.blockers() {
-            if task.mandatory() || blocker.mandatory() {
+            if (task.is_active_plan_authority() && task.mandatory()) || blocker.mandatory() {
                 blockers.push(GoalFinalizationBlocker::new("UNRESOLVED_TASK_BLOCKER", Some(task_id.clone()), format!("{}: {}", blocker.code(), blocker.detail())));
             }
         }

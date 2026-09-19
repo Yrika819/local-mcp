@@ -249,7 +249,7 @@ pub(crate) fn select_next_action(goal: &Goal) -> Result<SchedulerDecision, Sched
         && goal
             .tasks()
             .values()
-            .filter(|task| task.mandatory())
+            .filter(|task| task.is_active_plan_authority() && task.mandatory())
             .all(|task| {
                 task.status() == TaskStatus::Completed
                     && task.blockers().is_empty()
@@ -599,7 +599,11 @@ fn ordered_workspace_leases<'a>(
 
 fn task_order_key<'a>(task_id: &'a TaskId, task: &Task) -> (u8, u32, &'a str) {
     (
-        if task.mandatory() { 0 } else { 1 },
+        if task.is_active_plan_authority() && task.mandatory() {
+            0
+        } else {
+            1
+        },
         task.created_plan_revision(),
         task_id.as_str(),
     )
@@ -609,7 +613,10 @@ fn dependencies_completed(goal: &Goal, task: &Task) -> bool {
     task.dependencies().iter().all(|dependency| {
         goal.tasks()
             .get(dependency.task_id())
-            .is_some_and(|dependency_task| dependency_task.status() == TaskStatus::Completed)
+            .is_some_and(|dependency_task| {
+                dependency_task.is_active_plan_authority()
+                    && dependency_task.status() == TaskStatus::Completed
+            })
     })
 }
 

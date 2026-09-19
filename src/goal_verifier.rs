@@ -185,7 +185,11 @@ pub(crate) fn evaluate_goal_verification(
 
 fn evaluate_global_gates(goal: &Goal) -> VerificationOutcome {
     let mut outcome = VerificationOutcome::Passed;
-    for task in goal.tasks().values().filter(|task| task.mandatory()) {
+    for task in goal
+        .tasks()
+        .values()
+        .filter(|task| task.is_active_plan_authority() && task.mandatory())
+    {
         let task_outcome = match task.status() {
             TaskStatus::Completed => {
                 if task.verification_specs().is_empty() {
@@ -229,7 +233,10 @@ fn evaluate_requirement(goal: &Goal, requirement: &GoalVerificationRequirement) 
                 };
             };
             let latest = task.verification_results().last();
-            let outcome = if !task.mandatory() || task.verification_specs().is_empty() {
+            let outcome = if !task.is_active_plan_authority()
+                || !task.mandatory()
+                || task.verification_specs().is_empty()
+            {
                 VerificationOutcome::Indeterminate
             } else {
                 match task.status() {

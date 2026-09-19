@@ -60,11 +60,15 @@ pub(crate) enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+    Superseded,
 }
 
 impl TaskStatus {
     pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Superseded
+        )
     }
 }
 
@@ -828,6 +832,24 @@ impl Task {
 
     pub(crate) fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    pub(crate) fn is_active_plan_authority(&self) -> bool {
+        self.status != TaskStatus::Superseded
+    }
+
+    pub(crate) fn supersede_for_host(&mut self, now: &str) -> Result<(), OrchestratorError> {
+        if self.status == TaskStatus::Superseded {
+            return Ok(());
+        }
+        if self.status.is_terminal() {
+            return Err(OrchestratorError::InvalidDag(
+                "only non-terminal pristine Tasks may be superseded".to_owned(),
+            ));
+        }
+        self.status = TaskStatus::Superseded;
+        self.updated_at = now.to_owned();
+        Ok(())
     }
 
     pub(crate) fn has_unknown_side_effect(&self) -> bool {

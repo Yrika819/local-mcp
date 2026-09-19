@@ -17,7 +17,7 @@ use crate::task::{
 };
 
 pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
-pub(crate) const GOAL_SCHEMA_VERSION: u32 = 2;
+pub(crate) const GOAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -360,6 +360,30 @@ impl PreExecutionPlanRejection {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PristinePlanSupersessionRecord {
+    rejection_request_id: String,
+    rejected_plan_revision: u32,
+    committed_plan_revision: u32,
+    canonical_proposal_digest: String,
+    affected_task_ids: Vec<TaskId>,
+    replacement_task_ids: Vec<TaskId>,
+    rebound_criterion_ids: Vec<CompletionCriterionId>,
+}
+
+impl PristinePlanSupersessionRecord {
+    pub(crate) fn rejection_request_id(&self) -> &str {
+        &self.rejection_request_id
+    }
+    pub(crate) fn canonical_proposal_digest(&self) -> &str {
+        &self.canonical_proposal_digest
+    }
+    pub(crate) fn rejected_plan_revision(&self) -> u32 {
+        self.rejected_plan_revision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GoalCheckpoint {
     id: String,
     goal_revision: u64,
@@ -422,6 +446,17 @@ pub(crate) struct ReplanMutation {
     pub(crate) add_criterion_requirements: Vec<(CompletionCriterionId, Vec<GoalVerificationRequirement>)>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PristinePlanSupersessionMutation {
+    pub(crate) rejection_request_id: String,
+    pub(crate) rejected_plan_revision: u32,
+    pub(crate) committed_plan_revision: u32,
+    pub(crate) canonical_proposal_digest: String,
+    pub(crate) affected_task_ids: Vec<TaskId>,
+    pub(crate) new_tasks: Vec<Task>,
+    pub(crate) criterion_rebindings: Vec<(CompletionCriterionId, Vec<TaskId>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Goal {
@@ -454,6 +489,8 @@ pub(crate) struct Goal {
     legacy_final_verification: Option<VerificationResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pre_execution_plan_rejections: Vec<PreExecutionPlanRejection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pristine_plan_supersessions: Vec<PristinePlanSupersessionRecord>,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -531,6 +568,7 @@ impl Goal {
             legacy_completion_criteria: Vec::new(),
             legacy_final_verification: None,
             pre_execution_plan_rejections: Vec::new(),
+            pristine_plan_supersessions: Vec::new(),
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -642,6 +680,19 @@ impl Goal {
         self.pre_execution_plan_rejections
             .iter()
             .find(|record| record.request_id() == request_id)
+    }
+
+    pub(crate) fn pristine_plan_supersessions(&self) -> &[PristinePlanSupersessionRecord] {
+        &self.pristine_plan_supersessions
+    }
+
+    pub(crate) fn find_pristine_plan_supersession(
+        &self,
+        request_id: &str,
+    ) -> Option<&PristinePlanSupersessionRecord> {
+        self.pristine_plan_supersessions
+            .iter()
+            .find(|record| record.rejection_request_id() == request_id)
     }
 
     pub(crate) fn has_pre_execution_plan_rejection_for_plan(&self, plan_revision: u32) -> bool {
@@ -1010,7 +1061,7 @@ impl Goal {
                     let task = candidate.tasks.get(requirement.task_id()).ok_or_else(|| {
                         OrchestratorError::InvalidDag("criterion strengthening references a missing Task".to_owned())
                     })?;
-                    if !task.mandatory() {
+                    if !task.is_active_plan_authority() || !task.mandatory() {
                         return Err(OrchestratorError::InvalidDag("TaskVerified may bind only a mandatory Task".to_owned()));
                     }
                     binding.requirements.push(requirement);
@@ -1024,6 +1075,247 @@ impl Goal {
         if candidate.status == GoalStatus::Replanning
             && !candidate.has_task_status(TaskStatus::NeedsReplan)
         {
+            candidate.transition_to(GoalStatus::Running, now)?;
+        }
+        candidate.add_checkpoint(CheckpointReason::ReplanCommitted, now)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn apply_pristine_plan_supersession(
+        &mut self,
+        mutation: PristinePlanSupersessionMutation,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.status.is_terminal()
+            || !matches!(self.status, GoalStatus::Running | GoalStatus::Replanning)
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "pristine-plan supersession requires a non-terminal RUNNING or REPLANNING Goal"
+                    .to_owned(),
+            ));
+        }
+        if self.plan_revision != mutation.rejected_plan_revision {
+            return Err(OrchestratorError::InvalidDag(
+                "pristine-plan supersession must target the current rejected plan revision"
+                    .to_owned(),
+            ));
+        }
+        let rejection = self
+            .find_pre_execution_plan_rejection(&mutation.rejection_request_id)
+            .ok_or_else(|| {
+                OrchestratorError::InvalidDag(
+                    "supersession rejection authority is missing".to_owned(),
+                )
+            })?;
+        if rejection.rejected_plan_revision() != mutation.rejected_plan_revision {
+            return Err(OrchestratorError::InvalidDag(
+                "supersession rejection authority targets another plan".to_owned(),
+            ));
+        }
+        let next_plan_revision = self
+            .plan_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
+        if mutation.committed_plan_revision != next_plan_revision {
+            return Err(OrchestratorError::InvalidDag(
+                "supersession committed plan revision is not the next revision".to_owned(),
+            ));
+        }
+
+        let derived_affected = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                (task.created_plan_revision() == mutation.rejected_plan_revision)
+                    .then_some(id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let supplied_affected = mutation
+            .affected_task_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if derived_affected.is_empty() || supplied_affected != derived_affected {
+            return Err(OrchestratorError::InvalidDag(
+                "supersession affected Task set is not the host-derived rejected plan".to_owned(),
+            ));
+        }
+
+        let mut candidate = self.clone();
+        for task_id in &derived_affected {
+            let task = candidate.tasks.get(task_id).expect("derived Task exists");
+            let pristine = task.attempts().is_empty()
+                && task.evidence_count() == 0
+                && task.verification_results().is_empty()
+                && task.blockers().is_empty()
+                && !task.has_unknown_side_effect()
+                && (!matches!(task.status(), TaskStatus::NeedsReplan)
+                    || task_id == rejection.trigger_task_id());
+            if !pristine
+                || matches!(
+                    task.status(),
+                    TaskStatus::Running
+                        | TaskStatus::Verifying
+                        | TaskStatus::Blocked
+                        | TaskStatus::Retryable
+                        | TaskStatus::Completed
+                        | TaskStatus::Failed
+                        | TaskStatus::Cancelled
+                        | TaskStatus::Superseded
+                )
+            {
+                return Err(OrchestratorError::InvalidDag(
+                    "supersession requires every affected Task to be pristine and pre-execution"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let mut new_task_ids = BTreeSet::new();
+        for task in mutation.new_tasks {
+            if task.created_plan_revision() != next_plan_revision
+                || task.status() != TaskStatus::Pending
+                || !task.attempts().is_empty()
+                || task.evidence_count() != 0
+                || !task.verification_results().is_empty()
+            {
+                return Err(OrchestratorError::InvalidDag(
+                    "supersession replacement Tasks must begin as pristine PENDING authority"
+                        .to_owned(),
+                ));
+            }
+            let id = task.id().clone();
+            if candidate.tasks.insert(id.clone(), task).is_some() || !new_task_ids.insert(id) {
+                return Err(OrchestratorError::InvalidDag(
+                    "supersession replacement Task identity is duplicated".to_owned(),
+                ));
+            }
+        }
+
+        for task_id in &derived_affected {
+            candidate
+                .tasks
+                .get_mut(task_id)
+                .expect("derived Task exists")
+                .supersede_for_host(now)?;
+        }
+
+        let old_spec = candidate.final_verification_spec.clone().ok_or_else(|| {
+            OrchestratorError::InvalidDag(
+                "supersession requires a structured Goal final-verification contract".to_owned(),
+            )
+        })?;
+        let mut requested = mutation
+            .criterion_rebindings
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut replacement_ids = BTreeSet::new();
+        let mut new_bindings = Vec::new();
+        for binding in old_spec.criterion_bindings() {
+            let affected_count = binding
+                .requirements()
+                .iter()
+                .filter(|requirement| derived_affected.contains(requirement.task_id()))
+                .count();
+            let replacements = if affected_count > 0 {
+                requested.remove(binding.criterion_id()).ok_or_else(|| {
+                    OrchestratorError::InvalidDag(
+                        "every affected criterion binding requires a replacement".to_owned(),
+                    )
+                })?
+            } else {
+                if requested.contains_key(binding.criterion_id()) {
+                    return Err(OrchestratorError::InvalidDag(
+                        "criterion rebindings may only replace affected proof Tasks".to_owned(),
+                    ));
+                }
+                Vec::new()
+            };
+            if affected_count > 0 {
+                if replacements.len() < affected_count
+                    || replacements
+                        .iter()
+                        .any(|id| !new_task_ids.contains(id) || !replacement_ids.insert(id.clone()))
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "criterion replacement coverage is not structurally equivalent".to_owned(),
+                    ));
+                }
+                for id in &replacements {
+                    let task = candidate.tasks.get(id).expect("replacement Task exists");
+                    if !task.is_active_plan_authority()
+                        || !task.mandatory()
+                        || task.verification_specs().is_empty()
+                    {
+                        return Err(OrchestratorError::InvalidDag("criterion replacement requires a new mandatory mechanically verified Task".to_owned()));
+                    }
+                }
+            }
+            let requirements = binding
+                .requirements()
+                .iter()
+                .filter(|requirement| !derived_affected.contains(requirement.task_id()))
+                .cloned()
+                .chain(
+                    replacements
+                        .into_iter()
+                        .map(|task_id| GoalVerificationRequirement::TaskVerified { task_id }),
+                )
+                .collect::<Vec<_>>();
+            new_bindings.push(GoalCriterionBinding::new(
+                binding.criterion_id().clone(),
+                requirements,
+            ));
+        }
+        if !requested.is_empty() || replacement_ids.len() != new_task_ids.len() {
+            return Err(OrchestratorError::InvalidDag(
+                "supersession replacement Tasks must be structurally bound exactly once".to_owned(),
+            ));
+        }
+        let mut spec = old_spec;
+        spec.plan_revision = next_plan_revision;
+        spec.criterion_bindings = new_bindings;
+        candidate.final_verification_spec = Some(spec);
+        candidate.plan_revision = next_plan_revision;
+        let mut affected_task_ids = derived_affected.into_iter().collect::<Vec<_>>();
+        affected_task_ids.sort();
+        let mut replacement_task_ids = new_task_ids.into_iter().collect::<Vec<_>>();
+        replacement_task_ids.sort();
+        let mut rebound_criterion_ids = candidate
+            .final_verification_spec
+            .as_ref()
+            .unwrap()
+            .criterion_bindings()
+            .iter()
+            .map(|binding| binding.criterion_id().clone())
+            .collect::<Vec<_>>();
+        rebound_criterion_ids.sort();
+        candidate
+            .pristine_plan_supersessions
+            .push(PristinePlanSupersessionRecord {
+                rejection_request_id: mutation.rejection_request_id,
+                rejected_plan_revision: mutation.rejected_plan_revision,
+                committed_plan_revision: mutation.committed_plan_revision,
+                canonical_proposal_digest: mutation.canonical_proposal_digest,
+                affected_task_ids,
+                replacement_task_ids,
+                rebound_criterion_ids,
+            });
+        for task_id in candidate.tasks.keys().cloned().collect::<Vec<_>>() {
+            if candidate.tasks[&task_id].status() == TaskStatus::Pending
+                && candidate.dependencies_satisfied(&task_id)?
+            {
+                candidate.tasks.get_mut(&task_id).unwrap().transition_to(
+                    TaskStatus::Ready,
+                    true,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+            }
+        }
+        if candidate.status == GoalStatus::Replanning {
             candidate.transition_to(GoalStatus::Running, now)?;
         }
         candidate.add_checkpoint(CheckpointReason::ReplanCommitted, now)?;
@@ -1874,10 +2166,11 @@ impl Goal {
             }
         }
         if changed
-            && candidate
-                .tasks
-                .values()
-                .any(|task| task.mandatory() && task.status() == TaskStatus::Blocked)
+            && candidate.tasks.values().any(|task| {
+                task.is_active_plan_authority()
+                    && task.mandatory()
+                    && task.status() == TaskStatus::Blocked
+            })
             && !candidate.status.is_terminal()
             && candidate.status != GoalStatus::Blocked
         {
@@ -1918,7 +2211,7 @@ impl Goal {
         }
         if self.completion_criteria.is_empty() {
             return Err(OrchestratorError::CorruptGoal(
-                "schema-2 Goal must have at least one host-owned completion criterion".to_owned(),
+                "schema-3 Goal must have at least one host-owned completion criterion".to_owned(),
             ));
         }
         let mut criterion_ids = BTreeSet::new();
@@ -1926,7 +2219,7 @@ impl Goal {
             criterion.id.validate()?;
             if criterion.description.trim().is_empty() || !criterion.required {
                 return Err(OrchestratorError::CorruptGoal(
-                    "schema-2 completion criteria must be non-empty and required in V1".to_owned(),
+                    "schema-3 completion criteria must be non-empty and required in V1".to_owned(),
                 ));
             }
             if !criterion_ids.insert(criterion.id.clone()) {
@@ -1991,9 +2284,135 @@ impl Goal {
                 ));
             }
         }
+        let mut supersession_request_ids = BTreeSet::new();
+        for record in &self.pristine_plan_supersessions {
+            if record.rejection_request_id.trim().is_empty()
+                || record.rejected_plan_revision == 0
+                || record.rejected_plan_revision >= record.committed_plan_revision
+                || record.committed_plan_revision > self.plan_revision
+                || record.canonical_proposal_digest.len() != 64
+                || !record
+                    .canonical_proposal_digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+                || record.affected_task_ids.is_empty()
+                || record.replacement_task_ids.is_empty()
+                || !supersession_request_ids.insert(record.rejection_request_id.clone())
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "Goal pristine-plan supersession history contains an invalid or duplicate record".to_owned(),
+                ));
+            }
+            let rejection = self
+                .find_pre_execution_plan_rejection(&record.rejection_request_id)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "pristine-plan supersession references a missing pre-execution rejection"
+                            .to_owned(),
+                    )
+                })?;
+            if rejection.rejected_plan_revision() != record.rejected_plan_revision
+                || record
+                    .affected_task_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != record.affected_task_ids.len()
+                || record
+                    .replacement_task_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != record.replacement_task_ids.len()
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "pristine-plan supersession history contains duplicate or mismatched Task identities".to_owned(),
+                ));
+            }
+            let derived_affected = self
+                .tasks
+                .iter()
+                .filter_map(|(id, task)| {
+                    (task.created_plan_revision() == record.rejected_plan_revision)
+                        .then_some(id.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            let recorded_affected = record
+                .affected_task_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let derived_replacements = self
+                .tasks
+                .iter()
+                .filter_map(|(id, task)| {
+                    (task.created_plan_revision() == record.committed_plan_revision)
+                        .then_some(id.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            let recorded_replacements = record
+                .replacement_task_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if derived_affected != recorded_affected
+                || derived_replacements != recorded_replacements
+                || recorded_affected
+                    .intersection(&recorded_replacements)
+                    .next()
+                    .is_some()
+                || record
+                    .affected_task_ids
+                    .iter()
+                    .any(|id| self.tasks[id].status() != TaskStatus::Superseded)
+                || record.replacement_task_ids.iter().any(|id| {
+                    let task = &self.tasks[id];
+                    task.status() == TaskStatus::Superseded
+                        || !task.mandatory()
+                        || task.verification_specs().is_empty()
+                })
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "pristine-plan supersession history is not bound to exact superseded and replacement Task authority".to_owned(),
+                ));
+            }
+            let criteria = self
+                .completion_criteria
+                .iter()
+                .map(|criterion| criterion.id.clone())
+                .collect::<BTreeSet<_>>();
+            let rebound_criteria = record
+                .rebound_criterion_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if rebound_criteria.len() != record.rebound_criterion_ids.len()
+                || rebound_criteria != criteria
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "pristine-plan supersession history has incomplete or duplicate criterion coverage".to_owned(),
+                ));
+            }
+            if let Some(spec) = self.final_verification_spec.as_ref() {
+                for binding in spec.criterion_bindings() {
+                    if binding
+                        .requirements()
+                        .iter()
+                        .any(|requirement| recorded_affected.contains(requirement.task_id()))
+                    {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "final-verification authority remains bound to a superseded Task"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         for checkpoint in &self.checkpoints {
             checkpoint.validate()?;
-            if checkpoint.goal_revision > self.revision || checkpoint.plan_revision > self.plan_revision {
+            if checkpoint.goal_revision > self.revision
+                || checkpoint.plan_revision > self.plan_revision
+            {
                 return Err(OrchestratorError::CorruptGoal(
                     "checkpoint refers to a future goal/plan revision".to_owned(),
                 ));
@@ -2070,7 +2489,7 @@ impl Goal {
                 let task = self.tasks.get(requirement.task_id()).ok_or_else(|| {
                     OrchestratorError::InvalidDag("TaskVerified binding references a missing Task".to_owned())
                 })?;
-                if !task.mandatory() {
+                if !task.is_active_plan_authority() || !task.mandatory() {
                     return Err(OrchestratorError::InvalidDag("TaskVerified binding references a non-mandatory Task".to_owned()));
                 }
             }
@@ -2112,6 +2531,11 @@ impl Goal {
                 let target = self.tasks.get(dependency_id).ok_or_else(|| {
                     OrchestratorError::InvalidDag("dependency target is missing".to_owned())
                 })?;
+                if task.is_active_plan_authority() && !target.is_active_plan_authority() {
+                    return Err(OrchestratorError::InvalidDag(
+                        "active Task cannot depend on a superseded Task".to_owned(),
+                    ));
+                }
                 if task.mandatory() && !target.mandatory() {
                     return Err(OrchestratorError::InvalidDag(
                         "mandatory task cannot rely on an optional hard dependency".to_owned(),
@@ -2193,7 +2617,10 @@ impl Goal {
         Ok(task.dependencies().iter().all(|dependency| {
             self.tasks
                 .get(dependency.task_id())
-                .is_some_and(|dependency| dependency.status() == TaskStatus::Completed)
+                .is_some_and(|dependency| {
+                    dependency.is_active_plan_authority()
+                        && dependency.status() == TaskStatus::Completed
+                })
         }))
     }
 
@@ -2205,7 +2632,7 @@ impl Goal {
         if self
             .tasks
             .values()
-            .filter(|task| task.mandatory())
+            .filter(|task| task.is_active_plan_authority() && task.mandatory())
             .any(|task| task.status() != TaskStatus::Completed)
             || self.tasks.values().any(|task| {
                 matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying | TaskStatus::NeedsReplan)
@@ -2219,10 +2646,22 @@ impl Goal {
                 "mandatory work/blockers/side effects are not fully resolved",
             ));
         }
-        if self.tasks.values().filter(|task| task.mandatory()).any(|task| {
-            task.verification_results().last().map(VerificationResult::outcome) != Some(VerificationOutcome::Passed)
-        }) {
-            return Err(invalid_goal_transition(from, to, "latest mandatory Task verification is not PASSED"));
+        if self
+            .tasks
+            .values()
+            .filter(|task| task.is_active_plan_authority() && task.mandatory())
+            .any(|task| {
+                task.verification_results()
+                    .last()
+                    .map(VerificationResult::outcome)
+                    != Some(VerificationOutcome::Passed)
+            })
+        {
+            return Err(invalid_goal_transition(
+                from,
+                to,
+                "latest mandatory Task verification is not PASSED",
+            ));
         }
         self.validate_dag()?;
         self.validate_final_verification_contract()
@@ -2236,7 +2675,7 @@ impl Goal {
         if self
             .tasks
             .values()
-            .filter(|task| task.mandatory())
+            .filter(|task| task.is_active_plan_authority() && task.mandatory())
             .any(|task| task.status() != TaskStatus::Completed)
         {
             return Err(invalid_goal_transition(
@@ -2248,7 +2687,7 @@ impl Goal {
         if self
             .tasks
             .values()
-            .filter(|task| task.mandatory())
+            .filter(|task| task.is_active_plan_authority() && task.mandatory())
             .any(|task| {
                 matches!(
                     task.status(),
@@ -2305,7 +2744,7 @@ impl Goal {
             || self
                 .tasks
                 .values()
-                .filter(|task| task.mandatory())
+                .filter(|task| task.is_active_plan_authority() && task.mandatory())
                 .any(|task| !task.blockers().is_empty())
     }
 }

@@ -311,6 +311,25 @@ impl TaskStore {
             goal.validate()?;
             return Ok(goal);
         }
+        if schema_version == 2 {
+            let mut migrated = value;
+            let migrated_object = migrated.as_object_mut().expect("validated object");
+            migrated_object.insert(
+                "schema_version".to_owned(),
+                Value::from(GOAL_SCHEMA_VERSION),
+            );
+            migrated_object.insert(
+                "pristine_plan_supersessions".to_owned(),
+                Value::Array(Vec::new()),
+            );
+            let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
+                OrchestratorError::CorruptGoal(format!(
+                    "schema-2 durable Goal shape is invalid: {error}"
+                ))
+            })?;
+            goal.validate()?;
+            return Ok(goal);
+        }
         if schema_version != GOAL_SCHEMA_VERSION as u64 {
             return Err(OrchestratorError::UnsupportedSchema(schema_version));
         }
@@ -697,6 +716,49 @@ mod tests {
                 assert!(matches!(error, OrchestratorError::CorruptGoal(_)));
             }
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_two_loads_as_in_memory_schema_three_without_rewriting() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("schema-two-migration");
+        let path = store.goal_path("schema-two-migration", goal.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut value = serde_json::to_value(&goal).unwrap();
+        value["schema_version"] = Value::from(2_u64);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("pristine_plan_supersessions");
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = store.load_goal("schema-two-migration", goal.id()).unwrap();
+        assert_eq!(loaded.schema_version(), GOAL_SCHEMA_VERSION);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let updated = store
+            .mutate_goal_snapshot(
+                "schema-two-migration",
+                goal.id(),
+                loaded.revision(),
+                |goal, _| {
+                    goal.add_blocker(crate::goal::GoalBlocker::new(
+                        "MIGRATION",
+                        "persist v3",
+                        false,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.schema_version(), GOAL_SCHEMA_VERSION);
+        let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["schema_version"],
+            Value::from(GOAL_SCHEMA_VERSION)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
