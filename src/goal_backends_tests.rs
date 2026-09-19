@@ -207,6 +207,42 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     assert!(calls[4].prompt().contains("REQUIRE_READONLY_REASSESSMENT"));
     assert!(calls[4].prompt().contains("An unresolved missing file, CLI, interface, artifact, or contract fact requires another bounded CODEX_READONLY investigation"));
     assert!(calls[4].prompt().contains("only an established fact with a scoped, justified change supports a CODEX_WRITER task"));
+    // Phase 3-4: pristine_plan_supersession model↔host contract is present in the Replanner prompt
+    assert!(calls[4].prompt().contains("pristine_plan_supersession"));
+    assert!(calls[4].prompt().contains("rejection_request_id"));
+    assert!(calls[4].prompt().contains("criterion_rebindings"));
+    assert!(calls[4].prompt().contains("criterion_id"));
+    assert!(calls[4].prompt().contains("replacement_task_refs"));
+    assert!(calls[4]
+        .prompt()
+        .contains("ONLY typed exception to additive replanning"));
+    assert!(calls[4]
+        .prompt()
+        .contains("never set it alongside any monotonic change"));
+    assert!(calls[4]
+        .prompt()
+        .contains("Free-text reason text is NOT authority"));
+    assert!(calls[4]
+        .prompt()
+        .contains("Ordinary replanning is strictly additive and monotonic"));
+    assert!(calls[4]
+        .prompt()
+        .contains("rejection_request_id is an exact string from request.pre_execution_plan_rejections"));
+    assert!(calls[4]
+        .prompt()
+        .contains("never invented or parsed from rejection.reason text"));
+    assert!(calls[4]
+        .prompt()
+        .contains("host rejection of a supersession proposal leaves plan_revision"));
+    assert!(calls[4]
+        .prompt()
+        .contains("no pre_execution_plan_rejection exists or its rejected_plan_revision differs from request.plan_revision"));
+    assert!(calls[4]
+        .prompt()
+        .contains("replacement refs point to Existing Tasks"));
+    assert!(calls[4]
+        .prompt()
+        .contains("REQUIRE_READONLY_REASSESSMENT applies without a new CODEX_READONLY"));
     assert!(!calls[4].prompt().contains("When trigger evidence says a required file, CLI, interface, or artifact is missing and satisfying it requires file changes, add a CODEX_WRITER"));
 }
 

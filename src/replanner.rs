@@ -2174,6 +2174,10 @@ mod tests {
         fs::read(goal_path(fixture)).unwrap()
     }
 
+    fn repo_bytes(fixture: &Fixture) -> Vec<u8> {
+        fs::read(fixture.repo.join("sentinel.txt")).unwrap()
+    }
+
     fn apply(fixture: &Fixture, proposal: &[u8]) -> Result<Goal, ReplannerError> {
         let current = fixture
             .store
@@ -2380,6 +2384,146 @@ mod tests {
                 .load_goal(&fixture.session.id, &fixture.goal_id),
             Err(OrchestratorError::CorruptGoal(_))
         ));
+    }
+
+    #[test]
+    fn supersession_with_unknown_rejection_request_id_is_rejected_nonmutating() {
+        let fixture = pre_execution_rejection_fixture();
+        let before = bytes(&fixture);
+        let before_repo = repo_bytes(&fixture);
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["summary"] = json!("replace the rejected pristine plan");
+        proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-NOT-REAL",
+            "criterion_rebindings": [{
+                "criterion_id": criterion_id,
+                "replacement_task_refs": [new_ref("replacement")]
+            }]
+        });
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap());
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
+        assert_eq!(bytes(&fixture), before);
+        assert_eq!(repo_bytes(&fixture), before_repo);
+        let reloaded = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(reloaded.plan_revision(), 1);
+        assert_eq!(reloaded.pristine_plan_supersessions().len(), 0);
+    }
+
+    #[test]
+    fn supersession_rejects_when_affected_task_has_prior_execution_evidence() {
+        let fixture = pre_execution_rejection_fixture();
+        // Simulate the rejected-plan Task having been executed before the
+        // rejection, making it non-pristine. The host must refuse supersession.
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        fixture
+            .store
+            .mutate_goal_snapshot(
+                &fixture.session.id,
+                &fixture.goal_id,
+                goal.revision(),
+                |goal, _| {
+                    goal.task_add_evidence(
+                        &fixture.trigger_id,
+                        TaskEvidence::StructuredObservation {
+                            requirement_id: "executed.before.rejection".to_owned(),
+                            source: "phase7-fixture".to_owned(),
+                            passed: true,
+                            detail: "prior execution evidence that violates pristineness"
+                                .to_owned(),
+                        },
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let before = bytes(&fixture);
+        let before_repo = repo_bytes(&fixture);
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["summary"] = json!("replace the rejected pristine plan");
+        proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-1",
+            "criterion_rebindings": [{
+                "criterion_id": criterion_id,
+                "replacement_task_refs": [new_ref("replacement")]
+            }]
+        });
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap());
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
+        assert_eq!(bytes(&fixture), before);
+        assert_eq!(repo_bytes(&fixture), before_repo);
+        let reloaded = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(reloaded.plan_revision(), 1);
+        assert_eq!(reloaded.pristine_plan_supersessions().len(), 0);
+        // Pristineness violation is preserved — the Task keeps its evidence.
+        assert_eq!(reloaded.tasks()[&fixture.trigger_id].evidence_count(), 1);
+    }
+
+    #[test]
+    fn supersession_with_existing_replacement_ref_is_rejected_nonmutating() {
+        let fixture = pre_execution_rejection_fixture();
+        let before = bytes(&fixture);
+        let before_repo = repo_bytes(&fixture);
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
+        let mut proposal = proposal_value(&fixture);
+        proposal["summary"] = json!("replace the rejected pristine plan");
+        proposal["add_tasks"] = json!([]);
+        proposal["add_dependencies"] = json!([]);
+        proposal["resolve_needs_replan"] = json!([]);
+        proposal["pristine_plan_supersession"] = json!({
+            "rejection_request_id": "rejection-feedback-1",
+            "criterion_rebindings": [{
+                "criterion_id": criterion_id,
+                "replacement_task_refs": [existing_ref(&fixture.trigger_id)]
+            }]
+        });
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap());
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplanAuthorityViolation(_))
+        ));
+        assert_eq!(bytes(&fixture), before);
+        assert_eq!(repo_bytes(&fixture), before_repo);
+        let reloaded = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(reloaded.plan_revision(), 1);
+        assert_eq!(reloaded.pristine_plan_supersessions().len(), 0);
     }
 
     #[test]
