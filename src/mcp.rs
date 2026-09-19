@@ -30,9 +30,59 @@ fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Maximum number of requests that may be dispatched concurrently.
+///
+/// This is a transport-level bound only: it prevents an unbounded number of
+/// in-flight requests from exhausting runtime resources while keeping the
+/// control plane responsive during long-running orchestration. Same-Goal
+/// mutation authority is *not* enforced here; it remains serialized by the
+/// OS-backed per-session Goal lock and optimistic revision checks in
+/// [`crate::task_store::TaskStore`].
+const MAX_CONCURRENT_REQUESTS: usize = 32;
+
+/// Entry point for the MCP stdio server.
+///
+/// The transport is deliberately **concurrent**: each inbound request is
+/// dispatched on its own task so that a long-running request (for example
+/// `goal_run`) can never block lightweight control-plane requests such as
+/// `ping` or `session_info`. Responses are funneled through a single
+/// serialized writer task, so stdout framing stays valid and request IDs are
+/// preserved even when responses complete out of order.
 pub async fn serve() -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    serve_with_io(tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Runs the MCP request loop over the provided async reader/writer pair.
+///
+/// Splitting the I/O handles out of [`serve`] keeps the concurrency logic
+/// testable without a real process: tests can drive requests through an
+/// in-memory duplex stream and assert on the raw framed responses.
+async fn serve_with_io<R, W>(reader: R, writer: W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Responses from per-request dispatch tasks are collected here and
+    // written to stdout by one dedicated task. This guarantees that exactly
+    // one complete JSON-RPC frame is written at a time (no byte interleaving)
+    // and that no dispatch task ever touches stdout directly.
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
+    let writer_handle = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(response) = response_rx.recv().await {
+            write_message(&mut writer, &response).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Bound the number of concurrently in-flight dispatch tasks. A permit is
+    // held for the lifetime of one request's dispatch, so at most
+    // `MAX_CONCURRENT_REQUESTS` handlers run at once. Permits are `async` and
+    // are acquired *before* a task is spawned, which means the read loop is
+    // throttled, not the response path.
+    let dispatch_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
+    let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -40,31 +90,73 @@ pub async fn serve() -> Result<()> {
         let request: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(error) => {
-                write_message(&mut stdout, &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}})).await?;
+                // Malformed JSON is answered immediately; it is not a valid
+                // request and must not consume a dispatch permit.
+                response_tx
+                    .send(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}))
+                    .await
+                    .context("response writer task terminated unexpectedly")?;
                 continue;
             }
         };
+        // Per the JSON-RPC/MCP model, notifications (requests without an `id`)
+        // never receive a response, so they are dropped here.
         if request.get("id").is_none() {
             continue;
         }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let response = match dispatch(&request).await {
-            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(error) => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
-            }
-        };
-        write_message(&mut stdout, &response).await?;
+
+        // Throttle inbound requests when the dispatch pool is saturated. This
+        // await is the only point where the read loop may pause; lightweight
+        // control-plane requests are therefore never stuck behind a long
+        // `goal_run` that is still being dispatched.
+        let permit = dispatch_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .context("dispatch permit semaphore closed unexpectedly")?;
+        let response_tx = response_tx.clone();
+        tokio::spawn(async move {
+            // Hold the permit for the entire dispatch so the concurrency bound
+            // reflects genuinely in-flight work.
+            let _permit = permit;
+            let response = match dispatch(&request).await {
+                Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+                Err(error) => {
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
+                }
+            };
+            // If the client disconnected the writer task will have terminated;
+            // the request's response is simply dropped.
+            let _ = response_tx.send(response).await;
+        });
     }
+
+    // stdin closed (EOF): stop accepting requests, then drain and flush all
+    // in-flight responses so the client sees every answer before we exit.
+    drop(response_tx);
+    writer_handle
+        .await
+        .context("response writer task panicked")??;
     Ok(())
 }
 
-async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
-    stdout
+/// Writes one complete, newline-delimited JSON-RPC frame.
+///
+/// This is the only function that writes response bytes. It is generic over
+/// the writer so the serialized writer task in [`serve_with_io`] can own any
+/// `AsyncWrite` implementation (stdout in production, an in-memory duplex in
+/// tests). Each call writes the serialized message and its trailing newline
+/// and flushes, so frames can never be partially written or interleaved.
+async fn write_message<W>(writer: &mut W, message: &Value) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    writer
         .write_all(serde_json::to_string(message)?.as_bytes())
         .await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -572,25 +664,52 @@ async fn goal_run(args: &Value, session: &config::Session) -> Result<Value> {
         "goal_id must be a canonical lowercase UUID"
     );
     let limits = GoalRunLimits::new(request.max_steps).map_err(|error| anyhow::anyhow!(error))?;
-    let store = TaskStore::new().map_err(|error| anyhow::anyhow!(error))?;
-    store
-        .load_goal(&session.id, &goal_id)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let session_id = session.id.clone();
+    let session = session.clone();
 
-    let backends = ProductionGoalBackends::production(session);
-    let result = goal_runner::run_goal_foreground(
-        &store,
-        session,
-        &goal_id,
-        limits,
-        backends.planner(),
-        backends.readonly(),
-        backends.writer(),
-        backends.reviewer(),
-        backends.replanner(),
-    )
-    .await;
-    text_result(serialize_goal_run_result(&result))
+    // `run_goal_foreground` drives the Scheduler/Worker/Replanner, whose
+    // production model transport performs a blocking `thread::join` (see
+    // `agent::ProductionModelTransport`) and whose durable store commits use
+    // blocking OS file locks (`TaskStore::with_session_lock`). Running it
+    // directly on the async worker thread would stall that thread for the
+    // entire orchestration. `spawn_blocking` moves the whole run onto the
+    // blocking thread pool so concurrent control-plane requests (ping,
+    // session_info, other Goals' status) stay responsive on the runtime.
+    //
+    // This changes *where* the run executes, not *who* may mutate the Goal:
+    // same-Goal mutation authority is still serialized by the OS-backed
+    // per-session lock and optimistic revision checks in `TaskStore`.
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let store = TaskStore::new().map_err(|error| anyhow::anyhow!(error))?;
+        store
+            .load_goal(&session_id, &goal_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        let backends = ProductionGoalBackends::production(&session);
+        // The runner is `async` only because lower authority boundaries
+        // (verifier/writer) may await; all model and durable-store work is
+        // synchronous. Drive it to completion on this blocking thread with a
+        // dedicated current-thread runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build goal_run runtime")?;
+        let result = runtime.block_on(goal_runner::run_goal_foreground(
+            &store,
+            &session,
+            &goal_id,
+            limits,
+            backends.planner(),
+            backends.readonly(),
+            backends.writer(),
+            backends.reviewer(),
+            backends.replanner(),
+        ));
+        text_result(serialize_goal_run_result(&result))
+    })
+    .await
+    .context("goal_run blocking task panicked")??;
+    Ok(result)
 }
 
 pub(crate) fn parse_goal_run_args(args: &Value) -> Result<GoalRunArgs> {
@@ -970,5 +1089,167 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");
+    }
+
+    // ------------------------------------------------------------------
+    // Transport concurrency regression tests (Phase 8)
+    //
+    // These tests drive the real `serve_with_io` transport loop with
+    // synthetic requests over in-memory duplex streams. They reproduce the
+    // historical freeze (a long-running request making the whole MCP control
+    // plane appear dead) deterministically, with no real model, worker,
+    // Goal, or repository involved.
+    // ------------------------------------------------------------------
+
+    /// Runs the transport loop against in-memory streams, sends each raw
+    /// JSON-RPC line, and collects up to `expected_responses` frames.
+    async fn run_transport_session(
+        requests: &[&str],
+        expected_responses: usize,
+        timeout: Duration,
+    ) -> Vec<Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client_tx, server_rx) = tokio::io::duplex(65536);
+        let (server_tx, client_rx) = tokio::io::duplex(65536);
+        let server = tokio::spawn(serve_with_io(server_rx, server_tx));
+
+        let mut writer = client_tx;
+        for request in requests {
+            writer
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        let mut responses = Vec::new();
+        let mut reader = BufReader::new(client_rx).lines();
+        let deadline = tokio::time::Instant::now() + timeout;
+        while responses.len() < expected_responses {
+            match tokio::time::timeout_at(deadline, reader.next_line()).await {
+                Ok(Ok(Some(line))) => responses.push(serde_json::from_str(&line).unwrap()),
+                _ => break,
+            }
+        }
+        // Closing client input signals EOF; the server must drain in-flight
+        // responses and exit cleanly.
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server did not exit after client disconnect")
+            .expect("server task panicked")
+            .expect("server returned an error");
+        responses
+    }
+
+    /// Regression: a slow long-running request (simulating `goal_run`) must
+    /// not block an unrelated lightweight `ping`. Before the fix, the second
+    /// request was never even read until the first finished.
+    #[tokio::test]
+    async fn slow_long_running_request_does_not_block_ping() {
+        let responses = run_transport_session(
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+            ],
+            2,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(responses.len(), 2);
+        let mut ids: Vec<i64> = responses.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// Regression: control-plane requests all respond with correct IDs and
+    /// well-formed JSON-RPC frames.
+    #[tokio::test]
+    async fn control_plane_requests_all_respond_with_correct_ids() {
+        let responses = run_transport_session(
+            &[
+                r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#,
+                r#"{"jsonrpc":"2.0","id":11,"method":"initialize","params":{}}"#,
+                r#"{"jsonrpc":"2.0","id":12,"method":"tools/list"}"#,
+            ],
+            3,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(responses.len(), 3);
+        let mut ids: Vec<i64> = responses.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![10, 11, 12]);
+        for response in &responses {
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert!(response.get("result").is_some() || response.get("error").is_some());
+        }
+    }
+
+    /// Regression: concurrently completing responses must never interleave
+    /// bytes — every raw line the client receives must parse as exactly one
+    /// complete JSON object with a unique request ID.
+    #[tokio::test]
+    async fn concurrent_responses_never_interleave_bytes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client_tx, server_rx) = tokio::io::duplex(65536);
+        let (server_tx, client_rx) = tokio::io::duplex(65536);
+        let server = tokio::spawn(serve_with_io(server_rx, server_tx));
+
+        let mut writer = client_tx;
+        for i in 0..32 {
+            writer
+                .write_all(format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"ping"}}"#).as_bytes())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        let mut reader = BufReader::new(client_rx);
+        let mut raw_lines = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while raw_lines.len() < 32 {
+            let mut line = String::new();
+            match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(_)) => raw_lines.push(line.trim().to_owned()),
+                _ => break,
+            }
+        }
+        drop(writer);
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+        assert_eq!(raw_lines.len(), 32, "every request got exactly one frame");
+        let mut seen_ids = std::collections::HashSet::new();
+        for frame in &raw_lines {
+            let parsed: Value = serde_json::from_str(frame)
+                .expect("frame bytes interleaved: line is not valid JSON");
+            assert_eq!(parsed["jsonrpc"], "2.0");
+            assert!(parsed["result"].is_object());
+            seen_ids.insert(parsed["id"].as_i64().unwrap());
+        }
+        assert_eq!(seen_ids.len(), 32, "duplicate or missing request IDs");
+    }
+
+    /// Regression: a malformed request gets an immediate parse error and does
+    /// not poison subsequent requests.
+    #[tokio::test]
+    async fn malformed_request_does_not_poison_subsequent_requests() {
+        let responses = run_transport_session(
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping""#, // truncated JSON
+                r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+            ],
+            2,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert_eq!(responses[1]["id"], 2);
+        assert!(responses[1]["result"].is_object());
     }
 }

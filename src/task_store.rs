@@ -974,4 +974,58 @@ mod tests {
         let second = serde_json::to_vec_pretty(&goal).unwrap();
         assert_eq!(first, second);
     }
+
+    /// Regression (transport concurrency): when two dispatch tasks race the
+    /// same Goal with the same expected revision, the OS-backed session lock
+    /// plus the optimistic revision check must guarantee that exactly one
+    /// mutation commits, the other fails deterministically with
+    /// `RevisionConflict`, and the durable revision advances exactly once.
+    #[test]
+    fn concurrent_same_goal_mutations_are_serialized_without_duplication() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let goal = goal("session-concurrent");
+        let goal_id = goal.id().clone();
+        let base_revision = goal.revision();
+        store.create_goal(&goal).unwrap();
+
+        let outcomes: Vec<Result<Goal, OrchestratorError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        store.mutate_goal_snapshot(
+                            "session-concurrent",
+                            &goal_id,
+                            base_revision,
+                            |goal, now| {
+                                goal.add_checkpoint(crate::goal::CheckpointReason::Recovery, now)
+                            },
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+
+        let applied = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        let conflicts = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    Err(OrchestratorError::RevisionConflict { .. })
+                )
+            })
+            .count();
+        assert_eq!(applied, 1, "exactly one racing mutation may commit");
+        assert_eq!(conflicts, 1, "the loser must fail with RevisionConflict");
+
+        let durable = store.load_goal("session-concurrent", &goal_id).unwrap();
+        assert_eq!(
+            durable.revision(),
+            base_revision + 1,
+            "durable revision must advance exactly once: no duplicate durable mutation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

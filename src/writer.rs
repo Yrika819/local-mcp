@@ -90,7 +90,7 @@ pub(crate) trait WriteBoundary {
         absolute: &'a Path,
         parent: &'a Path,
         content: &'a str,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>;
 }
 
 struct ExecutionWriteBoundary;
@@ -101,7 +101,7 @@ impl WriteBoundary for ExecutionWriteBoundary {
         absolute: &'a Path,
         parent: &'a Path,
         content: &'a str,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>> {
         Box::pin(execution::write_file_content(absolute, parent, content))
     }
 }
@@ -1979,7 +1979,7 @@ mod tests {
             _absolute: &'a std::path::Path,
             _parent: &'a std::path::Path,
             _content: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + 'a>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>
         {
             Box::pin(async move {
                 self.calls
@@ -2033,7 +2033,7 @@ mod tests {
             absolute: &'a std::path::Path,
             _parent: &'a std::path::Path,
             content: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + 'a>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>
         {
             Box::pin(async move {
                 std::fs::write(absolute, content)?;
