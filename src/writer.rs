@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
-use std::future::Future;
 use std::fs;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::config;
 use crate::agent::AgentError;
+use crate::config;
 use crate::execution;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalId, GoalStatus};
@@ -40,6 +40,10 @@ pub(crate) const MAX_WORKER_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_REVIEW_RESULT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "Frozen writer backend error variant remains part of the staged writer contract."
+)]
 pub(crate) enum WriterError {
     Backend(String),
     Model(AgentError),
@@ -120,6 +124,10 @@ pub(crate) struct WriterRequest {
     forbidden_paths: Vec<PathBuf>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen writer request accessors are retained for staged writer backend consumers."
+)]
 impl WriterRequest {
     pub(crate) fn goal_id(&self) -> &str {
         &self.goal_id
@@ -173,6 +181,10 @@ pub(crate) struct ReviewerRequest {
     files: Vec<ReviewFileEvidence>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen reviewer request accessors are retained for staged reviewer backend consumers."
+)]
 impl ReviewerRequest {
     pub(crate) fn goal_id(&self) -> &str {
         &self.goal_id
@@ -211,6 +223,10 @@ pub(crate) struct ReviewFileEvidence {
     size: Option<u64>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen review-file evidence accessors are retained for staged reviewer consumers."
+)]
 impl ReviewFileEvidence {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -400,11 +416,22 @@ pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
 ) -> Result<Goal, WriterError> {
     let boundary = ExecutionWriteBoundary;
     run_writer_attempt_with_boundary(
-        store, session, goal_id, task_id, expected_revision, writer, reviewer, &boundary,
+        store,
+        session,
+        goal_id,
+        task_id,
+        expected_revision,
+        writer,
+        reviewer,
+        &boundary,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Writer authority, revision, mutation, reviewer, and boundary channels remain explicit by design."
+)]
 pub(crate) async fn run_writer_attempt_with_boundary<
     W: WriterBackend,
     R: ReviewerBackend,
@@ -548,11 +575,8 @@ pub(crate) async fn run_writer_attempt_with_boundary<
             .collect(),
     )
     .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
-    let mut durable = store.mutate_goal_snapshot(
-        &session.id,
-        goal_id,
-        request.goal_revision,
-        |goal, _now| {
+    let mut durable =
+        store.mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, _now| {
             ensure_active_attempt_store(goal, task_id, &request)?;
             goal.task_prepare_latest_mutation_intent(task_id, intent.clone())?;
             for request_id in &request_ids {
@@ -568,8 +592,7 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 )?;
             }
             Ok(())
-        },
-    )?;
+        })?;
 
     for (index, (operation, request_id)) in operations.iter().zip(&request_ids).enumerate() {
         durable = store.mutate_goal_snapshot(
@@ -691,7 +714,7 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 after_sha256: post.sha256.clone(),
                 size: post.size,
             })
-        .collect(),
+            .collect(),
     };
 
     let reviewer_invocation_id = format!("reviewer:{}", request.attempt_id);
@@ -835,12 +858,12 @@ pub(crate) async fn resume_writer_reviewer<R: ReviewerBackend>(
             "reviewer recovery requires a reconciled performed Writer attempt".to_owned(),
         ));
     }
-    let attempt = task
-        .latest_attempt()
-        .ok_or_else(|| WriterError::AuthorityViolation("reviewer Task lacks an Attempt".to_owned()))?;
-    let intent = attempt
-        .mutation_intent()
-        .ok_or_else(|| WriterError::AuthorityViolation("reviewer recovery lacks MutationIntent".to_owned()))?;
+    let attempt = task.latest_attempt().ok_or_else(|| {
+        WriterError::AuthorityViolation("reviewer Task lacks an Attempt".to_owned())
+    })?;
+    let intent = attempt.mutation_intent().ok_or_else(|| {
+        WriterError::AuthorityViolation("reviewer recovery lacks MutationIntent".to_owned())
+    })?;
     let writer_summary = attempt
         .worker_report()
         .map(|report| report.summary().to_owned())
@@ -873,20 +896,18 @@ pub(crate) async fn resume_writer_reviewer<R: ReviewerBackend>(
         files,
     };
     let invocation_id = format!("reviewer:{attempt_id}");
-    let reviewer_snapshot = store.mutate_goal_snapshot(
-        &session.id,
-        goal_id,
-        snapshot.revision(),
-        |goal, _now| {
+    let reviewer_snapshot =
+        store.mutate_goal_snapshot(&session.id, goal_id, snapshot.revision(), |goal, _now| {
             ensure_reviewer_context_store(goal, task_id, &request)?;
             goal.task_advance_latest_mutation_intent(
                 task_id,
                 &operation_id,
-                MutationIntentUpdate::BeginReviewer { invocation_id: invocation_id.clone() },
+                MutationIntentUpdate::BeginReviewer {
+                    invocation_id: invocation_id.clone(),
+                },
             )?;
             Ok(())
-        },
-    )?;
+        })?;
     request.goal_revision = reviewer_snapshot.revision();
 
     let review_raw = match reviewer.review(&request) {
@@ -998,6 +1019,13 @@ fn validate_goal_session_binding(
             "writer Goal cwd does not match session cwd".to_owned(),
         ));
     }
+    config::validate_path_authority(session, &goal_cwd, config::PathIntent::ExecutionCwd).map_err(
+        |error| {
+            OrchestratorError::InvalidDag(format!(
+                "writer Goal cwd is outside session roots: {error}"
+            ))
+        },
+    )?;
     Ok(())
 }
 
@@ -1104,13 +1132,12 @@ fn parse_and_validate_writer_result(
                         "total writer content exceeds {MAX_TOTAL_WRITE_CONTENT_BYTES} bytes"
                     )));
                 }
-                if let PreimageExpectation::Sha256 { sha256 } = expected_preimage {
-                    if !is_canonical_sha256(sha256) {
-                        return Err(WriterError::OutputInvalid(
-                            "expected preimage SHA-256 must be 64 lowercase hex characters"
-                                .to_owned(),
-                        ));
-                    }
+                if let PreimageExpectation::Sha256 { sha256 } = expected_preimage
+                    && !is_canonical_sha256(sha256)
+                {
+                    return Err(WriterError::OutputInvalid(
+                        "expected preimage SHA-256 must be 64 lowercase hex characters".to_owned(),
+                    ));
                 }
             }
         }
@@ -1979,12 +2006,15 @@ mod tests {
             _absolute: &'a std::path::Path,
             _parent: &'a std::path::Path,
             _content: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
+        > {
             Box::pin(async move {
-                self.calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let goal = self.store.load_goal(&self.session.id, self.goal_id).unwrap();
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let goal = self
+                    .store
+                    .load_goal(&self.session.id, self.goal_id)
+                    .unwrap();
                 let task = goal.tasks().get(self.task_id).unwrap();
                 assert_eq!(
                     task.latest_attempt()
@@ -2033,8 +2063,9 @@ mod tests {
             absolute: &'a std::path::Path,
             _parent: &'a std::path::Path,
             content: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
+        > {
             Box::pin(async move {
                 std::fs::write(absolute, content)?;
                 anyhow::bail!("injected crash after successful filesystem write")
@@ -2081,8 +2112,16 @@ mod tests {
             .store
             .load_goal(&fixture.session.id, &fixture.goal_id)
             .unwrap();
-        assert!(crate::mutation_recovery::reconcile_goal_mutations(&mut recovered, "2026-09-16T00:00:01Z").unwrap());
-        recovered.recover_stale_running("2026-09-16T00:00:02Z").unwrap();
+        assert!(
+            crate::mutation_recovery::reconcile_goal_mutations(
+                &mut recovered,
+                "2026-09-16T00:00:01Z"
+            )
+            .unwrap()
+        );
+        recovered
+            .recover_stale_running("2026-09-16T00:00:02Z")
+            .unwrap();
         let stored_revision = fixture
             .store
             .load_goal(&fixture.session.id, &fixture.goal_id)
@@ -2103,7 +2142,10 @@ mod tests {
         let task = recovered.tasks().get(&fixture.first).unwrap();
         assert_eq!(task.status(), TaskStatus::Running);
         assert!(task.needs_reviewer_recovery());
-        assert_eq!(task.latest_attempt().unwrap().side_effect_state(), Some(SideEffectState::ConfirmedPerformed));
+        assert_eq!(
+            task.latest_attempt().unwrap().side_effect_state(),
+            Some(SideEffectState::ConfirmedPerformed)
+        );
         assert_eq!(
             crate::scheduler::select_next_action(&recovered).unwrap(),
             crate::scheduler::SchedulerDecision::RunReviewer {
@@ -2120,7 +2162,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(reviewed.tasks()[&fixture.first].status(), TaskStatus::Verifying);
+        assert_eq!(
+            reviewed.tasks()[&fixture.first].status(),
+            TaskStatus::Verifying
+        );
         assert_eq!(
             reviewed.tasks()[&fixture.first]
                 .latest_attempt()
@@ -2310,7 +2355,7 @@ mod tests {
     fn writer_path_authority_rejects_escape_git_magic_and_git_internals() {
         let fixture = lease_fixture();
         let root = std::fs::canonicalize(&fixture.root).unwrap();
-        let allowed = vec![fixture.root.clone()];
+        let allowed = std::slice::from_ref(&fixture.root);
         std::fs::create_dir_all(fixture.root.join("forbidden")).unwrap();
         let forbidden = vec![fixture.root.join("forbidden")];
         let outside = fixture
@@ -2326,7 +2371,7 @@ mod tests {
             ":(top)target.txt".to_owned(),
             "forbidden/target.txt".to_owned(),
         ] {
-            let result = resolve_scoped_write_path(&raw, &root, &allowed, &forbidden);
+            let result = resolve_scoped_write_path(&raw, &root, allowed, &forbidden);
             assert!(
                 matches!(result, Err(WriterError::AuthorityViolation(_))),
                 "accepted {raw}"
@@ -2355,8 +2400,12 @@ mod tests {
         symlink(&outside, fixture.root.join("link")).unwrap();
         let root = std::fs::canonicalize(&fixture.root).unwrap();
 
-        let result =
-            resolve_scoped_write_path("link/escape.txt", &root, &[fixture.root.clone()], &[]);
+        let result = resolve_scoped_write_path(
+            "link/escape.txt",
+            &root,
+            std::slice::from_ref(&fixture.root),
+            &[],
+        );
         assert!(matches!(result, Err(WriterError::AuthorityViolation(_))));
 
         std::fs::remove_dir_all(fixture.root).unwrap();

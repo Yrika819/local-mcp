@@ -7,12 +7,19 @@ use crate::config;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
-use crate::mutation::{FileObservation, MutationIntent, MutationOperationIntent, MutationPreimage, MutationIntentState};
+use crate::mutation::{
+    FileObservation, MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage,
+};
 use crate::mutation_recovery;
 use crate::planner::{PlannerBackend, planner_request_for_goal};
-use crate::readonly_worker::{ReadonlyBackend, ReadonlyError, readonly_request_for_model_backend_test};
+use crate::readonly_worker::{
+    ReadonlyBackend, ReadonlyError, readonly_request_for_model_backend_test,
+};
 use crate::scheduler::{SchedulerDecision, select_next_action};
-use crate::task::{ReplaySafety, Task, TaskOperationKind, TaskScope, TaskStatus, TaskTransitionContext, VerificationSpec, WorkerKind};
+use crate::task::{
+    ReplaySafety, Task, TaskOperationKind, TaskScope, TaskStatus, TaskTransitionContext,
+    VerificationSpec, WorkerKind,
+};
 use crate::task_store::TaskStore;
 use crate::writer::{WriterBackend, WriterError, writer_request_for_model_backend_test};
 
@@ -63,12 +70,23 @@ fn scope(repo: &std::path::Path, worker: WorkerKind) -> TaskScope {
     let (operation, replay) = if worker == WorkerKind::CodexReadonly {
         (TaskOperationKind::ReadOnly, ReplaySafety::SafeReadOnly)
     } else {
-        (TaskOperationKind::LocalMutation, ReplaySafety::VerifyBeforeRetry)
+        (
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        )
     };
-    TaskScope::new(vec![repo.to_path_buf()], vec![repo.join(".git")], operation, replay)
+    TaskScope::new(
+        vec![repo.to_path_buf()],
+        vec![repo.join(".git")],
+        operation,
+        replay,
+    )
 }
 
-fn synthetic_goal(root: &std::path::Path, worker: WorkerKind) -> (config::Session, TaskStore, Goal, crate::task::TaskId) {
+fn synthetic_goal(
+    root: &std::path::Path,
+    worker: WorkerKind,
+) -> (config::Session, TaskStore, Goal, crate::task::TaskId) {
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("sentinel.txt"), b"unchanged\n").unwrap();
@@ -115,24 +133,54 @@ fn synthetic_fault_script_is_ordered_and_preserves_role_contracts() {
     ]));
     let backends = ProductionGoalBackends::with_transport(&session, transport.clone());
 
-    assert_eq!(backends.planner().propose_initial_plan(&planner_request_for_goal(
-        &Goal::new(session.id.clone(), cwd.clone(), "objective", None, vec![], vec![], NOW).unwrap(),
-        &session,
-    ).unwrap()).unwrap(), b"planner");
+    assert_eq!(
+        backends
+            .planner()
+            .propose_initial_plan(
+                &planner_request_for_goal(
+                    &Goal::new(
+                        session.id.clone(),
+                        cwd.clone(),
+                        "objective",
+                        None,
+                        vec![],
+                        vec![],
+                        NOW
+                    )
+                    .unwrap(),
+                    &session,
+                )
+                .unwrap()
+            )
+            .unwrap(),
+        b"planner"
+    );
     let readonly_error = backends
         .readonly()
         .investigate(&readonly_request_for_model_backend_test(cwd.clone()))
         .unwrap_err();
-    assert!(matches!(readonly_error, ReadonlyError::Model(AgentError::Timeout)));
-    assert_eq!(backends.writer().propose(&writer_request_for_model_backend_test(cwd)).unwrap(), b"writer");
+    assert!(matches!(
+        readonly_error,
+        ReadonlyError::Model(AgentError::Timeout)
+    ));
+    assert_eq!(
+        backends
+            .writer()
+            .propose(&writer_request_for_model_backend_test(cwd))
+            .unwrap(),
+        b"writer"
+    );
 
     let calls = transport.calls.lock().unwrap();
-    assert_eq!(calls.iter().map(ModelInvocation::role).collect::<Vec<_>>(), vec![
-        ModelRole::Planner,
-        ModelRole::Readonly,
-        ModelRole::Writer,
-    ]);
-    assert!(calls.iter().all(|call| call.prompt().contains("Return JSON only")));
+    assert_eq!(
+        calls.iter().map(ModelInvocation::role).collect::<Vec<_>>(),
+        vec![ModelRole::Planner, ModelRole::Readonly, ModelRole::Writer,]
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.prompt().contains("Return JSON only"))
+    );
 }
 
 #[test]
@@ -151,11 +199,16 @@ fn synthetic_writer_fault_is_typed_without_host_mutation() {
 #[test]
 fn scheduler_decision_survives_durable_reload_for_readonly_and_writer_routes() {
     for worker in [WorkerKind::CodexReadonly, WorkerKind::CodexWriter] {
-        let root = std::env::temp_dir().join(format!("local-mcp-hardening-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("local-mcp-hardening-{}", uuid::Uuid::new_v4()));
         let (session, store, goal, task_id) = synthetic_goal(&root, worker);
         let expected = match worker {
-            WorkerKind::CodexReadonly => SchedulerDecision::RunReadonly { task_id: task_id.clone() },
-            WorkerKind::CodexWriter => SchedulerDecision::RunWriter { task_id: task_id.clone() },
+            WorkerKind::CodexReadonly => SchedulerDecision::RunReadonly {
+                task_id: task_id.clone(),
+            },
+            WorkerKind::CodexWriter => SchedulerDecision::RunWriter {
+                task_id: task_id.clone(),
+            },
             _ => unreachable!(),
         };
         assert_eq!(select_next_action(&goal).unwrap(), expected);
@@ -171,26 +224,41 @@ fn crash_reload_with_unknown_writer_side_effect_is_blocked_and_not_replayed() {
     let root = std::env::temp_dir().join(format!("local-mcp-hardening-{}", uuid::Uuid::new_v4()));
     let (session, store, goal, task_id) = synthetic_goal(&root, WorkerKind::CodexWriter);
     store.create_goal(&goal).unwrap();
-    let running = store.mutate_goal_snapshot(&session.id, goal.id(), goal.revision(), |goal, now| {
-        goal.transition_task(&task_id, TaskStatus::Running, TaskTransitionContext::default(), now)?;
-        goal.task_bind_latest_attempt_execution(
-            &task_id,
-            Some("writer-op".to_owned()),
-            Some("writer-scope".to_owned()),
-            Some("writer-request".to_owned()),
-            Some(SideEffectClass::LocalMutation),
-            Some(SideEffectState::Unknown),
-            Some(1),
-            Some(1),
-        )
-    }).unwrap();
-    let recovered = store.recover_goal(&session.id, goal.id(), running.revision()).unwrap();
+    let running = store
+        .mutate_goal_snapshot(&session.id, goal.id(), goal.revision(), |goal, now| {
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Running,
+                TaskTransitionContext::default(),
+                now,
+            )?;
+            goal.task_bind_latest_attempt_execution(
+                &task_id,
+                Some("writer-op".to_owned()),
+                Some("writer-scope".to_owned()),
+                Some("writer-request".to_owned()),
+                Some(SideEffectClass::LocalMutation),
+                Some(SideEffectState::Unknown),
+                Some(1),
+                Some(1),
+            )
+        })
+        .unwrap();
+    let recovered = store
+        .recover_goal(&session.id, goal.id(), running.revision())
+        .unwrap();
     assert_eq!(recovered.status(), GoalStatus::Blocked);
     let task = recovered.tasks().get(&task_id).unwrap();
     assert_eq!(task.status(), TaskStatus::Blocked);
-    assert_eq!(task.blockers().last().unwrap().code(), "RECOVERY_RECONCILIATION_REQUIRED");
+    assert_eq!(
+        task.blockers().last().unwrap().code(),
+        "RECOVERY_RECONCILIATION_REQUIRED"
+    );
     assert_eq!(task.attempts().len(), 1);
-    assert_eq!(task.latest_attempt().unwrap().side_effect_state(), Some(SideEffectState::Unknown));
+    assert_eq!(
+        task.latest_attempt().unwrap().side_effect_state(),
+        Some(SideEffectState::Unknown)
+    );
     assert!(task.latest_attempt().unwrap().operation_id().is_some());
     let reloaded = store.load_goal(&session.id, goal.id()).unwrap();
     assert_eq!(reloaded, recovered);
@@ -204,8 +272,15 @@ fn durable_writer_reconciliation_records_confirmed_not_performed_after_reload() 
     store.create_goal(&goal).unwrap();
     let prepared = store
         .mutate_goal_snapshot(&session.id, goal.id(), goal.revision(), |goal, now| {
-            goal.transition_task(&task_id, TaskStatus::Running, TaskTransitionContext::default(), now)?;
-            let target = std::fs::canonicalize(&session.cwd).unwrap().join("reconcile.txt");
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Running,
+                TaskTransitionContext::default(),
+                now,
+            )?;
+            let target = std::fs::canonicalize(&session.cwd)
+                .unwrap()
+                .join("reconcile.txt");
             let intent = MutationIntent::new(
                 "operation-reload".to_owned(),
                 "scope-reload".to_owned(),
@@ -226,7 +301,11 @@ fn durable_writer_reconciliation_records_confirmed_not_performed_after_reload() 
     assert!(mutation_recovery::reconcile_goal_mutations(&mut reloaded, NOW).unwrap());
     let task = reloaded.tasks().get(&task_id).unwrap();
     assert_eq!(
-        task.latest_attempt().unwrap().mutation_intent().unwrap().state(),
+        task.latest_attempt()
+            .unwrap()
+            .mutation_intent()
+            .unwrap()
+            .state(),
         MutationIntentState::ReconciledNotPerformed
     );
     assert!(task.evidence().iter().any(|evidence| matches!(
@@ -239,16 +318,42 @@ fn durable_writer_reconciliation_records_confirmed_not_performed_after_reload() 
 #[test]
 fn synthetic_campaign_manifest_has_thirty_unique_bounded_cases() {
     const CASES: [&str; 30] = [
-        "readonly-only-success", "writer-only-success", "readonly-timeout", "readonly-transport-failure",
-        "readonly-malformed-output", "readonly-blocked", "readonly-needs-replan", "readonly-failed",
-        "readonly-exhausted-budget", "writer-safe-pre-mutation-retry", "writer-review-block", "writer-stale-preimage",
-        "writer-forbidden-path", "writer-symlink-escape", "writer-postimage-mismatch", "writer-confirmed-performed-recovery",
-        "writer-unknown-side-effect-recovery", "writer-exhausted-budget", "writer-lease-held", "reviewer-schema-rejection",
-        "planner-schema-rejection", "replanner-monotonic-addition", "replanner-trigger-preservation", "dependency-wait",
-        "readiness-propagation", "paused-no-action", "terminal-no-action", "goal-blocked-no-action", "goal-finalizer-gate",
+        "readonly-only-success",
+        "writer-only-success",
+        "readonly-timeout",
+        "readonly-transport-failure",
+        "readonly-malformed-output",
+        "readonly-blocked",
+        "readonly-needs-replan",
+        "readonly-failed",
+        "readonly-exhausted-budget",
+        "writer-safe-pre-mutation-retry",
+        "writer-review-block",
+        "writer-stale-preimage",
+        "writer-forbidden-path",
+        "writer-symlink-escape",
+        "writer-postimage-mismatch",
+        "writer-confirmed-performed-recovery",
+        "writer-unknown-side-effect-recovery",
+        "writer-exhausted-budget",
+        "writer-lease-held",
+        "reviewer-schema-rejection",
+        "planner-schema-rejection",
+        "replanner-monotonic-addition",
+        "replanner-trigger-preservation",
+        "dependency-wait",
+        "readiness-propagation",
+        "paused-no-action",
+        "terminal-no-action",
+        "goal-blocked-no-action",
+        "goal-finalizer-gate",
         "long-chain-reload",
     ];
     let unique = CASES.iter().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(unique.len(), CASES.len());
-    assert!(CASES.iter().all(|case| !case.is_empty() && case.len() <= 64));
+    assert!(
+        CASES
+            .iter()
+            .all(|case| !case.is_empty() && case.len() <= 64)
+    );
 }

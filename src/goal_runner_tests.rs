@@ -78,7 +78,12 @@ impl FakeAuthorities {
         next: Option<RunnerGoalState>,
     ) -> Self {
         self.scheduler.push_back(SchedulerScript {
-            result: Ok(step_result(action, revision_before, revision_after, outcome)),
+            result: Ok(step_result(
+                action,
+                revision_before,
+                revision_after,
+                outcome,
+            )),
             next,
         });
         self
@@ -123,10 +128,10 @@ impl FakeAuthorities {
 impl GoalRunnerAuthorities for FakeAuthorities {
     fn load_goal_state(&mut self) -> Result<RunnerGoalState, RunnerDriverError> {
         self.load_calls += 1;
-        if self.load_calls == 1 {
-            if let Some(error) = self.initial_load_error.take() {
-                return Err(error);
-            }
+        if self.load_calls == 1
+            && let Some(error) = self.initial_load_error.take()
+        {
+            return Err(error);
         }
         Ok(self.state)
     }
@@ -137,7 +142,10 @@ impl GoalRunnerAuthorities for FakeAuthorities {
     ) -> Result<SchedulerStepResult, RunnerDriverError> {
         self.scheduler_calls += 1;
         self.expected_revisions.push(expected_revision);
-        let script = self.scheduler.pop_front().expect("unexpected Scheduler call");
+        let script = self
+            .scheduler
+            .pop_front()
+            .expect("unexpected Scheduler call");
         if let Some(next) = script.next {
             self.state = next;
         }
@@ -150,7 +158,10 @@ impl GoalRunnerAuthorities for FakeAuthorities {
     ) -> Result<RunnerFinalizerStepResult, RunnerDriverError> {
         self.finalizer_calls += 1;
         self.expected_revisions.push(expected_revision);
-        let script = self.finalizer.pop_front().expect("unexpected Finalizer call");
+        let script = self
+            .finalizer
+            .pop_front()
+            .expect("unexpected Finalizer call");
         if let Some(next) = script.next {
             self.state = next;
         }
@@ -183,7 +194,11 @@ fn step_result(
 }
 
 fn trace_actions(result: &crate::goal_runner::GoalRunResult) -> Vec<GoalRunTraceAction> {
-    result.trace.iter().map(|entry| entry.action.clone()).collect()
+    result
+        .trace
+        .iter()
+        .map(|entry| entry.action.clone())
+        .collect()
 }
 
 #[test]
@@ -275,7 +290,11 @@ async fn phase10_normal_multistep_success_is_sequential() {
         .scheduler_step(SchedulerAction::RunWriter, 2, 3, GoalStatus::Running)
         .scheduler_step(SchedulerAction::VerifyTask, 3, 4, GoalStatus::Running)
         .scheduler_step(SchedulerAction::VerifyGoal, 4, 5, GoalStatus::Verifying)
-        .finalizer_step(6, GoalFinalizationOutcome::ReadyToComplete, GoalStatus::Completed);
+        .finalizer_step(
+            6,
+            GoalFinalizationOutcome::ReadyToComplete,
+            GoalStatus::Completed,
+        );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(5)).await;
     assert_eq!(result.stop_reason, GoalRunStopReason::Completed);
     assert_eq!(result.steps_attempted, 5);
@@ -316,7 +335,11 @@ async fn phase10_task_and_goal_verifier_are_distinct_steps() {
 async fn phase10_goal_verifier_and_finalizer_are_distinct_steps() {
     let mut fake = FakeAuthorities::new(GoalStatus::Running, 10)
         .scheduler_step(SchedulerAction::VerifyGoal, 10, 11, GoalStatus::Verifying)
-        .finalizer_step(12, GoalFinalizationOutcome::ReadyToComplete, GoalStatus::Completed);
+        .finalizer_step(
+            12,
+            GoalFinalizationOutcome::ReadyToComplete,
+            GoalStatus::Completed,
+        );
 
     let first = run_goal_with_authorities(&mut fake, goal_id(), limits(1)).await;
     assert_eq!(first.stop_reason, GoalRunStopReason::StepBudgetExhausted);
@@ -332,8 +355,11 @@ async fn phase10_goal_verifier_and_finalizer_are_distinct_steps() {
 
 #[tokio::test]
 async fn phase10_verifying_entry_uses_finalizer_directly_as_separate_authority() {
-    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 20)
-        .finalizer_step(21, GoalFinalizationOutcome::ReadyToComplete, GoalStatus::Completed);
+    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 20).finalizer_step(
+        21,
+        GoalFinalizationOutcome::ReadyToComplete,
+        GoalStatus::Completed,
+    );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(1)).await;
     assert_eq!(result.stop_reason, GoalRunStopReason::Completed);
     assert_eq!(fake.scheduler_calls, 0);
@@ -361,8 +387,12 @@ async fn phase10_needs_replan_lifecycle_never_collapses_actions() {
 
 #[tokio::test]
 async fn phase10_failed_goal_verification_stops_without_finalizer() {
-    let mut fake = FakeAuthorities::new(GoalStatus::Running, 2)
-        .scheduler_step(SchedulerAction::VerifyGoal, 2, 3, GoalStatus::Failed);
+    let mut fake = FakeAuthorities::new(GoalStatus::Running, 2).scheduler_step(
+        SchedulerAction::VerifyGoal,
+        2,
+        3,
+        GoalStatus::Failed,
+    );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(3)).await;
     assert_eq!(result.stop_reason, GoalRunStopReason::Failed);
     assert_eq!(result.terminal_status, Some(GoalStatus::Failed));
@@ -372,8 +402,12 @@ async fn phase10_failed_goal_verification_stops_without_finalizer() {
 
 #[tokio::test]
 async fn phase10_indeterminate_goal_verification_stops_blocked() {
-    let mut fake = FakeAuthorities::new(GoalStatus::Running, 2)
-        .scheduler_step(SchedulerAction::VerifyGoal, 2, 3, GoalStatus::Blocked);
+    let mut fake = FakeAuthorities::new(GoalStatus::Running, 2).scheduler_step(
+        SchedulerAction::VerifyGoal,
+        2,
+        3,
+        GoalStatus::Blocked,
+    );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(3)).await;
     assert_eq!(result.stop_reason, GoalRunStopReason::Blocked);
     assert_eq!(fake.scheduler_calls, 1);
@@ -384,7 +418,11 @@ async fn phase10_indeterminate_goal_verification_stops_blocked() {
 async fn phase10_follows_scheduler_priority_without_task_selection() {
     let mut fake = FakeAuthorities::new(GoalStatus::Running, 4)
         .scheduler_step(SchedulerAction::VerifyGoal, 4, 5, GoalStatus::Verifying)
-        .finalizer_step(6, GoalFinalizationOutcome::ReadyToComplete, GoalStatus::Completed);
+        .finalizer_step(
+            6,
+            GoalFinalizationOutcome::ReadyToComplete,
+            GoalStatus::Completed,
+        );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(2)).await;
     assert_eq!(result.stop_reason, GoalRunStopReason::Completed);
     assert_eq!(
@@ -407,7 +445,10 @@ async fn phase10_unsupported_worker_stops_after_one_scheduler_call() {
         None,
     );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(5)).await;
-    assert_eq!(result.stop_reason, GoalRunStopReason::UnsupportedWorker(worker));
+    assert_eq!(
+        result.stop_reason,
+        GoalRunStopReason::UnsupportedWorker(worker)
+    );
     assert_eq!(result.steps_attempted, 1);
     assert_eq!(fake.scheduler_calls, 1);
 }
@@ -539,8 +580,11 @@ async fn phase10_applied_without_revision_progress_is_rejected() {
 
 #[tokio::test]
 async fn phase10_finalizer_without_revision_progress_is_rejected() {
-    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 3)
-        .finalizer_step(3, GoalFinalizationOutcome::ReadyToComplete, GoalStatus::Verifying);
+    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 3).finalizer_step(
+        3,
+        GoalFinalizationOutcome::ReadyToComplete,
+        GoalStatus::Verifying,
+    );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(3)).await;
     assert!(matches!(
         result.stop_reason,
@@ -587,8 +631,11 @@ async fn phase10_trace_is_ordered_deterministic_and_bounded() {
 
 #[tokio::test]
 async fn phase10_completed_reentry_is_idempotent() {
-    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 1)
-        .finalizer_step(2, GoalFinalizationOutcome::ReadyToComplete, GoalStatus::Completed);
+    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 1).finalizer_step(
+        2,
+        GoalFinalizationOutcome::ReadyToComplete,
+        GoalStatus::Completed,
+    );
     let first = run_goal_with_authorities(&mut fake, goal_id(), limits(2)).await;
     assert_eq!(first.stop_reason, GoalRunStopReason::Completed);
     assert_eq!(fake.finalizer_calls, 1);
@@ -604,8 +651,11 @@ async fn phase10_completed_reentry_is_idempotent() {
 
 #[tokio::test]
 async fn phase10_finalization_not_ready_stops_without_spin() {
-    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 3)
-        .finalizer_step(3, GoalFinalizationOutcome::NotReady, GoalStatus::Verifying);
+    let mut fake = FakeAuthorities::new(GoalStatus::Verifying, 3).finalizer_step(
+        3,
+        GoalFinalizationOutcome::NotReady,
+        GoalStatus::Verifying,
+    );
     let result = run_goal_with_authorities(&mut fake, goal_id(), limits(4)).await;
     assert_eq!(
         result.stop_reason,
@@ -652,7 +702,10 @@ fn phase10_static_authority_bypass_and_background_absence() {
         "join_all",
         "loop {",
     ] {
-        assert!(!source.contains(forbidden), "forbidden Runner token: {forbidden}");
+        assert!(
+            !source.contains(forbidden),
+            "forbidden Runner token: {forbidden}"
+        );
     }
     assert!(source.contains("scheduler::scheduler_step"));
     assert!(source.contains("goal_finalizer::finalize_goal_at_revision"));

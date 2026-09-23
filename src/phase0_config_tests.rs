@@ -77,7 +77,9 @@ async fn missing_and_corrupt_session_errors_are_frozen() {
 
     let corrupt_id = unique_id("phase0-corrupt");
     let path = config::session_path(&corrupt_id).unwrap();
-    tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+    tokio::fs::create_dir_all(path.parent().unwrap())
+        .await
+        .unwrap();
     tokio::fs::write(&path, b"{not-json").await.unwrap();
     let corrupt = config::load_session(&corrupt_id)
         .await

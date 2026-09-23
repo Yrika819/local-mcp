@@ -105,6 +105,10 @@ pub(crate) struct MutationOperationIntent {
     state: MutationOperationState,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen mutation-operation evidence accessors are retained for staged writer/recovery consumers."
+)]
 impl MutationOperationIntent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -183,6 +187,10 @@ pub(crate) struct MutationIntent {
     operations: Vec<MutationOperationIntent>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen mutation-intent reviewer accessor is retained for staged writer/reviewer integration."
+)]
 impl MutationIntent {
     pub(crate) fn new(
         operation_id: String,
@@ -264,8 +272,10 @@ impl MutationIntent {
                 ) {
                     return Err(corrupt("invalid MutationIntent reconciliation state"));
                 }
-                if matches!(self.state, MutationIntentState::Partial | MutationIntentState::Unknown)
-                    && self.state != state
+                if matches!(
+                    self.state,
+                    MutationIntentState::Partial | MutationIntentState::Unknown
+                ) && self.state != state
                 {
                     return Err(corrupt("reconciliation state cannot be rewritten"));
                 }
@@ -314,7 +324,9 @@ impl MutationIntent {
         if self.side_effect_class != SideEffectClass::LocalMutation
             || self.replay_safety != ReplaySafety::VerifyBeforeRetry
         {
-            return Err(corrupt("MutationIntent has an invalid Writer authority classification"));
+            return Err(corrupt(
+                "MutationIntent has an invalid Writer authority classification",
+            ));
         }
         if self.operations.is_empty() || self.operations.len() > MAX_MUTATION_OPERATIONS {
             return Err(corrupt("MutationIntent operation count is out of bounds"));
@@ -325,7 +337,7 @@ impl MutationIntent {
             if !indices.insert(operation.index) {
                 return Err(corrupt("MutationIntent has duplicate operation index"));
             }
-            if operation.path.as_os_str().len() == 0
+            if operation.path.as_os_str().is_empty()
                 || operation.path.as_os_str().len() > MAX_MUTATION_PATH_BYTES
                 || !operation.path.is_absolute()
             {
@@ -335,20 +347,27 @@ impl MutationIntent {
             if !paths.insert(path) {
                 return Err(corrupt("MutationIntent has duplicate operation path"));
             }
-            validate_digest(&operation.intended_after_sha256, "intended postimage digest")?;
+            validate_digest(
+                &operation.intended_after_sha256,
+                "intended postimage digest",
+            )?;
             validate_id(&operation.request_id, "request identity")?;
             validate_observation(&operation.observed_before)?;
             if let MutationPreimage::Sha256 { sha256 } = &operation.expected_preimage {
                 validate_digest(sha256, "expected preimage digest")?;
             }
-            if !matches!(self.state, MutationIntentState::Prepared | MutationIntentState::Applying)
-                && operation.state != MutationOperationState::Applied
+            if !matches!(
+                self.state,
+                MutationIntentState::Prepared | MutationIntentState::Applying
+            ) && operation.state != MutationOperationState::Applied
                 && matches!(
                     self.state,
                     MutationIntentState::Applied | MutationIntentState::ReconciledPerformed
                 )
             {
-                return Err(corrupt("completed MutationIntent has incomplete operation state"));
+                return Err(corrupt(
+                    "completed MutationIntent has incomplete operation state",
+                ));
             }
         }
         match self.reviewer.state {
@@ -358,9 +377,10 @@ impl MutationIntent {
                 }
             }
             ReviewerInvocationState::Invoking | ReviewerInvocationState::Persisted => {
-                let id = self.reviewer.invocation_id.as_deref().ok_or_else(|| {
-                    corrupt("active Reviewer invocation is missing its identity")
-                })?;
+                let id =
+                    self.reviewer.invocation_id.as_deref().ok_or_else(|| {
+                        corrupt("active Reviewer invocation is missing its identity")
+                    })?;
                 validate_id(id, "Reviewer invocation identity")?;
             }
         }

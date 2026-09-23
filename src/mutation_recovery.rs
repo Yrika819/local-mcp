@@ -48,7 +48,10 @@ pub(crate) fn classify_observations(
         return Ok(ReconciliationDecision::NotPerformed);
     }
     if after_count == operations.len()
-        && matches!(intent_state, MutationIntentState::Applying | MutationIntentState::Applied)
+        && matches!(
+            intent_state,
+            MutationIntentState::Applying | MutationIntentState::Applied
+        )
     {
         return Ok(ReconciliationDecision::Performed);
     }
@@ -166,9 +169,10 @@ pub(crate) fn reconcile_goal_mutations(
         if decision == ReconciliationDecision::Performed
             && intent.reviewer_state() == crate::mutation::ReviewerInvocationState::Invoking
         {
-            let task = goal.tasks().get(&task_id).ok_or_else(|| {
-                OrchestratorError::InvalidDag("task is missing".to_owned())
-            })?;
+            let task = goal
+                .tasks()
+                .get(&task_id)
+                .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?;
             if task.status() != crate::task::TaskStatus::Blocked {
                 goal.task_add_blocker(
                     &task_id,
@@ -186,11 +190,14 @@ pub(crate) fn reconcile_goal_mutations(
                 )?;
             }
         }
-        if matches!(decision, ReconciliationDecision::Partial | ReconciliationDecision::Unknown)
-        {
-            let task = goal.tasks().get(&task_id).ok_or_else(|| {
-                OrchestratorError::InvalidDag("task is missing".to_owned())
-            })?;
+        if matches!(
+            decision,
+            ReconciliationDecision::Partial | ReconciliationDecision::Unknown
+        ) {
+            let task = goal
+                .tasks()
+                .get(&task_id)
+                .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?;
             if task.status() != crate::task::TaskStatus::Blocked {
                 goal.task_add_blocker(
                     &task_id,
@@ -236,7 +243,10 @@ fn observe_path(path: &Path) -> Result<FileObservation, OrchestratorError> {
                 ));
             }
             let bytes = std::fs::read(path).map_err(OrchestratorError::PersistenceIo)?;
-            Ok(FileObservation::exists(bytes.len() as u64, sha256_hex(&bytes)))
+            Ok(FileObservation::exists(
+                bytes.len() as u64,
+                sha256_hex(&bytes),
+            ))
         }
     }
 }
@@ -268,12 +278,26 @@ mod tests {
     fn reconciliation_decision_table_is_conservative() {
         let before = vec![FileObservation::absent(), FileObservation::absent()];
         let after = vec![
-            FileObservation::exists(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
-            FileObservation::exists(1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+            FileObservation::exists(
+                1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            FileObservation::exists(
+                1,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
         ];
         let operations = vec![
-            operation(0, before[0].clone(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            operation(1, before[1].clone(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            operation(
+                0,
+                before[0].clone(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            operation(
+                1,
+                before[1].clone(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
         ];
         assert_eq!(
             classify_observations(MutationIntentState::Prepared, &operations, &before).unwrap(),
@@ -296,18 +320,20 @@ mod tests {
             classify_observations(
                 MutationIntentState::Applying,
                 &operations,
-                &[FileObservation::exists(1, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned()), before[1].clone()],
+                &[
+                    FileObservation::exists(
+                        1,
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                            .to_owned()
+                    ),
+                    before[1].clone()
+                ],
             )
             .unwrap(),
             ReconciliationDecision::Unknown
         );
         assert_eq!(
-            classify_observations(
-                MutationIntentState::Applying,
-                &operations,
-                &before,
-            )
-            .unwrap(),
+            classify_observations(MutationIntentState::Applying, &operations, &before,).unwrap(),
             ReconciliationDecision::Unknown
         );
     }

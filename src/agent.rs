@@ -86,6 +86,10 @@ pub(crate) struct ModelInvocationOutput {
     exit_status: i32,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen model-output accessors are retained for the staged Goal Orchestrator backend interface."
+)]
 impl ModelInvocationOutput {
     pub(crate) fn new(stdout: Vec<u8>, safe_stderr: String, exit_status: i32) -> Self {
         Self {
@@ -498,7 +502,7 @@ pub(crate) fn require_approval_for_test(approved: bool) -> Result<(), AgentError
     require_approval(approved)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn safe_diagnostic_for_test(bytes: &[u8]) -> String {
     safe_diagnostic(bytes)
 }

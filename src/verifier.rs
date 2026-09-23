@@ -96,6 +96,10 @@ pub(crate) struct VerificationDecision {
     evidence: Vec<TaskEvidence>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen verification-decision accessors are retained for staged runner consumers."
+)]
 impl VerificationDecision {
     pub(crate) fn outcome(&self) -> VerificationDecisionOutcome {
         self.outcome
@@ -243,7 +247,10 @@ pub(crate) fn prepare(
     })
 }
 
-pub(crate) async fn evaluate(snapshot: &Snapshot, session: &config::Session) -> Result<VerificationDecision, VerifierError> {
+pub(crate) async fn evaluate(
+    snapshot: &Snapshot,
+    session: &config::Session,
+) -> Result<VerificationDecision, VerifierError> {
     let mut checks = Vec::with_capacity(snapshot.specs.len());
     let mut observations = Vec::new();
     let mut evidence = Vec::new();
@@ -275,7 +282,10 @@ pub(crate) async fn evaluate(snapshot: &Snapshot, session: &config::Session) -> 
     }
 
     let git_required = snapshot.specs.iter().any(|spec| {
-        matches!(spec, VerificationSpec::GitScope { .. } | VerificationSpec::NoForbiddenChanges { .. })
+        matches!(
+            spec,
+            VerificationSpec::GitScope { .. } | VerificationSpec::NoForbiddenChanges { .. }
+        )
     });
     let git_for_scope = snapshot.scope.operation_kind() != TaskOperationKind::ReadOnly;
     let git = if git_required || git_for_scope {
@@ -337,7 +347,8 @@ pub(crate) async fn evaluate(snapshot: &Snapshot, session: &config::Session) -> 
             fact: if any {
                 "host FileSnapshot paths checked against TaskScope".to_owned()
             } else {
-                "no Git state or host FileSnapshot exists for mutating scope reconciliation".to_owned()
+                "no Git state or host FileSnapshot exists for mutating scope reconciliation"
+                    .to_owned()
             },
             passed: any && scope_ok,
         });
@@ -351,7 +362,11 @@ pub(crate) async fn evaluate(snapshot: &Snapshot, session: &config::Session) -> 
         if check.passed {
             passed_count += 1;
         }
-        checks.push(VerificationCheckResult::new(index, check.passed, Some(check.detail.clone())));
+        checks.push(VerificationCheckResult::new(
+            index,
+            check.passed,
+            Some(check.detail.clone()),
+        ));
         observations.push(Observation {
             index: Some(index),
             kind: kind_name(spec).to_owned(),
@@ -387,7 +402,11 @@ async fn evaluate_spec(
             match fs::metadata(&path) {
                 Ok(metadata) => {
                     let passed = !*must_be_file || metadata.is_file();
-                    let digest = if metadata.is_file() { hash_file(&path).ok() } else { None };
+                    let digest = if metadata.is_file() {
+                        hash_file(&path).ok()
+                    } else {
+                        None
+                    };
                     Ok(Check {
                         passed,
                         detail: if passed {
@@ -395,7 +414,11 @@ async fn evaluate_spec(
                         } else {
                             format!("{} exists but is not a regular file", path.display())
                         },
-                        disposition: if passed { Disposition::Pass } else { Disposition::Retryable },
+                        disposition: if passed {
+                            Disposition::Pass
+                        } else {
+                            Disposition::Retryable
+                        },
                         evidence: vec![TaskEvidence::FileSnapshot {
                             path,
                             exists: true,
@@ -423,12 +446,18 @@ async fn evaluate_spec(
                 }),
             }
         }
-        VerificationSpec::FileDigest { path, expected_sha256 } => {
+        VerificationSpec::FileDigest {
+            path,
+            expected_sha256,
+        } => {
             let path = resolve_path(path, &snapshot.cwd)?;
             match fs::metadata(&path) {
                 Ok(metadata) if metadata.is_file() => {
                     let actual = hash_file(&path).map_err(|error| {
-                        VerifierError::Observation(format!("cannot hash {}: {error}", path.display()))
+                        VerifierError::Observation(format!(
+                            "cannot hash {}: {error}",
+                            path.display()
+                        ))
                     })?;
                     let passed = actual.eq_ignore_ascii_case(expected_sha256);
                     Ok(Check {
@@ -436,9 +465,18 @@ async fn evaluate_spec(
                         detail: if passed {
                             format!("{} SHA-256 matches durable expectation", path.display())
                         } else {
-                            format!("{} SHA-256 mismatch: expected {}, observed {}", path.display(), expected_sha256, actual)
+                            format!(
+                                "{} SHA-256 mismatch: expected {}, observed {}",
+                                path.display(),
+                                expected_sha256,
+                                actual
+                            )
                         },
-                        disposition: if passed { Disposition::Pass } else { Disposition::Retryable },
+                        disposition: if passed {
+                            Disposition::Pass
+                        } else {
+                            Disposition::Retryable
+                        },
                         evidence: vec![TaskEvidence::FileSnapshot {
                             path,
                             exists: true,
@@ -451,13 +489,23 @@ async fn evaluate_spec(
                     passed: false,
                     detail: format!("{} is not a regular file", path.display()),
                     disposition: Disposition::Retryable,
-                    evidence: vec![TaskEvidence::FileSnapshot { path, exists: true, size: None, sha256: None }],
+                    evidence: vec![TaskEvidence::FileSnapshot {
+                        path,
+                        exists: true,
+                        size: None,
+                        sha256: None,
+                    }],
                 }),
                 Err(error) if error.kind() == ErrorKind::NotFound => Ok(Check {
                     passed: false,
                     detail: format!("{} is absent", path.display()),
                     disposition: Disposition::Retryable,
-                    evidence: vec![TaskEvidence::FileSnapshot { path, exists: false, size: None, sha256: None }],
+                    evidence: vec![TaskEvidence::FileSnapshot {
+                        path,
+                        exists: false,
+                        size: None,
+                        sha256: None,
+                    }],
                 }),
                 Err(error) => Ok(Check {
                     passed: false,
@@ -467,7 +515,11 @@ async fn evaluate_spec(
                 }),
             }
         }
-        VerificationSpec::CommandExit { command, cwd, accepted_exit_codes } => {
+        VerificationSpec::CommandExit {
+            command,
+            cwd,
+            accepted_exit_codes,
+        } => {
             validate_command(command)?;
             let cwd = cwd
                 .as_ref()
@@ -482,10 +534,13 @@ async fn evaluate_spec(
                     evidence: Vec::new(),
                 });
             }
-            let observed = run_command(command, &cwd, accepted_exit_codes, session, COMMAND_TIMEOUT).await?;
+            let observed =
+                run_command(command, &cwd, accepted_exit_codes, session, COMMAND_TIMEOUT).await?;
             let passed = observed.command_finished
                 && observed.execution_error.is_none()
-                && observed.exit_code.is_some_and(|code| accepted_exit_codes.contains(&code));
+                && observed
+                    .exit_code
+                    .is_some_and(|code| accepted_exit_codes.contains(&code));
             Ok(Check {
                 passed,
                 detail: format!(
@@ -507,11 +562,15 @@ async fn evaluate_spec(
                 }],
             })
         }
-        VerificationSpec::GitScope { allowed_changed_paths, require_no_other_changes } => {
+        VerificationSpec::GitScope {
+            allowed_changed_paths,
+            require_no_other_changes,
+        } => {
             let Some(git) = git else {
                 return Ok(Check {
                     passed: false,
-                    detail: "Git scope cannot be evaluated because Git observation is unavailable".to_owned(),
+                    detail: "Git scope cannot be evaluated because Git observation is unavailable"
+                        .to_owned(),
                     disposition: Disposition::Blocked,
                     evidence: Vec::new(),
                 });
@@ -520,16 +579,28 @@ async fn evaluate_spec(
                 .iter()
                 .map(|path| resolve_path(path, &snapshot.cwd))
                 .collect::<Result<Vec<_>, _>>()?;
-            let outside = git.changed.iter().filter(|path| !in_boundaries(path, &allowed)).count();
+            let outside = git
+                .changed
+                .iter()
+                .filter(|path| !in_boundaries(path, &allowed))
+                .count();
             let passed = !*require_no_other_changes || outside == 0;
             Ok(Check {
                 passed,
                 detail: if passed {
-                    format!("Git scope accepted {} changed path(s) from {}", git.changed.len(), git.root.display())
+                    format!(
+                        "Git scope accepted {} changed path(s) from {}",
+                        git.changed.len(),
+                        git.root.display()
+                    )
                 } else {
                     format!("Git contains {outside} changed path(s) outside allowed scope")
                 },
-                disposition: if passed { Disposition::Pass } else { Disposition::Blocked },
+                disposition: if passed {
+                    Disposition::Pass
+                } else {
+                    Disposition::Blocked
+                },
                 evidence: Vec::new(),
             })
         }
@@ -537,7 +608,8 @@ async fn evaluate_spec(
             let Some(git) = git else {
                 return Ok(Check {
                     passed: false,
-                    detail: "forbidden-path check cannot be evaluated without Git observation".to_owned(),
+                    detail: "forbidden-path check cannot be evaluated without Git observation"
+                        .to_owned(),
                     disposition: Disposition::Blocked,
                     evidence: Vec::new(),
                 });
@@ -546,7 +618,11 @@ async fn evaluate_spec(
                 .iter()
                 .map(|path| resolve_path(path, &snapshot.cwd))
                 .collect::<Result<Vec<_>, _>>()?;
-            let violating = git.changed.iter().filter(|path| in_boundaries(path, &forbidden)).count();
+            let violating = git
+                .changed
+                .iter()
+                .filter(|path| in_boundaries(path, &forbidden))
+                .count();
             let passed = violating == 0;
             Ok(Check {
                 passed,
@@ -555,34 +631,55 @@ async fn evaluate_spec(
                 } else {
                     format!("{violating} forbidden Git path(s) are changed")
                 },
-                disposition: if passed { Disposition::Pass } else { Disposition::Blocked },
+                disposition: if passed {
+                    Disposition::Pass
+                } else {
+                    Disposition::Blocked
+                },
                 evidence: Vec::new(),
             })
         }
         VerificationSpec::StructuredEvidence { requirement_id } => {
             let found = snapshot.evidence.iter().rev().find_map(|item| match item {
-                TaskEvidence::StructuredObservation { requirement_id: id, source, passed, detail }
-                    if id == requirement_id => Some((source, *passed, detail)),
+                TaskEvidence::StructuredObservation {
+                    requirement_id: id,
+                    source,
+                    passed,
+                    detail,
+                } if id == requirement_id => Some((source, *passed, detail)),
                 _ => None,
             });
             match found {
                 Some((source, passed, detail)) => Ok(Check {
                     passed,
-                    detail: format!("structured requirement {requirement_id} from {source}: {detail}"),
-                    disposition: if passed { Disposition::Pass } else { Disposition::Failed },
+                    detail: format!(
+                        "structured requirement {requirement_id} from {source}: {detail}"
+                    ),
+                    disposition: if passed {
+                        Disposition::Pass
+                    } else {
+                        Disposition::Failed
+                    },
                     evidence: Vec::new(),
                 }),
                 None => Ok(Check {
                     passed: false,
-                    detail: format!("required host structured evidence {requirement_id} is missing"),
+                    detail: format!(
+                        "required host structured evidence {requirement_id} is missing"
+                    ),
                     disposition: Disposition::Blocked,
                     evidence: Vec::new(),
                 }),
             }
         }
-        VerificationSpec::ReviewGate { max_blocking_findings } => {
+        VerificationSpec::ReviewGate {
+            max_blocking_findings,
+        } => {
             let found = snapshot.evidence.iter().rev().find_map(|item| match item {
-                TaskEvidence::ReviewResult { summary, blocking_findings } => Some((summary, *blocking_findings)),
+                TaskEvidence::ReviewResult {
+                    summary,
+                    blocking_findings,
+                } => Some((summary, *blocking_findings)),
                 _ => None,
             });
             match found {
@@ -590,8 +687,14 @@ async fn evaluate_spec(
                     let passed = count <= *max_blocking_findings;
                     Ok(Check {
                         passed,
-                        detail: format!("review gate observed {count} blocking finding(s), maximum {max_blocking_findings}: {summary}"),
-                        disposition: if passed { Disposition::Pass } else { Disposition::Blocked },
+                        detail: format!(
+                            "review gate observed {count} blocking finding(s), maximum {max_blocking_findings}: {summary}"
+                        ),
+                        disposition: if passed {
+                            Disposition::Pass
+                        } else {
+                            Disposition::Blocked
+                        },
                         evidence: Vec::new(),
                     })
                 }
@@ -624,71 +727,103 @@ pub(crate) fn commit(
     let authority = VerifierCompletionAuthority::new();
 
     store
-        .mutate_goal_snapshot(&session.id, &snapshot.goal_id, snapshot.revision, |goal, now| {
-            if goal.status() != GoalStatus::Running || goal.plan_revision() != snapshot.plan_revision {
-                return Err(OrchestratorError::InvalidDag("stale verifier Goal/plan state".to_owned()));
-            }
-            let task = goal.tasks().get(&snapshot.task_id).ok_or_else(|| {
-                OrchestratorError::InvalidDag("verification Task disappeared".to_owned())
-            })?;
-            if task.status() != TaskStatus::Verifying || task.verification_specs() != snapshot.specs.as_slice() {
-                return Err(OrchestratorError::InvalidDag("stale verifier Task/spec state".to_owned()));
-            }
-            let attempt = task.latest_attempt().ok_or_else(|| {
-                OrchestratorError::CorruptGoal("VERIFYING Task lacks attempt".to_owned())
-            })?;
-            if attempt.id() != &snapshot.attempt_id
-                || attempt.operation_id() != snapshot.operation_id.as_deref()
-                || attempt.scope_identity() != snapshot.scope_identity.as_deref()
-            {
-                return Err(OrchestratorError::InvalidDag("stale verifier attempt identity".to_owned()));
-            }
+        .mutate_goal_snapshot(
+            &session.id,
+            &snapshot.goal_id,
+            snapshot.revision,
+            |goal, now| {
+                if goal.status() != GoalStatus::Running
+                    || goal.plan_revision() != snapshot.plan_revision
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "stale verifier Goal/plan state".to_owned(),
+                    ));
+                }
+                let task = goal.tasks().get(&snapshot.task_id).ok_or_else(|| {
+                    OrchestratorError::InvalidDag("verification Task disappeared".to_owned())
+                })?;
+                if task.status() != TaskStatus::Verifying
+                    || task.verification_specs() != snapshot.specs.as_slice()
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "stale verifier Task/spec state".to_owned(),
+                    ));
+                }
+                let attempt = task.latest_attempt().ok_or_else(|| {
+                    OrchestratorError::CorruptGoal("VERIFYING Task lacks attempt".to_owned())
+                })?;
+                if attempt.id() != &snapshot.attempt_id
+                    || attempt.operation_id() != snapshot.operation_id.as_deref()
+                    || attempt.scope_identity() != snapshot.scope_identity.as_deref()
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "stale verifier attempt identity".to_owned(),
+                    ));
+                }
 
-            goal.task_record_verification_result(&snapshot.task_id, result.clone())?;
-            for item in decision.evidence.iter().cloned() {
-                goal.task_add_evidence(&snapshot.task_id, item)?;
-            }
-            for item in &decision.observations {
+                goal.task_record_verification_result(&snapshot.task_id, result.clone())?;
+                for item in decision.evidence.iter().cloned() {
+                    goal.task_add_evidence(&snapshot.task_id, item)?;
+                }
+                for item in &decision.observations {
+                    goal.task_add_evidence(
+                        &snapshot.task_id,
+                        TaskEvidence::VerificationObservation {
+                            verification_id: verification_id.clone(),
+                            attempt_id: snapshot.attempt_id.clone(),
+                            verification_index: item.index,
+                            verification_kind: item.kind.clone(),
+                            observed_fact: item.fact.clone(),
+                            passed: item.passed,
+                            observed_at: finished_at.clone(),
+                            source: VERIFIER_SOURCE.to_owned(),
+                        },
+                    )?;
+                }
                 goal.task_add_evidence(
                     &snapshot.task_id,
-                    TaskEvidence::VerificationObservation {
+                    TaskEvidence::Verification {
                         verification_id: verification_id.clone(),
-                        attempt_id: snapshot.attempt_id.clone(),
-                        verification_index: item.index,
-                        verification_kind: item.kind.clone(),
-                        observed_fact: item.fact.clone(),
-                        passed: item.passed,
-                        observed_at: finished_at.clone(),
-                        source: VERIFIER_SOURCE.to_owned(),
+                        passed,
                     },
                 )?;
-            }
-            goal.task_add_evidence(
-                &snapshot.task_id,
-                TaskEvidence::Verification {
-                    verification_id: verification_id.clone(),
-                    passed,
-                },
-            )?;
 
-            match decision.outcome {
-                VerificationDecisionOutcome::Pass => goal.complete_task_from_verifier(
-                    &snapshot.task_id,
-                    &authority,
-                    TaskTransitionContext { active_worker_stopped: true, side_effect_reconciled: true },
-                    now,
-                )?,
-                VerificationDecisionOutcome::Blocked => {
-                    goal.task_add_blocker(
+                match decision.outcome {
+                    VerificationDecisionOutcome::Pass => goal.complete_task_from_verifier(
                         &snapshot.task_id,
-                        TaskBlocker::new("VERIFICATION_BLOCKED", decision.summary.clone(), true),
-                    )?;
-                    goal.transition_task(&snapshot.task_id, TaskStatus::Blocked, TaskTransitionContext::default(), now)?;
+                        &authority,
+                        TaskTransitionContext {
+                            active_worker_stopped: true,
+                            side_effect_reconciled: true,
+                        },
+                        now,
+                    )?,
+                    VerificationDecisionOutcome::Blocked => {
+                        goal.task_add_blocker(
+                            &snapshot.task_id,
+                            TaskBlocker::new(
+                                "VERIFICATION_BLOCKED",
+                                decision.summary.clone(),
+                                true,
+                            ),
+                        )?;
+                        goal.transition_task(
+                            &snapshot.task_id,
+                            TaskStatus::Blocked,
+                            TaskTransitionContext::default(),
+                            now,
+                        )?;
+                    }
+                    other => goal.transition_task(
+                        &snapshot.task_id,
+                        other.task_status(),
+                        TaskTransitionContext::default(),
+                        now,
+                    )?,
                 }
-                other => goal.transition_task(&snapshot.task_id, other.task_status(), TaskTransitionContext::default(), now)?,
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
         .map_err(VerifierError::from)
 }
 
@@ -700,7 +835,11 @@ fn aggregate(values: &[Disposition], retry_allowed: bool) -> VerificationDecisio
     } else if values.contains(&Disposition::NeedsReplan) {
         VerificationDecisionOutcome::NeedsReplan
     } else if values.contains(&Disposition::Retryable) {
-        if retry_allowed { VerificationDecisionOutcome::Retryable } else { VerificationDecisionOutcome::NeedsReplan }
+        if retry_allowed {
+            VerificationDecisionOutcome::Retryable
+        } else {
+            VerificationDecisionOutcome::NeedsReplan
+        }
     } else {
         VerificationDecisionOutcome::Pass
     }
@@ -730,7 +869,9 @@ fn side_effect_reconciled(snapshot: &Snapshot) -> bool {
 
 fn validate_session_binding(goal: &Goal, session: &config::Session) -> Result<(), VerifierError> {
     if goal.session_id() != session.id {
-        return Err(VerifierError::InvalidState("Goal/session binding mismatch".to_owned()));
+        return Err(VerifierError::InvalidState(
+            "Goal/session binding mismatch".to_owned(),
+        ));
     }
     let goal_cwd = fs::canonicalize(goal.cwd()).map_err(|error| {
         VerifierError::InvalidState(format!("Goal cwd cannot be canonicalized: {error}"))
@@ -739,8 +880,13 @@ fn validate_session_binding(goal: &Goal, session: &config::Session) -> Result<()
         VerifierError::InvalidState(format!("session cwd cannot be canonicalized: {error}"))
     })?;
     if goal_cwd != session_cwd {
-        return Err(VerifierError::InvalidState("Goal cwd does not match session cwd".to_owned()));
+        return Err(VerifierError::InvalidState(
+            "Goal cwd does not match session cwd".to_owned(),
+        ));
     }
+    config::validate_path_authority(session, &goal_cwd, config::PathIntent::ExecutionCwd).map_err(
+        |error| VerifierError::InvalidState(format!("Goal cwd is outside session roots: {error}")),
+    )?;
     Ok(())
 }
 
@@ -758,12 +904,21 @@ fn kind_name(spec: &VerificationSpec) -> &'static str {
 
 fn resolve_path(path: &Path, root: &Path) -> Result<PathBuf, VerifierError> {
     if path.components().any(|part| part == Component::ParentDir) {
-        return Err(VerifierError::InvalidState("verification path contains parent traversal".to_owned()));
+        return Err(VerifierError::InvalidState(
+            "verification path contains parent traversal".to_owned(),
+        ));
     }
-    let absolute = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
     let resolved = canonicalize_existing_prefix(&absolute)?;
     if !resolved.starts_with(root) {
-        return Err(VerifierError::InvalidState(format!("verification path escapes Goal cwd: {}", path.display())));
+        return Err(VerifierError::InvalidState(format!(
+            "verification path escapes Goal cwd: {}",
+            path.display()
+        )));
     }
     Ok(resolved)
 }
@@ -773,11 +928,15 @@ fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, VerifierError> {
     let mut suffix = Vec::new();
     while !existing.exists() {
         let name = existing.file_name().ok_or_else(|| {
-            VerifierError::InvalidState("verification path has no canonicalizable ancestor".to_owned())
+            VerifierError::InvalidState(
+                "verification path has no canonicalizable ancestor".to_owned(),
+            )
         })?;
         suffix.push(name.to_os_string());
         if !existing.pop() {
-            return Err(VerifierError::InvalidState("verification path has no canonicalizable ancestor".to_owned()));
+            return Err(VerifierError::InvalidState(
+                "verification path has no canonicalizable ancestor".to_owned(),
+            ));
         }
     }
     let mut resolved = fs::canonicalize(&existing).map_err(|error| {
@@ -794,7 +953,9 @@ fn in_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
 }
 
 fn in_boundaries(path: &Path, boundaries: &[PathBuf]) -> bool {
-    boundaries.iter().any(|boundary| path == boundary || path.starts_with(boundary))
+    boundaries
+        .iter()
+        .any(|boundary| path == boundary || path.starts_with(boundary))
 }
 
 fn hash_file(path: &Path) -> std::io::Result<String> {
@@ -807,7 +968,9 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 fn validate_command(command: &[String]) -> Result<(), VerifierError> {
     if command.is_empty() {
-        return Err(VerifierError::InvalidState("verification command is empty".to_owned()));
+        return Err(VerifierError::InvalidState(
+            "verification command is empty".to_owned(),
+        ));
     }
     let executable = Path::new(&command[0])
         .file_name()
@@ -815,11 +978,15 @@ fn validate_command(command: &[String]) -> Result<(), VerifierError> {
         .unwrap_or(&command[0])
         .to_ascii_lowercase();
     if executable.ends_with("sh") || executable == "cmd" || executable.contains("powershell") {
-        return Err(VerifierError::InvalidState("shell-based verification command is not permitted".to_owned()));
+        return Err(VerifierError::InvalidState(
+            "shell-based verification command is not permitted".to_owned(),
+        ));
     }
     match fallback::infer_side_effect_class(command, None) {
         SideEffectClass::LocalMutation | SideEffectClass::RemoteMutation => {
-            Err(VerifierError::InvalidState("verification command is classified as mutating".to_owned()))
+            Err(VerifierError::InvalidState(
+                "verification command is classified as mutating".to_owned(),
+            ))
         }
         SideEffectClass::None | SideEffectClass::Unknown => Ok(()),
     }
@@ -850,13 +1017,19 @@ async fn await_execution(
 ) -> Result<CommandObservation, VerifierError> {
     match tokio::time::timeout(timeout, &mut execution.handle).await {
         Ok(Ok(Ok(payload))) => parse_execution_payload(&payload),
-        Ok(Ok(Err(error))) => parse_execution_payload(&error.to_string()).or_else(|_| {
-            Err(VerifierError::Observation(format!("command failed without structured evidence: {error:#}")))
+        Ok(Ok(Err(error))) => parse_execution_payload(&error.to_string()).map_err(|_| {
+            VerifierError::Observation(format!(
+                "command failed without structured evidence: {error:#}"
+            ))
         }),
-        Ok(Err(error)) => Err(VerifierError::Observation(format!("command join failed: {error}"))),
+        Ok(Err(error)) => Err(VerifierError::Observation(format!(
+            "command join failed: {error}"
+        ))),
         Err(_) => {
             execution.handle.abort();
-            Err(VerifierError::Observation("verification command exceeded bounded timeout".to_owned()))
+            Err(VerifierError::Observation(
+                "verification command exceeded bounded timeout".to_owned(),
+            ))
         }
     }
 }
@@ -868,54 +1041,101 @@ fn parse_execution_payload(text: &str) -> Result<CommandObservation, VerifierErr
     let request_id = value
         .get("request_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| VerifierError::Observation("execution evidence lacks request_id".to_owned()))?
+        .ok_or_else(|| {
+            VerifierError::Observation("execution evidence lacks request_id".to_owned())
+        })?
         .to_owned();
     Ok(CommandObservation {
         request_id,
-        exit_code: value.get("exit_code").and_then(Value::as_i64).and_then(|code| i32::try_from(code).ok()),
-        stdout: value.get("stdout").and_then(Value::as_str).unwrap_or_default().to_owned(),
-        stderr: value.get("stderr").and_then(Value::as_str).unwrap_or_default().to_owned(),
-        command_finished: value.get("command_finished").and_then(Value::as_bool).unwrap_or(false),
-        execution_error: value.get("execution_error").and_then(Value::as_str).map(str::to_owned),
+        exit_code: value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        stdout: value
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        stderr: value
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        command_finished: value
+            .get("command_finished")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        execution_error: value
+            .get("execution_error")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
-async fn observe_git(root: &Path, session: &config::Session) -> Result<GitObservation, VerifierError> {
+async fn observe_git(
+    root: &Path,
+    session: &config::Session,
+) -> Result<GitObservation, VerifierError> {
     let accepted = [0];
     let top = run_command(
-        &["git".to_owned(), "rev-parse".to_owned(), "--show-toplevel".to_owned()],
+        &[
+            "git".to_owned(),
+            "rev-parse".to_owned(),
+            "--show-toplevel".to_owned(),
+        ],
         root,
         &accepted,
         session,
         COMMAND_TIMEOUT,
-    ).await?;
+    )
+    .await?;
     if top.exit_code != Some(0) || !top.command_finished {
-        return Err(VerifierError::Observation("Goal cwd is not an observable Git worktree".to_owned()));
+        return Err(VerifierError::Observation(
+            "Goal cwd is not an observable Git worktree".to_owned(),
+        ));
     }
     let git_root = fs::canonicalize(top.stdout.trim()).map_err(|error| {
         VerifierError::Observation(format!("cannot canonicalize Git root: {error}"))
     })?;
     if !root.starts_with(&git_root) {
-        return Err(VerifierError::Observation("Git root does not contain Goal cwd".to_owned()));
+        return Err(VerifierError::Observation(
+            "Git root does not contain Goal cwd".to_owned(),
+        ));
     }
     let status = run_command(
-        &["git".to_owned(), "status".to_owned(), "--porcelain=v1".to_owned(), "-z".to_owned(), "--untracked-files=all".to_owned()],
+        &[
+            "git".to_owned(),
+            "status".to_owned(),
+            "--porcelain=v1".to_owned(),
+            "-z".to_owned(),
+            "--untracked-files=all".to_owned(),
+        ],
         &git_root,
         &accepted,
         session,
         COMMAND_TIMEOUT,
-    ).await?;
+    )
+    .await?;
     if status.exit_code != Some(0) || !status.command_finished {
-        return Err(VerifierError::Observation("Git status observation failed".to_owned()));
+        return Err(VerifierError::Observation(
+            "Git status observation failed".to_owned(),
+        ));
     }
     let changed = parse_status_paths(&status.stdout, &git_root)?;
     let staged = run_command(
-        &["git".to_owned(), "diff".to_owned(), "--cached".to_owned(), "--name-only".to_owned(), "-z".to_owned()],
+        &[
+            "git".to_owned(),
+            "diff".to_owned(),
+            "--cached".to_owned(),
+            "--name-only".to_owned(),
+            "-z".to_owned(),
+        ],
         &git_root,
         &accepted,
         session,
         COMMAND_TIMEOUT,
-    ).await?;
+    )
+    .await?;
     let staged = parse_nul_paths(&staged.stdout, &git_root)?;
     let head = run_command(
         &["git".to_owned(), "rev-parse".to_owned(), "HEAD".to_owned()],
@@ -923,18 +1143,29 @@ async fn observe_git(root: &Path, session: &config::Session) -> Result<GitObserv
         &accepted,
         session,
         COMMAND_TIMEOUT,
-    ).await.ok()
-        .filter(|value| value.exit_code == Some(0) && value.command_finished)
-        .map(|value| value.stdout.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    Ok(GitObservation { head, root: git_root, changed, staged })
+    )
+    .await
+    .ok()
+    .filter(|value| value.exit_code == Some(0) && value.command_finished)
+    .map(|value| value.stdout.trim().to_owned())
+    .filter(|value| !value.is_empty());
+    Ok(GitObservation {
+        head,
+        root: git_root,
+        changed,
+        staged,
+    })
 }
 
 fn parse_status_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, VerifierError> {
     let mut paths = BTreeSet::new();
     for token in stdout.split('\0').filter(|token| !token.is_empty()) {
         let bytes = token.as_bytes();
-        let raw = if bytes.len() >= 3 && bytes[2] == b' ' { &token[3..] } else { token };
+        let raw = if bytes.len() >= 3 && bytes[2] == b' ' {
+            &token[3..]
+        } else {
+            token
+        };
         paths.insert(resolve_git_path(raw, root)?);
     }
     Ok(paths.into_iter().collect())
@@ -951,17 +1182,21 @@ fn parse_nul_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, VerifierEr
 fn resolve_git_path(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
     let path = Path::new(raw);
     if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
-        return Err(VerifierError::Observation("Git emitted an unsafe path".to_owned()));
+        return Err(VerifierError::Observation(
+            "Git emitted an unsafe path".to_owned(),
+        ));
     }
     canonicalize_existing_prefix(&root.join(path))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 pub(crate) async fn test_command_timeout(
     command: &[String],
     cwd: &Path,
     session: &config::Session,
     timeout: Duration,
 ) -> Result<(), VerifierError> {
-    run_command(command, cwd, &[0], session, timeout).await.map(|_| ())
+    run_command(command, cwd, &[0], session, timeout)
+        .await
+        .map(|_| ())
 }

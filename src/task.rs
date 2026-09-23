@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fallback::{SideEffectClass, SideEffectState};
-use crate::mutation::{MutationIntent, MutationIntentUpdate, MutationIntentState};
+use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
 
 macro_rules! durable_id {
@@ -278,13 +278,13 @@ impl VerificationResult {
                 ));
             }
         }
-        if self.outcome == VerificationOutcome::Passed {
-            if seen.len() != spec_count || self.checks.iter().any(|check| !check.passed) {
-                return Err(OrchestratorError::CorruptGoal(
-                    "passed verification result does not contain a passing result for every specification"
-                        .to_owned(),
-                ));
-            }
+        if self.outcome == VerificationOutcome::Passed
+            && (seen.len() != spec_count || self.checks.iter().any(|check| !check.passed))
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "passed verification result does not contain a passing result for every specification"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -386,6 +386,10 @@ pub(crate) struct TaskAttempt {
     mutation_intent: Option<MutationIntent>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen task-attempt number accessor is retained for staged scheduler/audit consumers."
+)]
 impl TaskAttempt {
     fn new(number: u32, worker: WorkerKind, started_at: &str) -> Self {
         Self {
@@ -456,7 +460,6 @@ impl TaskAttempt {
     pub(crate) fn worker_report(&self) -> Option<&WorkerReport> {
         self.worker_report.as_ref()
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,6 +610,10 @@ pub(crate) struct Task {
     updated_at: String,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Task authority, scope, verification, budgets, plan revision, and timestamps remain explicit."
+)]
 impl Task {
     pub(crate) fn new(
         title: impl Into<String>,
@@ -797,13 +804,15 @@ impl Task {
     }
 
     fn is_readonly_replan_reconciled_attempt(&self, attempt_id: &AttemptId) -> bool {
-        self.evidence.iter().any(|evidence| matches!(
-            evidence,
-            TaskEvidence::ReadonlyReplanRecovery {
-                attempt_id: evidence_attempt_id,
-                ..
-            } if evidence_attempt_id == attempt_id
-        ))
+        self.evidence.iter().any(|evidence| {
+            matches!(
+                evidence,
+                TaskEvidence::ReadonlyReplanRecovery {
+                    attempt_id: evidence_attempt_id,
+                    ..
+                } if evidence_attempt_id == attempt_id
+            )
+        })
     }
 
     fn is_semantic_budget_exempt_attempt(&self, attempt_id: &AttemptId) -> bool {
@@ -813,13 +822,15 @@ impl Task {
     }
 
     fn is_legacy_writer_reconciled_attempt(&self, attempt_id: &AttemptId) -> bool {
-        self.evidence.iter().any(|evidence| matches!(
-            evidence,
-            TaskEvidence::LegacyWriterPreMutationReconciliation {
-                attempt_id: evidence_attempt_id,
-                ..
-            } if evidence_attempt_id == attempt_id
-        ))
+        self.evidence.iter().any(|evidence| {
+            matches!(
+                evidence,
+                TaskEvidence::LegacyWriterPreMutationReconciliation {
+                    attempt_id: evidence_attempt_id,
+                    ..
+                } if evidence_attempt_id == attempt_id
+            )
+        })
     }
 
     pub(crate) fn created_plan_revision(&self) -> u32 {
@@ -887,17 +898,15 @@ impl Task {
                 }
                 if let Some((previous_attempt, previous_side_effect)) =
                     budget_by_operation.get(operation_id).copied()
-                {
-                    if increases_budget(previous_attempt, attempt.remaining_attempt_budget)
+                    && (increases_budget(previous_attempt, attempt.remaining_attempt_budget)
                         || increases_budget(
                             previous_side_effect,
                             attempt.remaining_side_effect_budget,
-                        )
-                    {
-                        return Err(OrchestratorError::CorruptGoal(
-                            "low-level operation budget increased across task attempts".to_owned(),
-                        ));
-                    }
+                        ))
+                {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "low-level operation budget increased across task attempts".to_owned(),
+                    ));
                 }
                 budget_by_operation.insert(
                     operation_id,
@@ -959,14 +968,23 @@ impl Task {
             })?;
             if intent.operation_id() != operation_id || intent.state() != *state {
                 return Err(OrchestratorError::CorruptGoal(
-                    "MutationIntent reconciliation evidence is not bound to intent state".to_owned(),
+                    "MutationIntent reconciliation evidence is not bound to intent state"
+                        .to_owned(),
                 ));
             }
             let expected_side_effect = match state {
-                MutationIntentState::ReconciledNotPerformed => SideEffectState::ConfirmedNotPerformed,
+                MutationIntentState::ReconciledNotPerformed => {
+                    SideEffectState::ConfirmedNotPerformed
+                }
                 MutationIntentState::ReconciledPerformed => SideEffectState::ConfirmedPerformed,
-                MutationIntentState::Partial | MutationIntentState::Unknown => SideEffectState::Unknown,
-                _ => return Err(OrchestratorError::CorruptGoal("invalid MutationIntent reconciliation state".to_owned())),
+                MutationIntentState::Partial | MutationIntentState::Unknown => {
+                    SideEffectState::Unknown
+                }
+                _ => {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "invalid MutationIntent reconciliation state".to_owned(),
+                    ));
+                }
             };
             if *side_effect_state != expected_side_effect {
                 return Err(OrchestratorError::CorruptGoal(
@@ -977,7 +995,10 @@ impl Task {
         let mut transport_evidence_attempts = BTreeSet::new();
         for evidence in &self.evidence {
             let (attempt_id, requires_failed_legacy) = match evidence {
-                TaskEvidence::ReadonlyTransportInterruption { attempt_id, interruption } => {
+                TaskEvidence::ReadonlyTransportInterruption {
+                    attempt_id,
+                    interruption,
+                } => {
                     if *interruption != ReadonlyTransportInterruptionKind::ModelTimeout {
                         return Err(OrchestratorError::CorruptGoal(
                             "unsupported readonly transport interruption kind".to_owned(),
@@ -1069,7 +1090,8 @@ impl Task {
                 || transport_evidence_attempts.contains(attempt_id)
             {
                 return Err(OrchestratorError::CorruptGoal(
-                    "duplicate or conflicting readonly recovery evidence for one attempt".to_owned(),
+                    "duplicate or conflicting readonly recovery evidence for one attempt"
+                        .to_owned(),
                 ));
             }
             let attempt = self
@@ -1097,9 +1119,7 @@ impl Task {
                 ));
             }
         }
-        if replan_recovery_attempts.len() as u32
-            > MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK
-        {
+        if replan_recovery_attempts.len() as u32 > MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK {
             return Err(OrchestratorError::CorruptGoal(
                 "readonly replan recovery budget exceeded".to_owned(),
             ));
@@ -1294,17 +1314,17 @@ impl Task {
             self.attempts
                 .push(TaskAttempt::new(number, self.worker, now));
         }
-        if from == TaskStatus::Running && next == TaskStatus::Verifying {
-            if self
+        if from == TaskStatus::Running
+            && next == TaskStatus::Verifying
+            && self
                 .latest_attempt()
                 .is_some_and(|attempt| attempt.side_effect_state == Some(SideEffectState::Unknown))
-            {
-                return Err(invalid_task_transition(
-                    from,
-                    next,
-                    "unknown side effect requires BLOCKED reconciliation",
-                ));
-            }
+        {
+            return Err(invalid_task_transition(
+                from,
+                next,
+                "unknown side effect requires BLOCKED reconciliation",
+            ));
         }
         if next == TaskStatus::Retryable && !self.retry_allowed() {
             return Err(invalid_task_transition(
@@ -1323,28 +1343,27 @@ impl Task {
                 "cancellation requires stopped worker and reconciled side effects",
             ));
         }
-        if matches!(
+        if (matches!(
             next,
             TaskStatus::Retryable
                 | TaskStatus::Blocked
                 | TaskStatus::NeedsReplan
                 | TaskStatus::Failed
-        ) || (from == TaskStatus::Running && next == TaskStatus::Verifying)
+        ) || (from == TaskStatus::Running && next == TaskStatus::Verifying))
+            && let Some(attempt) = self.attempts.last_mut()
         {
-            if let Some(attempt) = self.attempts.last_mut() {
-                if attempt.finished_at.is_none() {
-                    attempt.finished_at = Some(now.to_owned());
-                }
-                if attempt.outcome.is_none() {
-                    attempt.outcome = Some(match next {
-                        TaskStatus::Retryable => AttemptOutcome::Retryable,
-                        TaskStatus::Blocked => AttemptOutcome::Blocked,
-                        TaskStatus::NeedsReplan => AttemptOutcome::NeedsReplan,
-                        TaskStatus::Failed => AttemptOutcome::Failed,
-                        TaskStatus::Verifying => AttemptOutcome::CandidateComplete,
-                        _ => unreachable!(),
-                    });
-                }
+            if attempt.finished_at.is_none() {
+                attempt.finished_at = Some(now.to_owned());
+            }
+            if attempt.outcome.is_none() {
+                attempt.outcome = Some(match next {
+                    TaskStatus::Retryable => AttemptOutcome::Retryable,
+                    TaskStatus::Blocked => AttemptOutcome::Blocked,
+                    TaskStatus::NeedsReplan => AttemptOutcome::NeedsReplan,
+                    TaskStatus::Failed => AttemptOutcome::Failed,
+                    TaskStatus::Verifying => AttemptOutcome::CandidateComplete,
+                    _ => unreachable!(),
+                });
             }
         }
         self.status = next;
@@ -1456,10 +1475,10 @@ impl Task {
             }
             attempt.scope_identity = Some(new_scope);
         }
-        if let Some(request_id) = request_id {
-            if !attempt.low_level_request_ids.contains(&request_id) {
-                attempt.low_level_request_ids.push(request_id);
-            }
+        if let Some(request_id) = request_id
+            && !attempt.low_level_request_ids.contains(&request_id)
+        {
+            attempt.low_level_request_ids.push(request_id);
         }
         ensure_budget_not_increased(attempt.remaining_attempt_budget, remaining_attempt_budget)?;
         ensure_budget_not_increased(
@@ -1586,17 +1605,21 @@ impl Task {
                 ));
             }
         };
-        if let Some(existing) = candidate.evidence.iter().find_map(|evidence| match evidence {
-            TaskEvidence::MutationReconciliation {
-                attempt_id: existing_attempt,
-                operation_id,
-                state: existing_state,
-                ..
-            } if existing_attempt == &attempt_id && operation_id == expected_operation_id => {
-                Some(*existing_state)
-            }
-            _ => None,
-        }) {
+        if let Some(existing) = candidate
+            .evidence
+            .iter()
+            .find_map(|evidence| match evidence {
+                TaskEvidence::MutationReconciliation {
+                    attempt_id: existing_attempt,
+                    operation_id,
+                    state: existing_state,
+                    ..
+                } if existing_attempt == &attempt_id && operation_id == expected_operation_id => {
+                    Some(*existing_state)
+                }
+                _ => None,
+            })
+        {
             if existing != state {
                 return Err(OrchestratorError::CorruptGoal(
                     "MutationIntent reconciliation outcome cannot be rewritten".to_owned(),
@@ -1606,13 +1629,15 @@ impl Task {
         }
         intent.apply_update(MutationIntentUpdate::Reconcile { state })?;
         attempt.side_effect_state = Some(side_effect_state);
-        candidate.evidence.push(TaskEvidence::MutationReconciliation {
-            attempt_id,
-            operation_id: expected_operation_id.to_owned(),
-            state,
-            side_effect_state,
-            summary,
-        });
+        candidate
+            .evidence
+            .push(TaskEvidence::MutationReconciliation {
+                attempt_id,
+                operation_id: expected_operation_id.to_owned(),
+                state,
+                side_effect_state,
+                summary,
+            });
         candidate.updated_at = now.to_owned();
         candidate.validate_local()?;
         *self = candidate;
@@ -1743,13 +1768,14 @@ impl Task {
             .expect("eligible legacy writer has an attempt")
             .id
             .clone();
-        self.evidence.push(TaskEvidence::LegacyWriterPreMutationReconciliation {
-            attempt_id,
-            authority: LegacyWriterReconciliationAuthorityKind::GoalResume,
-            reason: LEGACY_WRITER_PRE_MUTATION_RECONCILIATION.to_owned(),
-            side_effect_state: SideEffectState::ConfirmedNotPerformed,
-            postcondition_proven: true,
-        });
+        self.evidence
+            .push(TaskEvidence::LegacyWriterPreMutationReconciliation {
+                attempt_id,
+                authority: LegacyWriterReconciliationAuthorityKind::GoalResume,
+                reason: LEGACY_WRITER_PRE_MUTATION_RECONCILIATION.to_owned(),
+                side_effect_state: SideEffectState::ConfirmedNotPerformed,
+                postcondition_proven: true,
+            });
         self.updated_at = now.to_owned();
         if self.semantic_attempts_remaining() == 0 {
             return Err(OrchestratorError::CorruptGoal(
@@ -1885,23 +1911,23 @@ impl Task {
             }
         }
         let can_retry_attempt = self.semantic_attempts_remaining() > 0;
-        let reconciled_postcondition = self
-            .evidence
-            .iter()
-            .rev()
-            .find_map(|evidence| match evidence {
-                TaskEvidence::RecoveryReconciliation {
-                    side_effect_state,
-                    postcondition_proven,
-                    ..
-                } => Some((*side_effect_state, *postcondition_proven)),
-                TaskEvidence::MutationReconciliation {
-                    state: MutationIntentState::ReconciledPerformed,
-                    side_effect_state,
-                    ..
-                } => Some((*side_effect_state, true)),
-                _ => None,
-            });
+        let reconciled_postcondition =
+            self.evidence
+                .iter()
+                .rev()
+                .find_map(|evidence| match evidence {
+                    TaskEvidence::RecoveryReconciliation {
+                        side_effect_state,
+                        postcondition_proven,
+                        ..
+                    } => Some((*side_effect_state, *postcondition_proven)),
+                    TaskEvidence::MutationReconciliation {
+                        state: MutationIntentState::ReconciledPerformed,
+                        side_effect_state,
+                        ..
+                    } => Some((*side_effect_state, true)),
+                    _ => None,
+                });
         if matches!(
             reconciled_postcondition,
             Some((SideEffectState::ConfirmedPerformed, true))
@@ -2001,9 +2027,7 @@ impl Task {
         {
             return Ok(false);
         }
-        if self.readonly_transport_interruptions()
-            >= MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK
-        {
+        if self.readonly_transport_interruptions() >= MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK {
             return Ok(false);
         }
         let Some(latest) = self.latest_attempt() else {
@@ -2016,10 +2040,7 @@ impl Task {
             || latest.side_effect_class != Some(SideEffectClass::None)
             || latest.side_effect_state != Some(SideEffectState::ConfirmedNotPerformed)
             || latest.remaining_attempt_budget != Some(0)
-            || latest
-                .worker_report
-                .as_ref()
-                .map(WorkerReport::summary)
+            || latest.worker_report.as_ref().map(WorkerReport::summary)
                 != Some(LEGACY_READONLY_TIMEOUT_REPORT)
         {
             return Ok(false);
@@ -2051,9 +2072,11 @@ impl Task {
         let consumed_after_recovery = self
             .semantic_attempts_consumed()
             .checked_sub(1)
-            .ok_or_else(|| OrchestratorError::CorruptGoal(
-                "legacy timeout recovery semantic budget underflow".to_owned(),
-            ))?;
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "legacy timeout recovery semantic budget underflow".to_owned(),
+                )
+            })?;
         if consumed_after_recovery >= self.max_attempts {
             return Ok(false);
         }
@@ -2096,7 +2119,8 @@ impl Task {
         self.updated_at = now.to_owned();
         if self.semantic_attempts_remaining() == 0 {
             return Err(OrchestratorError::CorruptGoal(
-                "readonly replan recovery failed to restore one bounded semantic attempt".to_owned(),
+                "readonly replan recovery failed to restore one bounded semantic attempt"
+                    .to_owned(),
             ));
         }
         Ok(true)
@@ -2918,7 +2942,13 @@ mod tests {
             .unwrap()
             .remove("mutation_intent");
         let decoded: Task = serde_json::from_value(value).unwrap();
-        assert!(decoded.latest_attempt().unwrap().mutation_intent().is_none());
+        assert!(
+            decoded
+                .latest_attempt()
+                .unwrap()
+                .mutation_intent()
+                .is_none()
+        );
         assert!(
             serde_json::to_value(&decoded).unwrap()["attempts"][0]
                 .get("mutation_intent")
@@ -2936,10 +2966,20 @@ mod tests {
             TaskOperationKind::LocalMutation,
             ReplaySafety::VerifyBeforeRetry,
         );
-        task.transition_to(TaskStatus::Ready, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
-        task.transition_to(TaskStatus::Running, true, TaskTransitionContext::default(), NOW)
-            .unwrap();
+        task.transition_to(
+            TaskStatus::Ready,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        task.transition_to(
+            TaskStatus::Running,
+            true,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         let intent = crate::mutation::MutationIntent::new(
             "operation-1".to_owned(),
             "scope-1".to_owned(),
@@ -2955,7 +2995,11 @@ mod tests {
         .unwrap();
         task.prepare_latest_mutation_intent(intent).unwrap();
         assert_eq!(
-            task.latest_attempt().unwrap().mutation_intent().unwrap().state(),
+            task.latest_attempt()
+                .unwrap()
+                .mutation_intent()
+                .unwrap()
+                .state(),
             crate::mutation::MutationIntentState::Prepared
         );
     }

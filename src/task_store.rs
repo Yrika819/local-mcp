@@ -43,7 +43,11 @@ impl TaskStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn goal_path_for_test(&self, session_id: &str, goal_id: &GoalId) -> Result<PathBuf, OrchestratorError> {
+    pub(crate) fn goal_path_for_test(
+        &self,
+        session_id: &str,
+        goal_id: &GoalId,
+    ) -> Result<PathBuf, OrchestratorError> {
         self.goal_path(session_id, goal_id)
     }
 
@@ -114,6 +118,10 @@ impl TaskStore {
         }
     }
 
+    #[expect(
+        dead_code,
+        reason = "Frozen transactional mutation entrypoint is retained for staged orchestrator integration."
+    )]
     pub(crate) fn mutate_goal<T, F>(
         &self,
         session_id: &str,
@@ -188,6 +196,10 @@ impl TaskStore {
         })
     }
 
+    #[expect(
+        dead_code,
+        reason = "Frozen recovery entrypoint is retained for staged orchestrator integration."
+    )]
     pub(crate) fn recover_goal(
         &self,
         session_id: &str,
@@ -230,8 +242,7 @@ impl TaskStore {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension().and_then(|value| value.to_str()) == Some("json")
-                    && path.is_file()
+                path.extension().and_then(|value| value.to_str()) == Some("json") && path.is_file()
             })
             .collect::<Vec<_>>();
         paths.sort();
@@ -286,27 +297,36 @@ impl TaskStore {
         let schema_version = object
             .get("schema_version")
             .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                OrchestratorError::CorruptGoal("missing schema_version".to_owned())
-            })?;
+            .ok_or_else(|| OrchestratorError::CorruptGoal("missing schema_version".to_owned()))?;
         if schema_version == 1 {
-            let status = object.get("status").and_then(Value::as_str).ok_or_else(|| {
-                OrchestratorError::CorruptGoal("legacy schema-1 Goal is missing status".to_owned())
-            })?;
+            let status = object
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "legacy schema-1 Goal is missing status".to_owned(),
+                    )
+                })?;
             if !matches!(status, "COMPLETED" | "FAILED" | "CANCELLED") {
                 return Err(OrchestratorError::SchemaUpgradeRequired(1));
             }
             let mut legacy = value;
             let legacy_object = legacy.as_object_mut().expect("validated object");
-            let criteria = legacy_object.remove("completion_criteria").unwrap_or_else(|| Value::Array(Vec::new()));
+            let criteria = legacy_object
+                .remove("completion_criteria")
+                .unwrap_or_else(|| Value::Array(Vec::new()));
             legacy_object.insert("legacy_completion_criteria".to_owned(), criteria);
             legacy_object.insert("completion_criteria".to_owned(), Value::Array(Vec::new()));
-            let old_final = legacy_object.remove("final_verification").unwrap_or(Value::Null);
+            let old_final = legacy_object
+                .remove("final_verification")
+                .unwrap_or(Value::Null);
             legacy_object.insert("legacy_final_verification".to_owned(), old_final);
             legacy_object.insert("final_verifications".to_owned(), Value::Array(Vec::new()));
             legacy_object.insert("final_verification_spec".to_owned(), Value::Null);
             let goal: Goal = serde_json::from_value(legacy).map_err(|error| {
-                OrchestratorError::CorruptGoal(format!("legacy durable Goal shape is invalid: {error}"))
+                OrchestratorError::CorruptGoal(format!(
+                    "legacy durable Goal shape is invalid: {error}"
+                ))
             })?;
             goal.validate()?;
             return Ok(goal);
@@ -385,7 +405,11 @@ impl TaskStore {
         write_result
     }
 
-    fn with_session_lock<T, F>(&self, session_id: &str, operation: F) -> Result<T, OrchestratorError>
+    fn with_session_lock<T, F>(
+        &self,
+        session_id: &str,
+        operation: F,
+    ) -> Result<T, OrchestratorError>
     where
         F: FnOnce() -> Result<T, OrchestratorError>,
     {
@@ -394,6 +418,7 @@ impl TaskStore {
         let lock_path = directory.join(".lock");
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;
@@ -417,11 +442,7 @@ impl TaskStore {
         Ok(self.state_root.join("goals").join(session_id))
     }
 
-    fn goal_path(
-        &self,
-        session_id: &str,
-        goal_id: &GoalId,
-    ) -> Result<PathBuf, OrchestratorError> {
+    fn goal_path(&self, session_id: &str, goal_id: &GoalId) -> Result<PathBuf, OrchestratorError> {
         goal_id_validate(goal_id)?;
         Ok(self
             .session_goal_dir(session_id)?
@@ -571,15 +592,38 @@ mod tests {
         )
     }
 
-    fn make_running_task(goal: &mut Goal, scope: TaskScope, worker: WorkerKind) -> crate::task::TaskId {
+    fn make_running_task(
+        goal: &mut Goal,
+        scope: TaskScope,
+        worker: WorkerKind,
+    ) -> crate::task::TaskId {
         let id = goal
-            .add_task("task", "task objective", true, worker, scope, vec![], 3, NOW)
+            .add_task(
+                "task",
+                "task objective",
+                true,
+                worker,
+                scope,
+                vec![],
+                3,
+                NOW,
+            )
             .unwrap();
         goal.transition_to(GoalStatus::Running, NOW).unwrap();
-        goal.transition_task(&id, TaskStatus::Ready, TaskTransitionContext::default(), NOW)
-            .unwrap();
-        goal.transition_task(&id, TaskStatus::Running, TaskTransitionContext::default(), NOW)
-            .unwrap();
+        goal.transition_task(
+            &id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.transition_task(
+            &id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
         id
     }
 
@@ -644,7 +688,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            OrchestratorError::RevisionConflict { expected: 1, actual: 2 }
+            OrchestratorError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            }
         ));
         assert_eq!(store.load_goal("session-c", &id).unwrap().revision(), 2);
         std::fs::remove_dir_all(root).unwrap();
@@ -667,8 +714,14 @@ mod tests {
         store.create_goal(&historical).unwrap();
         let next = goal(other_session);
         store.create_goal(&next).unwrap();
-        assert_eq!(store.list_goals_for_session(other_session).unwrap().len(), 2);
-        assert_eq!(store.load_active_goal(other_session).unwrap().unwrap().id(), next.id());
+        assert_eq!(
+            store.list_goals_for_session(other_session).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store.load_active_goal(other_session).unwrap().unwrap().id(),
+            next.id()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -767,7 +820,14 @@ mod tests {
         let root = state_root();
         let store = TaskStore::with_state_root(root.clone());
         let goal_id = GoalId::new();
-        for unsafe_id in ["", "..", "../escape", "/absolute", "slash/name", "ユニコード"] {
+        for unsafe_id in [
+            "",
+            "..",
+            "../escape",
+            "/absolute",
+            "slash/name",
+            "ユニコード",
+        ] {
             assert!(matches!(
                 store.load_goal(unsafe_id, &goal_id),
                 Err(OrchestratorError::UnsafeIdentifier(_))
@@ -808,9 +868,11 @@ mod tests {
 
         for fault in [FaultPoint::BeforeTempWrite, FaultPoint::BeforeReplace] {
             let failing = TaskStore::with_fault(root.clone(), fault);
-            assert!(failing
-                .mutate_goal("session-h", &id, 1, |_goal, _now| Ok(()))
-                .is_err());
+            assert!(
+                failing
+                    .mutate_goal("session-h", &id, 1, |_goal, _now| Ok(()))
+                    .is_err()
+            );
             assert_eq!(std::fs::read(&final_path).unwrap(), before);
             assert_eq!(normal.load_goal("session-h", &id).unwrap().revision(), 1);
         }
@@ -846,7 +908,8 @@ mod tests {
                 NOW,
             )
             .unwrap();
-        goal.strengthen_task_dependencies(&b, vec![a.clone()]).unwrap();
+        goal.strengthen_task_dependencies(&b, vec![a.clone()])
+            .unwrap();
         let goal_id = goal.id().clone();
         store.create_goal(&goal).unwrap();
         let final_path = store.goal_path("session-transactional", &goal_id).unwrap();
@@ -883,9 +946,18 @@ mod tests {
         store.create_goal(&goal).unwrap();
         let recovered = store.recover_goal("session-i", &goal_id, 1).unwrap();
         assert_eq!(recovered.revision(), 2);
-        assert_eq!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Retryable);
         assert_eq!(
-            store.load_goal("session-i", &goal_id).unwrap().tasks().get(&task_id).unwrap().status(),
+            recovered.tasks().get(&task_id).unwrap().status(),
+            TaskStatus::Retryable
+        );
+        assert_eq!(
+            store
+                .load_goal("session-i", &goal_id)
+                .unwrap()
+                .tasks()
+                .get(&task_id)
+                .unwrap()
+                .status(),
             TaskStatus::Retryable
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -912,7 +984,10 @@ mod tests {
         store.create_goal(&goal).unwrap();
         let recovered = store.recover_goal("session-j", &goal_id, 1).unwrap();
         assert_eq!(recovered.status(), GoalStatus::Blocked);
-        assert_eq!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Blocked);
+        assert_eq!(
+            recovered.tasks().get(&task_id).unwrap().status(),
+            TaskStatus::Blocked
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -945,8 +1020,14 @@ mod tests {
         let goal_id = goal.id().clone();
         store.create_goal(&goal).unwrap();
         let recovered = store.recover_goal("session-k", &goal_id, 1).unwrap();
-        assert_eq!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Verifying);
-        assert_ne!(recovered.tasks().get(&task_id).unwrap().status(), TaskStatus::Completed);
+        assert_eq!(
+            recovered.tasks().get(&task_id).unwrap().status(),
+            TaskStatus::Verifying
+        );
+        assert_ne!(
+            recovered.tasks().get(&task_id).unwrap().status(),
+            TaskStatus::Completed
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -957,8 +1038,20 @@ mod tests {
         let directory = store.session_goal_dir("lock-session").unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(".lock");
-        let first = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
-        let second = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let first = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let second = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         first.lock().unwrap();
         assert!(second.try_lock().is_err());
         first.unlock().unwrap();
@@ -1004,18 +1097,16 @@ mod tests {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
         });
 
         let applied = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
         let conflicts = outcomes
             .iter()
-            .filter(|outcome| {
-                matches!(
-                    outcome,
-                    Err(OrchestratorError::RevisionConflict { .. })
-                )
-            })
+            .filter(|outcome| matches!(outcome, Err(OrchestratorError::RevisionConflict { .. })))
             .count();
         assert_eq!(applied, 1, "exactly one racing mutation may commit");
         assert_eq!(conflicts, 1, "the loser must fail with RevisionConflict");

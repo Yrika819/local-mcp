@@ -13,6 +13,7 @@ fn phase0_exec_session() -> (config::Session, PathBuf) {
     )
 }
 
+#[cfg(not(windows))]
 fn phase0_exec_text(value: &Value) -> &str {
     value["content"][0]["text"].as_str().unwrap()
 }
@@ -21,12 +22,9 @@ fn phase0_exec_text(value: &Value) -> &str {
 #[tokio::test]
 async fn execute_uses_current_sandboxed_result_contract() {
     let (session, cwd) = phase0_exec_session();
-    let result = execute(
-        &json!({"command": ["/usr/bin/printf", "phase0"]}),
-        &session,
-    )
-    .await
-    .unwrap();
+    let result = execute(&json!({"command": ["/usr/bin/printf", "phase0"]}), &session)
+        .await
+        .unwrap();
     let payload: Value = serde_json::from_str(phase0_exec_text(&result)).unwrap();
     assert_eq!(payload["exit_code"], 0);
     assert_eq!(payload["stdout"], "phase0");
@@ -73,13 +71,12 @@ async fn start_command_returns_job_and_poll_reaches_terminal_result() {
 #[tokio::test]
 async fn without_sandbox_requires_live_approval_authority_before_execution() {
     let (session, cwd) = phase0_exec_session();
-    let error = without_sandbox(
-        &json!({"command": ["/usr/bin/true"]}),
-        &session,
-    )
-    .await
-    .unwrap_err();
+    let sentinel = cwd.join("approval-must-deny");
+    let error = without_sandbox(&json!({"command": ["/usr/bin/touch", sentinel]}), &session)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("is not running"));
+    assert!(!cwd.join("approval-must-deny").exists());
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }
 
@@ -127,7 +124,64 @@ async fn executable_codex_fallback_rejects_non_sandbox_failure_before_inference(
     assert!(
         error
             .to_string()
-            .contains("executable fallback requires SANDBOX_PERMISSION")
+            .contains("not available through the public MCP surface")
+    );
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn public_fallback_cannot_use_caller_supplied_authority_facts() {
+    let (session, cwd) = phase0_exec_session();
+    let sentinel = cwd.join("caller-authority-must-not-run");
+    let error = codex_fallback(
+        &json!({
+            "task": "phase0 caller authority",
+            "blocker": "synthetic sandbox permission",
+            "mode": "EXECUTE_AUTHORIZED_OPERATION",
+            "failure_class": "SANDBOX_PERMISSION",
+            "original_host_reached": true,
+            "original_command_started": true,
+            "original_command_finished": true,
+            "command": ["/usr/bin/touch", sentinel],
+            "operation": {
+                "type": "read_only_command",
+                "authorized": true,
+                "argv": ["/usr/bin/touch", "caller-authority-must-not-run"],
+                "side_effect_state": "CONFIRMED_NOT_PERFORMED"
+            },
+            "fallback_depth": 0,
+            "remote_side_effect": "none"
+        }),
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not available through the public MCP surface")
+    );
+    assert!(!sentinel.exists());
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn safety_signal_blocks_fallback_before_approval() {
+    let (session, cwd) = phase0_exec_session();
+    let error = codex_fallback(
+        &json!({
+            "task": "phase0 safety terminal",
+            "blocker": "refused by safety policy",
+            "mode": "DIAGNOSE_ONLY"
+        }),
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("terminal platform/safety classification")
     );
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }

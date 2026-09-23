@@ -1,6 +1,10 @@
 use std::fmt;
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "RecoveryBlocked remains part of the frozen durable orchestrator error contract."
+)]
 pub(crate) enum OrchestratorError {
     GoalNotFound,
     ActiveGoalAlreadyExists,
@@ -52,17 +56,17 @@ impl fmt::Display for OrchestratorError {
                 from,
                 to,
                 reason,
-            } => write!(
-                f,
-                "invalid {entity} transition {from} -> {to}: {reason}"
-            ),
+            } => write!(f, "invalid {entity} transition {from} -> {to}: {reason}"),
             Self::InvalidDag(reason) => write!(f, "invalid task DAG: {reason}"),
             Self::CorruptGoal(reason) => write!(f, "goal state is corrupt: {reason}"),
             Self::UnsupportedSchema(version) => {
                 write!(f, "unsupported goal schema version {version}")
             }
             Self::SchemaUpgradeRequired(version) => {
-                write!(f, "SCHEMA_UPGRADE_REQUIRED: goal schema version {version} requires explicit authority upgrade")
+                write!(
+                    f,
+                    "SCHEMA_UPGRADE_REQUIRED: goal schema version {version} requires explicit authority upgrade"
+                )
             }
             Self::RevisionConflict { expected, actual } => write!(
                 f,

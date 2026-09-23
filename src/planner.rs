@@ -248,6 +248,10 @@ pub(crate) fn planner_request_for_goal(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen planner entrypoint is retained for staged Goal Orchestrator integration."
+)]
 pub(crate) fn plan_initial_goal<B: PlannerBackend>(
     store: &TaskStore,
     session: &config::Session,

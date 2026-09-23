@@ -291,11 +291,11 @@ impl OperationContract {
         }
     }
 
+    /// Only operations whose semantics and exact scope are host-validated may
+    /// reach the internal executable fallback. A caller label of
+    /// `read_only_command` is never an authority grant.
     pub fn auto_execute_allowlisted(&self) -> bool {
-        matches!(
-            self.kind,
-            OperationType::GitStagePaths | OperationType::ReadOnlyCommand
-        )
+        matches!(self.kind, OperationType::GitStagePaths)
     }
 
     pub fn side_effect_class(&self) -> SideEffectClass {
@@ -313,7 +313,9 @@ impl OperationContract {
                 command.extend(self.paths.clone());
                 Ok(command)
             }
-            OperationType::ReadOnlyCommand => Ok(self.argv.clone()),
+            OperationType::ReadOnlyCommand => {
+                anyhow::bail!("read_only_command is never executable-fallback allowlisted")
+            }
             _ => anyhow::bail!("operation type is not executable fallback allowlisted"),
         }
     }
@@ -363,6 +365,10 @@ pub struct LifecycleEvidence {
 }
 
 impl LifecycleEvidence {
+    #[allow(
+        dead_code,
+        reason = "Host-received lifecycle evidence is retained for the frozen fallback state model."
+    )]
     pub fn host_received() -> Self {
         Self {
             host_reached: true,

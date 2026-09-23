@@ -16,8 +16,7 @@ use crate::task::{
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
-const READONLY_RESPONSE_LIMIT_REPORT: &str =
-    "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
+const READONLY_RESPONSE_LIMIT_REPORT: &str = "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
 
 pub(crate) struct ReadonlyTransportRecoveryAuthority {
     _private: (),
@@ -54,6 +53,10 @@ pub(crate) struct GoalApiError {
     active_goal: Option<GoalIdentityView>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen API error-code accessor is retained for the staged MCP contract."
+)]
 impl GoalApiError {
     pub(crate) fn code(&self) -> &'static str {
         self.code
@@ -805,9 +808,8 @@ fn reconcile_legacy_readonly_timeout_failures(
     let task_ids = goal
         .tasks()
         .iter()
-        .filter_map(|(task_id, task)| {
-            (task.status() == TaskStatus::Failed).then(|| task_id.clone())
-        })
+        .filter(|(_, task)| task.status() == TaskStatus::Failed)
+        .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
     let authority = ReadonlyTransportRecoveryAuthority::for_goal_resume();
     for task_id in task_ids {
@@ -1084,17 +1086,14 @@ fn status_view(goal: &Goal) -> GoalStatusView {
     let active_tasks = goal
         .tasks()
         .iter()
-        .filter_map(|(id, task)| {
-            matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying)
-                .then(|| id.as_str().to_owned())
-        })
+        .filter(|(_, task)| matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying))
+        .map(|(id, _)| id.as_str().to_owned())
         .collect();
     let next_runnable_tasks = goal
         .tasks()
         .iter()
-        .filter_map(|(id, task)| {
-            (task.status() == TaskStatus::Ready).then(|| id.as_str().to_owned())
-        })
+        .filter(|(_, task)| task.status() == TaskStatus::Ready)
+        .map(|(id, _)| id.as_str().to_owned())
         .collect();
     GoalStatusView {
         goal_id: goal.id().as_str().to_owned(),
@@ -1345,13 +1344,15 @@ fn task_status_name(status: TaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use serde_json::json;
 
     use crate::fallback::{SideEffectClass, SideEffectState};
     use crate::goal::CheckpointReason;
-    use crate::mutation::{MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage};
+    use crate::mutation::{
+        MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage,
+    };
     use crate::planner::{PlannerBackend, PlannerError, PlannerRequest};
     use crate::readonly_worker::{ReadonlyBackend, ReadonlyError};
     use crate::replanner::{ReplannerBackend, ReplannerError, ReplannerRequest};
@@ -1474,7 +1475,7 @@ mod tests {
         })
     }
 
-    fn read_goal_bytes(root: &PathBuf, session: &config::Session, goal_id: &str) -> Vec<u8> {
+    fn read_goal_bytes(root: &Path, session: &config::Session, goal_id: &str) -> Vec<u8> {
         std::fs::read(
             root.join("state")
                 .join("goals")
@@ -1637,6 +1638,10 @@ mod tests {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Test fixture keeps each durable rejection-policy field explicit for regression coverage."
+    )]
     fn pre_execution_rejection_args_with_policy(
         session: &config::Session,
         goal_id: &GoalId,
@@ -1660,9 +1665,7 @@ mod tests {
         args
     }
 
-    fn legacy_writer_goal(
-        session: &config::Session,
-    ) -> (Goal, crate::task::TaskId) {
+    fn legacy_writer_goal(session: &config::Session) -> (Goal, crate::task::TaskId) {
         legacy_writer_goal_with_changed_files(session, vec![])
     }
 
@@ -1707,7 +1710,11 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let attempt_id = goal.tasks()[&task_id].latest_attempt().unwrap().id().clone();
+        let attempt_id = goal.tasks()[&task_id]
+            .latest_attempt()
+            .unwrap()
+            .id()
+            .clone();
         goal.task_record_latest_worker_report(
             &task_id,
             WorkerReport::new("legacy writer was blocked before mutation", changed_files),
@@ -2785,8 +2792,7 @@ mod tests {
 
     #[test]
     fn resume_reconciles_safe_readonly_response_limit_for_replan() {
-        const RESPONSE_LIMIT_REPORT: &str =
-            "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
+        const RESPONSE_LIMIT_REPORT: &str = "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
         let (root, session, store) = fixture("resume-resp-limit");
         let (mut goal, task_id) =
             running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
@@ -2813,13 +2819,14 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let attempt_id = goal.tasks()[&task_id].latest_attempt().unwrap().id().clone();
+        let attempt_id = goal.tasks()[&task_id]
+            .latest_attempt()
+            .unwrap()
+            .id()
+            .clone();
         let goal_id = goal.id().clone();
         store.create_goal(&goal).unwrap();
-        let before_attempt = store
-            .load_goal(&session.id, &goal_id)
-            .unwrap()
-            .tasks()[&task_id]
+        let before_attempt = store.load_goal(&session.id, &goal_id).unwrap().tasks()[&task_id]
             .latest_attempt()
             .unwrap()
             .clone();
@@ -2968,12 +2975,8 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let (mut goal, task_id) = running_goal(
-            &session,
-            mutation_scope(),
-            WorkerKind::CodexWriter,
-            true,
-        );
+        let (mut goal, task_id) =
+            running_goal(&session, mutation_scope(), WorkerKind::CodexWriter, true);
         let intent = MutationIntent::new(
             "generic-writer-recovery".to_owned(),
             "generic-writer-scope".to_owned(),
@@ -2987,7 +2990,8 @@ mod tests {
             )],
         )
         .unwrap();
-        goal.task_prepare_latest_mutation_intent(&task_id, intent).unwrap();
+        goal.task_prepare_latest_mutation_intent(&task_id, intent)
+            .unwrap();
         let goal_id = goal.id().clone();
         store.create_goal(&goal).unwrap();
         let prepared = store.load_goal(&session.id, &goal_id).unwrap();
@@ -3549,7 +3553,11 @@ mod tests {
         .unwrap();
         goal.task_add_blocker(
             &task_id,
-            crate::task::TaskBlocker::new("WRITER_BLOCKED", "writer could not inspect source", true),
+            crate::task::TaskBlocker::new(
+                "WRITER_BLOCKED",
+                "writer could not inspect source",
+                true,
+            ),
         )
         .unwrap();
         goal.transition_task(
@@ -3646,8 +3654,9 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut operation_goal, &operation_task, "WRITER_BLOCKED");
-        assert!(!operation_goal.tasks()[&operation_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(
+            !operation_goal.tasks()[&operation_task].can_reconcile_legacy_writer_pre_mutation()
+        );
 
         let (mut scope_goal, scope_task) = legacy_writer_goal(&session);
         scope_goal
@@ -3663,8 +3672,7 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut scope_goal, &scope_task, "WRITER_BLOCKED");
-        assert!(!scope_goal.tasks()[&scope_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(!scope_goal.tasks()[&scope_task].can_reconcile_legacy_writer_pre_mutation());
 
         let (mut request_goal, request_task) = legacy_writer_goal(&session);
         request_goal
@@ -3680,13 +3688,14 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut request_goal, &request_task, "WRITER_BLOCKED");
-        assert!(!request_goal.tasks()[&request_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(!request_goal.tasks()[&request_task].can_reconcile_legacy_writer_pre_mutation());
 
-        let (changed_goal, changed_task) =
-            blocked_legacy_writer_goal(&session, vec![PathBuf::from("changed.py")], "WRITER_BLOCKED");
-        assert!(!changed_goal.tasks()[&changed_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        let (changed_goal, changed_task) = blocked_legacy_writer_goal(
+            &session,
+            vec![PathBuf::from("changed.py")],
+            "WRITER_BLOCKED",
+        );
+        assert!(!changed_goal.tasks()[&changed_task].can_reconcile_legacy_writer_pre_mutation());
 
         let (mut snapshot_goal, snapshot_task) = legacy_writer_goal(&session);
         snapshot_goal
@@ -3701,8 +3710,7 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut snapshot_goal, &snapshot_task, "WRITER_BLOCKED");
-        assert!(!snapshot_goal.tasks()[&snapshot_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(!snapshot_goal.tasks()[&snapshot_task].can_reconcile_legacy_writer_pre_mutation());
 
         let (mut review_goal, review_task) = legacy_writer_goal(&session);
         review_goal
@@ -3715,8 +3723,7 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut review_goal, &review_task, "WRITER_BLOCKED");
-        assert!(!review_goal.tasks()[&review_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(!review_goal.tasks()[&review_task].can_reconcile_legacy_writer_pre_mutation());
 
         let (mut performed_goal, performed_task) = legacy_writer_goal(&session);
         performed_goal
@@ -3732,8 +3739,9 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut performed_goal, &performed_task, "WRITER_BLOCKED");
-        assert!(!performed_goal.tasks()[&performed_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(
+            !performed_goal.tasks()[&performed_task].can_reconcile_legacy_writer_pre_mutation()
+        );
 
         let (mut unknown_goal, unknown_task) = legacy_writer_goal(&session);
         unknown_goal
@@ -3749,24 +3757,25 @@ mod tests {
             )
             .unwrap();
         block_writer_goal(&mut unknown_goal, &unknown_task, "WRITER_BLOCKED");
-        assert!(!unknown_goal.tasks()[&unknown_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(!unknown_goal.tasks()[&unknown_task].can_reconcile_legacy_writer_pre_mutation());
 
         let (post_mutation_goal, post_mutation_task) =
             blocked_legacy_writer_goal(&session, vec![], "WRITER_MUTATION_FAILED");
-        assert!(!post_mutation_goal.tasks()[&post_mutation_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(
+            !post_mutation_goal.tasks()[&post_mutation_task]
+                .can_reconcile_legacy_writer_pre_mutation()
+        );
 
         let (unrelated_goal, unrelated_task) =
             blocked_legacy_writer_goal(&session, vec![], "TOOL_MISSING");
-        assert!(!unrelated_goal.tasks()[&unrelated_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(
+            !unrelated_goal.tasks()[&unrelated_task].can_reconcile_legacy_writer_pre_mutation()
+        );
 
         let (mut readonly_goal, readonly_task) =
             running_goal(&session, read_only_scope(), WorkerKind::CodexReadonly, true);
         block_writer_goal(&mut readonly_goal, &readonly_task, "WRITER_BLOCKED");
-        assert!(!readonly_goal.tasks()[&readonly_task]
-            .can_reconcile_legacy_writer_pre_mutation());
+        assert!(!readonly_goal.tasks()[&readonly_task].can_reconcile_legacy_writer_pre_mutation());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3788,18 +3797,28 @@ mod tests {
         let after_first = store.load_goal(&session.id, &goal_id).unwrap();
         let bytes_after_first = read_goal_bytes(&root, &session, goal_id.as_str());
         assert_eq!(first.status, GoalStatus::Running);
-        assert_eq!(after_first.tasks()[&task_id].attempts()[0], historical_attempt);
-        assert!(after_first.tasks()[&task_id].evidence().iter().any(|evidence| {
-            matches!(
-                evidence,
-                TaskEvidence::LegacyWriterPreMutationReconciliation { reason, .. }
-                    if reason == crate::task::LEGACY_WRITER_PRE_MUTATION_RECONCILIATION
-            )
-        }));
-        assert!(after_first
-            .checkpoints()
-            .iter()
-            .any(|checkpoint| checkpoint.reason() == CheckpointReason::Recovery));
+        assert_eq!(
+            after_first.tasks()[&task_id].attempts()[0],
+            historical_attempt
+        );
+        assert!(
+            after_first.tasks()[&task_id]
+                .evidence()
+                .iter()
+                .any(|evidence| {
+                    matches!(
+                        evidence,
+                        TaskEvidence::LegacyWriterPreMutationReconciliation { reason, .. }
+                            if reason == crate::task::LEGACY_WRITER_PRE_MUTATION_RECONCILIATION
+                    )
+                })
+        );
+        assert!(
+            after_first
+                .checkpoints()
+                .iter()
+                .any(|checkpoint| checkpoint.reason() == CheckpointReason::Recovery)
+        );
 
         let second = goal_resume(
             &serde_json::json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
@@ -3810,8 +3829,14 @@ mod tests {
         let after_second = store.load_goal(&session.id, &goal_id).unwrap();
         assert_eq!(second.status, GoalStatus::Running);
         assert_eq!(after_second.revision(), after_first.revision());
-        assert_eq!(after_second.tasks()[&task_id].evidence().len(), after_first.tasks()[&task_id].evidence().len());
-        assert_eq!(bytes_after_first, read_goal_bytes(&root, &session, goal_id.as_str()));
+        assert_eq!(
+            after_second.tasks()[&task_id].evidence().len(),
+            after_first.tasks()[&task_id].evidence().len()
+        );
+        assert_eq!(
+            bytes_after_first,
+            read_goal_bytes(&root, &session, goal_id.as_str())
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3850,7 +3875,10 @@ mod tests {
         assert_eq!(task.semantic_attempts_consumed(), 1);
         assert_eq!(task.semantic_attempts_remaining(), 0);
         assert_eq!(task.max_attempts(), 1);
-        assert_eq!(request.attempt_id(), task.latest_attempt().unwrap().id().as_str());
+        assert_eq!(
+            request.attempt_id(),
+            task.latest_attempt().unwrap().id().as_str()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4042,19 +4070,14 @@ mod tests {
         )));
 
         store
-            .mutate_goal_snapshot(
-                &session.id,
-                &goal_id,
-                recovered.revision(),
-                |goal, now| {
-                    goal.transition_task(
-                        &task_id,
-                        TaskStatus::Running,
-                        TaskTransitionContext::default(),
-                        now,
-                    )
-                },
-            )
+            .mutate_goal_snapshot(&session.id, &goal_id, recovered.revision(), |goal, now| {
+                goal.transition_task(
+                    &task_id,
+                    TaskStatus::Running,
+                    TaskTransitionContext::default(),
+                    now,
+                )
+            })
             .unwrap();
         let attempt_three = store.load_goal(&session.id, &goal_id).unwrap();
         let task = &attempt_three.tasks()[&task_id];
@@ -4145,13 +4168,14 @@ mod tests {
             .unwrap();
             let before = goal.clone();
             let authority = ReadonlyTransportRecoveryAuthority::for_goal_resume();
-            assert!(!goal
-                .recover_legacy_readonly_timeout_task(&task_id, &authority, NOW)
-                .unwrap());
+            assert!(
+                !goal
+                    .recover_legacy_readonly_timeout_task(&task_id, &authority, NOW)
+                    .unwrap()
+            );
             assert_eq!(goal, before);
             assert_eq!(goal.tasks()[&task_id].status(), TaskStatus::Failed);
         }
         std::fs::remove_dir_all(root).unwrap();
     }
-
 }

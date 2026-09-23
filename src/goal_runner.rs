@@ -246,6 +246,10 @@ where
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Runner authority backends and execution limits remain explicit at this frozen boundary."
+)]
 pub(crate) async fn run_goal_foreground<P, RB, W, R, RP>(
     store: &TaskStore,
     session: &config::Session,

@@ -24,6 +24,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SessionIo for T {}
 type SessionStream = Box<dyn SessionIo>;
 
 #[cfg(unix)]
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 struct SessionListener(UnixListener);
 #[cfg(windows)]
 struct SessionListener {
@@ -31,6 +38,13 @@ struct SessionListener {
     server: NamedPipeServer,
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 impl SessionListener {
     async fn accept(&mut self) -> Result<SessionStream> {
         #[cfg(unix)]
@@ -43,7 +57,7 @@ impl SessionListener {
             // cancelling this future from `tokio::select!` cannot drop it.
             self.server.connect().await?;
             let server = std::mem::replace(&mut self.server, new_pipe(&self.path, false)?);
-            return Ok(Box::new(server));
+            Ok(Box::new(server))
         }
     }
 }
@@ -52,12 +66,27 @@ impl SessionListener {
 fn new_pipe(path: &Path, first: bool) -> Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
     options.first_pipe_instance(first);
-    // Tokio creates the pipe with a null SECURITY_ATTRIBUTES pointer, so the
-    // Windows default security descriptor applies. This is documented in the
-    // README rather than presented as equivalent to Unix's explicit 0600 mode.
-    Ok(options.create(path)?)
+    // Keep PIPE_REJECT_REMOTE_CLIENTS (Tokio default is already true).
+    options.reject_remote_clients(true);
+    // Supply an explicit current-user-only security descriptor. Tokio's default
+    // `create` uses a null SECURITY_ATTRIBUTES pointer, which applies the Windows
+    // default named-pipe DACL (broad principals such as Everyone/Anonymous).
+    let security = crate::pipe_security::CurrentUserPipeSecurity::new()
+        .context("failed to build current-user-only pipe security descriptor")?;
+    let attrs = security.attributes();
+    // SAFETY: `attrs` is a valid SECURITY_ATTRIBUTES whose lpSecurityDescriptor
+    // points at an absolute descriptor owned by `security`, which outlives this call.
+    // CreateNamedPipeW copies the descriptor into the object.
+    unsafe { Ok(options.create_with_security_attributes_raw(path, &attrs as *const _ as *mut _)?) }
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 async fn connect(path: &Path) -> Result<SessionStream> {
     #[cfg(unix)]
     {
@@ -86,11 +115,36 @@ async fn connect(path: &Path) -> Result<SessionStream> {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 fn bind_listener(path: &Path) -> Result<SessionListener> {
     Ok(SessionListener(UnixListener::bind(path)?))
 }
 
+#[cfg(unix)]
+async fn bind_unix_session_listener(path: &Path) -> Result<SessionListener> {
+    let state_dir = path.parent().context("session socket has no parent")?;
+    tokio::fs::create_dir_all(state_dir).await?;
+    tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    remove_stale_socket(&path.to_path_buf()).await?;
+    let listener = bind_listener(path)?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(listener)
+}
+
 #[cfg(windows)]
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 fn bind_listener(path: &Path) -> Result<SessionListener> {
     Ok(SessionListener {
         path: path.to_owned(),
@@ -108,6 +162,13 @@ pub struct Request {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 enum Message {
     Approval {
         request: Request,
@@ -118,6 +179,13 @@ enum Message {
     },
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 pub async fn request(
     session_id: &str,
     operation: &str,
@@ -152,6 +220,13 @@ pub async fn request(
 /// Sends a one-way activity update to the `start` screen. Activity reporting is
 /// deliberately best-effort: an MCP operation must not fail just because its UI
 /// was closed between loading the session and completing the operation.
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option<String>) {
     let Ok(path) = config::socket_path(session_id) else {
         return;
@@ -171,21 +246,25 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
     let _ = stream.shutdown().await;
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 pub async fn start(session_id: Option<&str>) -> Result<()> {
     let mut session = config::create_session(&std::env::current_dir()?, session_id).await?;
     let path = config::socket_path(&session.id)?;
     #[cfg(unix)]
-    {
-        let state_dir = path.parent().context("session socket has no parent")?;
-        tokio::fs::create_dir_all(state_dir).await?;
-        tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
-    }
-    remove_stale_socket(&path).await?;
-
-    let mut listener =
-        bind_listener(&path).with_context(|| format!("failed to listen at {}", path.display()))?;
-    #[cfg(unix)]
-    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    let mut listener = bind_unix_session_listener(&path)
+        .await
+        .with_context(|| format!("failed to listen at {}", path.display()))?;
+    #[cfg(windows)]
+    let mut listener = {
+        remove_stale_socket(&path).await?;
+        bind_listener(&path).with_context(|| format!("failed to listen at {}", path.display()))?
+    };
     eprintln!(
         "local-mcp session: {}\ncwd: {}\n\
          Give this session ID to the agent so it can include it in local-mcp tool calls.\n\
@@ -225,6 +304,13 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 fn show_activity(title: &str, detail: Option<&str>) {
     eprintln!("\n• {title}");
     if let Some(detail) = detail.filter(|value| !value.is_empty()) {
@@ -235,6 +321,13 @@ fn show_activity(title: &str, detail: Option<&str>) {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
+    )
+)]
 async fn remove_stale_socket(path: &PathBuf) -> Result<()> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
@@ -257,7 +350,9 @@ async fn handle_input(
     match input {
         "/permissions yolo" | "/permission yolo" => {
             *yolo = true;
-            eprintln!("Permissions: yolo (all unsandboxed calls are allowed for this session)");
+            eprintln!(
+                "WARNING: Permissions yolo allows every approval-gated host-native call for this session only; restart resets it. MCP callers cannot enable yolo."
+            );
             while let Some((request, mut stream)) = pending.pop_front() {
                 eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
                 stream.write_all(b"allow\n").await?;
@@ -360,6 +455,117 @@ fn show_next(pending: &VecDeque<(Request, SessionStream)>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn approval_ipc_allow_deny_invalid_and_missing_are_distinct() -> Result<()> {
+        let id = format!("ipc-approval-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        let cwd = std::env::temp_dir().join(format!("local-mcp-approval-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd)?;
+
+        let mut listener = bind_unix_session_listener(&path).await?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert!(serde_json::from_str::<Message>(&line).is_ok());
+            stream.write_all(b"maybe\n").await.unwrap();
+        });
+        assert!(
+            request(&id, "test-op", "detail".into(), cwd.clone())
+                .await
+                .is_err()
+        );
+        server.await?;
+
+        let mut listener = bind_unix_session_listener(&path).await?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            stream.write_all(b"deny\n").await.unwrap();
+        });
+        assert!(!request(&id, "test-op", "detail".into(), cwd.clone()).await?);
+        server.await?;
+
+        let mut listener = bind_unix_session_listener(&path).await?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            stream.write_all(b"allow\n").await.unwrap();
+        });
+        assert!(request(&id, "test-op", "detail".into(), cwd.clone()).await?);
+        server.await?;
+
+        let missing_id = format!("ipc-missing-{}", Uuid::new_v4());
+        assert!(
+            request(&missing_id, "test-op", "detail".into(), cwd.clone())
+                .await
+                .is_err()
+        );
+        remove_stale_socket(&path.to_path_buf()).await?;
+        std::fs::remove_dir_all(cwd)?;
+        Ok(())
+    }
+
+    #[test]
+    fn approval_pipe_payload_cannot_set_session_yolo_state() {
+        let approval = r#"{"type":"approval","request":{"id":"00000000-0000-4000-8000-000000000001","operation":"execute","detail":"argv","cwd":"/tmp"},"yolo":true}"#;
+        let parsed: Message = serde_json::from_str(approval).unwrap();
+        assert!(matches!(parsed, Message::Approval { .. }));
+        let activity = r#"{"type":"activity","title":"t","yolo":true}"#;
+        let parsed: Message = serde_json::from_str(activity).unwrap();
+        assert!(matches!(parsed, Message::Activity { .. }));
+    }
+
+    #[tokio::test]
+    async fn session_socket_uses_private_modes_and_unlinks_stale_symlinks() -> Result<()> {
+        let id = format!("ipc-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        let outside = std::env::temp_dir().join(format!("local-mcp-ipc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&outside)?;
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, "unchanged")?;
+
+        let state_dir = path.parent().context("session socket has no parent")?;
+        tokio::fs::create_dir_all(state_dir).await?;
+        std::os::unix::fs::symlink(&sentinel, &path)?;
+        let listener = bind_unix_session_listener(&path).await?;
+
+        let directory = std::fs::metadata(state_dir)?;
+        assert_eq!(directory.permissions().mode() & 0o777, 0o700);
+        assert_eq!(directory.uid(), unsafe { libc::geteuid() });
+        let socket = std::fs::symlink_metadata(&path)?;
+        assert!(socket.file_type().is_socket());
+        assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+        assert_eq!(socket.uid(), unsafe { libc::geteuid() });
+        assert_eq!(std::fs::read_to_string(&sentinel)?, "unchanged");
+
+        drop(listener);
+        remove_stale_socket(&path).await?;
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&sentinel)?, "unchanged");
+        std::fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -398,5 +604,158 @@ mod tests {
         let _second_client = timeout(Duration::from_secs(1), waiting_client).await???;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_pipe_instance_rejects_double_bind() -> Result<()> {
+        let path = pipe_path();
+        let _listener = bind_listener(&path)?;
+        assert!(
+            bind_listener(&path).is_err(),
+            "second first_pipe_instance bind must fail while the session owns the pipe"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_pipe_current_user_only_acl() -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        let path = pipe_path();
+        let listener = bind_listener(&path)?;
+        let handle = listener.server.as_raw_handle() as *mut _;
+        let (owner, aces) = crate::pipe_security::inspect_handle_security(handle)?;
+        let user = crate::pipe_security::current_user_sid()?;
+        crate::pipe_security::assert_current_user_only(&owner, &aces, &user)?;
+
+        // Everyone and Anonymous must not appear as any ACE principal.
+        for ace in &aces {
+            assert!(
+                ace.sid_string != "S-1-1-0",
+                "Everyone must not be granted pipe access"
+            );
+            assert!(
+                ace.sid_string != "S-1-5-7",
+                "Anonymous must not be granted pipe access"
+            );
+            assert!(
+                !crate::pipe_security::is_broad_principal(&ace.sid_string),
+                "broad principal {} must not be granted pipe access",
+                ace.sid_string
+            );
+        }
+
+        // Mechanical evidence (categories only; no personal username).
+        let owner_category = if owner == user {
+            "current-user"
+        } else {
+            "other"
+        };
+        eprintln!(
+            "ACL_EVIDENCE owner={owner_category} ace_count={}",
+            aces.len()
+        );
+        for (index, ace) in aces.iter().enumerate() {
+            let principal = if ace.sid_string == user {
+                "current-user"
+            } else if crate::pipe_security::is_broad_principal(&ace.sid_string) {
+                "broad-forbidden"
+            } else if ace.sid_string.starts_with("S-1-5-21-") {
+                "unrelated-account"
+            } else {
+                "other-well-known"
+            };
+            eprintln!(
+                "ACL_EVIDENCE ace[{index}] principal={principal} allowed={} mask={:#x}",
+                ace.allowed, ace.mask
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_pipe_same_user_can_connect() -> Result<()> {
+        let path = pipe_path();
+        let mut listener = bind_listener(&path)?;
+        let client = ClientOptions::new().open(&path)?;
+        let _server = timeout(Duration::from_secs(1), listener.accept()).await??;
+        drop(client);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_fails_closed_on_invalid_and_deny_responses() -> Result<()> {
+        let id = format!("approval-fail-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        let cwd = std::env::temp_dir().join(format!("local-mcp-approval-fail-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd)?;
+
+        // Invalid response must be an error, never an implicit allow.
+        let mut listener = bind_listener(&path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            stream.write_all(b"maybe\n").await.unwrap();
+        });
+        let invalid = request(&id, "test-op", "detail".into(), cwd.clone()).await;
+        assert!(
+            invalid.is_err(),
+            "invalid approval response must fail closed"
+        );
+        server.await.unwrap();
+
+        // Deny is an explicit false, not an error and not an allow.
+        let mut listener = bind_listener(&path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            stream.write_all(b"deny\n").await.unwrap();
+        });
+        let denied = request(&id, "test-op", "detail".into(), cwd.clone()).await?;
+        assert!(!denied, "deny must return false");
+        server.await.unwrap();
+
+        // Allow is the only true success path.
+        let mut listener = bind_listener(&path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            stream.write_all(b"allow\n").await.unwrap();
+        });
+        let allowed = request(&id, "test-op", "detail".into(), cwd.clone()).await?;
+        assert!(allowed, "allow must return true");
+        server.await.unwrap();
+
+        // Missing session pipe must fail closed before any host-native work.
+        let missing_id = format!("approval-missing-{}", Uuid::new_v4());
+        let missing = request(&missing_id, "test-op", "detail".into(), cwd.clone()).await;
+        assert!(missing.is_err());
+
+        let _ = std::fs::remove_dir_all(&cwd);
+        Ok(())
+    }
+
+    #[test]
+    fn yolo_cannot_be_enabled_by_pipe_messages() {
+        // Approval/Activity are the only IPC variants. yolo is stdin-local state
+        // in `start()` and is not deserializable from the pipe protocol.
+        let approval = r#"{"type":"approval","request":{"id":"7418eda5-fd07-4e00-ace5-c1ece2f68a02","operation":"execute","detail":"argv","cwd":"C:\\tmp"},"yolo":true}"#;
+        let parsed: Message = serde_json::from_str(approval).unwrap();
+        assert!(matches!(parsed, Message::Approval { .. }));
+        let activity = r#"{"type":"activity","title":"t","yolo":true}"#;
+        let parsed: Message = serde_json::from_str(activity).unwrap();
+        assert!(matches!(parsed, Message::Activity { .. }));
     }
 }

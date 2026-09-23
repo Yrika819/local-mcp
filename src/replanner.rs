@@ -425,9 +425,8 @@ pub(crate) fn replanner_request_for_goal(
         .pre_execution_plan_rejections()
         .iter()
         .filter(|rejection| {
-            latest_committed_replan_revision.map_or(true, |revision| {
-                rejection.rejected_plan_revision() >= revision
-            })
+            latest_committed_replan_revision
+                .is_none_or(|revision| rejection.rejected_plan_revision() >= revision)
         })
         .count();
 
@@ -497,6 +496,10 @@ pub(crate) fn replanner_request_for_goal(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen replanner entrypoint is retained for staged Goal Orchestrator integration."
+)]
 pub(crate) fn replan_goal<B: ReplannerBackend>(
     store: &TaskStore,
     session: &config::Session,
@@ -1345,8 +1348,8 @@ fn validate_pristine_plan_supersession(
         })
         .map(|task| ValidatedTaskRef::New(task.proposal_id.clone()))
         .collect::<BTreeSet<_>>();
-    if rejection.replan_policy() == PreExecutionPlanReplanPolicy::RequireReadonlyReassessment {
-        if readonly_refs.is_empty()
+    if rejection.replan_policy() == PreExecutionPlanReplanPolicy::RequireReadonlyReassessment
+        && (readonly_refs.is_empty()
             || new_tasks
                 .iter()
                 .filter(|task| task.scope.operation_kind() != TaskOperationKind::ReadOnly)
@@ -1355,10 +1358,9 @@ fn validate_pristine_plan_supersession(
                         .dependencies
                         .iter()
                         .any(|dependency| readonly_refs.contains(dependency))
-                })
-        {
-            return Err(ReplannerError::ReplanAuthorityViolation("REQUIRE_READONLY_REASSESSMENT requires replacement mutation Tasks to depend on a new safe READ_ONLY reassessment".to_owned()));
-        }
+                }))
+    {
+        return Err(ReplannerError::ReplanAuthorityViolation("REQUIRE_READONLY_REASSESSMENT requires replacement mutation Tasks to depend on a new safe READ_ONLY reassessment".to_owned()));
     }
     if new_tasks.iter().flat_map(|task| task.dependencies.iter()).any(|dependency| matches!(dependency, ValidatedTaskRef::Existing(id) if affected.contains(id))) {
         return Err(ReplannerError::ReplanAuthorityViolation("replacement Tasks cannot depend on superseded rejected-plan Tasks".to_owned()));
@@ -2567,7 +2569,11 @@ mod tests {
             .unwrap();
         assert_eq!(repair.worker(), WorkerKind::CodexWriter);
         assert_eq!(repair.status(), TaskStatus::Ready);
-        assert!(task.dependencies().iter().any(|dependency| dependency.task_id() == repair.id()));
+        assert!(
+            task.dependencies()
+                .iter()
+                .any(|dependency| dependency.task_id() == repair.id())
+        );
     }
 
     #[test]
@@ -3019,7 +3025,12 @@ mod tests {
             result.checkpoints().last().unwrap().goal_status(),
             GoalStatus::Running
         );
-        assert!(result.tasks().values().any(|task| task.status() == TaskStatus::Ready));
+        assert!(
+            result
+                .tasks()
+                .values()
+                .any(|task| task.status() == TaskStatus::Ready)
+        );
     }
 
     #[test]

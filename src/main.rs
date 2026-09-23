@@ -1,3 +1,8 @@
+#![allow(
+    unfulfilled_lint_expectations,
+    reason = "Frozen item-scoped lint contracts are evaluated in both production and test targets."
+)]
+
 mod agent;
 mod approvals;
 mod config;
@@ -13,6 +18,8 @@ mod mcp;
 mod mutation;
 mod mutation_recovery;
 mod orchestrator_error;
+#[cfg(windows)]
+mod pipe_security;
 mod planner;
 mod readonly_worker;
 mod replanner;
@@ -29,9 +36,9 @@ mod agent_tests;
 #[cfg(test)]
 mod goal_backends_tests;
 #[cfg(test)]
-mod goal_hardening_tests;
-#[cfg(test)]
 mod goal_finalizer_tests;
+#[cfg(test)]
+mod goal_hardening_tests;
 #[cfg(test)]
 mod goal_runner_tests;
 #[cfg(test)]

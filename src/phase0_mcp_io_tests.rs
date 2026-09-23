@@ -79,9 +79,242 @@ async fn write_file_replaces_existing_utf8_content() {
     .unwrap();
     let output: Value = serde_json::from_str(phase0_io_text(&result)).unwrap();
     assert_eq!(output["exit_code"], 0);
-    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "new\nβeta\n");
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "new\nβeta\n"
+    );
 
     let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn filesystem_tools_reject_outside_paths_without_side_effects() {
+    let (session, root) = phase0_io_session();
+    let outside = root
+        .parent()
+        .unwrap()
+        .join(format!("local-mcp-phase0-outside-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&outside).await.unwrap();
+    tokio::fs::write(outside.join("secret.txt"), "secret")
+        .await
+        .unwrap();
+    tokio::fs::write(
+        outside.join("image.png"),
+        b"\x89PNG\r\n\x1a\nphase0-test-image",
+    )
+    .await
+    .unwrap();
+    let outside_new_parent = outside.join("new-parent");
+    tokio::fs::create_dir_all(&outside_new_parent)
+        .await
+        .unwrap();
+
+    phase0_io_cleanup_session(&session.id).await;
+    config::save_session(&session).await.unwrap();
+
+    let read = call_tool(&json!({
+        "name": "read_file",
+        "arguments": {"session_id": session.id, "path": outside.join("secret.txt")}
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        read.to_string()
+            .contains("outside the session's permitted directories")
+    );
+
+    let image = call_tool(&json!({
+        "name": "get_image",
+        "arguments": {"session_id": session.id, "path": outside.join("image.png")}
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        image
+            .to_string()
+            .contains("outside the session's permitted directories")
+    );
+
+    let listed = call_tool(&json!({
+        "name": "list_directory",
+        "arguments": {"session_id": session.id, "path": outside}
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        listed
+            .to_string()
+            .contains("outside the session's permitted directories")
+    );
+
+    let write = write_file(
+        &json!({
+            "path": outside.join("created.txt"),
+            "content": "must not be written"
+        }),
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        write
+            .to_string()
+            .contains("outside the session's permitted directories")
+    );
+    assert!(!outside.join("created.txt").exists());
+
+    let new_parent_write = write_file(
+        &json!({
+            "path": outside_new_parent.join("created.txt"),
+            "content": "must not be written"
+        }),
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        new_parent_write
+            .to_string()
+            .contains("outside the session's permitted directories")
+    );
+    assert!(!outside_new_parent.join("created.txt").exists());
+
+    let cwd_error = cwd(&json!({"cwd": outside}), &session).unwrap_err();
+    assert!(
+        cwd_error
+            .to_string()
+            .contains("outside the session's permitted directories")
+    );
+
+    #[cfg(unix)]
+    {
+        let link = root.join("outside-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let symlink_read = call_tool(&json!({
+            "name": "read_file",
+            "arguments": {"session_id": session.id, "path": link.join("secret.txt")}
+        }))
+        .await
+        .unwrap_err();
+        assert!(
+            symlink_read
+                .to_string()
+                .contains("outside the session's permitted directories")
+        );
+
+        let symlink_write = write_file(
+            &json!({
+                "path": link.join("created.txt"),
+                "content": "must not be written"
+            }),
+            &session,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            symlink_write
+                .to_string()
+                .contains("outside the session's permitted directories")
+        );
+        assert!(!outside.join("created.txt").exists());
+    }
+
+    phase0_io_cleanup_session(&session.id).await;
+    let _ = tokio::fs::remove_dir_all(root).await;
+    let _ = tokio::fs::remove_dir_all(outside).await;
+}
+
+#[tokio::test]
+async fn write_file_rejects_dangling_final_symlink_escape() {
+    let (session, root) = phase0_io_session();
+    let outside = root
+        .parent()
+        .unwrap()
+        .join(format!("local-mcp-phase0-dangling-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&outside).await.unwrap();
+    let outside_target = outside.join("escaped.txt");
+
+    let link = root.join("dangling.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_target, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_target, &link).unwrap();
+
+    let result = write_file(
+        &json!({
+            "path": "dangling.txt",
+            "content": "must not escape"
+        }),
+        &session,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "write through dangling final symlink must be rejected"
+    );
+    assert!(
+        !outside_target.exists(),
+        "dangling final symlink write must not create the outside target"
+    );
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+    let _ = tokio::fs::remove_dir_all(outside).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn write_file_rejects_ads_through_final_symlink() {
+    let (session, root) = phase0_io_session();
+    let outside = root
+        .parent()
+        .unwrap()
+        .join(format!("local-mcp-phase0-ads-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&outside).await.unwrap();
+    let outside_target = outside.join("ads-target.txt");
+    tokio::fs::write(&outside_target, "base").await.unwrap();
+
+    let link = root.join("ads.txt");
+    std::os::windows::fs::symlink_file(&outside_target, &link).unwrap();
+
+    let result = write_file(
+        &json!({
+            "path": "ads.txt:stream",
+            "content": "must not escape via ADS"
+        }),
+        &session,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "ADS write through final symlink must be rejected"
+    );
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+    let _ = tokio::fs::remove_dir_all(outside).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn write_file_requires_live_host_native_approval_before_writing() {
+    let (session, root) = phase0_io_session();
+    let path = root.join("must-not-write.txt");
+    let result = write_file(
+        &json!({
+            "path": "must-not-write.txt",
+            "content": "requires approval"
+        }),
+        &session,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "host-native write_file must fail closed without live approval"
+    );
+    assert!(
+        !path.exists(),
+        "write_file must not create files before host-native approval"
+    );
+    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]

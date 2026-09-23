@@ -1,19 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::de::Error as _;
 use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config;
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
+#[cfg(test)]
+use crate::task::{ReplaySafety, TaskScope, WorkerKind};
 use crate::task::{
-    ReplaySafety, Task, TaskDependency, TaskId, TaskOperationKind, TaskScope, TaskStatus,
-    TaskTransitionContext, VerificationId, VerificationOutcome, VerificationResult, VerificationSpec, WorkerKind,
-    WorkerReport,
+    Task, TaskDependency, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
+    VerificationId, VerificationOutcome, VerificationResult, VerificationSpec, WorkerReport,
 };
 
 pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
@@ -51,16 +52,22 @@ impl GoalId {
 pub(crate) struct CompletionCriterionId(String);
 
 impl CompletionCriterionId {
-    pub(crate) fn new() -> Self { Self(Uuid::new_v4().to_string()) }
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
     pub(crate) fn parse(value: &str) -> Result<Self, OrchestratorError> {
         let uuid = Uuid::parse_str(value)
             .map_err(|_| OrchestratorError::UnsafeIdentifier("CompletionCriterionId".to_owned()))?;
         Ok(Self(uuid.to_string()))
     }
-    pub(crate) fn as_str(&self) -> &str { &self.0 }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
     fn validate(&self) -> Result<(), OrchestratorError> {
         if Self::parse(&self.0)?.0 != self.0 {
-            return Err(OrchestratorError::UnsafeIdentifier("CompletionCriterionId".to_owned()));
+            return Err(OrchestratorError::UnsafeIdentifier(
+                "CompletionCriterionId".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -77,13 +84,25 @@ pub(crate) struct GoalCompletionCriterion {
 impl GoalCompletionCriterion {
     fn new(description: String) -> Result<Self, OrchestratorError> {
         if description.trim().is_empty() {
-            return Err(OrchestratorError::CorruptGoal("completion criterion description must not be empty".to_owned()));
+            return Err(OrchestratorError::CorruptGoal(
+                "completion criterion description must not be empty".to_owned(),
+            ));
         }
-        Ok(Self { id: CompletionCriterionId::new(), description, required: true })
+        Ok(Self {
+            id: CompletionCriterionId::new(),
+            description,
+            required: true,
+        })
     }
-    pub(crate) fn id(&self) -> &CompletionCriterionId { &self.id }
-    pub(crate) fn description(&self) -> &str { &self.description }
-    pub(crate) fn required(&self) -> bool { self.required }
+    pub(crate) fn id(&self) -> &CompletionCriterionId {
+        &self.id
+    }
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+    pub(crate) fn required(&self) -> bool {
+        self.required
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -93,7 +112,11 @@ pub(crate) enum GoalVerificationRequirement {
 }
 
 impl GoalVerificationRequirement {
-    pub(crate) fn task_id(&self) -> &TaskId { match self { Self::TaskVerified { task_id } => task_id } }
+    pub(crate) fn task_id(&self) -> &TaskId {
+        match self {
+            Self::TaskVerified { task_id } => task_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,9 +127,21 @@ pub(crate) struct GoalCriterionBinding {
 }
 
 impl GoalCriterionBinding {
-    pub(crate) fn new(criterion_id: CompletionCriterionId, requirements: Vec<GoalVerificationRequirement>) -> Self { Self { criterion_id, requirements } }
-    pub(crate) fn criterion_id(&self) -> &CompletionCriterionId { &self.criterion_id }
-    pub(crate) fn requirements(&self) -> &[GoalVerificationRequirement] { &self.requirements }
+    pub(crate) fn new(
+        criterion_id: CompletionCriterionId,
+        requirements: Vec<GoalVerificationRequirement>,
+    ) -> Self {
+        Self {
+            criterion_id,
+            requirements,
+        }
+    }
+    pub(crate) fn criterion_id(&self) -> &CompletionCriterionId {
+        &self.criterion_id
+    }
+    pub(crate) fn requirements(&self) -> &[GoalVerificationRequirement] {
+        &self.requirements
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,10 +151,23 @@ pub(crate) struct GoalFinalVerificationSpec {
     criterion_bindings: Vec<GoalCriterionBinding>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen final-verification accessors are retained for staged Goal Orchestrator authority wiring."
+)]
 impl GoalFinalVerificationSpec {
-    pub(crate) fn new(plan_revision: u32, criterion_bindings: Vec<GoalCriterionBinding>) -> Self { Self { plan_revision, criterion_bindings } }
-    pub(crate) fn plan_revision(&self) -> u32 { self.plan_revision }
-    pub(crate) fn criterion_bindings(&self) -> &[GoalCriterionBinding] { &self.criterion_bindings }
+    pub(crate) fn new(plan_revision: u32, criterion_bindings: Vec<GoalCriterionBinding>) -> Self {
+        Self {
+            plan_revision,
+            criterion_bindings,
+        }
+    }
+    pub(crate) fn plan_revision(&self) -> u32 {
+        self.plan_revision
+    }
+    pub(crate) fn criterion_bindings(&self) -> &[GoalCriterionBinding] {
+        &self.criterion_bindings
+    }
     pub(crate) fn canonical_digest(&self) -> String {
         let mut bindings = self.criterion_bindings.clone();
         bindings.sort_by(|a, b| a.criterion_id.cmp(&b.criterion_id));
@@ -145,7 +193,9 @@ impl GoalFinalVerificationSpec {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum VerificationOrigin { HostDeterministicGoalVerifier }
+pub(crate) enum VerificationOrigin {
+    HostDeterministicGoalVerifier,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -159,11 +209,25 @@ pub(crate) enum GoalRequirementObservation {
     },
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen verification-observation accessors are retained for staged verifier consumers."
+)]
 impl GoalRequirementObservation {
     pub(crate) fn task_verification_identity(&self) -> (&TaskId, Option<&VerificationId>) {
-        match self { Self::TaskVerified { task_id, verification_id, .. } => (task_id, verification_id.as_ref()) }
+        match self {
+            Self::TaskVerified {
+                task_id,
+                verification_id,
+                ..
+            } => (task_id, verification_id.as_ref()),
+        }
     }
-    pub(crate) fn outcome(&self) -> VerificationOutcome { match self { Self::TaskVerified { outcome, .. } => *outcome } }
+    pub(crate) fn outcome(&self) -> VerificationOutcome {
+        match self {
+            Self::TaskVerified { outcome, .. } => *outcome,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,11 +238,31 @@ pub(crate) struct GoalCriterionVerificationResult {
     observations: Vec<GoalRequirementObservation>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen criterion-result accessors are retained for staged final-verification consumers."
+)]
 impl GoalCriterionVerificationResult {
-    pub(crate) fn new(criterion_id: CompletionCriterionId, outcome: VerificationOutcome, observations: Vec<GoalRequirementObservation>) -> Self { Self { criterion_id, outcome, observations } }
-    pub(crate) fn criterion_id(&self) -> &CompletionCriterionId { &self.criterion_id }
-    pub(crate) fn outcome(&self) -> VerificationOutcome { self.outcome }
-    pub(crate) fn observations(&self) -> &[GoalRequirementObservation] { &self.observations }
+    pub(crate) fn new(
+        criterion_id: CompletionCriterionId,
+        outcome: VerificationOutcome,
+        observations: Vec<GoalRequirementObservation>,
+    ) -> Self {
+        Self {
+            criterion_id,
+            outcome,
+            observations,
+        }
+    }
+    pub(crate) fn criterion_id(&self) -> &CompletionCriterionId {
+        &self.criterion_id
+    }
+    pub(crate) fn outcome(&self) -> VerificationOutcome {
+        self.outcome
+    }
+    pub(crate) fn observations(&self) -> &[GoalRequirementObservation] {
+        &self.observations
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,21 +281,73 @@ pub(crate) struct GoalFinalVerificationRecord {
     finished_at: String,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen durable verification-record accessors are retained for staged authority consumers."
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Durable verification identity, revisions, digest, criteria, and timestamps remain explicit."
+)]
 impl GoalFinalVerificationRecord {
-    pub(crate) fn new(outcome: VerificationOutcome, goal_id: GoalId, evaluated_goal_revision: u64, committed_goal_revision: u64, plan_revision: u32, contract_digest: String, criterion_results: Vec<GoalCriterionVerificationResult>, started_at: impl Into<String>, finished_at: impl Into<String>) -> Self {
-        Self { id: VerificationId::new(), outcome, source: VerificationOrigin::HostDeterministicGoalVerifier, goal_id, evaluated_goal_revision, committed_goal_revision, plan_revision, contract_digest, criterion_results, started_at: started_at.into(), finished_at: finished_at.into() }
+    pub(crate) fn new(
+        outcome: VerificationOutcome,
+        goal_id: GoalId,
+        evaluated_goal_revision: u64,
+        committed_goal_revision: u64,
+        plan_revision: u32,
+        contract_digest: String,
+        criterion_results: Vec<GoalCriterionVerificationResult>,
+        started_at: impl Into<String>,
+        finished_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: VerificationId::new(),
+            outcome,
+            source: VerificationOrigin::HostDeterministicGoalVerifier,
+            goal_id,
+            evaluated_goal_revision,
+            committed_goal_revision,
+            plan_revision,
+            contract_digest,
+            criterion_results,
+            started_at: started_at.into(),
+            finished_at: finished_at.into(),
+        }
     }
-    pub(crate) fn id(&self) -> &VerificationId { &self.id }
-    pub(crate) fn outcome(&self) -> VerificationOutcome { self.outcome }
-    pub(crate) fn source(&self) -> VerificationOrigin { self.source }
-    pub(crate) fn goal_id(&self) -> &GoalId { &self.goal_id }
-    pub(crate) fn evaluated_goal_revision(&self) -> u64 { self.evaluated_goal_revision }
-    pub(crate) fn committed_goal_revision(&self) -> u64 { self.committed_goal_revision }
-    pub(crate) fn plan_revision(&self) -> u32 { self.plan_revision }
-    pub(crate) fn contract_digest(&self) -> &str { &self.contract_digest }
-    pub(crate) fn criterion_results(&self) -> &[GoalCriterionVerificationResult] { &self.criterion_results }
-    pub(crate) fn started_at(&self) -> &str { &self.started_at }
-    pub(crate) fn finished_at(&self) -> &str { &self.finished_at }
+    pub(crate) fn id(&self) -> &VerificationId {
+        &self.id
+    }
+    pub(crate) fn outcome(&self) -> VerificationOutcome {
+        self.outcome
+    }
+    pub(crate) fn source(&self) -> VerificationOrigin {
+        self.source
+    }
+    pub(crate) fn goal_id(&self) -> &GoalId {
+        &self.goal_id
+    }
+    pub(crate) fn evaluated_goal_revision(&self) -> u64 {
+        self.evaluated_goal_revision
+    }
+    pub(crate) fn committed_goal_revision(&self) -> u64 {
+        self.committed_goal_revision
+    }
+    pub(crate) fn plan_revision(&self) -> u32 {
+        self.plan_revision
+    }
+    pub(crate) fn contract_digest(&self) -> &str {
+        &self.contract_digest
+    }
+    pub(crate) fn criterion_results(&self) -> &[GoalCriterionVerificationResult] {
+        &self.criterion_results
+    }
+    pub(crate) fn started_at(&self) -> &str {
+        &self.started_at
+    }
+    pub(crate) fn finished_at(&self) -> &str {
+        &self.finished_at
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,17 +419,12 @@ pub(crate) enum PreExecutionPlanRejectionAuthorityKind {
     GoalResume,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum PreExecutionPlanReplanPolicy {
+    #[default]
     Normal,
     RequireReadonlyReassessment,
-}
-
-impl Default for PreExecutionPlanReplanPolicy {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +501,10 @@ pub(crate) struct PristinePlanSupersessionRecord {
     rebound_criterion_ids: Vec<CompletionCriterionId>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen plan-supersession accessors are retained for staged replanner consumers."
+)]
 impl PristinePlanSupersessionRecord {
     pub(crate) fn rejection_request_id(&self) -> &str {
         &self.rejection_request_id
@@ -443,7 +578,8 @@ pub(crate) struct ReplanMutation {
     pub(crate) add_verification: Vec<(TaskId, Vec<VerificationSpec>)>,
     pub(crate) strengthen_mandatory: Vec<TaskId>,
     pub(crate) resolve_needs_replan: Vec<TaskId>,
-    pub(crate) add_criterion_requirements: Vec<(CompletionCriterionId, Vec<GoalVerificationRequirement>)>,
+    pub(crate) add_criterion_requirements:
+        Vec<(CompletionCriterionId, Vec<GoalVerificationRequirement>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -497,6 +633,14 @@ pub(crate) struct Goal {
     completed_at: Option<String>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Goal state-machine methods include the frozen orchestrator contract and are not all reachable from the current read-only public surface."
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Goal authority, revision, scope, verification, budget, and timestamp channels remain explicit."
+)]
 impl Goal {
     pub(crate) fn new(
         session_id: impl Into<String>,
@@ -626,7 +770,10 @@ impl Goal {
         if self.schema_version == 1 {
             return self.legacy_completion_criteria.clone();
         }
-        self.completion_criteria.iter().map(|criterion| criterion.description.clone()).collect()
+        self.completion_criteria
+            .iter()
+            .map(|criterion| criterion.description.clone())
+            .collect()
     }
 
     pub(crate) fn final_verification_spec(&self) -> Option<&GoalFinalVerificationSpec> {
@@ -649,8 +796,12 @@ impl Goal {
         self.legacy_final_verification.as_ref()
     }
 
-    pub(crate) fn latest_applicable_final_verification(&self) -> Option<&GoalFinalVerificationRecord> {
-        if self.schema_version != GOAL_SCHEMA_VERSION { return None; }
+    pub(crate) fn latest_applicable_final_verification(
+        &self,
+    ) -> Option<&GoalFinalVerificationRecord> {
+        if self.schema_version != GOAL_SCHEMA_VERSION {
+            return None;
+        }
         let digest = self.final_verification_spec.as_ref()?.canonical_digest();
         self.final_verifications.iter().rev().find(|record| {
             let revision_applicable = record.committed_goal_revision == self.revision
@@ -714,9 +865,9 @@ impl Goal {
     }
 
     pub(crate) fn has_active_tasks(&self) -> bool {
-        self.tasks.values().any(|task| {
-            matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying)
-        })
+        self.tasks
+            .values()
+            .any(|task| matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying))
     }
 
     pub(crate) fn has_unknown_side_effects(&self) -> bool {
@@ -725,9 +876,10 @@ impl Goal {
 
     pub(crate) fn has_blocking_state(&self) -> bool {
         !self.blockers.is_empty()
-            || self.tasks.values().any(|task| {
-                task.status() == TaskStatus::Blocked || !task.blockers().is_empty()
-            })
+            || self
+                .tasks
+                .values()
+                .any(|task| task.status() == TaskStatus::Blocked || !task.blockers().is_empty())
             || self.has_unknown_side_effects()
     }
 
@@ -750,7 +902,8 @@ impl Goal {
         contract: GoalFinalVerificationSpec,
         now: &str,
     ) -> Result<(), OrchestratorError> {
-        if self.status != GoalStatus::Planning || self.plan_revision != 0 || !self.tasks.is_empty() {
+        if self.status != GoalStatus::Planning || self.plan_revision != 0 || !self.tasks.is_empty()
+        {
             return Err(OrchestratorError::InvalidDag(
                 "initial plan materialization requires a PLANNING Goal with plan_revision 0 and no Tasks"
                     .to_owned(),
@@ -825,10 +978,16 @@ impl Goal {
         let bindings = self
             .completion_criteria
             .iter()
-            .map(|criterion| GoalCriterionBinding::new(
-                criterion.id.clone(),
-                mandatory_ids.iter().cloned().map(|task_id| GoalVerificationRequirement::TaskVerified { task_id }).collect(),
-            ))
+            .map(|criterion| {
+                GoalCriterionBinding::new(
+                    criterion.id.clone(),
+                    mandatory_ids
+                        .iter()
+                        .cloned()
+                        .map(|task_id| GoalVerificationRequirement::TaskVerified { task_id })
+                        .collect(),
+                )
+            })
             .collect();
         self.materialize_initial_plan_with_contract(
             tasks,
@@ -853,9 +1012,10 @@ impl Goal {
             ));
         }
 
-        let next_plan_revision = self.plan_revision.checked_add(1).ok_or_else(|| {
-            OrchestratorError::InvalidDag("plan revision overflow".to_owned())
-        })?;
+        let next_plan_revision = self
+            .plan_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
         let criterion_additions = mutation.add_criterion_requirements;
         let before = self.clone();
         let dependency_targets = mutation
@@ -910,10 +1070,9 @@ impl Goal {
                         .to_owned(),
                 ));
             }
-            let task = candidate
-                .tasks
-                .get(&task_id)
-                .ok_or_else(|| OrchestratorError::InvalidDag("target task is missing".to_owned()))?;
+            let task = candidate.tasks.get(&task_id).ok_or_else(|| {
+                OrchestratorError::InvalidDag("target task is missing".to_owned())
+            })?;
             let mut dependencies = task.dependencies().to_vec();
             let mut seen = dependencies
                 .iter()
@@ -942,10 +1101,9 @@ impl Goal {
                         .to_owned(),
                 ));
             }
-            let task = candidate
-                .tasks
-                .get(&task_id)
-                .ok_or_else(|| OrchestratorError::InvalidDag("target task is missing".to_owned()))?;
+            let task = candidate.tasks.get(&task_id).ok_or_else(|| {
+                OrchestratorError::InvalidDag("target task is missing".to_owned())
+            })?;
             let mut verification = task.verification_specs().to_vec();
             for spec in additions {
                 if verification.contains(&spec) {
@@ -969,10 +1127,9 @@ impl Goal {
                     "duplicate mandatory strengthening".to_owned(),
                 ));
             }
-            let task = candidate
-                .tasks
-                .get_mut(&task_id)
-                .ok_or_else(|| OrchestratorError::InvalidDag("target task is missing".to_owned()))?;
+            let task = candidate.tasks.get_mut(&task_id).ok_or_else(|| {
+                OrchestratorError::InvalidDag("target task is missing".to_owned())
+            })?;
             if task.mandatory() {
                 return Err(OrchestratorError::InvalidDag(
                     "mandatory strengthening must change an optional Task".to_owned(),
@@ -990,13 +1147,13 @@ impl Goal {
             }
             if !dependency_targets.contains(&task_id) {
                 return Err(OrchestratorError::InvalidDag(
-                    "NEEDS_REPLAN may resolve only after a new prerequisite is committed".to_owned(),
+                    "NEEDS_REPLAN may resolve only after a new prerequisite is committed"
+                        .to_owned(),
                 ));
             }
-            let task = candidate
-                .tasks
-                .get(&task_id)
-                .ok_or_else(|| OrchestratorError::InvalidDag("target task is missing".to_owned()))?;
+            let task = candidate.tasks.get(&task_id).ok_or_else(|| {
+                OrchestratorError::InvalidDag("target task is missing".to_owned())
+            })?;
             if task.status() != TaskStatus::NeedsReplan {
                 return Err(OrchestratorError::InvalidDag(
                     "only NEEDS_REPLAN Tasks may be resolved by the Replanner".to_owned(),
@@ -1039,30 +1196,53 @@ impl Goal {
 
         {
             let spec = candidate.final_verification_spec.as_mut().ok_or_else(|| {
-                OrchestratorError::InvalidDag("replan requires an existing structured Goal final-verification contract".to_owned())
+                OrchestratorError::InvalidDag(
+                    "replan requires an existing structured Goal final-verification contract"
+                        .to_owned(),
+                )
             })?;
             spec.plan_revision = next_plan_revision;
-            let criterion_ids = candidate.completion_criteria.iter().map(|criterion| criterion.id.clone()).collect::<BTreeSet<_>>();
+            let criterion_ids = candidate
+                .completion_criteria
+                .iter()
+                .map(|criterion| criterion.id.clone())
+                .collect::<BTreeSet<_>>();
             let mut seen_criteria = BTreeSet::new();
             for (criterion_id, additions) in criterion_additions {
                 if !criterion_ids.contains(&criterion_id) {
-                    return Err(OrchestratorError::InvalidDag("replan criterion binding references an unknown completion criterion".to_owned()));
+                    return Err(OrchestratorError::InvalidDag(
+                        "replan criterion binding references an unknown completion criterion"
+                            .to_owned(),
+                    ));
                 }
                 if additions.is_empty() || !seen_criteria.insert(criterion_id.clone()) {
                     return Err(OrchestratorError::InvalidDag("criterion binding strengthening must be non-empty and grouped once per criterion".to_owned()));
                 }
-                let binding = spec.criterion_bindings.iter_mut().find(|binding| binding.criterion_id == criterion_id).ok_or_else(|| {
-                    OrchestratorError::InvalidDag("replan cannot create missing initial criterion coverage".to_owned())
-                })?;
+                let binding = spec
+                    .criterion_bindings
+                    .iter_mut()
+                    .find(|binding| binding.criterion_id == criterion_id)
+                    .ok_or_else(|| {
+                        OrchestratorError::InvalidDag(
+                            "replan cannot create missing initial criterion coverage".to_owned(),
+                        )
+                    })?;
                 for requirement in additions {
                     if binding.requirements.contains(&requirement) {
-                        return Err(OrchestratorError::InvalidDag("replan cannot duplicate an existing Goal verification requirement".to_owned()));
+                        return Err(OrchestratorError::InvalidDag(
+                            "replan cannot duplicate an existing Goal verification requirement"
+                                .to_owned(),
+                        ));
                     }
                     let task = candidate.tasks.get(requirement.task_id()).ok_or_else(|| {
-                        OrchestratorError::InvalidDag("criterion strengthening references a missing Task".to_owned())
+                        OrchestratorError::InvalidDag(
+                            "criterion strengthening references a missing Task".to_owned(),
+                        )
                     })?;
                     if !task.is_active_plan_authority() || !task.mandatory() {
-                        return Err(OrchestratorError::InvalidDag("TaskVerified may bind only a mandatory Task".to_owned()));
+                        return Err(OrchestratorError::InvalidDag(
+                            "TaskVerified may bind only a mandatory Task".to_owned(),
+                        ));
                     }
                     binding.requirements.push(requirement);
                 }
@@ -1330,20 +1510,31 @@ impl Goal {
             self.final_verification_spec = None;
             return;
         }
-        let mandatory_ids = self.tasks.iter()
+        let mandatory_ids = self
+            .tasks
+            .iter()
             .filter_map(|(task_id, task)| task.mandatory().then_some(task_id.clone()))
             .collect::<Vec<_>>();
         if mandatory_ids.is_empty() {
             self.final_verification_spec = None;
             return;
         }
-        let bindings = self.completion_criteria.iter().map(|criterion| {
-            GoalCriterionBinding::new(
-                criterion.id.clone(),
-                mandatory_ids.iter().cloned().map(|task_id| GoalVerificationRequirement::TaskVerified { task_id }).collect(),
-            )
-        }).collect();
-        self.final_verification_spec = Some(GoalFinalVerificationSpec::new(self.plan_revision, bindings));
+        let bindings = self
+            .completion_criteria
+            .iter()
+            .map(|criterion| {
+                GoalCriterionBinding::new(
+                    criterion.id.clone(),
+                    mandatory_ids
+                        .iter()
+                        .cloned()
+                        .map(|task_id| GoalVerificationRequirement::TaskVerified { task_id })
+                        .collect(),
+                )
+            })
+            .collect();
+        self.final_verification_spec =
+            Some(GoalFinalVerificationSpec::new(self.plan_revision, bindings));
     }
 
     #[cfg(test)]
@@ -1363,9 +1554,10 @@ impl Goal {
                 "terminal goal task graph is immutable".to_owned(),
             ));
         }
-        let next_plan_revision = self.plan_revision.checked_add(1).ok_or_else(|| {
-            OrchestratorError::InvalidDag("plan revision overflow".to_owned())
-        })?;
+        let next_plan_revision = self
+            .plan_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
         let task = Task::new(
             title,
             objective,
@@ -1386,7 +1578,11 @@ impl Goal {
         }
         candidate.plan_revision = next_plan_revision;
         candidate.rebuild_test_final_verification_contract();
-        if candidate.final_verification_spec.is_some() { candidate.validate()?; } else { candidate.validate_dag()?; }
+        if candidate.final_verification_spec.is_some() {
+            candidate.validate()?;
+        } else {
+            candidate.validate_dag()?;
+        }
         *self = candidate;
         Ok(id)
     }
@@ -1427,9 +1623,10 @@ impl Goal {
             .get_mut(task_id)
             .expect("target checked above")
             .strengthen_dependencies(dependencies, &completed)?;
-        candidate.plan_revision = candidate.plan_revision.checked_add(1).ok_or_else(|| {
-            OrchestratorError::InvalidDag("plan revision overflow".to_owned())
-        })?;
+        candidate.plan_revision = candidate
+            .plan_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
         candidate.rebuild_test_final_verification_contract();
         candidate.validate()?;
         *self = candidate;
@@ -1448,9 +1645,10 @@ impl Goal {
             .get_mut(task_id)
             .ok_or_else(|| OrchestratorError::InvalidDag("target task is missing".to_owned()))?
             .strengthen_verification(verification)?;
-        candidate.plan_revision = candidate.plan_revision.checked_add(1).ok_or_else(|| {
-            OrchestratorError::InvalidDag("plan revision overflow".to_owned())
-        })?;
+        candidate.plan_revision = candidate
+            .plan_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
         candidate.rebuild_test_final_verification_contract();
         candidate.validate()?;
         *self = candidate;
@@ -1881,9 +2079,15 @@ impl Goal {
                 "Goal final-verification record authority binding is invalid".to_owned(),
             ));
         }
-        let expected_digest = self.final_verification_spec.as_ref().ok_or_else(|| {
-            OrchestratorError::CorruptGoal("Goal final-verification contract is missing".to_owned())
-        })?.canonical_digest();
+        let expected_digest = self
+            .final_verification_spec
+            .as_ref()
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "Goal final-verification contract is missing".to_owned(),
+                )
+            })?
+            .canonical_digest();
         if record.contract_digest != expected_digest {
             return Err(OrchestratorError::CorruptGoal(
                 "Goal final-verification record contract digest is stale".to_owned(),
@@ -1894,7 +2098,11 @@ impl Goal {
                 "Goal final-verification committed revision binding is invalid".to_owned(),
             ));
         }
-        if self.final_verifications.iter().any(|existing| existing.id == record.id) {
+        if self
+            .final_verifications
+            .iter()
+            .any(|existing| existing.id == record.id)
+        {
             return Err(OrchestratorError::CorruptGoal(
                 "Goal final-verification identity is duplicated".to_owned(),
             ));
@@ -1930,7 +2138,11 @@ impl Goal {
     pub(crate) fn enter_verifying_for_test(&mut self, now: &str) -> Result<(), OrchestratorError> {
         let from = self.status;
         if from != GoalStatus::Running {
-            return Err(invalid_goal_transition(from, GoalStatus::Verifying, "test helper requires RUNNING"));
+            return Err(invalid_goal_transition(
+                from,
+                GoalStatus::Verifying,
+                "test helper requires RUNNING",
+            ));
         }
         self.require_goal_verification_entry_ready(from, GoalStatus::Verifying)?;
         self.status = GoalStatus::Verifying;
@@ -1944,42 +2156,57 @@ impl Goal {
         result: VerificationResult,
     ) -> Result<(), OrchestratorError> {
         if self.status != GoalStatus::Verifying {
-            return Err(invalid_goal_transition(self.status, self.status, "test final verification helper requires VERIFYING"));
+            return Err(invalid_goal_transition(
+                self.status,
+                self.status,
+                "test final verification helper requires VERIFYING",
+            ));
         }
         let spec = self.final_verification_spec.as_ref().ok_or_else(|| {
-            OrchestratorError::InvalidDag("test final verification helper requires structured contract".to_owned())
+            OrchestratorError::InvalidDag(
+                "test final verification helper requires structured contract".to_owned(),
+            )
         })?;
         let mut criterion_results = Vec::new();
         for binding in &spec.criterion_bindings {
-            let observations = binding.requirements.iter().map(|requirement| {
-                let task_id = requirement.task_id().clone();
-                let task = self.tasks.get(&task_id);
-                let latest = task.and_then(|task| task.verification_results().last());
-                GoalRequirementObservation::TaskVerified {
-                    task_id,
-                    task_status: task.map(|task| task.status()).unwrap_or(TaskStatus::Blocked),
-                    verification_id: latest.map(|verification| verification.id().clone()),
-                    verification_outcome: latest.map(|verification| verification.outcome()),
-                    outcome: latest.map(|verification| verification.outcome()).unwrap_or(VerificationOutcome::Indeterminate),
-                }
-            }).collect();
+            let observations = binding
+                .requirements
+                .iter()
+                .map(|requirement| {
+                    let task_id = requirement.task_id().clone();
+                    let task = self.tasks.get(&task_id);
+                    let latest = task.and_then(|task| task.verification_results().last());
+                    GoalRequirementObservation::TaskVerified {
+                        task_id,
+                        task_status: task
+                            .map(|task| task.status())
+                            .unwrap_or(TaskStatus::Blocked),
+                        verification_id: latest.map(|verification| verification.id().clone()),
+                        verification_outcome: latest.map(|verification| verification.outcome()),
+                        outcome: latest
+                            .map(|verification| verification.outcome())
+                            .unwrap_or(VerificationOutcome::Indeterminate),
+                    }
+                })
+                .collect();
             criterion_results.push(GoalCriterionVerificationResult::new(
                 binding.criterion_id.clone(),
                 result.outcome(),
                 observations,
             ));
         }
-        self.final_verifications.push(GoalFinalVerificationRecord::new(
-            result.outcome(),
-            self.id.clone(),
-            self.revision,
-            self.revision,
-            self.plan_revision,
-            spec.canonical_digest(),
-            criterion_results,
-            result.started_at().to_owned(),
-            result.finished_at().to_owned(),
-        ));
+        self.final_verifications
+            .push(GoalFinalVerificationRecord::new(
+                result.outcome(),
+                self.id.clone(),
+                self.revision,
+                self.revision,
+                self.plan_revision,
+                spec.canonical_digest(),
+                criterion_results,
+                result.started_at().to_owned(),
+                result.finished_at().to_owned(),
+            ));
         Ok(())
     }
 
@@ -2046,49 +2273,51 @@ impl Goal {
             (from, next),
             (
                 GoalStatus::Planning,
-                GoalStatus::Running | GoalStatus::Blocked | GoalStatus::Cancelling | GoalStatus::Failed
+                GoalStatus::Running
+                    | GoalStatus::Blocked
+                    | GoalStatus::Cancelling
+                    | GoalStatus::Failed
+            ) | (
+                GoalStatus::Running,
+                GoalStatus::Replanning
+                    | GoalStatus::Pausing
+                    | GoalStatus::Blocked
+                    | GoalStatus::Cancelling
+                    | GoalStatus::Failed
+            ) | (
+                GoalStatus::Replanning,
+                GoalStatus::Running
+                    | GoalStatus::Blocked
+                    | GoalStatus::Pausing
+                    | GoalStatus::Cancelling
+                    | GoalStatus::Failed
+            ) | (
+                GoalStatus::Pausing,
+                GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::Cancelling
+            ) | (
+                GoalStatus::Paused,
+                GoalStatus::Running
+                    | GoalStatus::Replanning
+                    | GoalStatus::Blocked
+                    | GoalStatus::Cancelling
+            ) | (
+                GoalStatus::Blocked,
+                GoalStatus::Running
+                    | GoalStatus::Replanning
+                    | GoalStatus::Paused
+                    | GoalStatus::Cancelling
+                    | GoalStatus::Failed
+            ) | (
+                GoalStatus::Verifying,
+                GoalStatus::Replanning
+                    | GoalStatus::Blocked
+                    | GoalStatus::Pausing
+                    | GoalStatus::Cancelling
+                    | GoalStatus::Failed
+            ) | (
+                GoalStatus::Cancelling,
+                GoalStatus::Cancelled | GoalStatus::Blocked
             )
-                | (
-                    GoalStatus::Running,
-                    GoalStatus::Replanning
-                        | GoalStatus::Pausing
-                        | GoalStatus::Blocked
-                        | GoalStatus::Cancelling
-                        | GoalStatus::Failed
-                )
-                | (
-                    GoalStatus::Replanning,
-                    GoalStatus::Running
-                        | GoalStatus::Blocked
-                        | GoalStatus::Pausing
-                        | GoalStatus::Cancelling
-                        | GoalStatus::Failed
-                )
-                | (
-                    GoalStatus::Pausing,
-                    GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::Cancelling
-                )
-                | (
-                    GoalStatus::Paused,
-                    GoalStatus::Running | GoalStatus::Replanning | GoalStatus::Blocked | GoalStatus::Cancelling
-                )
-                | (
-                    GoalStatus::Blocked,
-                    GoalStatus::Running
-                        | GoalStatus::Replanning
-                        | GoalStatus::Paused
-                        | GoalStatus::Cancelling
-                        | GoalStatus::Failed
-                )
-                | (
-                    GoalStatus::Verifying,
-                    GoalStatus::Replanning
-                        | GoalStatus::Blocked
-                        | GoalStatus::Pausing
-                        | GoalStatus::Cancelling
-                        | GoalStatus::Failed
-                )
-                | (GoalStatus::Cancelling, GoalStatus::Cancelled | GoalStatus::Blocked)
         );
         if !allowed {
             return Err(invalid_goal_transition(
@@ -2108,17 +2337,18 @@ impl Goal {
                 ));
             }
         }
-        if from == GoalStatus::Cancelling && next == GoalStatus::Cancelled {
-            if self.tasks.values().any(|task| {
+        if from == GoalStatus::Cancelling
+            && next == GoalStatus::Cancelled
+            && self.tasks.values().any(|task| {
                 matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying)
                     || task.has_unknown_side_effect()
-            }) {
-                return Err(invalid_goal_transition(
-                    from,
-                    next,
-                    "active work or unresolved side effects remain",
-                ));
-            }
+            })
+        {
+            return Err(invalid_goal_transition(
+                from,
+                next,
+                "active work or unresolved side effects remain",
+            ));
         }
         self.status = next;
         self.updated_at = now.to_owned();
@@ -2194,7 +2424,9 @@ impl Goal {
             return self.validate_legacy_schema1_terminal();
         }
         if self.schema_version != GOAL_SCHEMA_VERSION {
-            return Err(OrchestratorError::UnsupportedSchema(self.schema_version as u64));
+            return Err(OrchestratorError::UnsupportedSchema(
+                self.schema_version as u64,
+            ));
         }
         if self.revision == 0 {
             return Err(OrchestratorError::CorruptGoal(
@@ -2249,7 +2481,8 @@ impl Goal {
                 || record.contract_digest.len() != 64
             {
                 return Err(OrchestratorError::CorruptGoal(
-                    "Goal final-verification history contains an invalid authority binding".to_owned(),
+                    "Goal final-verification history contains an invalid authority binding"
+                        .to_owned(),
                 ));
             }
         }
@@ -2425,9 +2658,10 @@ impl Goal {
             ));
         }
         if self.status.is_terminal()
-            && self.tasks.values().any(|task| {
-                matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying)
-            })
+            && self
+                .tasks
+                .values()
+                .any(|task| matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying))
         {
             return Err(OrchestratorError::CorruptGoal(
                 "terminal goal contains active task state".to_owned(),
@@ -2444,13 +2678,17 @@ impl Goal {
             return Err(OrchestratorError::SchemaUpgradeRequired(1));
         }
         if self.revision == 0 {
-            return Err(OrchestratorError::CorruptGoal("legacy Goal revision must start at 1".to_owned()));
+            return Err(OrchestratorError::CorruptGoal(
+                "legacy Goal revision must start at 1".to_owned(),
+            ));
         }
         self.id.validate()?;
         config::validate_session_id(&self.session_id)
             .map_err(|_| OrchestratorError::CorruptGoal("invalid legacy session_id".to_owned()))?;
         if self.objective.trim().is_empty() || self.completed_at.is_none() {
-            return Err(OrchestratorError::CorruptGoal("legacy terminal Goal shape is invalid".to_owned()));
+            return Err(OrchestratorError::CorruptGoal(
+                "legacy terminal Goal shape is invalid".to_owned(),
+            ));
         }
         self.validate_dag()?;
         Ok(())
@@ -2458,45 +2696,67 @@ impl Goal {
 
     pub(crate) fn validate_final_verification_contract(&self) -> Result<(), OrchestratorError> {
         if self.schema_version != GOAL_SCHEMA_VERSION {
-            return Err(OrchestratorError::SchemaUpgradeRequired(self.schema_version as u64));
+            return Err(OrchestratorError::SchemaUpgradeRequired(
+                self.schema_version as u64,
+            ));
         }
         let spec = self.final_verification_spec.as_ref().ok_or_else(|| {
-            OrchestratorError::InvalidDag("structured Goal final-verification contract is missing".to_owned())
+            OrchestratorError::InvalidDag(
+                "structured Goal final-verification contract is missing".to_owned(),
+            )
         })?;
         if spec.plan_revision != self.plan_revision {
             return Err(OrchestratorError::InvalidDag(
                 "Goal final-verification contract plan_revision is stale".to_owned(),
             ));
         }
-        let criterion_ids = self.completion_criteria.iter().map(|criterion| criterion.id.clone()).collect::<BTreeSet<_>>();
+        let criterion_ids = self
+            .completion_criteria
+            .iter()
+            .map(|criterion| criterion.id.clone())
+            .collect::<BTreeSet<_>>();
         let mut bound = BTreeSet::new();
         for binding in &spec.criterion_bindings {
             binding.criterion_id.validate()?;
             if !criterion_ids.contains(&binding.criterion_id) {
-                return Err(OrchestratorError::InvalidDag("Goal verification binding references an unknown criterion".to_owned()));
+                return Err(OrchestratorError::InvalidDag(
+                    "Goal verification binding references an unknown criterion".to_owned(),
+                ));
             }
             if !bound.insert(binding.criterion_id.clone()) {
-                return Err(OrchestratorError::InvalidDag("Goal verification criterion binding is duplicated".to_owned()));
+                return Err(OrchestratorError::InvalidDag(
+                    "Goal verification criterion binding is duplicated".to_owned(),
+                ));
             }
             if binding.requirements.is_empty() {
-                return Err(OrchestratorError::InvalidDag("required completion criterion has no structured proof requirement".to_owned()));
+                return Err(OrchestratorError::InvalidDag(
+                    "required completion criterion has no structured proof requirement".to_owned(),
+                ));
             }
             let mut seen_requirements = BTreeSet::new();
             for requirement in &binding.requirements {
                 if !seen_requirements.insert(requirement.clone()) {
-                    return Err(OrchestratorError::InvalidDag("Goal verification requirement is duplicated".to_owned()));
+                    return Err(OrchestratorError::InvalidDag(
+                        "Goal verification requirement is duplicated".to_owned(),
+                    ));
                 }
                 let task = self.tasks.get(requirement.task_id()).ok_or_else(|| {
-                    OrchestratorError::InvalidDag("TaskVerified binding references a missing Task".to_owned())
+                    OrchestratorError::InvalidDag(
+                        "TaskVerified binding references a missing Task".to_owned(),
+                    )
                 })?;
                 if !task.is_active_plan_authority() || !task.mandatory() {
-                    return Err(OrchestratorError::InvalidDag("TaskVerified binding references a non-mandatory Task".to_owned()));
+                    return Err(OrchestratorError::InvalidDag(
+                        "TaskVerified binding references a non-mandatory Task".to_owned(),
+                    ));
                 }
             }
         }
         for criterion in &self.completion_criteria {
             if criterion.required && !bound.contains(&criterion.id) {
-                return Err(OrchestratorError::InvalidDag("required completion criterion is not structurally mapped".to_owned()));
+                return Err(OrchestratorError::InvalidDag(
+                    "required completion criterion is not structurally mapped".to_owned(),
+                ));
             }
         }
         Ok(())
@@ -2509,7 +2769,9 @@ impl Goal {
                     "task map key does not match task ID".to_owned(),
                 ));
             }
-            if task.created_plan_revision() == 0 || task.created_plan_revision() > self.plan_revision {
+            if task.created_plan_revision() == 0
+                || task.created_plan_revision() > self.plan_revision
+            {
                 return Err(OrchestratorError::InvalidDag(
                     "task created_plan_revision is outside the Goal plan history".to_owned(),
                 ));
@@ -2635,7 +2897,10 @@ impl Goal {
             .filter(|task| task.is_active_plan_authority() && task.mandatory())
             .any(|task| task.status() != TaskStatus::Completed)
             || self.tasks.values().any(|task| {
-                matches!(task.status(), TaskStatus::Running | TaskStatus::Verifying | TaskStatus::NeedsReplan)
+                matches!(
+                    task.status(),
+                    TaskStatus::Running | TaskStatus::Verifying | TaskStatus::NeedsReplan
+                )
             })
             || self.has_unresolved_mandatory_blocker()
             || self.tasks.values().any(Task::has_unknown_side_effect)
@@ -2716,7 +2981,9 @@ impl Goal {
                 "unresolved blocker or unknown side effect remains",
             ));
         }
-        if self.latest_applicable_final_verification().map(GoalFinalVerificationRecord::outcome)
+        if self
+            .latest_applicable_final_verification()
+            .map(GoalFinalVerificationRecord::outcome)
             != Some(VerificationOutcome::Passed)
         {
             return Err(invalid_goal_transition(
@@ -2750,8 +3017,11 @@ impl Goal {
 }
 
 fn record_task_identities_current(goal: &Goal, record: &GoalFinalVerificationRecord) -> bool {
-    record.criterion_results.iter().flat_map(|criterion| criterion.observations.iter()).all(|observation| {
-        match observation {
+    record
+        .criterion_results
+        .iter()
+        .flat_map(|criterion| criterion.observations.iter())
+        .all(|observation| match observation {
             GoalRequirementObservation::TaskVerified {
                 task_id,
                 task_status,
@@ -2759,9 +3029,17 @@ fn record_task_identities_current(goal: &Goal, record: &GoalFinalVerificationRec
                 verification_outcome,
                 ..
             } => {
-                let Some(task) = goal.tasks.get(task_id) else { return false; };
-                if task.status() != *task_status { return false; }
-                match (verification_id, verification_outcome, task.verification_results().last()) {
+                let Some(task) = goal.tasks.get(task_id) else {
+                    return false;
+                };
+                if task.status() != *task_status {
+                    return false;
+                }
+                match (
+                    verification_id,
+                    verification_outcome,
+                    task.verification_results().last(),
+                ) {
                     (Some(expected_id), Some(expected_outcome), Some(current)) => {
                         current.id() == expected_id && current.outcome() == *expected_outcome
                     }
@@ -2769,8 +3047,7 @@ fn record_task_identities_current(goal: &Goal, record: &GoalFinalVerificationRec
                     _ => false,
                 }
             }
-        }
-    })
+        })
 }
 
 fn validate_replan_history_immutability(
@@ -2779,7 +3056,9 @@ fn validate_replan_history_immutability(
 ) -> Result<(), OrchestratorError> {
     for (task_id, old) in &before.tasks {
         let new = after.tasks.get(task_id).ok_or_else(|| {
-            OrchestratorError::InvalidDag("replanning cannot delete existing Task history".to_owned())
+            OrchestratorError::InvalidDag(
+                "replanning cannot delete existing Task history".to_owned(),
+            )
         })?;
         if old.is_terminal() {
             if old != new {
@@ -2858,10 +3137,7 @@ fn invalid_goal_transition(
     )
 }
 
-fn serialize_tasks<S>(
-    tasks: &BTreeMap<TaskId, Task>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_tasks<S>(tasks: &BTreeMap<TaskId, Task>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -2935,15 +3211,19 @@ mod tests {
             active_worker_stopped: true,
             side_effect_reconciled: true,
         };
-        goal.transition_task(id, TaskStatus::Ready, safe, NOW).unwrap();
-        goal.transition_task(id, TaskStatus::Running, safe, NOW).unwrap();
-        goal.transition_task(id, TaskStatus::Verifying, safe, NOW).unwrap();
+        goal.transition_task(id, TaskStatus::Ready, safe, NOW)
+            .unwrap();
+        goal.transition_task(id, TaskStatus::Running, safe, NOW)
+            .unwrap();
+        goal.transition_task(id, TaskStatus::Verifying, safe, NOW)
+            .unwrap();
         goal.task_record_verification_result(
             id,
             VerificationResult::new(VerificationOutcome::Passed, vec![], NOW, NOW),
         )
         .unwrap();
-        goal.transition_task(id, TaskStatus::Completed, safe, NOW).unwrap();
+        goal.transition_task(id, TaskStatus::Completed, safe, NOW)
+            .unwrap();
     }
 
     #[test]
@@ -2989,8 +3269,10 @@ mod tests {
         let b = add_task(&mut goal, true);
         let c = add_task(&mut goal, true);
         let d = add_task(&mut goal, true);
-        goal.strengthen_task_dependencies(&b, vec![a.clone()]).unwrap();
-        goal.strengthen_task_dependencies(&c, vec![a.clone()]).unwrap();
+        goal.strengthen_task_dependencies(&b, vec![a.clone()])
+            .unwrap();
+        goal.strengthen_task_dependencies(&c, vec![a.clone()])
+            .unwrap();
         goal.strengthen_task_dependencies(&d, vec![b, c]).unwrap();
         goal.validate_dag().unwrap();
     }
@@ -3000,9 +3282,16 @@ mod tests {
         let mut goal = goal();
         let a = add_task(&mut goal, true);
         let b = add_task(&mut goal, true);
-        assert!(goal.strengthen_task_dependencies(&a, vec![a.clone()]).is_err());
-        assert!(goal.strengthen_task_dependencies(&a, vec![TaskId::new()]).is_err());
-        goal.strengthen_task_dependencies(&b, vec![a.clone()]).unwrap();
+        assert!(
+            goal.strengthen_task_dependencies(&a, vec![a.clone()])
+                .is_err()
+        );
+        assert!(
+            goal.strengthen_task_dependencies(&a, vec![TaskId::new()])
+                .is_err()
+        );
+        goal.strengthen_task_dependencies(&b, vec![a.clone()])
+            .unwrap();
         assert!(goal.strengthen_task_dependencies(&a, vec![b]).is_err());
     }
 
@@ -3011,9 +3300,10 @@ mod tests {
         let mut goal = goal();
         let a = add_task(&mut goal, true);
         let b = add_task(&mut goal, true);
-        assert!(goal
-            .strengthen_task_dependencies(&b, vec![a.clone(), a])
-            .is_err());
+        assert!(
+            goal.strengthen_task_dependencies(&b, vec![a.clone(), a])
+                .is_err()
+        );
     }
 
     #[test]
@@ -3021,9 +3311,10 @@ mod tests {
         let mut goal = goal();
         let optional = add_task(&mut goal, false);
         let mandatory = add_task(&mut goal, true);
-        assert!(goal
-            .strengthen_task_dependencies(&mandatory, vec![optional])
-            .is_err());
+        assert!(
+            goal.strengthen_task_dependencies(&mandatory, vec![optional])
+                .is_err()
+        );
     }
 
     #[test]
@@ -3031,10 +3322,12 @@ mod tests {
         let mut goal = goal();
         let a = add_task(&mut goal, true);
         let b = add_task(&mut goal, true);
-        goal.strengthen_task_dependencies(&b, vec![a.clone()]).unwrap();
-        assert!(goal
-            .transition_task(&b, TaskStatus::Ready, TaskTransitionContext::default(), NOW)
-            .is_err());
+        goal.strengthen_task_dependencies(&b, vec![a.clone()])
+            .unwrap();
+        assert!(
+            goal.transition_task(&b, TaskStatus::Ready, TaskTransitionContext::default(), NOW)
+                .is_err()
+        );
         complete_task(&mut goal, &a);
         goal.transition_task(&b, TaskStatus::Ready, TaskTransitionContext::default(), NOW)
             .unwrap();
@@ -3057,7 +3350,8 @@ mod tests {
         ))
         .unwrap();
         assert!(goal.transition_to(GoalStatus::Completed, NOW).is_err());
-        goal.add_checkpoint(CheckpointReason::FinalVerification, NOW).unwrap();
+        goal.add_checkpoint(CheckpointReason::FinalVerification, NOW)
+            .unwrap();
         assert!(goal.transition_to(GoalStatus::Completed, NOW).is_err());
         crate::goal_finalizer::complete_goal_for_test(&mut goal, NOW).unwrap();
         assert!(goal.is_terminal());
@@ -3113,15 +3407,16 @@ mod tests {
         let mut goal = goal();
         let id = add_task(&mut goal, true);
         complete_task(&mut goal, &id);
-        assert!(goal
-            .task_add_evidence(
+        assert!(
+            goal.task_add_evidence(
                 &id,
                 TaskEvidence::ReviewResult {
                     summary: "late rewrite".into(),
                     blocking_findings: 0,
                 },
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -3129,7 +3424,8 @@ mod tests {
         let mut goal = goal();
         let a = add_task(&mut goal, true);
         let b = add_task(&mut goal, true);
-        goal.strengthen_task_dependencies(&b, vec![a.clone()]).unwrap();
+        goal.strengthen_task_dependencies(&b, vec![a.clone()])
+            .unwrap();
         let before = goal.clone();
         assert!(goal.strengthen_task_dependencies(&a, vec![b]).is_err());
         assert_eq!(goal, before);
@@ -3140,9 +3436,10 @@ mod tests {
         let mut goal = goal();
         let task = add_task(&mut goal, true);
         let before = goal.clone();
-        assert!(goal
-            .strengthen_task_dependencies(&task, vec![TaskId::new()])
-            .is_err());
+        assert!(
+            goal.strengthen_task_dependencies(&task, vec![TaskId::new()])
+                .is_err()
+        );
         assert_eq!(goal, before);
     }
 
@@ -3151,7 +3448,8 @@ mod tests {
         let mut goal = goal();
         let dependency = add_task(&mut goal, true);
         let task = add_task(&mut goal, true);
-        goal.strengthen_task_dependencies(&task, vec![dependency]).unwrap();
+        goal.strengthen_task_dependencies(&task, vec![dependency])
+            .unwrap();
         let before = goal.clone();
         assert!(goal.strengthen_task_dependencies(&task, vec![]).is_err());
         assert_eq!(goal, before);
@@ -3179,15 +3477,16 @@ mod tests {
         let task = add_task(&mut goal, true);
         complete_task(&mut goal, &task);
         let before = goal.clone();
-        assert!(goal
-            .task_add_evidence(
+        assert!(
+            goal.task_add_evidence(
                 &task,
                 TaskEvidence::ReviewResult {
                     summary: "late rewrite".into(),
                     blocking_findings: 0,
                 },
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(goal, before);
     }
 
@@ -3205,7 +3504,8 @@ mod tests {
             NOW,
         ))
         .unwrap();
-        goal.add_checkpoint(CheckpointReason::FinalVerification, NOW).unwrap();
+        goal.add_checkpoint(CheckpointReason::FinalVerification, NOW)
+            .unwrap();
         assert!(goal.transition_to(GoalStatus::Completed, NOW).is_err());
     }
 }

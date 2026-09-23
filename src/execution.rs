@@ -49,6 +49,7 @@ pub(crate) async fn write_file_content(
     {
         // Windows has no application sandbox here, so avoid depending on a
         // shell utility for the file-edit operation.
+        let _ = parent;
         tokio::fs::write(absolute, content).await?;
         Ok(sandbox::Output {
             status: 0,
@@ -58,10 +59,7 @@ pub(crate) async fn write_file_content(
     }
 }
 
-pub(crate) async fn execute(
-    args: &Value,
-    session: &config::Session,
-) -> Result<ExecutionOutcome> {
+pub(crate) async fn execute(args: &Value, session: &config::Session) -> Result<ExecutionOutcome> {
     let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
@@ -80,7 +78,8 @@ pub(crate) async fn start_command(
     args: &Value,
     session: &config::Session,
 ) -> Result<BackgroundExecution> {
-    let (rendered_command, handle) = spawn_sandboxed_command("start_command", args, session).await?;
+    let (rendered_command, handle) =
+        spawn_sandboxed_command("start_command", args, session).await?;
     Ok(BackgroundExecution {
         rendered_command,
         handle,
@@ -96,14 +95,14 @@ pub(crate) fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-pub(crate) fn cwd(args: &Value, session_cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
     let path = args
         .get("cwd")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .map(|path| resolve_path(session_cwd, path))
-        .unwrap_or_else(|| session_cwd.to_owned());
-    std::fs::canonicalize(&path).with_context(|| format!("cannot resolve cwd {}", path.display()))
+        .map(|path| resolve_path(&session.cwd, path))
+        .unwrap_or_else(|| session.cwd.clone());
+    config::validate_path_authority(session, &path, config::PathIntent::ExecutionCwd)
 }
 
 pub(crate) fn required_command(args: &Value) -> Result<Vec<String>> {
@@ -178,7 +177,7 @@ async fn spawn_sandboxed_command(
     session: &config::Session,
 ) -> Result<(String, JoinHandle<Result<String>>)> {
     let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
+    let cwd = cwd(args, session)?;
     let policy = execution_policy(args)?;
     if primary_execution_requires_approval(policy.primary_execution_mode) {
         let approved = approvals::request(
@@ -190,10 +189,9 @@ async fn spawn_sandboxed_command(
         .await?;
         ensure_primary_execution_authorized(policy.primary_execution_mode, approved, operation)?;
     }
-    let mut roots = session.permitted_directories.clone();
-    if !roots.iter().any(|root| cwd.starts_with(root)) {
-        roots.push(cwd.clone());
-    }
+    // The caller-provided cwd was validated against the persisted roots above.
+    // It must never become a new sandbox root.
+    let roots = session.permitted_directories.clone();
 
     let pre_index_snapshot =
         capture_index_snapshot_if_needed(&command, &cwd, policy.operation.as_ref()).await;
@@ -665,7 +663,10 @@ async fn emit_fallback_trace(
     .await;
 }
 
-pub(crate) async fn codex_fallback(args: &Value, session: &config::Session) -> Result<BackgroundExecution> {
+pub(crate) async fn codex_fallback(
+    args: &Value,
+    session: &config::Session,
+) -> Result<BackgroundExecution> {
     let task = args
         .get("task")
         .and_then(Value::as_str)
@@ -676,7 +677,7 @@ pub(crate) async fn codex_fallback(args: &Value, session: &config::Session) -> R
         .and_then(Value::as_str)
         .context("missing blocker")?;
     anyhow::ensure!(blocker.len() <= 64 * 1024, "blocker is too large");
-    let cwd = cwd(args, &session.cwd)?;
+    let cwd = cwd(args, session)?;
     let request_id = Uuid::new_v4().to_string();
     let mode = args
         .get("mode")
@@ -716,6 +717,15 @@ pub(crate) async fn codex_fallback(args: &Value, session: &config::Session) -> R
     {
         anyhow::bail!("terminal platform/safety classification: Codex fallback is not permitted");
     }
+
+    // Public MCP callers may request diagnosis only. Executable fallback is an
+    // internal continuation of the host-observed execute/start_command path;
+    // accepting caller-supplied lifecycle, failure, or side-effect facts here
+    // would turn assertions into authority.
+    anyhow::ensure!(
+        mode == "DIAGNOSE_ONLY",
+        "EXECUTE_AUTHORIZED_OPERATION is not available through the public MCP surface"
+    );
 
     match mode {
         "DIAGNOSE_ONLY" => {
@@ -762,7 +772,11 @@ pub(crate) async fn codex_fallback(args: &Value, session: &config::Session) -> R
                 report_command_finished(session_id, &task_label, &result).await;
                 result
             });
-            Ok(BackgroundExecution { rendered_command: label, handle, activity: "Started" })
+            Ok(BackgroundExecution {
+                rendered_command: label,
+                handle,
+                activity: "Started",
+            })
         }
         "EXECUTE_AUTHORIZED_OPERATION" => {
             let failure_class = explicit_failure_class
@@ -862,7 +876,11 @@ pub(crate) async fn codex_fallback(args: &Value, session: &config::Session) -> R
                 report_command_finished(session_id, &task_label, &result).await;
                 result
             });
-            Ok(BackgroundExecution { rendered_command: label, handle, activity: "Started" })
+            Ok(BackgroundExecution {
+                rendered_command: label,
+                handle,
+                activity: "Started",
+            })
         }
         other => anyhow::bail!("unsupported fallback mode: {other}"),
     }
@@ -873,13 +891,18 @@ fn parse_failure_class(value: &str) -> Result<fallback::FailureClass> {
         .with_context(|| format!("invalid failure_class: {value}"))
 }
 
-pub(crate) async fn without_sandbox(args: &Value, session: &config::Session) -> Result<ExecutionOutcome> {
+pub(crate) async fn without_sandbox(
+    args: &Value,
+    session: &config::Session,
+) -> Result<ExecutionOutcome> {
     let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
+    let cwd = cwd(args, session)?;
     if !approvals::request(
         &session.id,
         "without_sandbox",
-        format!("argv: {command:?}"),
+        format!(
+            "mode=HOST_NATIVE sandboxed=false network=true mutation_capable=true argv={command:?}"
+        ),
         cwd.clone(),
     )
     .await?

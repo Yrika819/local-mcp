@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
+use crate::agent::safe_diagnostic_for_test;
 use crate::agent::{
     AgentError, MODEL_PROMPT_LIMIT, MODEL_STDERR_LIMIT, MODEL_STDOUT_LIMIT, ModelInvocation,
     ModelInvocationOutput, ModelRole, ModelTransport, configured_model_from_for_test,
-    require_approval_for_test, run_bounded_process_for_test, safe_diagnostic_for_test,
+    require_approval_for_test, run_bounded_process_for_test,
 };
 
 #[derive(Default)]
@@ -56,6 +58,7 @@ fn model_roles_are_fixed_and_provider_free() {
     assert_eq!(ModelRole::Replanner.as_str(), "REPLANNER");
 }
 
+#[cfg(unix)]
 fn command(program: &str, args: &[&str]) -> Vec<String> {
     std::iter::once(program.to_owned())
         .chain(args.iter().map(|arg| (*arg).to_owned()))
@@ -158,7 +161,10 @@ fn model_config_and_approval_are_host_owned_and_typed() {
         configured_model_from_for_test(Some("bad\nmodel"), "fallback-model").unwrap_err(),
         AgentError::InvalidConfiguration
     );
-    assert_eq!(require_approval_for_test(false), Err(AgentError::ApprovalDenied));
+    assert_eq!(
+        require_approval_for_test(false),
+        Err(AgentError::ApprovalDenied)
+    );
     assert_eq!(require_approval_for_test(true), Ok(()));
 }
 

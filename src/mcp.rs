@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -48,6 +49,13 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 /// `ping` or `session_info`. Responses are funneled through a single
 /// serialized writer task, so stdout framing stays valid and request IDs are
 /// preserved even when responses complete out of order.
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "The MCP process entrypoint is not called by the in-process test harness."
+    )
+)]
 pub async fn serve() -> Result<()> {
     serve_with_io(tokio::io::stdin(), tokio::io::stdout()).await
 }
@@ -80,7 +88,8 @@ where
     // `MAX_CONCURRENT_REQUESTS` handlers run at once. Permits are `async` and
     // are acquired *before* a task is spawned, which means the read loop is
     // throttled, not the response path.
-    let dispatch_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));
+    let dispatch_permits =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));
 
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
@@ -221,7 +230,7 @@ pub(crate) fn tools() -> Value {
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"accepted_exit_codes":{"type":"array","items":{"type":"integer"},"maxItems":32},"operation":{"type":"object"},"fallback_depth":{"type":"integer","minimum":0,"maximum":1}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"codex_fallback","description":"Policy V2 explicit Codex fallback. Defaults to DIAGNOSE_ONLY and always runs Codex read-only. EXECUTE_AUTHORIZED_OPERATION additionally requires an explicit structured allowlisted operation and exact command; the host, not Codex, executes the generated exact operation and independently verifies it. Platform/safety blocks are terminal.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1},"blocker":{"type":"string","minLength":1},"phase":{"type":"string"},"mode":{"type":"string","enum":["DIAGNOSE_ONLY","EXECUTE_AUTHORIZED_OPERATION"],"default":"DIAGNOSE_ONLY"},"failure_class":{"type":"string","enum":["SANDBOX_PERMISSION","HOST_ENVIRONMENT","TOOL_MISSING","NETWORK_REMOTE","SEMANTIC_FAILURE","PLATFORM_SAFETY","TRANSPORT_FAILURE","UNKNOWN"]},"original_host_reached":{"type":"boolean"},"original_command_started":{"type":"boolean"},"original_command_finished":{"type":"boolean"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"operation":{"type":"object"},"fallback_depth":{"type":"integer","minimum":0,"maximum":1},"cwd":{"type":"string"},"requires_code_change":{"type":"boolean","default":false},"remote_side_effect":{"type":"string","enum":["none","not_started","unknown"],"default":"none"}},"required":["session_id","task","blocker"],"additionalProperties":false}},
+        {"name":"codex_fallback","description":"Diagnose-only Codex fallback. The host may invoke Codex read-only for bounded diagnosis; public callers cannot supply execution authority, lifecycle evidence, side-effect state, or a host-native command. Platform/safety blocks are terminal.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1},"blocker":{"type":"string","minLength":1},"phase":{"type":"string"},"failure_class":{"type":"string","enum":["SANDBOX_PERMISSION","HOST_ENVIRONMENT","TOOL_MISSING","NETWORK_REMOTE","SEMANTIC_FAILURE","PLATFORM_SAFETY","TRANSPORT_FAILURE","UNKNOWN"]},"cwd":{"type":"string"},"requires_code_change":{"type":"boolean","default":false}},"required":["session_id","task","blocker"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode. Returns normally when it finishes within 20 seconds; longer commands continue as a background job and return a job_id for poll_job/stop_job.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"goal_start","description":"Create one durable non-terminal Goal for this Local MCP session. This does not execute tasks or repository work in Phase 3.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"objective":{"type":"string","minLength":1,"maxLength":131072},"title":{"type":"string","maxLength":256},"constraints":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"completion_criteria":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"idempotency_key":{"type":"string","maxLength":128}},"required":["session_id","objective"]}},
         {"name":"goal_status","description":"Read the current durable Goal status without recovery, execution, or mutation. Omit goal_id to resolve the unique non-terminal Goal for the session.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"}},"required":["session_id"]}},
@@ -269,7 +278,7 @@ pub(crate) fn tools() -> Value {
     for tool in tools.as_array_mut().unwrap() {
         if matches!(
             tool.get("name").and_then(Value::as_str),
-            Some("execute" | "start_command" | "codex_fallback")
+            Some("execute" | "start_command")
         ) && let Some(operation) = tool.pointer_mut("/inputSchema/properties/operation")
         {
             *operation = operation_schema.clone();
@@ -301,7 +310,12 @@ async fn call_tool(params: &Value) -> Result<Value> {
             text_result(serde_json::to_string_pretty(&session)?)
         }
         "get_image" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let requested = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let path = config::validate_path_authority(
+                &session,
+                &requested,
+                config::PathIntent::ReadExisting,
+            )?;
             let result = get_image(&path).await;
             report_result(
                 &session.id,
@@ -312,7 +326,12 @@ async fn call_tool(params: &Value) -> Result<Value> {
             result
         }
         "read_file" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let requested = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let path = config::validate_path_authority(
+                &session,
+                &requested,
+                config::PathIntent::ReadExisting,
+            )?;
             let result = tokio::fs::read_to_string(&path)
                 .await
                 .context("failed to read file");
@@ -325,7 +344,12 @@ async fn call_tool(params: &Value) -> Result<Value> {
             text_result(result?)
         }
         "list_directory" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let requested = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let path = config::validate_path_authority(
+                &session,
+                &requested,
+                config::PathIntent::ListDirectory,
+            )?;
             let result = list_directory(&path).await;
             report_result(
                 &session.id,
@@ -462,8 +486,12 @@ fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
     execution::resolve_path(session_cwd, path)
 }
 
-fn cwd(args: &Value, session_cwd: &Path) -> Result<PathBuf> {
-    execution::cwd(args, session_cwd)
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates path authority to the live execution module."
+)]
+fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
+    execution::cwd(args, session)
 }
 
 async fn list_directory(path: &Path) -> Result<String> {
@@ -482,7 +510,15 @@ async fn list_directory(path: &Path) -> Result<String> {
 }
 
 async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
-    let absolute = resolve_path(&session.cwd, required_path(args, "path")?);
+    let requested = resolve_path(&session.cwd, required_path(args, "path")?);
+    // Prefer symlink_metadata over exists(): a dangling final symlink must not
+    // be classified as a creatable new file (write would follow the link).
+    let intent = if requested.symlink_metadata().is_ok() {
+        config::PathIntent::WriteExisting
+    } else {
+        config::PathIntent::CreateFile
+    };
+    let absolute = config::validate_path_authority(session, &requested, intent)?;
     let parent = absolute.parent().context("file has no parent directory")?;
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("parent does not exist: {}", parent.display()))?;
@@ -490,6 +526,20 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         .get("content")
         .and_then(Value::as_str)
         .context("missing content")?;
+    #[cfg(windows)]
+    anyhow::ensure!(
+        approvals::request(
+            &session.id,
+            "write_file_host_native",
+            format!(
+                "mode=HOST_NATIVE sandboxed=false network=false mutation_capable=true path={}",
+                absolute.display()
+            ),
+            session.cwd.clone(),
+        )
+        .await?,
+        "user denied host-native write_file"
+    );
     let previous = tokio::fs::read_to_string(&absolute)
         .await
         .unwrap_or_default();
@@ -535,14 +585,26 @@ async fn start_command(args: &Value, session: &config::Session) -> Result<Value>
     store_execution_job(session, job).await
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates execution policy to the live execution module."
+)]
 fn primary_execution_mode() -> fallback::PrimaryExecutionMode {
     execution::primary_execution_mode()
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates approval policy to the live execution module."
+)]
 fn primary_execution_requires_approval(mode: fallback::PrimaryExecutionMode) -> bool {
     execution::primary_execution_requires_approval(mode)
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates authorization to the live execution module."
+)]
 fn ensure_primary_execution_authorized(
     mode: fallback::PrimaryExecutionMode,
     approved: bool,
@@ -551,10 +613,18 @@ fn ensure_primary_execution_authorized(
     execution::ensure_primary_execution_authorized(mode, approved, operation)
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates execution policy to the live execution module."
+)]
 fn execution_policy(args: &Value) -> Result<execution::ExecutionPolicy> {
     execution::execution_policy(args)
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates result processing to the live execution module."
+)]
 async fn process_sandboxed_attempt(
     session_id: &str,
     command: &[String],
@@ -648,6 +718,10 @@ fn required_job_id(args: &Value) -> Result<Uuid> {
     Uuid::parse_str(value).context("invalid job_id")
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates command validation to the live execution module."
+)]
 fn required_command(args: &Value) -> Result<Vec<String>> {
     execution::required_command(args)
 }
@@ -831,10 +905,18 @@ fn trace_outcome_name(outcome: &goal_runner::GoalRunTraceOutcome) -> &'static st
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates command rendering to the live execution module."
+)]
 fn render_command(command: &[String]) -> String {
     execution::render_command(command)
 }
 
+#[expect(
+    dead_code,
+    reason = "Legacy MCP test seam delegates shell-word rendering to the live execution module."
+)]
 fn shell_word(value: &str) -> String {
     execution::shell_word(value)
 }
@@ -1176,7 +1258,10 @@ mod tests {
         )
         .await;
         assert_eq!(responses.len(), 2);
-        let mut ids: Vec<i64> = responses.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        let mut ids: Vec<i64> = responses
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
     }
@@ -1196,7 +1281,10 @@ mod tests {
         )
         .await;
         assert_eq!(responses.len(), 3);
-        let mut ids: Vec<i64> = responses.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        let mut ids: Vec<i64> = responses
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
         ids.sort();
         assert_eq!(ids, vec![10, 11, 12]);
         for response in &responses {
@@ -1283,7 +1371,11 @@ mod tests {
             Ok(outcome) => outcome,
             Err(join_error) => Err(anyhow::anyhow!(
                 "internal error: request handler failed ({})",
-                if join_error.is_panic() { "panic" } else { "cancelled" }
+                if join_error.is_panic() {
+                    "panic"
+                } else {
+                    "cancelled"
+                }
             )),
         };
         let response = match outcome {
@@ -1294,10 +1386,12 @@ mod tests {
         };
         assert_eq!(response["id"], 7);
         assert_eq!(response["error"]["code"], -32000);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("panic"));
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("panic")
+        );
 
         // The runtime is unaffected: a follow-up task still runs to completion.
         let follow_up = tokio::spawn(async move { 42_u32 }).await.unwrap();

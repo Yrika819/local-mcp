@@ -2,10 +2,7 @@ use std::path::Path;
 
 use crate::fallback;
 
-fn stage_operation(
-    attempts: u32,
-    side_effects: u32,
-) -> fallback::OperationContract {
+fn stage_operation(attempts: u32, side_effects: u32) -> fallback::OperationContract {
     fallback::OperationContract {
         kind: fallback::OperationType::GitStagePaths,
         authorized: true,
@@ -165,13 +162,51 @@ fn host_native_permission_failure_is_not_labeled_sandbox_permission() {
 }
 
 #[test]
+fn read_only_command_never_grants_executable_fallback() {
+    let operation = fallback::OperationContract {
+        kind: fallback::OperationType::ReadOnlyCommand,
+        authorized: true,
+        operation_id: None,
+        paths: vec![],
+        argv: vec!["/bin/sh".into(), "-c".into(), "touch outside".into()],
+        source: None,
+        destination: None,
+        target: None,
+        create_only: false,
+        force: false,
+        attempt_budget_remaining: 1,
+        side_effect_budget_remaining: 1,
+        side_effect_state: Some(fallback::SideEffectState::ConfirmedNotPerformed),
+    };
+    assert!(!operation.auto_execute_allowlisted());
+    let decision = fallback::decide(fallback::DecisionInput {
+        failure_class: fallback::FailureClass::SandboxPermission,
+        safety_signal: false,
+        primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
+        lifecycle: fallback::LifecycleEvidence::completed(),
+        operation: Some(&operation),
+        side_effect_class: fallback::SideEffectClass::None,
+        side_effect_state: fallback::SideEffectState::ConfirmedNotPerformed,
+        fallback_depth: 0,
+        max_depth: 1,
+        budget: fallback::Budget::from_operation(Some(&operation)),
+        scope_valid: true,
+        automatic_enabled: true,
+        auto_execute_enabled: true,
+    });
+    assert_ne!(decision.action, fallback::FallbackAction::Execute);
+}
+
+#[test]
 fn codex_command_contract_is_read_only_ephemeral_and_cwd_scoped() {
     let cwd = std::env::temp_dir();
     let command = fallback::codex_read_only_command(&cwd, fallback::Effort::Low).unwrap();
     assert!(command.windows(2).any(|pair| pair == ["-s", "read-only"]));
     assert!(command.iter().any(|arg| arg == "--ephemeral"));
     assert!(command.iter().any(|arg| arg == "--ignore-user-config"));
-    assert!(command.windows(2).any(|pair| {
-        pair[0] == "-C" && Path::new(&pair[1]) == cwd.as_path()
-    }));
+    assert!(
+        command
+            .windows(2)
+            .any(|pair| { pair[0] == "-C" && Path::new(&pair[1]) == cwd.as_path() })
+    );
 }

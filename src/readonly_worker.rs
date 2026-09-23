@@ -23,6 +23,10 @@ const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = 8 * 1024;
 const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "Frozen read-only backend error variant remains part of the staged worker contract."
+)]
 pub(crate) enum ReadonlyError {
     Model(AgentError),
     Backend(String),
@@ -67,6 +71,10 @@ pub(crate) struct ReadonlyRequest {
     verification: Vec<VerificationSpec>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen read-only request identity accessors are retained for staged model-backend consumers."
+)]
 impl ReadonlyRequest {
     pub(crate) fn goal_id(&self) -> &str {
         &self.goal_id
@@ -121,6 +129,10 @@ struct ReadonlyResult {
     evidence: Vec<ReadonlyEvidence>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Frozen read-only backend fixture constructor is retained for staged adapter tests."
+)]
 pub(crate) fn readonly_request_for_model_backend_test(goal_cwd: PathBuf) -> ReadonlyRequest {
     ReadonlyRequest {
         goal_id: "00000000-0000-4000-8000-000000000001".to_owned(),

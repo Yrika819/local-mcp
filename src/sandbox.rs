@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
+#[cfg(not(windows))]
 use codex_protocol::models::PermissionProfile;
+#[cfg(not(windows))]
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::AsyncWriteExt;
@@ -74,15 +76,13 @@ fn sandbox_process(
         } else {
             NetworkSandboxPolicy::Restricted
         };
-    #[cfg(not(all(test, target_os = "linux")))]
+    #[cfg(not(any(windows, all(test, target_os = "linux"))))]
     let network_policy = NetworkSandboxPolicy::Restricted;
-    let permissions = PermissionProfile::workspace_write_with(
-        &roots,
-        network_policy,
-        true,
-        true,
-    )
-    .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
+    #[cfg(not(windows))]
+    let permissions = PermissionProfile::workspace_write_with(&roots, network_policy, true, true)
+        .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
+    #[cfg(windows)]
+    let _ = roots;
 
     #[cfg(target_os = "linux")]
     let mut process = {
@@ -99,17 +99,19 @@ fn sandbox_process(
             .parent()
             .context("local-mcp executable has no parent directory")?
             .to_owned();
-        let mut executable = executable_dir.join("codex-linux-sandbox");
+        let executable = executable_dir.join("codex-linux-sandbox");
         #[cfg(test)]
-        if !executable.is_file()
+        let executable = if !executable.is_file()
             && executable_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
-            && let Some(debug_dir) = executable_dir.parent()
         {
-            let test_helper = debug_dir.join("codex-linux-sandbox");
-            if test_helper.is_file() {
-                executable = test_helper;
-            }
-        }
+            executable_dir
+                .parent()
+                .map(|debug_dir| debug_dir.join("codex-linux-sandbox"))
+                .filter(|test_helper| test_helper.is_file())
+                .unwrap_or(executable)
+        } else {
+            executable
+        };
         anyhow::ensure!(
             executable.is_file(),
             "sandbox helper is missing: {}",
@@ -204,6 +206,7 @@ pub async fn run_tracked(
     })
 }
 
+#[cfg(unix)]
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -370,6 +373,196 @@ mod tests {
         )
         .await?;
         assert_ne!(output.status, 0);
+
+        std::fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_directory() -> PathBuf {
+        std::env::temp_dir().join(format!("local-mcp-linux-sandbox-{}", Uuid::new_v4()))
+    }
+
+    async fn run_shell(cwd: &Path, script: &str) -> Result<Output> {
+        run(
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            cwd,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn bubblewrap_confines_filesystem_writes_to_workspace() -> Result<()> {
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+        let existing_outside = outside.join("sentinel.txt");
+        std::fs::write(&existing_outside, "untouched")?;
+
+        let allowed = run_shell(
+            &workspace,
+            "printf readable > existing.txt && mkdir nested && printf new > nested/new.txt",
+        )
+        .await?;
+        assert_eq!(allowed.status, 0, "{}", allowed.stderr);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("existing.txt"))?,
+            "readable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("nested/new.txt"))?,
+            "new"
+        );
+
+        let absolute_escape = run_shell(
+            &workspace,
+            &format!(
+                "printf escaped > '{}'",
+                outside.join("absolute.txt").display()
+            ),
+        )
+        .await?;
+        assert_ne!(absolute_escape.status, 0, "{}", absolute_escape.stderr);
+
+        let traversal_escape =
+            run_shell(&workspace, "printf escaped > ../outside/traversal.txt").await?;
+        assert_ne!(traversal_escape.status, 0, "{}", traversal_escape.stderr);
+
+        std::os::unix::fs::symlink(&outside, workspace.join("intermediate-link"))?;
+        std::os::unix::fs::symlink(&existing_outside, workspace.join("final-link"))?;
+        std::os::unix::fs::symlink(
+            outside.join("dangling-target.txt"),
+            workspace.join("dangling-link"),
+        )?;
+        for path in [
+            "intermediate-link/intermediate.txt",
+            "final-link",
+            "dangling-link",
+        ] {
+            let escaped = run_shell(&workspace, &format!("printf escaped > '{path}'")).await?;
+            assert_ne!(escaped.status, 0, "path {path}: {}", escaped.stderr);
+        }
+
+        assert_eq!(std::fs::read_to_string(existing_outside)?, "untouched");
+        assert!(!outside.join("absolute.txt").exists());
+        assert!(!outside.join("traversal.txt").exists());
+        assert!(!outside.join("intermediate.txt").exists());
+        assert!(!outside.join("dangling-target.txt").exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "run on native Linux with LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK unset"]
+    async fn bubblewrap_restricted_network_blocks_ip_sockets_and_exposes_only_loopback()
+    -> Result<()> {
+        anyhow::ensure!(
+            std::env::var("LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK").as_deref() != Ok("1"),
+            "network isolation test requires the production restricted-network policy"
+        );
+
+        let workspace = test_directory();
+        std::fs::create_dir_all(&workspace)?;
+
+        let ip_socket = run_shell(
+            &workspace,
+            "/usr/bin/python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM)'",
+        )
+        .await?;
+        assert_ne!(ip_socket.status, 0, "IPv4 socket creation was allowed");
+        assert!(
+            ip_socket.stderr.contains("Operation not permitted"),
+            "expected seccomp EPERM for IP socket creation, got: {}",
+            ip_socket.stderr
+        );
+
+        let socket_families = run_shell(
+            &workspace,
+            r#"/usr/bin/python3 -c 'import errno, socket
+n=0
+for family in (socket.AF_INET, socket.AF_INET6):
+ for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+  try: socket.socket(family, kind)
+  except OSError as error:
+   assert error.errno == errno.EPERM, error
+   n += 1
+  else: raise SystemExit("IP socket creation unexpectedly succeeded")
+assert n == 4
+socket.socketpair()
+'"#,
+        )
+        .await?;
+        assert_eq!(socket_families.status, 0, "{}", socket_families.stderr);
+
+        let proxy_environment = run_shell(
+            &workspace,
+            r#"/usr/bin/python3 -c 'import os
+names={"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
+present=[name for name in os.environ if name.lower() in names]
+assert not present, present
+'"#,
+        )
+        .await?;
+        assert_eq!(proxy_environment.status, 0, "{}", proxy_environment.stderr);
+
+        let interfaces = run(
+            &["/bin/cat".into(), "/proc/net/dev".into()],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(interfaces.status, 0, "{}", interfaces.stderr);
+        let visible_interfaces: Vec<_> = interfaces
+            .stdout
+            .lines()
+            .skip(2)
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+            .collect();
+        assert_eq!(visible_interfaces, ["lo"]);
+
+        let external_network = run(
+            &[
+                "/usr/bin/curl".into(),
+                "--noproxy".into(),
+                "*".into(),
+                "--connect-timeout".into(),
+                "2".into(),
+                "--max-time".into(),
+                "3".into(),
+                "--silent".into(),
+                "--show-error".into(),
+                "https://1.1.1.1".into(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(external_network.status, 0, "external network was reachable");
+
+        let dns = run(
+            &[
+                "/usr/bin/getent".into(),
+                "hosts".into(),
+                "example.com".into(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(dns.status, 0, "external DNS resolution succeeded");
 
         std::fs::remove_dir_all(workspace)?;
         Ok(())

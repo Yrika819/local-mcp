@@ -171,6 +171,10 @@ impl ProductionGoalBackends {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Injected transport constructor is retained for the frozen backend test seam."
+    )]
     pub(crate) fn with_transport<T>(session: &config::Session, transport: Arc<T>) -> Self
     where
         T: ModelTransport + 'static,

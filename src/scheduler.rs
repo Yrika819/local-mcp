@@ -138,6 +138,10 @@ pub(crate) struct SchedulerSelection {
     decision: SchedulerDecision,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen scheduler decision accessor is retained for staged runner consumers."
+)]
 impl SchedulerSelection {
     pub(crate) fn revision(&self) -> u64 {
         self.snapshot.revision()
@@ -362,6 +366,10 @@ pub(crate) fn select_scheduler_action(goal: &Goal) -> Result<SchedulerSelection,
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Scheduler authority backends, session identity, and revision remain explicit at this frozen boundary."
+)]
 pub(crate) async fn scheduler_step<P, RB, W, R, RP>(
     store: &TaskStore,
     session: &config::Session,
@@ -409,6 +417,10 @@ where
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Scheduler dispatch keeps each authority backend and durable revision channel explicit."
+)]
 pub(crate) async fn dispatch_selected_action<P, RB, W, R, RP>(
     store: &TaskStore,
     session: &config::Session,
@@ -2040,7 +2052,10 @@ mod tests {
         let task = &interrupted.tasks()[&task_id];
         assert_eq!(task.status(), TaskStatus::Retryable);
         assert_eq!(task.attempts().len(), 1);
-        assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Interrupted));
+        assert_eq!(
+            task.attempts()[0].outcome(),
+            Some(AttemptOutcome::Interrupted)
+        );
         assert_eq!(
             task.attempts()[0].side_effect_class(),
             Some(crate::fallback::SideEffectClass::None)
@@ -2091,7 +2106,10 @@ mod tests {
                 .unwrap();
             let task = &current.tasks()[&task_id];
             assert_eq!(task.attempts().len(), expected_number as usize);
-            assert_eq!(task.attempts().last().unwrap().outcome(), Some(AttemptOutcome::Interrupted));
+            assert_eq!(
+                task.attempts().last().unwrap().outcome(),
+                Some(AttemptOutcome::Interrupted)
+            );
             assert_eq!(task.attempts().last().unwrap().number(), expected_number);
             assert_eq!(task.semantic_attempts_consumed(), 0);
             assert_eq!(task.max_attempts(), 2);
@@ -2121,11 +2139,17 @@ mod tests {
                     .revision();
             } else {
                 assert_eq!(task.status(), TaskStatus::Blocked);
-                assert_eq!(task.readonly_transport_interruptions(), MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK);
+                assert_eq!(
+                    task.readonly_transport_interruptions(),
+                    MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK
+                );
                 assert_eq!(task.blockers()[0].code(), "READONLY_TRANSPORT_UNAVAILABLE");
             }
         }
-        assert_eq!(backend.calls.get(), MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK as usize);
+        assert_eq!(
+            backend.calls.get(),
+            MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK as usize
+        );
     }
 
     #[tokio::test]
@@ -2154,7 +2178,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let interrupted = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let interrupted = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         let first_id = interrupted.tasks()[&task_id].attempts()[0].id().clone();
         fixture
             .store
@@ -2172,7 +2199,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let ready = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let ready = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         scheduler_step(
             &fixture.store,
             &fixture.session,
@@ -2186,7 +2216,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let verifying = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let verifying = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         let task = &verifying.tasks()[&task_id];
         assert_eq!(task.status(), TaskStatus::Verifying);
         assert_eq!(task.attempts().len(), 2);
@@ -2238,12 +2271,23 @@ mod tests {
             )
             .await
             .unwrap();
-            let durable = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+            let durable = fixture
+                .store
+                .load_goal(&fixture.session.id, &goal_id)
+                .unwrap();
             let task = &durable.tasks()[&task_id];
             assert_eq!(task.semantic_attempts_consumed(), 1, "error={error:?}");
             assert_eq!(task.semantic_attempts_remaining(), 1, "error={error:?}");
-            assert_eq!(task.readonly_transport_interruptions(), 0, "error={error:?}");
-            assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Retryable), "error={error:?}");
+            assert_eq!(
+                task.readonly_transport_interruptions(),
+                0,
+                "error={error:?}"
+            );
+            assert_eq!(
+                task.attempts()[0].outcome(),
+                Some(AttemptOutcome::Retryable),
+                "error={error:?}"
+            );
             assert_eq!(backend.calls.get(), 1);
         }
     }
@@ -2279,12 +2323,22 @@ mod tests {
             )
             .await
             .unwrap();
-            let durable = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+            let durable = fixture
+                .store
+                .load_goal(&fixture.session.id, &goal_id)
+                .unwrap();
             let task = &durable.tasks()[&task_id];
             assert_eq!(task.status(), expected, "status={status}");
             assert_eq!(task.semantic_attempts_consumed(), 1, "status={status}");
-            assert_eq!(task.readonly_transport_interruptions(), 0, "status={status}");
-            assert_ne!(task.attempts()[0].outcome(), Some(AttemptOutcome::Interrupted));
+            assert_eq!(
+                task.readonly_transport_interruptions(),
+                0,
+                "status={status}"
+            );
+            assert_ne!(
+                task.attempts()[0].outcome(),
+                Some(AttemptOutcome::Interrupted)
+            );
         }
     }
 
@@ -2314,13 +2368,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let durable = fixture.store.load_goal(&fixture.session.id, &goal_id).unwrap();
+        let durable = fixture
+            .store
+            .load_goal(&fixture.session.id, &goal_id)
+            .unwrap();
         let task = &durable.tasks()[&task_id];
         assert_eq!(task.status(), TaskStatus::Retryable);
         assert_eq!(task.semantic_attempts_consumed(), 1);
         assert_eq!(task.semantic_attempts_remaining(), 1);
         assert_eq!(task.readonly_transport_interruptions(), 0);
-        assert_eq!(task.attempts()[0].outcome(), Some(AttemptOutcome::Retryable));
+        assert_eq!(
+            task.attempts()[0].outcome(),
+            Some(AttemptOutcome::Retryable)
+        );
     }
 
     #[tokio::test]
