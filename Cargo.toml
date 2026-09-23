@@ -3,8 +3,11 @@ name = "local-mcp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-license = "Apache-2.0"
+license = "MIT"
 description = "A sandboxed local-machine MCP server with out-of-band approvals"
+homepage = "https://github.com/nakasyou/local-mcp"
+repository = "https://github.com/nakasyou/local-mcp"
+readme = "README.md"
 default-run = "local-mcp"
 
 [dependencies]
@@ -30,6 +33,16 @@ rama-utils = "=0.3.0-alpha.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 openssl = { version = "0.10", features = ["vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 codex-sandboxing = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }

@@ -43,15 +43,14 @@
                       pkgs.bash
                       pkgs.curl
                     ]
-                    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.bubblewrap ]
                   )
                 }
             '';
 
             meta = {
               description = "Sandboxed local-machine MCP server with out-of-band approvals";
-              homepage = "https://github.com/openai/codex";
-              license = pkgs.lib.licenses.asl20;
+              homepage = "https://github.com/nakasyou/local-mcp";
+              license = pkgs.lib.licenses.mit;
               mainProgram = "local-mcp";
               platforms = supportedSystems;
             };
@@ -83,7 +82,7 @@
               pkg-config
               rustc
               rustfmt
-            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.bubblewrap ];
+            ];
           };
         }
       );
