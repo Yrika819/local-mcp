@@ -9,54 +9,105 @@ permissions:
 
 jobs:
   test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: ubuntu-x64
+            runner: ubuntu-24.04
+            runner_arch: X64
+            uname: x86_64
+            rust_host: x86_64-unknown-linux-gnu
+          - name: macos-intel
+            runner: macos-15-intel
+            runner_arch: X64
+            uname: x86_64
+            rust_host: x86_64-apple-darwin
+          - name: macos-arm64
+            runner: macos-15
+            runner_arch: ARM64
+            uname: arm64
+            rust_host: aarch64-apple-darwin
+          - name: windows-x64
+            runner: windows-2025
+            runner_arch: X64
+            uname: x86_64
+            rust_host: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        run: rustup show
-      - name: Install Linux sandbox runtime
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
-      - name: Diagnose Linux user namespaces before repair
+        with:
+          persist-credentials: false
+      - name: Log runner and toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+          printf 'uname_m=%s\n' "$(uname -m)"
+          rustc --version --verbose
+          cargo --version
+          test "$RUNNER_ARCH" = '${{ matrix.runner_arch }}'
+          test "$(uname -m)" = '${{ matrix.uname }}'
+          host=$(rustc -vV | awk -F': ' '/^host:/{print $2}')
+          printf 'rust_host=%s\n' "$host"
+          test "$host" = '${{ matrix.rust_host }}'
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run production clippy
+        run: cargo clippy --locked -- -D warnings
+      - name: Run all-targets clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Build fixed upstream Bubblewrap for Linux validation
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          uname -a
-          sysctl kernel.unprivileged_userns_clone || true
-          sysctl kernel.apparmor_restrict_unprivileged_userns || true
-          sysctl user.max_user_namespaces || true
-          which bwrap
-          bwrap --version
-          set +e
-          bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user /bin/true
-          status=$?
-          set -e
-          echo "pre_fix_bwrap_status=${status}"
-      - name: Enable Linux sandbox user namespaces on CI runner
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      - name: Verify Linux user namespaces after repair
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sysctl kernel.unprivileged_userns_clone || true
-          sysctl kernel.apparmor_restrict_unprivileged_userns || true
-          sysctl user.max_user_namespaces || true
-          bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user /bin/true
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libcap-dev
+          git clone --quiet https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap"
+          git -C "$RUNNER_TEMP/bubblewrap" checkout --quiet --detach 2a76602a8c71f36c1527cf9fc3417d9149822e0c
+          test "$(git -C "$RUNNER_TEMP/bubblewrap" rev-parse HEAD)" = 2a76602a8c71f36c1527cf9fc3417d9149822e0c
+          meson setup "$RUNNER_TEMP/bubblewrap/build" "$RUNNER_TEMP/bubblewrap" \
+            --prefix="$RUNNER_TEMP/bubblewrap-prefix" \
+            -Dselinux=disabled -Dman=disabled -Dtests=false \
+            -Dbash_completion=disabled -Dzsh_completion=disabled
+          meson compile -C "$RUNNER_TEMP/bubblewrap/build"
+          meson install -C "$RUNNER_TEMP/bubblewrap/build"
+          echo "$RUNNER_TEMP/bubblewrap-prefix/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" --version
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
         run: cargo build --locked --bin codex-linux-sandbox
-      - name: Test
-        env:
-          LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK: ${{ runner.os == 'Linux' && '1' || '0' }}
+      - name: Run tests
         run: cargo test --locked --all-targets
+      - name: Run native Linux restricted-network sandbox test
+        if: runner.os == 'Linux'
+        shell: bash
+        run: env -u LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK cargo test --locked sandbox::linux_tests::bubblewrap_restricted_network_blocks_ip_sockets_and_exposes_only_loopback -- --ignored --exact
       - name: Build release
         run: cargo build --release --locked
+      - name: Log release binary architecture
+        if: runner.os != 'Windows'
+        shell: bash
+        run: file target/release/local-mcp
+      - name: Log Windows release binary architecture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $path = (Resolve-Path 'target/release/local-mcp.exe').Path
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          Write-Output "release_pe_machine=0x$($machine.ToString('X4'))"
+          if ($machine -ne 0x8664) { throw "Unexpected PE machine: 0x$($machine.ToString('X4'))" }
+      - name: CLI smoke
+        shell: bash
+        run: |
+          set -euxo pipefail
+          binary=target/release/local-mcp
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          "$binary" --version
+          "$binary" --help
