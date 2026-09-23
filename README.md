@@ -1,18 +1,55 @@
 # local-mcp
 
+Local MCP is released under the MIT License. OpenAI Codex dependencies retain
+their own upstream licenses and notices. Local MCP is an independent project and is
+not affiliated with or endorsed by OpenAI.
+
+This project is not a tool for bypassing OpenAI safety, policy, usage, or rate-limit decisions.
+Safety and policy refusals are terminal: Local MCP does not reroute them to another
+model, shell, retry, or host-native execution path.
+
 `local-mcp` exposes basic local-machine capabilities as MCP tools: file reads,
 image reads, directory listings, sandboxed file writes and commands, plus explicitly approved
 unsandboxed command execution. It intentionally does not provide web search or a
 dedicated network-request tool.
 
-Commands are isolated with OpenAI Codex's `codex-rs/sandboxing`: Landlock and the
-Linux sandbox helper on Linux, and Seatbelt (`sandbox-exec`) on macOS. Network
-access is denied for ordinary commands.
+## Goal Orchestrator
+
+Public `goal_*` tools provide a durable Goal / Task Orchestrator for bounded,
+host-controlled work. `goal_start` records an objective without executing it;
+`goal_status`, `goal_pause`, `goal_resume`, `goal_cancel`, and `goal_result` manage
+or inspect durable state; and `goal_run` advances one Goal for a caller-provided
+step budget. Goal state is session-scoped and does not grant filesystem, network,
+host-native, Git, publication, or fallback authority. Effectful work continues to
+use the existing Local MCP sandbox, approval, side-effect, verification, and
+recovery boundaries. Codex processes used by the orchestrator are read-only.
+
+## Platform support
+
+| Platform | Status | Security boundary |
+| --- | --- | --- |
+| macOS | Supported for Public v1 (native Intel x86_64 validation) | Codex Seatbelt sandbox for ordinary commands; Unix path and approval checks |
+| Linux | Supported for Public v1 when requirements below are met | Bubblewrap 0.12.0 or newer, user/PID/network namespaces, and seccomp; Unix path and approval checks |
+| Windows | Experimental for Public v1; runtime/security validation deferred | Host-native command and file paths with approval; no Unix-equivalent process sandbox |
+
+Windows is not covered by the macOS release verification described below. Do not treat
+successful macOS or Linux validation as Windows security validation.
+
+Commands use separate platform sandboxes: Bubblewrap plus seccomp through the
+pinned Codex Linux helper on Linux, and Seatbelt (`sandbox-exec`) on macOS.
+Ordinary commands have network access denied. Linux requires upstream Bubblewrap
+0.12.0 or newer; the helper rejects older or unparseable versions before starting
+the requested command. See [Linux sandbox support](docs/linux_sandbox.md) for
+requirements and tested scope. The legacy Landlock path is not selected by Local
+MCP and does not replace the full Bubblewrap filesystem/network contract.
 
 ## Usage
 
+The primary Public v1 release artifact is the platform-built `local-mcp` binary.
+On macOS, build it from source with the locked dependency graph:
+
 ```sh
-cargo build --release
+cargo build --release --locked
 
 # Run one persistent MCP server (for example through a tunnel):
 local-mcp mcp
@@ -39,14 +76,20 @@ local-mcp start my-project
 /permission status
 ```
 
-With Nix, `curl` and `bash` are included in the runtime environment. Linux builds
-also include `bwrap`:
+With Nix, `curl` and `bash` are included in the runtime environment. On Linux,
+provide upstream Bubblewrap 0.12.0 or newer on the host `PATH`; the flake does not
+substitute the pinned Nixpkgs Bubblewrap package because it is older than the
+security fix:
 
 ```sh
-nix run github:OWNER/local-mcp
+nix run github:nakasyou/local-mcp
 nix develop
 nix build
 ```
+
+This release metadata does not promise a crates.io package or a prebuilt GitHub
+download. Use the source build above or the optional Nix flake. On Linux, the
+release build also includes the `codex-linux-sandbox` helper described below.
 
 The session working directory is the directory where `local-mcp start` was run;
 there is no separate persistent cwd setting. On Linux and macOS, sandboxed calls are
@@ -64,8 +107,8 @@ sessions.
 image content. Relative image paths are resolved from the session working directory.
 
 Each session uses its own local IPC endpoint: an explicitly permission-restricted
-Unix domain socket on Unix, or a named pipe using Windows' default security
-descriptor. Both the MCP server and the start UI block on I/O, so idle operation
+Unix domain socket on Unix, or a named pipe with an explicit current-user-only
+Windows DACL. Both the MCP server and the start UI block on I/O, so idle operation
 and pending approvals do not use polling timers.
 
 The `start` screen also receives live activity from MCP calls. It shows file and
@@ -130,15 +173,11 @@ operation to Codex.
 | remote mutation + `UNKNOWN` side effect | terminal block pending read-only reconciliation |
 | remote mutation already performed | no retry; budget consumed |
 
-The explicit `codex_fallback` tool has two modes:
-
-- `DIAGNOSE_ONLY`: Codex runs with a **read-only** sandbox and may only inspect
-  and report.
-- `EXECUTE_AUTHORIZED_OPERATION`: available only for a `SANDBOXED` primary
-  execution and an explicitly authorized, structured, allowlisted operation with
-  confirmed host execution evidence,
-  `CONFIRMED_NOT_PERFORMED` state, remaining budget, exact scope, and
-  `fallback_depth == 0`.
+The public `codex_fallback` tool is `DIAGNOSE_ONLY`. Codex runs with a
+**read-only** sandbox and may only inspect and report. Public callers cannot
+provide executable fallback authority, lifecycle evidence, or side-effect state.
+Executable fallback is only an internal continuation of the host-observed
+`execute`/`start_command` path.
 
 Policy V2 deliberately does not give Codex arbitrary mutation authority. For
 executable fallback, Codex performs a read-only preflight; Local MCP then
@@ -149,8 +188,10 @@ normal push into a force push, or inventing additional mutations.
 
 The initial automatic execute allowlist is intentionally small:
 
-- exact structured `read_only_command`;
 - exact-path `git_stage_paths` using canonical `git add -- <paths...>` scope.
+
+`read_only_command` is intentionally not in the executable fallback allowlist:
+a caller-supplied read-only label cannot grant host-native execution.
 
 Pathspecs that can broaden staging (`.`, parent traversal, globs, Git pathspec
 magic, `.git` internals, and absolute paths) are rejected before mutation.
@@ -197,19 +238,21 @@ does not use alternate command spellings, `without_sandbox`, Codex, or another
 route to evade platform, tool, host, or sandbox safety controls.
 
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
-install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
-available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
-the system `/usr/bin/sandbox-exec`. Windows uses named-pipe IPC and direct argv
-execution; it does not currently provide the filesystem/network sandbox enforced
-by Linux and macOS. Consequently, `execute` and `start_command` require approval
-on Windows unless the session is in yolo mode, while `write_file` writes directly
-to the requested host path. Because these command operations are host-native,
+install or copy both into the same directory, and ensure upstream Bubblewrap
+0.12.0 or newer is available in `PATH`. Older versions fail closed before the
+requested command starts. On macOS, only `local-mcp` is needed; sandboxed commands use
+the system `/usr/bin/sandbox-exec`. Windows support is **experimental for Public v1**: it uses named-pipe IPC and direct argv
+execution, and it does not currently provide the filesystem/network sandbox enforced
+by Linux and macOS. The named pipe rejects remote clients and is created with an
+explicit current-user-only DACL (owner and sole allow ACE are the current Windows
+user SID; no Everyone, Anonymous, Authenticated Users, SYSTEM, or Administrators
+grant). Consequently, `execute` and `start_command` require approval
+on Windows unless the session is in yolo mode, while `write_file` performs a host-native mutation only after the persisted
+session permitted-root check and explicit approval. It must not be mistaken for the Unix sandbox. Because these command operations are host-native,
 permission-like failures on Windows do not qualify as `SANDBOX_PERMISSION` and
-cannot enter executable sandbox fallback. The Windows named pipe uses the
-[default security descriptor](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights),
-which grants full control to LocalSystem, administrators, and the creator owner,
-and read access to Everyone and anonymous users; unlike Unix, `local-mcp` does not
-install an explicit per-user ACL. Windows builds use the MSVC Rust target and
+cannot enter executable sandbox fallback. Unlike Unix's 0600 socket mode bit, the
+Windows ACL is installed at pipe creation via `CreateNamedPipeW` security
+attributes (not a post-create default descriptor). Windows builds use the MSVC Rust target and
 require Visual Studio Build Tools with the "Desktop development with C++"
 workload. Build from a Developer PowerShell with
 `cargo build --locked --release`.
