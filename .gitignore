@@ -1,1 +1,11 @@
 /target
+
+# Local machine state and editor metadata
+.DS_Store
+.local/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.zed/
