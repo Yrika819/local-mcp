@@ -1,8 +1,11 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::secure_fs;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -133,6 +136,20 @@ pub fn state_dir() -> Result<PathBuf> {
         .context("could not determine a local state directory")
 }
 
+fn ensure_session_directories() -> Result<PathBuf> {
+    let state_root = state_dir()?;
+    let sessions_dir = state_root.join("sessions");
+    secure_fs::ensure_private_directory(&state_root, None)
+        .with_context(|| format!("cannot secure state directory {}", state_root.display()))?;
+    secure_fs::ensure_private_directory(&sessions_dir, Some(&state_root)).with_context(|| {
+        format!(
+            "cannot secure sessions directory {}",
+            sessions_dir.display()
+        )
+    })?;
+    Ok(sessions_dir)
+}
+
 pub fn session_path(id: &str) -> Result<PathBuf> {
     validate_session_id(id)?;
     Ok(state_dir()?.join("sessions").join(format!("{id}.json")))
@@ -167,34 +184,76 @@ fn socket_path_for_id(id: &str) -> PathBuf {
 }
 
 pub async fn create_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
-    let cwd = canonical_directory(cwd)?;
-    let id = id
-        .map(str::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    validate_session_id(&id)?;
-    let session = Session {
-        id,
-        cwd: cwd.clone(),
-        permitted_directories: vec![cwd],
-    };
-    save_session(&session).await?;
-    Ok(session)
+    let cwd = cwd.to_owned();
+    let id = id.map(str::to_owned);
+    tokio::task::spawn_blocking(move || -> Result<Session> {
+        let cwd = canonical_directory(&cwd)?;
+        let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        validate_session_id(&id)?;
+        let session = Session {
+            id,
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
+        };
+        let bytes = serde_json::to_vec_pretty(&session)?;
+        save_session_blocking(&session.id, bytes)?;
+        Ok(session)
+    })
+    .await
+    .map_err(anyhow::Error::from)?
+}
+
+fn load_session_blocking(id: &str) -> Result<Vec<u8>> {
+    let path = session_path(id)?;
+    ensure_session_directories()?;
+    let mut file = secure_fs::open_private_existing(&path, false)
+        .with_context(|| format!("session {id} was not found; run `local-mcp start` first"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("session {id} was not found; run `local-mcp start` first"))?;
+    Ok(bytes)
+}
+
+fn save_session_blocking(id: &str, bytes: Vec<u8>) -> Result<()> {
+    let path = session_path(id)?;
+    let directory = ensure_session_directories()?;
+    match secure_fs::open_private_existing(&path, false) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot secure existing session file"),
+    }
+    let (temporary, mut file) = secure_fs::create_unique_temp(&path)?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = secure_fs::remove_private_temp(&temporary);
+        return Err(error).context("failed to write session state");
+    }
+    if let Err(error) = secure_fs::atomic_replace(&temporary, &path) {
+        let _ = secure_fs::remove_private_temp(&temporary);
+        return Err(error).context("failed to replace session state");
+    }
+    if let Err(error) = secure_fs::sync_parent_directory(&directory) {
+        let _ = secure_fs::remove_private_temp(&temporary);
+        return Err(error).context("failed to sync session state directory");
+    }
+    Ok(())
 }
 
 pub async fn load_session(id: &str) -> Result<Session> {
-    let path = session_path(id)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("session {id} was not found; run `local-mcp start` first"))?;
+    let id = id.to_owned();
+    let bytes = tokio::task::spawn_blocking(move || load_session_blocking(&id)).await??;
     serde_json::from_slice(&bytes).context("invalid local-mcp session")
 }
 
 pub async fn save_session(session: &Session) -> Result<()> {
-    let path = session_path(&session.id)?;
-    tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    tokio::fs::write(&temporary, serde_json::to_vec_pretty(session)?).await?;
-    tokio::fs::rename(temporary, path).await?;
+    let id = session.id.clone();
+    let bytes = serde_json::to_vec_pretty(session)?;
+    tokio::task::spawn_blocking(move || save_session_blocking(&id, bytes)).await??;
     Ok(())
 }
 

@@ -1,14 +1,13 @@
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::config;
 use crate::goal::{GOAL_SCHEMA_VERSION, GOAL_STORE_FORMAT, Goal, GoalId};
 use crate::orchestrator_error::OrchestratorError;
+use crate::secure_fs;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,10 +72,14 @@ impl TaskStore {
                 return Err(OrchestratorError::ActiveGoalAlreadyExists);
             }
             let path = self.goal_path(goal.session_id(), goal.id())?;
-            if path.exists() {
-                return Err(OrchestratorError::CorruptGoal(
-                    "goal ID already exists".to_owned(),
-                ));
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "goal ID already exists".to_owned(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
             self.commit_goal_unlocked(goal)
         })
@@ -235,16 +238,25 @@ impl TaskStore {
 
     fn load_all_unlocked(&self, session_id: &str) -> Result<Vec<Goal>, OrchestratorError> {
         let directory = self.session_goal_dir(session_id)?;
-        if !directory.exists() {
-            return Ok(Vec::new());
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                if !metadata.file_type().is_file() {
+                    return Err(OrchestratorError::PersistenceIo(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "goal JSON entry is not a regular file",
+                    )));
+                }
+                paths.push(path);
+            }
         }
-        let mut paths = std::fs::read_dir(&directory)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().and_then(|value| value.to_str()) == Some("json") && path.is_file()
-            })
-            .collect::<Vec<_>>();
         paths.sort();
         let mut goals = Vec::with_capacity(paths.len());
         for path in paths {
@@ -265,8 +277,18 @@ impl TaskStore {
         goal_id: &GoalId,
     ) -> Result<Goal, OrchestratorError> {
         let path = self.goal_path(session_id, goal_id)?;
-        if !path.is_file() {
-            return Err(OrchestratorError::GoalNotFound);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(OrchestratorError::PersistenceIo(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "goal path is not a regular file",
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(OrchestratorError::GoalNotFound);
+            }
+            Err(error) => return Err(error.into()),
         }
         let goal = self.load_path_unlocked(&path)?;
         if goal.session_id() != session_id || goal.id() != goal_id {
@@ -279,7 +301,8 @@ impl TaskStore {
 
     fn load_path_unlocked(&self, path: &Path) -> Result<Goal, OrchestratorError> {
         let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
+        let mut file = secure_fs::open_private_existing(path, false)?;
+        file.read_to_end(&mut bytes)?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
             OrchestratorError::CorruptGoal("authoritative Goal JSON does not parse".to_owned())
         })?;
@@ -363,13 +386,16 @@ impl TaskStore {
     fn commit_goal_unlocked(&self, goal: &Goal) -> Result<(), OrchestratorError> {
         goal.validate()?;
         let path = self.goal_path(goal.session_id(), goal.id())?;
+        let goals_root = self.state_root.join("goals");
         let directory = path.parent().expect("goal path always has parent");
-        std::fs::create_dir_all(directory)?;
+        secure_fs::ensure_private_directory(&goals_root, Some(&self.state_root))?;
+        secure_fs::ensure_private_directory(directory, Some(&goals_root))?;
+        match secure_fs::open_private_existing(&path, false) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let bytes = serde_json::to_vec_pretty(goal)?;
-        // Keep the atomic temporary name short. The UUID is sufficient for
-        // create_new uniqueness and avoids pushing valid 64-byte session IDs
-        // over legacy Windows MAX_PATH limits.
-        let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
 
         #[cfg(test)]
         if self.fault == Some(FaultPoint::BeforeTempWrite) {
@@ -378,31 +404,36 @@ impl TaskStore {
             )));
         }
 
+        let (temporary, mut file) = secure_fs::create_unique_temp(&path)?;
         let write_result = (|| -> Result<(), OrchestratorError> {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)?;
             file.write_all(&bytes)?;
             file.flush()?;
             file.sync_all()?;
-
-            #[cfg(test)]
-            if self.fault == Some(FaultPoint::BeforeReplace) {
-                return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
-                    "injected atomic replace failure",
-                )));
-            }
-
-            atomic_replace(&temporary, &path)?;
-            sync_parent_directory(directory)?;
             Ok(())
         })();
-
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = secure_fs::remove_private_temp(&temporary);
+            return Err(error);
         }
-        write_result
+
+        #[cfg(test)]
+        if self.fault == Some(FaultPoint::BeforeReplace) {
+            let _ = secure_fs::remove_private_temp(&temporary);
+            return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
+                "injected atomic replace failure",
+            )));
+        }
+
+        if let Err(error) = secure_fs::atomic_replace(&temporary, &path) {
+            let _ = secure_fs::remove_private_temp(&temporary);
+            return Err(error.into());
+        }
+        if let Err(error) = secure_fs::sync_parent_directory(directory) {
+            let _ = secure_fs::remove_private_temp(&temporary);
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     fn with_session_lock<T, F>(
@@ -414,14 +445,12 @@ impl TaskStore {
         F: FnOnce() -> Result<T, OrchestratorError>,
     {
         let directory = self.session_goal_dir(session_id)?;
-        std::fs::create_dir_all(&directory)?;
+        let goals_root = self.state_root.join("goals");
+        secure_fs::ensure_private_directory(&self.state_root, None)?;
+        secure_fs::ensure_private_directory(&goals_root, Some(&self.state_root))?;
+        secure_fs::ensure_private_directory(&directory, Some(&goals_root))?;
         let lock_path = directory.join(".lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
+        let lock = secure_fs::create_or_open_lock(&lock_path)?;
         lock.lock()?;
         let result = operation();
         let unlock_result = lock.unlock();
@@ -455,59 +484,6 @@ fn goal_id_validate(goal_id: &GoalId) -> Result<(), OrchestratorError> {
     if canonical != *goal_id {
         return Err(OrchestratorError::UnsafeIdentifier("GoalId".to_owned()));
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn atomic_replace(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(temporary, destination)
-}
-
-#[cfg(windows)]
-fn atomic_replace(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-    }
-
-    let existing = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let new = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            existing.as_ptr(),
-            new.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(directory: &Path) -> std::io::Result<()> {
-    File::open(directory)?.sync_all()
-}
-
-#[cfg(windows)]
-fn sync_parent_directory(_directory: &Path) -> std::io::Result<()> {
-    // MoveFileExW is requested with WRITE_THROUGH. Opening directories for
-    // FlushFileBuffers requires additional platform privileges/flags, so V1
-    // relies on the documented replace primitive on Windows.
     Ok(())
 }
 
@@ -552,6 +528,10 @@ mod tests {
         ReplaySafety, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
         TaskTransitionContext, WorkerKind,
     };
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use uuid::Uuid;
 
     const NOW: &str = "2026-01-01T00:00:00Z";
 
@@ -559,6 +539,65 @@ mod tests {
         let root = std::env::temp_dir().join(format!("local-mcp-phase2-store-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_store_bootstraps_missing_state_base_without_private_chmod() {
+        let root = state_root();
+        let _cleanup = StateRootCleanup(root.clone());
+        let reference = root.join("reference");
+        std::fs::create_dir_all(&reference).unwrap();
+        let reference_mode = mode(&reference);
+        std::fs::remove_dir(&reference).unwrap();
+        let missing_base = root.join("missing-base");
+        let state_root = missing_base.join("state");
+        let store = TaskStore::with_state_root(state_root.clone());
+        let session = format!("bootstrap-session-{}", Uuid::new_v4());
+        let goal = goal(&session);
+        let goal_id = goal.id().clone();
+
+        store.create_goal(&goal).unwrap();
+
+        let goals_root = state_root.join("goals");
+        let session_dir = store.session_goal_dir(&session).unwrap();
+        assert_eq!(mode(&missing_base), reference_mode);
+        assert_eq!(mode(&state_root), 0o700);
+        assert_eq!(mode(&goals_root), 0o700);
+        assert_eq!(mode(&session_dir), 0o700);
+        assert_eq!(mode(&store.goal_path(&session, &goal_id).unwrap()), 0o600);
+    }
+
+    #[cfg(unix)]
+    struct StateRootCleanup(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for StateRootCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn assert_modes(phase: &str, checks: &[(&str, &std::path::Path, u32, u32)]) {
+        let failures = checks
+            .iter()
+            .filter(|(_, _, expected, actual)| expected != actual)
+            .map(|(label, path, expected, actual)| {
+                format!(
+                    "{phase} {label} {}: actual {:04o}, expected {:04o}",
+                    path.display(),
+                    actual,
+                    expected
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn goal(session: &str) -> Goal {
@@ -645,6 +684,110 @@ mod tests {
         assert_eq!(loaded.id(), goal.id());
         assert_eq!(loaded.revision(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_store_initial_state_modes_are_private() {
+        let root = state_root();
+        let _cleanup = StateRootCleanup(root.clone());
+        let store = TaskStore::with_state_root(root.clone());
+        let session = format!("permission-session-{}", Uuid::new_v4());
+        let goal = goal(&session);
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let goals_root = root.join("goals");
+        let goal_dir = store.session_goal_dir(&session).unwrap();
+        let goal_path = store.goal_path(&session, &goal_id).unwrap();
+        let lock_path = goal_dir.join(".lock");
+        let modes = [
+            ("state root", root.as_path(), 0o700, mode(&root)),
+            ("goals root", goals_root.as_path(), 0o700, mode(&goals_root)),
+            ("goal directory", goal_dir.as_path(), 0o700, mode(&goal_dir)),
+            ("Goal JSON", goal_path.as_path(), 0o600, mode(&goal_path)),
+            ("lock file", lock_path.as_path(), 0o600, mode(&lock_path)),
+        ];
+        assert_modes("initial state", &modes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_store_normal_operations_repair_permissive_modes() {
+        let root = state_root();
+        let _cleanup = StateRootCleanup(root.clone());
+        let store = TaskStore::with_state_root(root.clone());
+        let session = format!("permission-session-{}", Uuid::new_v4());
+        let mut initial = goal(&session);
+        initial.transition_to(GoalStatus::Failed, NOW).unwrap();
+        let initial_id = initial.id().clone();
+        store.create_goal(&initial).unwrap();
+        let next = goal(&session);
+        let next_id = next.id().clone();
+        let goals_root = root.join("goals");
+        let goal_dir = store.session_goal_dir(&session).unwrap();
+        let initial_path = store.goal_path(&session, &initial_id).unwrap();
+        let next_path = store.goal_path(&session, &next_id).unwrap();
+        let lock_path = goal_dir.join(".lock");
+
+        for path in [&root, &goals_root, &goal_dir] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        for path in [&initial_path, &lock_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        let lock_before = std::fs::metadata(&lock_path).unwrap();
+        let lock_identity = (lock_before.dev(), lock_before.ino());
+
+        store.load_goal(&session, &initial_id).unwrap();
+        assert_eq!(store.list_goals_for_session(&session).unwrap().len(), 1);
+        store.create_goal(&next).unwrap();
+        store.load_goal(&session, &next_id).unwrap();
+
+        let lock_after = std::fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            (lock_after.dev(), lock_after.ino()),
+            lock_identity,
+            "normal operations replaced the session lock inode"
+        );
+        let modes = [
+            ("state root", root.as_path(), 0o700, mode(&root)),
+            ("goals root", goals_root.as_path(), 0o700, mode(&goals_root)),
+            ("goal directory", goal_dir.as_path(), 0o700, mode(&goal_dir)),
+            (
+                "initial Goal JSON",
+                initial_path.as_path(),
+                0o600,
+                mode(&initial_path),
+            ),
+            (
+                "created Goal JSON",
+                next_path.as_path(),
+                0o600,
+                mode(&next_path),
+            ),
+            ("lock file", lock_path.as_path(), 0o600, mode(&lock_path)),
+        ];
+        assert_modes("normal operations", &modes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_enumeration_rejects_json_symlink_without_reading_target() {
+        let root = state_root();
+        let _cleanup = StateRootCleanup(root.clone());
+        let store = TaskStore::with_state_root(root.clone());
+        let session = format!("symlink-session-{}", Uuid::new_v4());
+        let goal = goal(&session);
+        store.create_goal(&goal).unwrap();
+        let outside = root.join("outside");
+        let sentinel = outside.join("sentinel");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let directory = store.session_goal_dir(&session).unwrap();
+        std::os::unix::fs::symlink(&sentinel, directory.join("foreign.json")).unwrap();
+
+        assert!(store.list_goals_for_session(&session).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::FileTypeExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
@@ -18,6 +18,7 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
+use crate::secure_fs;
 
 trait SessionIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> SessionIo for T {}
@@ -129,11 +130,10 @@ fn bind_listener(path: &Path) -> Result<SessionListener> {
 #[cfg(unix)]
 async fn bind_unix_session_listener(path: &Path) -> Result<SessionListener> {
     let state_dir = path.parent().context("session socket has no parent")?;
-    tokio::fs::create_dir_all(state_dir).await?;
-    tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
-    remove_stale_socket(&path.to_path_buf()).await?;
+    secure_fs::ensure_private_directory(state_dir, None)?;
+    remove_stale_socket(path).await?;
     let listener = bind_listener(path)?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    secure_fs::secure_socket(path)?;
     Ok(listener)
 }
 
@@ -328,16 +328,21 @@ fn show_activity(title: &str, detail: Option<&str>) {
         reason = "Approval IPC is reached through the process entrypoint, not the in-process test harness."
     )
 )]
-async fn remove_stale_socket(path: &PathBuf) -> Result<()> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
+async fn remove_stale_socket(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() || metadata.file_type().is_symlink() => {
+            tokio::fs::remove_file(path)
+                .await
+                .context("failed to remove stale session socket")
+        }
+        Ok(_) => anyhow::bail!("unexpected non-socket path at {}", path.display()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("failed to remove stale session socket"),
+        Err(error) => Err(error).context("failed to inspect stale session socket"),
     }
 }
 
 #[cfg(windows)]
-async fn remove_stale_socket(_path: &PathBuf) -> Result<()> {
+async fn remove_stale_socket(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -532,6 +537,18 @@ mod unix_tests {
         let activity = r#"{"type":"activity","title":"t","yolo":true}"#;
         let parsed: Message = serde_json::from_str(activity).unwrap();
         assert!(matches!(parsed, Message::Activity { .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_regular_file_is_not_removed() -> Result<()> {
+        let id = format!("ipc-regular-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, b"keep")?;
+        assert!(remove_stale_socket(&path).await.is_err());
+        assert_eq!(std::fs::read(&path)?, b"keep");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ mod readonly_worker;
 mod replanner;
 mod sandbox;
 mod scheduler;
+mod secure_fs;
 mod task;
 mod task_store;
 mod verifier;
@@ -51,6 +52,8 @@ mod phase0_fallback_tests;
 mod phase0_tests;
 #[cfg(test)]
 mod phase11_goal_run_tests;
+#[cfg(all(test, unix))]
+mod secure_fs_tests;
 #[cfg(test)]
 mod verifier_tests;
 
