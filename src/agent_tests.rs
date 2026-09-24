@@ -3,12 +3,33 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::time::Instant;
+#[cfg(unix)]
+use uuid::Uuid;
+
+#[cfg(unix)]
 use crate::agent::safe_diagnostic_for_test;
 use crate::agent::{
     AgentError, MODEL_PROMPT_LIMIT, MODEL_STDERR_LIMIT, MODEL_STDOUT_LIMIT, ModelInvocation,
     ModelInvocationOutput, ModelRole, ModelTransport, configured_model_from_for_test,
     require_approval_for_test, run_bounded_process_for_test,
 };
+#[cfg(unix)]
+use crate::agent::{
+    PROCESS_CLEANUP_GRACE, run_bounded_host_process, run_bounded_process_async_for_test,
+};
+
+#[cfg(unix)]
+fn temporary_script(root: &Path, name: &str, body: &str) -> PathBuf {
+    let path = root.join(name);
+    std::fs::write(&path, body).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
 
 #[derive(Default)]
 struct RecordingTransport {
@@ -66,6 +87,33 @@ fn command(program: &str, args: &[&str]) -> Vec<String> {
 }
 
 #[cfg(unix)]
+async fn wait_for_pid(path: &Path) -> libc::pid_t {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path)
+                && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+async fn wait_for_process_exit(pid: libc::pid_t) -> bool {
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[cfg(unix)]
 #[test]
 fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
     let output = run_bounded_process_for_test(
@@ -118,6 +166,187 @@ fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
         .unwrap_err(),
         AgentError::ResponseTooLarge
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_host_launcher_kills_descendant_retaining_pipes() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-descendant-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    let script = temporary_script(
+        &root,
+        "descendant.sh",
+        &format!(
+            "#!/bin/sh\n/bin/sleep 3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            pid_path.display()
+        ),
+    );
+    let started = Instant::now();
+    let timeout = Duration::from_secs(1);
+    let result = run_bounded_host_process(
+        &[script.to_string_lossy().into_owned()],
+        b"prompt",
+        &root,
+        timeout,
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), AgentError::Timeout);
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let mut alive = true;
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_host_launcher_cancellation_kills_group_and_joins_parent() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-cancel-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    let script = temporary_script(
+        &root,
+        "cancel.sh",
+        &format!(
+            "#!/bin/sh\n/bin/sleep 5 &\nprintf '%s' \"$!\" > '{}'\nexec /bin/sleep 5\n",
+            pid_path.display()
+        ),
+    );
+    let command = vec![script.to_string_lossy().into_owned()];
+    let cwd = root.clone();
+    let handle = tokio::spawn(async move {
+        run_bounded_host_process(&command, b"prompt", &cwd, Duration::from_secs(30)).await
+    });
+    let pid = wait_for_pid(&pid_path).await;
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+    let stopped = wait_for_process_exit(pid).await;
+    if !stopped {
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(stopped);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_host_launcher_deadline_bounds_blocked_stdin_write() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-stdin-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = temporary_script(&root, "ignore-stdin.sh", "#!/bin/sh\nexec /bin/sleep 1\n");
+    let prompt = vec![b'x'; 1024 * 1024];
+    let started = Instant::now();
+    let result = run_bounded_host_process(
+        &[script.to_string_lossy().into_owned()],
+        &prompt,
+        &root,
+        Duration::from_millis(150),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), AgentError::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn async_launcher_cleans_retained_pipe_tasks_by_deadline_plus_grace() {
+    let root =
+        std::env::temp_dir().join(format!("local-mcp-agent-async-cleanup-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    let script = temporary_script(
+        &root,
+        "retained-pipes.sh",
+        &format!(
+            "#!/bin/sh\n/bin/sleep 3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            pid_path.display()
+        ),
+    );
+    let timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    let result = run_bounded_process_async_for_test(
+        &[script.to_string_lossy().into_owned()],
+        b"prompt",
+        &root,
+        timeout,
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), AgentError::Timeout);
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let mut alive = true;
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_kills_group_before_blocked_stdin_cleanup() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-exit-writer-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    let marker = root.join("descendant.marker");
+    let script = temporary_script(
+        &root,
+        "exit-with-descendant.sh",
+        &format!(
+            "#!/bin/sh\nexec 3<&0\n/bin/sh -c 'sleep 0.2; touch \"$1\"; sleep 3' sh '{}' <&3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            marker.display(),
+            pid_path.display()
+        ),
+    );
+    let prompt = vec![b'x'; 1024 * 1024];
+    let timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    let result = run_bounded_host_process(
+        &[script.to_string_lossy().into_owned()],
+        &prompt,
+        &root,
+        timeout,
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), AgentError::Timeout);
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
+    assert!(!marker.exists());
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let mut alive = true;
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

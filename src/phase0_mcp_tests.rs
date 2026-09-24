@@ -162,6 +162,23 @@ fn goal_tool_catalog_is_exactly_additive() {
     );
 }
 
+#[test]
+fn execute_operation_schema_omits_legacy_authority_fields() {
+    let tools = tools();
+    for name in ["execute", "start_command"] {
+        let operation = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()["inputSchema"]["properties"]["operation"]
+            .clone();
+        let properties = operation["properties"].as_object().unwrap();
+        assert!(properties.get("authorized").is_none());
+        assert!(properties.get("side_effect_state").is_none());
+    }
+}
+
 #[tokio::test]
 async fn initialize_contract_is_frozen() {
     let value = dispatch(&json!({
@@ -220,6 +237,46 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
             .contains("unknown job_id")
     );
 
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn finished_poll_atomically_owns_job_before_concurrent_stop() {
+    let (session, cwd) = phase0_session();
+    let handle = tokio::spawn(async { Ok("done".to_owned()) });
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let started = store_job(&session, "phase0-poll-race".into(), handle, "Started")
+        .await
+        .unwrap();
+    let id = job_id(&started);
+    let args = json!({"job_id": id.to_string()});
+    let stop_args = args.clone();
+    let stop_session = session.clone();
+    let stop_outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let recorded_stop = std::sync::Arc::clone(&stop_outcome);
+    let polled = poll_job_with_after_finished_removal(&args, &session, move || async move {
+        let result = stop_job(&stop_args, &stop_session).await;
+        *recorded_stop.lock().unwrap() = Some(result);
+    })
+    .await
+    .unwrap();
+    assert_eq!(text(&polled), "done");
+    let stop = stop_outcome
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .expect_err("stop must not remove a job already owned by finished poll");
+    assert!(stop.to_string().contains("unknown job_id"));
+    assert!(
+        poll_job(&args, &session)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown job_id")
+    );
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }
 

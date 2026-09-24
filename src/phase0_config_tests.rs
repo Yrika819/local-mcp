@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
 use crate::config;
+use crate::secure_fs;
 
 fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
@@ -16,8 +19,81 @@ fn temp_directory(prefix: &str) -> PathBuf {
 
 async fn cleanup_session(id: &str) {
     if let Ok(path) = config::session_path(id) {
-        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        remove_session_temps(&path);
     }
+}
+
+fn remove_session_temps(path: &Path) {
+    let Ok(prefix) = secure_fs::temp_prefix(path) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(path.parent().unwrap()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) && name.to_string_lossy().ends_with(".tmp") {
+            let _ = secure_fs::remove_private_temp(&entry_path);
+        }
+    }
+}
+
+#[cfg(unix)]
+struct SessionCleanup {
+    id: String,
+    cwd: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        if let Ok(path) = config::session_path(&self.id) {
+            let _ = std::fs::remove_file(&path);
+            remove_session_temps(&path);
+        }
+        let _ = std::fs::remove_dir_all(&self.cwd);
+    }
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn assert_modes(phase: &str, checks: &[(&str, &Path, u32, u32)]) {
+    let failures = checks
+        .iter()
+        .filter(|(_, _, expected, actual)| expected != actual)
+        .map(|(label, path, expected, actual)| {
+            format!(
+                "{phase} {label} {}: actual {:04o}, expected {:04o}",
+                path.display(),
+                actual,
+                expected
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(unix)]
+fn assert_session_modes(phase: &str, path: &Path, state_root: &Path, sessions_dir: &Path) {
+    assert_modes(
+        phase,
+        &[
+            ("final JSON", path, 0o600, mode(path)),
+            ("state root", state_root, 0o700, mode(state_root)),
+            (
+                "sessions directory",
+                sessions_dir,
+                0o700,
+                mode(sessions_dir),
+            ),
+        ],
+    );
 }
 
 #[tokio::test]
@@ -50,7 +126,7 @@ async fn session_create_load_update_and_atomic_replace_are_frozen() {
     );
     assert!(path.is_file());
 
-    let prefix = format!("{id}.json.");
+    let prefix = secure_fs::temp_prefix(&path).unwrap();
     let mut entries = tokio::fs::read_dir(path.parent().unwrap()).await.unwrap();
     while let Some(entry) = entries.next_entry().await.unwrap() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -81,10 +157,70 @@ async fn missing_and_corrupt_session_errors_are_frozen() {
         .await
         .unwrap();
     tokio::fs::write(&path, b"{not-json").await.unwrap();
+    let before = std::fs::read(&path).unwrap();
     let corrupt = config::load_session(&corrupt_id)
         .await
         .err()
         .expect("corrupt session must fail");
     assert!(corrupt.to_string().contains("invalid local-mcp session"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    #[cfg(unix)]
+    assert_eq!(mode(&path), 0o600);
     cleanup_session(&corrupt_id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn saved_session_final_and_state_modes_are_private() {
+    let cwd = temp_directory("local-mcp-phase0-saved-permissions-cwd");
+    let id = unique_id("phase0-saved-permissions");
+    let _cleanup = SessionCleanup {
+        id: id.clone(),
+        cwd: cwd.clone(),
+    };
+
+    config::create_session(&cwd, Some(&id)).await.unwrap();
+    let path = config::session_path(&id).unwrap();
+    let state_root = config::state_dir().unwrap();
+    let sessions_dir = state_root.join("sessions");
+    assert_session_modes("saved session", &path, &state_root, &sessions_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_save_replaces_permissive_final_with_private_mode() {
+    let cwd = temp_directory("local-mcp-phase0-save-permissions-cwd");
+    let id = unique_id("phase0-save-permissions");
+    let _cleanup = SessionCleanup {
+        id: id.clone(),
+        cwd: cwd.clone(),
+    };
+
+    let session = config::create_session(&cwd, Some(&id)).await.unwrap();
+    let path = config::session_path(&id).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    config::save_session(&session).await.unwrap();
+    let state_root = config::state_dir().unwrap();
+    let sessions_dir = state_root.join("sessions");
+    assert_session_modes("save replacement", &path, &state_root, &sessions_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_load_repairs_permissive_final_with_private_mode() {
+    let cwd = temp_directory("local-mcp-phase0-load-permissions-cwd");
+    let id = unique_id("phase0-load-permissions");
+    let _cleanup = SessionCleanup {
+        id: id.clone(),
+        cwd: cwd.clone(),
+    };
+
+    config::create_session(&cwd, Some(&id)).await.unwrap();
+    let path = config::session_path(&id).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let loaded = config::load_session(&id).await.unwrap();
+    assert_eq!(loaded.id, id);
+    let state_root = config::state_dir().unwrap();
+    let sessions_dir = state_root.join("sessions");
+    assert_session_modes("load repair", &path, &state_root, &sessions_dir);
 }

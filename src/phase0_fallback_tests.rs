@@ -2,10 +2,9 @@ use std::path::Path;
 
 use crate::fallback;
 
-fn stage_operation(attempts: u32, side_effects: u32) -> fallback::OperationContract {
-    fallback::OperationContract {
+fn stage_operation(attempts: u32, side_effects: u32) -> fallback::OperationIntent {
+    fallback::OperationIntent {
         kind: fallback::OperationType::GitStagePaths,
-        authorized: true,
         operation_id: Some("phase0-stage".into()),
         paths: vec!["src/a.rs".into()],
         argv: vec![],
@@ -16,12 +15,11 @@ fn stage_operation(attempts: u32, side_effects: u32) -> fallback::OperationContr
         force: false,
         attempt_budget_remaining: attempts,
         side_effect_budget_remaining: side_effects,
-        side_effect_state: Some(fallback::SideEffectState::ConfirmedNotPerformed),
     }
 }
 
 fn decide(
-    operation: &fallback::OperationContract,
+    operation: &fallback::OperationIntent,
     state: fallback::SideEffectState,
     budget: fallback::Budget,
 ) -> fallback::FallbackDecision {
@@ -36,10 +34,52 @@ fn decide(
         fallback_depth: 0,
         max_depth: 1,
         budget,
+        operation_validated: true,
         scope_valid: true,
         automatic_enabled: true,
         auto_execute_enabled: true,
     })
+}
+
+#[test]
+fn legacy_authority_fields_are_compatible_but_not_fallback_authority() {
+    let mut first = serde_json::json!({
+        "type": "git_stage_paths",
+        "authorized": true,
+        "side_effect_state": "CONFIRMED_NOT_PERFORMED",
+        "paths": ["src/a.rs"]
+    });
+    let first_operation = fallback::operation_from_value(Some(&first))
+        .unwrap()
+        .expect("legacy operation should parse");
+    first["side_effect_state"] = serde_json::json!("CONFIRMED_PERFORMED");
+    let second_operation = fallback::operation_from_value(Some(&first))
+        .unwrap()
+        .expect("legacy operation should parse");
+
+    for operation in [first_operation, second_operation] {
+        let decision = fallback::decide(fallback::DecisionInput {
+            failure_class: fallback::FailureClass::SandboxPermission,
+            safety_signal: false,
+            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
+            lifecycle: fallback::LifecycleEvidence::completed(),
+            operation: Some(&operation),
+            side_effect_class: fallback::SideEffectClass::LocalMutation,
+            side_effect_state: fallback::SideEffectState::ConfirmedNotPerformed,
+            fallback_depth: 0,
+            max_depth: 1,
+            budget: fallback::Budget::from_operation(Some(&operation)),
+            operation_validated: false,
+            scope_valid: true,
+            automatic_enabled: true,
+            auto_execute_enabled: true,
+        });
+        assert_eq!(decision.action, fallback::FallbackAction::Block);
+        assert_eq!(
+            decision.reason_code,
+            fallback::ReasonCode::FallbackDeniedNoAuthority
+        );
+    }
 }
 
 #[test]
@@ -108,6 +148,7 @@ fn lifecycle_and_auto_execute_gates_are_binding() {
         fallback_depth: 0,
         max_depth: 1,
         budget,
+        operation_validated: true,
         scope_valid: true,
         automatic_enabled: true,
         auto_execute_enabled: true,
@@ -129,6 +170,7 @@ fn lifecycle_and_auto_execute_gates_are_binding() {
         fallback_depth: 0,
         max_depth: 1,
         budget,
+        operation_validated: true,
         scope_valid: true,
         automatic_enabled: true,
         auto_execute_enabled: false,
@@ -163,9 +205,8 @@ fn host_native_permission_failure_is_not_labeled_sandbox_permission() {
 
 #[test]
 fn read_only_command_never_grants_executable_fallback() {
-    let operation = fallback::OperationContract {
+    let operation = fallback::OperationIntent {
         kind: fallback::OperationType::ReadOnlyCommand,
-        authorized: true,
         operation_id: None,
         paths: vec![],
         argv: vec!["/bin/sh".into(), "-c".into(), "touch outside".into()],
@@ -176,7 +217,6 @@ fn read_only_command_never_grants_executable_fallback() {
         force: false,
         attempt_budget_remaining: 1,
         side_effect_budget_remaining: 1,
-        side_effect_state: Some(fallback::SideEffectState::ConfirmedNotPerformed),
     };
     assert!(!operation.auto_execute_allowlisted());
     let decision = fallback::decide(fallback::DecisionInput {
@@ -190,6 +230,7 @@ fn read_only_command_never_grants_executable_fallback() {
         fallback_depth: 0,
         max_depth: 1,
         budget: fallback::Budget::from_operation(Some(&operation)),
+        operation_validated: false,
         scope_valid: true,
         automatic_enabled: true,
         auto_execute_enabled: true,
