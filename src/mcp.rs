@@ -257,7 +257,6 @@ pub(crate) fn tools() -> Value {
                     "unstructured"
                 ]
             },
-            "authorized": {"type": "boolean", "default": false},
             "operation_id": {"type": "string", "maxLength": 128},
             "paths": {"type": "array", "items": {"type": "string"}},
             "argv": {"type": "array", "items": {"type": "string"}},
@@ -267,11 +266,7 @@ pub(crate) fn tools() -> Value {
             "create_only": {"type": "boolean", "default": false},
             "force": {"type": "boolean", "default": false},
             "attempt_budget_remaining": {"type": "integer", "minimum": 0, "default": 1},
-            "side_effect_budget_remaining": {"type": "integer", "minimum": 0, "default": 1},
-            "side_effect_state": {
-                "type": "string",
-                "enum": ["CONFIRMED_NOT_PERFORMED", "CONFIRMED_PERFORMED", "UNKNOWN"]
-            }
+            "side_effect_budget_remaining": {"type": "integer", "minimum": 0, "default": 1}
         },
         "required": ["type"]
     });
@@ -669,21 +664,40 @@ async fn store_job(
 }
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
+    poll_job_with_after_finished_removal(args, session, || async {}).await
+}
+
+async fn poll_job_with_after_finished_removal<F, Fut>(
+    args: &Value,
+    session: &config::Session,
+    after_finished_removal: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let job_id = required_job_id(args)?;
-    let finished = {
-        let jobs = jobs().lock().unwrap();
+    let job = {
+        let mut jobs = jobs().lock().unwrap();
         let job = jobs.get(&job_id).context("unknown job_id")?;
         anyhow::ensure!(
             job.session_id == session.id,
             "job does not belong to this session"
         );
-        job.handle.is_finished()
+        if job.handle.is_finished() {
+            Some(
+                jobs.remove(&job_id)
+                    .context("finished job missing under lock")?,
+            )
+        } else {
+            None
+        }
     };
-    if !finished {
+    let Some(job) = job else {
         return text_result(json!({"status":"running","job_id":job_id}).to_string());
-    }
+    };
 
-    let job = jobs().lock().unwrap().remove(&job_id).unwrap();
+    after_finished_removal().await;
     let result = job.handle.await.context("background command task failed")?;
     text_result(result?)
 }
@@ -1084,13 +1098,13 @@ mod tests {
 
     #[tokio::test]
     async fn expected_nonzero_exit_returns_normal_structured_result() {
-        let policy = ExecutionPolicy {
-            request_id: "expected-state-test".into(),
-            accepted_exit_codes: vec![0, 1],
-            operation: None,
-            fallback_depth: 0,
-            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
-        };
+        let policy = ExecutionPolicy::new(
+            "expected-state-test".into(),
+            vec![0, 1],
+            None,
+            0,
+            fallback::PrimaryExecutionMode::Sandboxed,
+        );
         let command = vec![
             "git".into(),
             "show-ref".into(),
@@ -1119,13 +1133,13 @@ mod tests {
 
     #[tokio::test]
     async fn successful_execution_preserves_stdout_stderr_and_exit_code() {
-        let policy = ExecutionPolicy {
-            request_id: "success-test".into(),
-            accepted_exit_codes: vec![0],
-            operation: None,
-            fallback_depth: 0,
-            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
-        };
+        let policy = ExecutionPolicy::new(
+            "success-test".into(),
+            vec![0],
+            None,
+            0,
+            fallback::PrimaryExecutionMode::Sandboxed,
+        );
         let result = process_sandboxed_attempt(
             "non-running-test-session",
             &["/bin/echo".into(), "ok".into()],
@@ -1146,17 +1160,23 @@ mod tests {
         assert_eq!(value["stderr"], "stderr");
         assert_eq!(value["failure_class"], "SUCCESS");
         assert_eq!(value["primary_execution_mode"], "SANDBOXED");
+        assert_eq!(value["fallback_decision"]["operation_validated"], false);
+        assert!(
+            value["fallback_decision"]
+                .get("operation_authorized")
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn semantic_nonzero_exit_is_returned_without_executable_fallback() {
-        let policy = ExecutionPolicy {
-            request_id: "semantic-test".into(),
-            accepted_exit_codes: vec![0],
-            operation: None,
-            fallback_depth: 0,
-            primary_execution_mode: fallback::PrimaryExecutionMode::Sandboxed,
-        };
+        let policy = ExecutionPolicy::new(
+            "semantic-test".into(),
+            vec![0],
+            None,
+            0,
+            fallback::PrimaryExecutionMode::Sandboxed,
+        );
         let error = process_sandboxed_attempt(
             "non-running-test-session",
             &["dotnet".into(), "test".into()],

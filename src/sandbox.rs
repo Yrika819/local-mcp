@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(not(windows))]
@@ -8,9 +13,19 @@ use codex_protocol::models::PermissionProfile;
 #[cfg(not(windows))]
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
+pub(crate) const TRUSTED_GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TRUSTED_GIT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const TRUSTED_GIT_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const TRUSTED_GIT_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const TRUSTED_GIT_STDERR_LIMIT: usize = 1024 * 1024;
+pub(crate) const TRUSTED_GIT_CLEANUP_GRACE: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
 pub struct Output {
     pub status: i32,
     pub stdout: String,
@@ -50,6 +65,75 @@ impl std::fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+struct AbortOnDrop<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(
+            self.get_mut()
+                .handle
+                .as_mut()
+                .expect("aborted task handle is missing"),
+        )
+        .poll(context)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(unix)]
+struct UnixProcessGroupGuard {
+    process_group_id: libc::pid_t,
+}
+
+#[cfg(unix)]
+impl UnixProcessGroupGuard {
+    fn new(process_group_id: u32) -> Self {
+        Self {
+            process_group_id: process_group_id as libc::pid_t,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.process_group_id > 0 {
+            let _ = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+        }
+    }
+}
 
 fn sandbox_process(
     command: &[String],
@@ -181,10 +265,14 @@ pub async fn run_tracked(
 ) -> std::result::Result<Output, RunError> {
     let (_, mut process) = sandbox_process(command, cwd, writable_roots, stdin.is_some())
         .map_err(|error| RunError::new(error, false, false))?;
+    #[cfg(unix)]
+    process.process_group(0);
     let mut child = process
         .spawn()
         .context("failed to start primary command")
         .map_err(|error| RunError::new(error, false, false))?;
+    #[cfg(unix)]
+    let _process_group_guard = UnixProcessGroupGuard::new(child.id().unwrap_or(0));
 
     if let Some(bytes) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
@@ -223,9 +311,412 @@ pub async fn run_unrestricted(
     cwd: &Path,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
-    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    run_unrestricted_inner(command, cwd, stdin, false)
+        .await
+        .map_err(|error| error.error)
+}
+
+#[allow(
+    dead_code,
+    reason = "Compatibility seam for bounded trusted Git callers."
+)]
+pub(crate) async fn run_unrestricted_clean(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_unrestricted_clean_with_limits(
+        command,
+        cwd,
+        stdin,
+        TRUSTED_GIT_STAGE_TIMEOUT,
+        TRUSTED_GIT_STDOUT_LIMIT,
+        TRUSTED_GIT_STDERR_LIMIT,
+    )
+    .await
+    .map_err(|error| error.error)
+}
+
+#[allow(
+    dead_code,
+    reason = "Compatibility seam for bounded tracked Git callers."
+)]
+pub(crate) async fn run_unrestricted_clean_tracked(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+) -> std::result::Result<Output, RunError> {
+    run_unrestricted_clean_with_limits(
+        command,
+        cwd,
+        stdin,
+        TRUSTED_GIT_STAGE_TIMEOUT,
+        TRUSTED_GIT_STDOUT_LIMIT,
+        TRUSTED_GIT_STDERR_LIMIT,
+    )
+    .await
+}
+
+pub(crate) async fn run_unrestricted_clean_with_limits(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> std::result::Result<Output, RunError> {
+    if command.is_empty() {
+        return Err(RunError::new(
+            anyhow::anyhow!("command must not be empty"),
+            false,
+            false,
+        ));
+    }
     let cwd = std::fs::canonicalize(cwd)
-        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))
+        .map_err(|error| RunError::new(error, false, false))?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let cleanup_deadline = deadline + TRUSTED_GIT_CLEANUP_GRACE;
+    let mut process = Command::new(&command[0]);
+    process
+        .kill_on_drop(true)
+        .args(&command[1..])
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(clean_git_environment())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = process
+        .spawn()
+        .context("failed to start bounded Git command")
+        .map_err(|error| RunError::new(error, false, false))?;
+    let process_group_id = child.id().unwrap_or(0);
+    #[cfg(unix)]
+    let _process_group_guard = UnixProcessGroupGuard::new(process_group_id);
+    let mut stdout_task: Option<CaptureTask> = None;
+    let mut stderr_task: Option<CaptureTask> = None;
+    let Some(stdout) = child.stdout.take() else {
+        let finished = cleanup_bounded_child(
+            &mut child,
+            process_group_id,
+            &mut stdout_task,
+            &mut stderr_task,
+            cleanup_deadline,
+        )
+        .await;
+        return Err(RunError::new(
+            anyhow::anyhow!("bounded Git command has no stdout pipe"),
+            true,
+            finished,
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let finished = cleanup_bounded_child(
+            &mut child,
+            process_group_id,
+            &mut stdout_task,
+            &mut stderr_task,
+            cleanup_deadline,
+        )
+        .await;
+        return Err(RunError::new(
+            anyhow::anyhow!("bounded Git command has no stderr pipe"),
+            true,
+            finished,
+        ));
+    };
+    let state = Arc::new(CaptureState::new());
+    stdout_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
+        stdout,
+        stdout_limit,
+        Arc::clone(&state),
+    ))));
+    stderr_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
+        stderr,
+        stderr_limit,
+        Arc::clone(&state),
+    ))));
+    if let Some(bytes) = stdin {
+        let Some(mut child_stdin) = child.stdin.take() else {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(
+                anyhow::anyhow!("bounded Git command has no stdin pipe"),
+                true,
+                finished,
+            ));
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, child_stdin.write_all(bytes)).await,
+            Ok(Ok(()))
+        ) {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(
+                anyhow::anyhow!("bounded Git command stdin write failed or timed out"),
+                true,
+                finished,
+            ));
+        }
+    }
+    drop(child.stdin.take());
+    let wait_result = loop {
+        if state.too_large.load(Ordering::Acquire) {
+            break Err(anyhow::anyhow!("bounded Git command output limit exceeded"));
+        }
+        if state.failed.load(Ordering::Acquire) {
+            break Err(anyhow::anyhow!("bounded Git command output capture failed"));
+        }
+        tokio::select! {
+            result = child.wait() => break result.map_err(anyhow::Error::from),
+            _ = tokio::time::sleep_until(deadline) => {
+                break Err(anyhow::anyhow!("bounded Git command timed out"));
+            }
+            _ = state.notify.notified() => {}
+        }
+    };
+    let status = match wait_result {
+        Ok(_status) if state.too_large.load(Ordering::Acquire) => {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(
+                anyhow::anyhow!("bounded Git command output limit exceeded"),
+                true,
+                finished,
+            ));
+        }
+        Ok(_status) if state.failed.load(Ordering::Acquire) => {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(
+                anyhow::anyhow!("bounded Git command output capture failed"),
+                true,
+                finished,
+            ));
+        }
+        Ok(status) => status,
+        Err(error) => {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(error, true, finished));
+        }
+    };
+    let stdout = match finish_capture_task(&mut stdout_task, cleanup_deadline).await {
+        Ok(value) => value,
+        Err(error) => {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(anyhow::anyhow!("{error}"), true, finished));
+        }
+    };
+    let stderr = match finish_capture_task(&mut stderr_task, cleanup_deadline).await {
+        Ok(value) => value,
+        Err(error) => {
+            let finished = cleanup_bounded_child(
+                &mut child,
+                process_group_id,
+                &mut stdout_task,
+                &mut stderr_task,
+                cleanup_deadline,
+            )
+            .await;
+            return Err(RunError::new(anyhow::anyhow!("{error}"), true, finished));
+        }
+    };
+    Ok(Output {
+        status: status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+struct CaptureState {
+    too_large: AtomicBool,
+    failed: AtomicBool,
+    notify: Notify,
+}
+
+impl CaptureState {
+    fn new() -> Self {
+        Self {
+            too_large: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CaptureError {
+    TooLarge,
+    Io,
+    DidNotFinish,
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => formatter.write_str("bounded Git command output limit exceeded"),
+            Self::Io => formatter.write_str("bounded Git command output capture failed"),
+            Self::DidNotFinish => {
+                formatter.write_str("bounded Git command output capture did not finish")
+            }
+        }
+    }
+}
+
+async fn capture_bounded<R>(
+    mut reader: R,
+    limit: usize,
+    state: Arc<CaptureState>,
+) -> Result<Vec<u8>, CaptureError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => return Ok(output),
+            Ok(read) if output.len().saturating_add(read) > limit => {
+                state.too_large.store(true, Ordering::Release);
+                state.notify.notify_one();
+                return Err(CaptureError::TooLarge);
+            }
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                state.failed.store(true, Ordering::Release);
+                state.notify.notify_one();
+                return Err(CaptureError::Io);
+            }
+        }
+    }
+}
+
+type CaptureTask = AbortOnDrop<Result<Vec<u8>, CaptureError>>;
+
+async fn finish_capture_task(
+    task: &mut Option<CaptureTask>,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, CaptureError> {
+    let Some(handle) = task.as_mut() else {
+        return Err(CaptureError::DidNotFinish);
+    };
+    match tokio::time::timeout_at(deadline, &mut *handle).await {
+        Ok(Ok(Ok(output))) => {
+            task.take();
+            Ok(output)
+        }
+        Ok(Ok(Err(error))) => {
+            task.take();
+            Err(error)
+        }
+        Ok(Err(_)) => {
+            task.take();
+            Err(CaptureError::DidNotFinish)
+        }
+        Err(_) => Err(CaptureError::DidNotFinish),
+    }
+}
+
+async fn abort_capture_task(task: &mut Option<CaptureTask>) {
+    if let Some(task) = task.as_mut() {
+        task.abort_and_join().await;
+    }
+    task.take();
+}
+
+#[cfg(unix)]
+fn kill_bounded_child(child: &mut Child, process_group_id: u32) {
+    if process_group_id != 0 {
+        let _ = unsafe { libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+}
+
+#[cfg(not(unix))]
+fn kill_bounded_child(child: &mut Child, _process_group_id: u32) {
+    let _ = child.start_kill();
+}
+
+async fn cleanup_bounded_child(
+    child: &mut Child,
+    process_group_id: u32,
+    stdout_task: &mut Option<CaptureTask>,
+    stderr_task: &mut Option<CaptureTask>,
+    cleanup_deadline: tokio::time::Instant,
+) -> bool {
+    kill_bounded_child(child, process_group_id);
+    let finished = matches!(
+        tokio::time::timeout_at(cleanup_deadline, child.wait()).await,
+        Ok(Ok(_))
+    );
+    kill_bounded_child(child, process_group_id);
+    abort_capture_task(stdout_task).await;
+    abort_capture_task(stderr_task).await;
+    finished
+}
+
+async fn run_unrestricted_inner(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    clean_environment: bool,
+) -> std::result::Result<Output, RunError> {
+    if command.is_empty() {
+        return Err(RunError::new(
+            anyhow::anyhow!("command must not be empty"),
+            false,
+            false,
+        ));
+    }
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))
+        .map_err(|error| RunError::new(error, false, false))?;
     let mut process = Command::new(&command[0]);
     process
         .kill_on_drop(true)
@@ -238,15 +729,29 @@ pub async fn run_unrestricted(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if clean_environment {
+        process.env_clear().envs(clean_git_environment());
+    }
+    #[cfg(unix)]
+    process.process_group(0);
     let mut child = process
         .spawn()
-        .context("failed to start unsandboxed command")?;
+        .context("failed to start unsandboxed command")
+        .map_err(|error| RunError::new(error, false, false))?;
+    #[cfg(unix)]
+    let _process_group_guard = UnixProcessGroupGuard::new(child.id().unwrap_or(0));
     if let Some(bytes) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
     {
-        child_stdin.write_all(bytes).await?;
+        child_stdin
+            .write_all(bytes)
+            .await
+            .map_err(|error| RunError::new(error.into(), true, false))?;
     }
-    let output = child.wait_with_output().await?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| RunError::new(error.into(), true, false))?;
     Ok(Output {
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -274,9 +779,46 @@ fn safe_environment() -> HashMap<String, String> {
     .collect()
 }
 
+fn clean_git_environment() -> HashMap<String, String> {
+    let mut environment = safe_environment();
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
+    environment.insert("GIT_CONFIG_GLOBAL".to_owned(), null_device_path());
+    environment.insert("GIT_ATTR_NOSYSTEM".to_owned(), "1".to_owned());
+    environment
+}
+
+#[cfg(windows)]
+pub(crate) fn null_device_path() -> String {
+    "NUL".to_owned()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn null_device_path() -> String {
+    "/dev/null".to_owned()
+}
+
 #[cfg(test)]
 mod unrestricted_tests {
     use super::*;
+
+    #[test]
+    fn clean_git_environment_drops_ambient_git_overrides() {
+        let environment = clean_git_environment();
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            assert!(!environment.contains_key(name), "{name}");
+        }
+        assert_eq!(
+            environment.get("GIT_CONFIG_NOSYSTEM"),
+            Some(&"1".to_owned())
+        );
+    }
 
     #[tokio::test]
     async fn host_native_execution_preserves_exit_and_output() -> Result<()> {
@@ -300,6 +842,50 @@ mod unrestricted_tests {
         assert_eq!(output.stdout, "stdout");
         assert_eq!(output.stderr, "stderr");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod abort_on_drop_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::oneshot;
+
+    use super::AbortOnDrop;
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_aborts_and_releases_task() {
+        let state = Arc::new(());
+        let weak = Arc::downgrade(&state);
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (dropped_sender, dropped_receiver) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _state = state;
+            let _signal = DropSignal(Some(dropped_sender));
+            let _ = started_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        let task = AbortOnDrop::new(handle);
+        started_receiver.await.unwrap();
+        drop(task);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            dropped_receiver.await.unwrap();
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 

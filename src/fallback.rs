@@ -192,19 +192,6 @@ impl OperationType {
             Self::Unstructured => "unstructured",
         }
     }
-
-    pub fn side_effect_class(self) -> SideEffectClass {
-        match self {
-            Self::ReadOnlyCommand => SideEffectClass::None,
-            Self::GitStagePaths | Self::GitCreateRef | Self::GitCommit => {
-                SideEffectClass::LocalMutation
-            }
-            Self::GitPushRef | Self::GithubWorkflowDispatch | Self::OtherRemoteMutation => {
-                SideEffectClass::RemoteMutation
-            }
-            Self::Unstructured => SideEffectClass::Unknown,
-        }
-    }
 }
 
 fn default_budget() -> u32 {
@@ -213,11 +200,9 @@ fn default_budget() -> u32 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperationContract {
+pub struct OperationIntent {
     #[serde(rename = "type")]
     pub kind: OperationType,
-    #[serde(default)]
-    pub authorized: bool,
     #[serde(default)]
     pub operation_id: Option<String>,
     #[serde(default)]
@@ -238,11 +223,9 @@ pub struct OperationContract {
     pub attempt_budget_remaining: u32,
     #[serde(default = "default_budget")]
     pub side_effect_budget_remaining: u32,
-    #[serde(default)]
-    pub side_effect_state: Option<SideEffectState>,
 }
 
-impl OperationContract {
+impl OperationIntent {
     pub fn validate(&self) -> Result<()> {
         if let Some(id) = &self.operation_id {
             anyhow::ensure!(!id.is_empty() && id.len() <= 128, "invalid operation_id");
@@ -281,7 +264,7 @@ impl OperationContract {
         match self.kind {
             OperationType::GitStagePaths => {
                 command.len() == self.paths.len() + 3
-                    && executable_name(command) == Some("git")
+                    && executable_name(command).is_some_and(is_git_executable_name)
                     && command.get(1).is_some_and(|value| value == "add")
                     && command.get(2).is_some_and(|value| value == "--")
                     && command[3..] == self.paths
@@ -297,35 +280,14 @@ impl OperationContract {
     pub fn auto_execute_allowlisted(&self) -> bool {
         matches!(self.kind, OperationType::GitStagePaths)
     }
-
-    pub fn side_effect_class(&self) -> SideEffectClass {
-        self.kind.side_effect_class()
-    }
-
-    pub fn build_exact_command(&self, original: &[String]) -> Result<Vec<String>> {
-        anyhow::ensure!(
-            self.scope_matches(original),
-            "operation scope does not match command"
-        );
-        match self.kind {
-            OperationType::GitStagePaths => {
-                let mut command = vec![original[0].clone(), "add".to_owned(), "--".to_owned()];
-                command.extend(self.paths.clone());
-                Ok(command)
-            }
-            OperationType::ReadOnlyCommand => {
-                anyhow::bail!("read_only_command is never executable-fallback allowlisted")
-            }
-            _ => anyhow::bail!("operation type is not executable fallback allowlisted"),
-        }
-    }
 }
 
 fn exact_relative_path(value: &str) -> bool {
     if value.is_empty()
         || value.starts_with('-')
-        || value.starts_with(":(")
         || value.contains('\0')
+        || value.contains('\\')
+        || value.contains(':')
         || value.contains('*')
         || value.contains('?')
         || value.contains('[')
@@ -333,28 +295,78 @@ fn exact_relative_path(value: &str) -> bool {
         return false;
     }
     let path = Path::new(value);
-    if path.is_absolute() {
+    if path.is_absolute() || value.ends_with('/') || value.contains("//") {
+        return false;
+    }
+    if value
+        .split('/')
+        .any(|component| component.is_empty() || component == "." || component == "..")
+    {
         return false;
     }
     let mut saw_normal = false;
     for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                if part == ".git" {
-                    return false;
-                }
-                saw_normal = true;
-            }
-            _ => return false,
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        let Some(part) = part.to_str() else {
+            return false;
+        };
+        if part.eq_ignore_ascii_case(".git") || windows_path_alias(part) {
+            return false;
         }
+        saw_normal = true;
     }
     saw_normal
+}
+
+fn windows_path_alias(value: &str) -> bool {
+    if matches!(value.chars().last(), Some(' ' | '.' | '\t')) {
+        return true;
+    }
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn executable_name(command: &[String]) -> Option<&str> {
     Path::new(command.first()?)
         .file_name()
         .and_then(|value| value.to_str())
+}
+
+fn is_git_executable_name(value: &str) -> bool {
+    value == "git" || (cfg!(windows) && value.eq_ignore_ascii_case("git.exe"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,44 +628,87 @@ fn strong_semantic_failure(command: &[String], combined: &str) -> bool {
 
 pub fn infer_side_effect_class(
     command: &[String],
-    operation: Option<&OperationContract>,
+    _operation: Option<&OperationIntent>,
 ) -> SideEffectClass {
-    if let Some(operation) = operation {
-        return operation.side_effect_class();
+    let Some(executable) = normalized_executable_name(command) else {
+        return SideEffectClass::Unknown;
+    };
+    match executable.as_str() {
+        "git" => git_side_effect_class(command),
+        "gh" => gh_side_effect_class(command),
+        _ => SideEffectClass::Unknown,
     }
+}
 
-    let executable = executable_name(command).unwrap_or_default();
-    if executable == "git" {
-        match command.get(1).map(String::as_str) {
-            Some("push") | Some("fetch-pack") | Some("send-pack") => {
-                return SideEffectClass::RemoteMutation;
-            }
-            Some("add") | Some("commit") | Some("update-ref") | Some("tag") | Some("branch")
-            | Some("reset") | Some("rebase") | Some("merge") => {
-                return SideEffectClass::LocalMutation;
-            }
-            _ => {}
-        }
+fn normalized_executable_name(command: &[String]) -> Option<String> {
+    let name = executable_name(command)?;
+    #[cfg(windows)]
+    {
+        let name = name.to_ascii_lowercase();
+        Some(name.strip_suffix(".exe").unwrap_or(&name).to_owned())
     }
-    if executable == "gh" {
-        let joined = command
-            .iter()
-            .skip(1)
-            .map(|value| value.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if contains_any(
-            &joined,
-            &[
-                "workflow run",
-                "api --method post",
-                "api -x post",
-                "pr create",
-                "release create",
-            ],
-        ) {
-            return SideEffectClass::RemoteMutation;
+    #[cfg(not(windows))]
+    {
+        Some(name.to_owned())
+    }
+}
+
+fn git_side_effect_class(command: &[String]) -> SideEffectClass {
+    let subcommand = command
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match subcommand.as_str() {
+        "push" | "fetch-pack" | "send-pack" => SideEffectClass::RemoteMutation,
+        "add" | "commit" | "update-ref" | "tag" | "branch" | "reset" | "rebase" | "merge"
+        | "checkout" | "switch" | "restore" | "rm" | "mv" | "clean" | "apply" | "cherry-pick"
+        | "revert" | "worktree" => SideEffectClass::LocalMutation,
+        "status" | "show" | "log" | "diff" | "rev-parse" | "ls-files" | "cat-file"
+        | "check-ignore" | "symbolic-ref" | "describe" | "blame" | "shortlog" | "show-ref"
+        | "for-each-ref" | "name-rev" | "diff-tree" | "ls-remote" | "version" | "help" => {
+            SideEffectClass::None
         }
+        _ => SideEffectClass::Unknown,
+    }
+}
+
+fn gh_side_effect_class(command: &[String]) -> SideEffectClass {
+    let joined = command
+        .iter()
+        .skip(1)
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if contains_any(
+        &joined,
+        &[
+            "workflow run",
+            "api --method post",
+            "api -x post",
+            "pr create",
+            "pr merge",
+            "issue create",
+            "issue close",
+            "release create",
+            "release upload",
+        ],
+    ) {
+        return SideEffectClass::RemoteMutation;
+    }
+    if contains_any(
+        &joined,
+        &[
+            "pr view",
+            "pr list",
+            "issue view",
+            "issue list",
+            "repo view",
+            "release list",
+            "workflow list",
+            "run list",
+        ],
+    ) {
+        return SideEffectClass::None;
     }
     SideEffectClass::Unknown
 }
@@ -666,7 +721,7 @@ pub struct Budget {
 }
 
 impl Budget {
-    pub fn from_operation(operation: Option<&OperationContract>) -> Self {
+    pub fn from_operation(operation: Option<&OperationIntent>) -> Self {
         match operation {
             Some(operation) => Self {
                 attempt_remaining: operation.attempt_budget_remaining,
@@ -697,6 +752,14 @@ impl Budget {
         }
     }
 
+    pub fn after_started_mutation_failure(self) -> Self {
+        Self {
+            attempt_remaining: self.attempt_remaining.saturating_sub(1),
+            side_effect_remaining: self.side_effect_remaining.saturating_sub(1),
+            locked: true,
+        }
+    }
+
     pub fn consume_fallback(self) -> Self {
         Self {
             attempt_remaining: self.attempt_remaining.saturating_sub(1),
@@ -711,12 +774,13 @@ pub struct DecisionInput<'a> {
     pub safety_signal: bool,
     pub primary_execution_mode: PrimaryExecutionMode,
     pub lifecycle: LifecycleEvidence,
-    pub operation: Option<&'a OperationContract>,
+    pub operation: Option<&'a OperationIntent>,
     pub side_effect_class: SideEffectClass,
     pub side_effect_state: SideEffectState,
     pub fallback_depth: u8,
     pub max_depth: u8,
     pub budget: Budget,
+    pub operation_validated: bool,
     pub scope_valid: bool,
     pub automatic_enabled: bool,
     pub auto_execute_enabled: bool,
@@ -727,7 +791,7 @@ pub struct FallbackDecision {
     pub action: FallbackAction,
     pub reason_code: ReasonCode,
     pub mode: Option<FallbackMode>,
-    pub operation_authorized: bool,
+    pub operation_validated: bool,
     pub side_effect_state: SideEffectState,
     pub attempt_budget_remaining: u32,
     pub side_effect_budget_remaining: u32,
@@ -736,12 +800,11 @@ pub struct FallbackDecision {
 }
 
 pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
-    let operation_authorized = input.operation.is_some_and(|op| op.authorized);
     let decision = |action, reason_code, mode, verification_required| FallbackDecision {
         action,
         reason_code,
         mode,
-        operation_authorized,
+        operation_validated: input.operation_validated,
         side_effect_state: input.side_effect_state,
         attempt_budget_remaining: input.budget.attempt_remaining,
         side_effect_budget_remaining: input.budget.side_effect_remaining,
@@ -860,7 +923,7 @@ pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
                     false,
                 );
             };
-            if !operation.authorized {
+            if !input.operation_validated {
                 return decision(
                     FallbackAction::Block,
                     ReasonCode::FallbackDeniedNoAuthority,
@@ -1102,7 +1165,7 @@ If evidence is insufficient, report UNKNOWN. Do not guess.
 pub fn execute_preflight_prompt(
     cwd: &Path,
     request_id: &str,
-    operation: &OperationContract,
+    operation: &OperationIntent,
 ) -> String {
     format!(
         r#"LOCAL-MCP CODEX FALLBACK POLICY V2 — EXECUTE_AUTHORIZED_OPERATION PREFLIGHT
@@ -1110,7 +1173,6 @@ pub fn execute_preflight_prompt(
 Request ID: {request_id}
 Repository / cwd: {cwd}
 Operation type: {operation_type}
-Authorized: {authorized}
 Fallback depth: 1
 
 This Codex invocation is READ-ONLY BY DESIGN.
@@ -1129,7 +1191,6 @@ Never attempt to bypass platform, tool, host, or sandbox safety controls.
         request_id = request_id,
         cwd = cwd.display(),
         operation_type = operation.kind.as_str(),
-        authorized = operation.authorized,
     )
 }
 
@@ -1208,14 +1269,18 @@ pub fn accepted_exit_codes(values: Option<&serde_json::Value>) -> Result<Vec<i32
     Ok(result)
 }
 
-pub fn operation_from_value(
-    value: Option<&serde_json::Value>,
-) -> Result<Option<OperationContract>> {
+pub fn operation_from_value(value: Option<&serde_json::Value>) -> Result<Option<OperationIntent>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    let operation: OperationContract =
-        serde_json::from_value(value.clone()).context("invalid operation contract")?;
+    let mut value = value.clone();
+    let object = value
+        .as_object_mut()
+        .context("operation must be an object")?;
+    object.remove("authorized");
+    object.remove("side_effect_state");
+    let operation: OperationIntent =
+        serde_json::from_value(value).context("invalid operation intent")?;
     operation.validate()?;
     Ok(Some(operation))
 }
@@ -1228,10 +1293,9 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 mod tests {
     use super::*;
 
-    fn git_stage_operation() -> OperationContract {
-        OperationContract {
+    fn git_stage_operation() -> OperationIntent {
+        OperationIntent {
             kind: OperationType::GitStagePaths,
-            authorized: true,
             operation_id: Some("case-b".to_owned()),
             paths: vec!["src/a.rs".to_owned(), "tests/a.rs".to_owned()],
             argv: vec![],
@@ -1242,13 +1306,12 @@ mod tests {
             force: false,
             attempt_budget_remaining: 1,
             side_effect_budget_remaining: 1,
-            side_effect_state: None,
         }
     }
 
     fn decision_for(
         failure_class: FailureClass,
-        operation: Option<&OperationContract>,
+        operation: Option<&OperationIntent>,
         side_effect_class: SideEffectClass,
         side_effect_state: SideEffectState,
         depth: u8,
@@ -1266,6 +1329,8 @@ mod tests {
             fallback_depth: depth,
             max_depth: 1,
             budget,
+            operation_validated: operation
+                .is_some_and(|operation| operation.kind == OperationType::GitStagePaths),
             scope_valid,
             automatic_enabled: true,
             auto_execute_enabled: true,
@@ -1392,6 +1457,7 @@ mod tests {
             fallback_depth: 0,
             max_depth: 1,
             budget: Budget::from_operation(Some(&operation)),
+            operation_validated: true,
             scope_valid: true,
             automatic_enabled: true,
             auto_execute_enabled: true,
@@ -1423,6 +1489,7 @@ mod tests {
             fallback_depth: 0,
             max_depth: 1,
             budget,
+            operation_validated: true,
             scope_valid: true,
             automatic_enabled: true,
             auto_execute_enabled: true,
@@ -1444,6 +1511,7 @@ mod tests {
             fallback_depth: 0,
             max_depth: 1,
             budget,
+            operation_validated: true,
             scope_valid: true,
             automatic_enabled: true,
             auto_execute_enabled: true,
@@ -1466,6 +1534,7 @@ mod tests {
             fallback_depth: 0,
             max_depth: 1,
             budget,
+            operation_validated: true,
             scope_valid: true,
             automatic_enabled: true,
             auto_execute_enabled: true,
@@ -1492,6 +1561,7 @@ mod tests {
             fallback_depth: 0,
             max_depth: 1,
             budget: Budget::from_operation(Some(&operation)),
+            operation_validated: true,
             scope_valid: true,
             automatic_enabled: true,
             auto_execute_enabled: true,
@@ -1562,9 +1632,8 @@ mod tests {
 
     #[test]
     fn case_e_ambiguous_remote_push_never_auto_retries() {
-        let operation = OperationContract {
+        let operation = OperationIntent {
             kind: OperationType::GitPushRef,
-            authorized: true,
             operation_id: Some("push".into()),
             paths: vec![],
             argv: vec![],
@@ -1575,7 +1644,6 @@ mod tests {
             force: false,
             attempt_budget_remaining: 1,
             side_effect_budget_remaining: 1,
-            side_effect_state: None,
         };
         let decision = decision_for(
             FailureClass::NetworkRemote,
@@ -1593,9 +1661,8 @@ mod tests {
 
     #[test]
     fn case_f_remote_already_performed_consumes_budget_and_does_not_retry() {
-        let operation = OperationContract {
+        let operation = OperationIntent {
             kind: OperationType::GitPushRef,
-            authorized: true,
             operation_id: Some("push".into()),
             paths: vec![],
             argv: vec![],
@@ -1606,7 +1673,6 @@ mod tests {
             force: false,
             attempt_budget_remaining: 1,
             side_effect_budget_remaining: 1,
-            side_effect_state: Some(SideEffectState::ConfirmedPerformed),
         };
         let budget = Budget::from_operation(Some(&operation))
             .after_state(SideEffectState::ConfirmedPerformed);
@@ -1738,6 +1804,136 @@ mod tests {
             after_drift,
             &["src/a.rs".into()]
         ));
+    }
+
+    #[test]
+    fn command_side_effects_override_read_only_intent() {
+        let operation = OperationIntent {
+            kind: OperationType::ReadOnlyCommand,
+            operation_id: None,
+            paths: vec![],
+            argv: vec!["git".into(), "status".into()],
+            source: None,
+            destination: None,
+            target: None,
+            create_only: false,
+            force: false,
+            attempt_budget_remaining: 1,
+            side_effect_budget_remaining: 1,
+        };
+        let push = vec!["git".into(), "push".into(), "origin".into(), "main".into()];
+        let shell_mutation = vec!["sh".into(), "-c".into(), "rm -rf /tmp/x".into()];
+        let status = vec!["git".into(), "status".into()];
+
+        assert_eq!(
+            infer_side_effect_class(&push, Some(&operation)),
+            SideEffectClass::RemoteMutation
+        );
+        assert_eq!(
+            infer_side_effect_class(&shell_mutation, Some(&operation)),
+            SideEffectClass::Unknown
+        );
+        assert_eq!(
+            infer_side_effect_class(&status, Some(&operation)),
+            SideEffectClass::None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_executable_names_preserve_case_for_side_effects() {
+        let operation = git_stage_operation();
+        assert_eq!(
+            infer_side_effect_class(
+                &[
+                    "GIT".to_owned(),
+                    "push".to_owned(),
+                    "origin".to_owned(),
+                    "main".to_owned(),
+                ],
+                Some(&operation),
+            ),
+            SideEffectClass::Unknown
+        );
+        assert_eq!(
+            infer_side_effect_class(
+                &[
+                    "git".to_owned(),
+                    "push".to_owned(),
+                    "origin".to_owned(),
+                    "main".to_owned(),
+                ],
+                Some(&operation),
+            ),
+            SideEffectClass::RemoteMutation
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_executable_names_are_normalized_for_side_effects() {
+        let operation = OperationIntent {
+            kind: OperationType::ReadOnlyCommand,
+            operation_id: None,
+            paths: vec![],
+            argv: vec!["git.exe".into(), "status".into()],
+            source: None,
+            destination: None,
+            target: None,
+            create_only: false,
+            force: false,
+            attempt_budget_remaining: 1,
+            side_effect_budget_remaining: 1,
+        };
+        assert_eq!(
+            infer_side_effect_class(
+                &[
+                    "git.exe".to_owned(),
+                    "push".to_owned(),
+                    "origin".to_owned(),
+                    "main".to_owned(),
+                ],
+                Some(&operation),
+            ),
+            SideEffectClass::RemoteMutation
+        );
+        assert_eq!(
+            infer_side_effect_class(
+                &["gh.exe".to_owned(), "pr".to_owned(), "create".to_owned()],
+                Some(&operation),
+            ),
+            SideEffectClass::RemoteMutation
+        );
+    }
+
+    #[test]
+    fn rejects_literal_pathspec_aliases_and_escapes() {
+        for path in [
+            ":/top",
+            ":!top",
+            ":^top",
+            ":(top)",
+            "foo\\ bar",
+            "foo\\bar",
+            "foo:bar",
+            ".GIT/config",
+            ".Git",
+            "CON",
+            "con.txt",
+            "CLOCK$",
+            "CONIN$",
+            "CONOUT$",
+            "name.",
+            "name ",
+            "dir/",
+            "dir//child",
+            "./dir",
+            "dir/./child",
+            "dir/../child",
+        ] {
+            assert!(!exact_relative_path(path), "{path}");
+        }
+        assert!(exact_relative_path("src/file name.rs"));
     }
 
     #[test]

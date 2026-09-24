@@ -1,18 +1,18 @@
 use std::env::VarError;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::thread::JoinHandle;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{approvals, fallback};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::task::JoinHandle;
+
+use crate::{approvals, fallback, sandbox};
 
 pub(crate) const MODEL_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const PROCESS_CLEANUP_GRACE: Duration = Duration::from_millis(500);
 pub(crate) const MODEL_STDOUT_LIMIT: usize = 2 * 1024 * 1024;
 pub(crate) const MODEL_STDERR_LIMIT: usize = 64 * 1024;
 pub(crate) const MODEL_PROMPT_LIMIT: usize = 256 * 1024;
@@ -255,7 +255,7 @@ fn joined_model_invocation(request: &ModelInvocation) -> Result<ModelInvocationO
             Err(_) => return Err(AgentError::Timeout),
         }
 
-        run_bounded_process(&command, request.prompt().as_bytes(), deadline)
+        run_bounded_process(&command, request.prompt().as_bytes(), None, deadline)
     })();
 
     match &result {
@@ -304,64 +304,153 @@ fn require_approval(approved: bool) -> Result<(), AgentError> {
     }
 }
 
-struct Capture {
-    receiver: mpsc::Receiver<Result<Vec<u8>, CaptureError>>,
-    handle: JoinHandle<()>,
-    too_large: Arc<AtomicBool>,
-    failed: Arc<AtomicBool>,
-}
-
 #[derive(Debug)]
 enum CaptureError {
     TooLarge,
     Io,
 }
 
-fn start_capture<R: Read + Send + 'static>(mut reader: R, limit: usize) -> Capture {
-    let (sender, receiver) = mpsc::channel();
-    let too_large = Arc::new(AtomicBool::new(false));
-    let failed = Arc::new(AtomicBool::new(false));
-    let too_large_for_reader = Arc::clone(&too_large);
-    let failed_for_reader = Arc::clone(&failed);
-    let handle = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        let result = loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break Ok(output),
-                Ok(read) if output.len().saturating_add(read) > limit => {
-                    too_large_for_reader.store(true, Ordering::Release);
-                    break Err(CaptureError::TooLarge);
-                }
-                Ok(read) => output.extend_from_slice(&buffer[..read]),
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    failed_for_reader.store(true, Ordering::Release);
-                    break Err(CaptureError::Io);
-                }
+async fn capture_bounded<R>(mut reader: R, limit: usize) -> Result<Vec<u8>, CaptureError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => return Ok(output),
+            Ok(read) if output.len().saturating_add(read) > limit => {
+                return Err(CaptureError::TooLarge);
             }
-        };
-        let _ = sender.send(result);
-    });
-    Capture {
-        receiver,
-        handle,
-        too_large,
-        failed,
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(CaptureError::Io),
+        }
     }
 }
 
-fn finish_capture(capture: Capture) -> Result<Vec<u8>, CaptureError> {
-    let result = capture.receiver.recv().unwrap_or(Err(CaptureError::Io));
-    let _ = capture.handle.join();
-    result
+async fn write_stdin(mut stdin: ChildStdin, prompt: Vec<u8>) -> io::Result<()> {
+    stdin.write_all(&prompt).await
 }
 
-fn kill_and_join(child: &mut Child, stdout: Capture, stderr: Capture) {
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = finish_capture(stdout);
-    let _ = finish_capture(stderr);
+fn capture_error_to_agent(error: CaptureError) -> AgentError {
+    match error {
+        CaptureError::TooLarge => AgentError::ResponseTooLarge,
+        CaptureError::Io => AgentError::TransportFailure,
+    }
+}
+
+struct AbortOnDrop<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(
+            self.get_mut()
+                .handle
+                .as_mut()
+                .expect("aborted task handle is missing"),
+        )
+        .poll(context)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(unix)]
+struct UnixProcessGroupGuard {
+    process_group_id: libc::pid_t,
+}
+
+#[cfg(unix)]
+impl UnixProcessGroupGuard {
+    fn new(process_group_id: u32) -> Self {
+        Self {
+            process_group_id: process_group_id as libc::pid_t,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.process_group_id > 0 {
+            let _ = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_child(child: &mut Child, process_group_id: u32) {
+    if process_group_id != 0 {
+        let _ = unsafe { libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+}
+
+#[cfg(not(unix))]
+fn kill_child(child: &mut Child, _process_group_id: u32) {
+    let _ = child.start_kill();
+}
+
+async fn abort_and_join<T>(task: &mut Option<AbortOnDrop<T>>) {
+    if let Some(task) = task.as_mut() {
+        task.abort_and_join().await;
+    }
+    task.take();
+}
+
+async fn cleanup_async_process(
+    child: &mut Child,
+    process_group_id: u32,
+    stdin_task: &mut Option<AbortOnDrop<io::Result<()>>>,
+    stdout_task: &mut Option<AbortOnDrop<Result<Vec<u8>, CaptureError>>>,
+    stderr_task: &mut Option<AbortOnDrop<Result<Vec<u8>, CaptureError>>>,
+    cleanup_deadline: Instant,
+) {
+    kill_child(child, process_group_id);
+    let _ = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(cleanup_deadline),
+        child.wait(),
+    )
+    .await;
+    kill_child(child, process_group_id);
+    abort_and_join(stdin_task).await;
+    abort_and_join(stdout_task).await;
+    abort_and_join(stderr_task).await;
 }
 
 fn safe_diagnostic(bytes: &[u8]) -> String {
@@ -377,107 +466,289 @@ fn safe_diagnostic(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Runs only the host-built read-only Codex command after approval.
-///
-/// The existing unrestricted helper waits for process completion and returns
-/// fully buffered output, so it cannot enforce the Goal seam's hard streaming
-/// stdout/stderr caps and one absolute approval+process deadline. This narrow
-/// launcher therefore owns only the already-approved Codex process lifetime;
-/// callers cannot supply an arbitrary command through this seam.
-fn run_bounded_process(
+struct RawProcessOutput {
+    success: bool,
+    exit_status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn raw_output_to_sandbox(output: RawProcessOutput) -> sandbox::Output {
+    sandbox::Output {
+        status: output.exit_status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: safe_diagnostic(&output.stderr),
+    }
+}
+
+async fn run_bounded_process_async(
     command: &[String],
     prompt: &[u8],
+    cwd: Option<&Path>,
     deadline: Instant,
-) -> Result<ModelInvocationOutput, AgentError> {
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<RawProcessOutput, AgentError> {
+    let cleanup_deadline = deadline + PROCESS_CLEANUP_GRACE;
     let (program, arguments) = command
         .split_first()
         .ok_or(AgentError::InvalidConfiguration)?;
-    let mut child = Command::new(program)
+    let cwd = cwd
+        .map(|path| std::fs::canonicalize(path).map_err(|_| AgentError::SpawnFailed))
+        .transpose()?;
+    let mut process = Command::new(program);
+    process
+        .kill_on_drop(true)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                AgentError::ExecutableUnavailable
-            } else {
-                AgentError::SpawnFailed
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd.as_deref() {
+        process.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = process.spawn().map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            AgentError::ExecutableUnavailable
+        } else {
+            AgentError::SpawnFailed
+        }
+    })?;
+    let process_group_id = child.id().unwrap_or(0);
+    #[cfg(unix)]
+    let _process_group_guard = UnixProcessGroupGuard::new(process_group_id);
+    let Some(stdin) = child.stdin.take() else {
+        kill_child(&mut child, process_group_id);
+        let _ = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(cleanup_deadline),
+            child.wait(),
+        )
+        .await;
+        return Err(AgentError::SpawnFailed);
+    };
+    let Some(stdout) = child.stdout.take() else {
+        kill_child(&mut child, process_group_id);
+        let _ = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(cleanup_deadline),
+            child.wait(),
+        )
+        .await;
+        return Err(AgentError::SpawnFailed);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        kill_child(&mut child, process_group_id);
+        let _ = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(cleanup_deadline),
+            child.wait(),
+        )
+        .await;
+        return Err(AgentError::SpawnFailed);
+    };
+    let mut stdin_task = Some(AbortOnDrop::new(tokio::spawn(write_stdin(
+        stdin,
+        prompt.to_vec(),
+    ))));
+    let mut stdout_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
+        stdout,
+        stdout_limit,
+    ))));
+    let mut stderr_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
+        stderr,
+        stderr_limit,
+    ))));
+    let mut status = None;
+    let mut stdin_result = None;
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let mut failure = None;
+    let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(timer);
+    loop {
+        if status.is_some()
+            && stdin_task.is_none()
+            && stdout_task.is_none()
+            && stderr_task.is_none()
+        {
+            break;
+        }
+        tokio::select! {
+            result = child.wait(), if status.is_none() => {
+                match result {
+                    Ok(exit_status) => {
+                        status = Some(exit_status);
+                        if stdin_task
+                            .as_ref()
+                            .is_some_and(|task| !task.is_finished())
+                        {
+                            failure = Some(AgentError::Timeout);
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        failure = Some(AgentError::TransportFailure);
+                        break;
+                    }
+                }
             }
-        })?;
-
-    let Some(stdout_reader) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(AgentError::SpawnFailed);
-    };
-    let Some(stderr_reader) = child.stderr.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(AgentError::SpawnFailed);
-    };
-    let stdout = start_capture(stdout_reader, MODEL_STDOUT_LIMIT);
-    let stderr = start_capture(stderr_reader, MODEL_STDERR_LIMIT);
-    let Some(mut stdin) = child.stdin.take() else {
-        kill_and_join(&mut child, stdout, stderr);
-        return Err(AgentError::SpawnFailed);
-    };
-    if let Err(error) = stdin.write_all(prompt) {
-        // A child may exit successfully without reading stdin (for example, a
-        // model shim that intentionally returns no response). On Unix that can
-        // race with this write and surface as BrokenPipe. Preserve the child
-        // exit/output mapping in that case instead of misclassifying it as a
-        // transport failure. Other stdin I/O failures remain transport errors.
-        if error.kind() != ErrorKind::BrokenPipe {
-            kill_and_join(&mut child, stdout, stderr);
-            return Err(AgentError::TransportFailure);
+            result = async {
+                stdin_task
+                    .as_mut()
+                    .expect("stdin task missing")
+                    .await
+            }, if stdin_task.is_some() => {
+                stdin_task = None;
+                match result {
+                    Ok(Ok(())) => stdin_result = Some(()),
+                    Ok(Err(error)) if error.kind() == ErrorKind::BrokenPipe => {
+                        stdin_result = Some(());
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        failure = Some(AgentError::TransportFailure);
+                        break;
+                    }
+                }
+            }
+            result = async {
+                stdout_task
+                    .as_mut()
+                    .expect("stdout task missing")
+                    .await
+            }, if stdout_task.is_some() => {
+                stdout_task = None;
+                match result {
+                    Ok(Ok(output)) => stdout_result = Some(Ok(output)),
+                    Ok(Err(error)) => {
+                        failure = Some(capture_error_to_agent(error));
+                        break;
+                    }
+                    Err(_) => {
+                        failure = Some(AgentError::TransportFailure);
+                        break;
+                    }
+                }
+            }
+            result = async {
+                stderr_task
+                    .as_mut()
+                    .expect("stderr task missing")
+                    .await
+            }, if stderr_task.is_some() => {
+                stderr_task = None;
+                match result {
+                    Ok(Ok(output)) => stderr_result = Some(Ok(output)),
+                    Ok(Err(error)) => {
+                        failure = Some(capture_error_to_agent(error));
+                        break;
+                    }
+                    Err(_) => {
+                        failure = Some(AgentError::TransportFailure);
+                        break;
+                    }
+                }
+            }
+            _ = &mut timer => {
+                failure = Some(AgentError::Timeout);
+                break;
+            }
         }
     }
-    drop(stdin);
+    if let Some(error) = failure {
+        cleanup_async_process(
+            &mut child,
+            process_group_id,
+            &mut stdin_task,
+            &mut stdout_task,
+            &mut stderr_task,
+            cleanup_deadline,
+        )
+        .await;
+        return Err(error);
+    }
+    let status = status.ok_or(AgentError::TransportFailure)?;
+    if stdin_result.is_none() {
+        return Err(AgentError::TransportFailure);
+    }
+    let stdout = stdout_result
+        .ok_or(AgentError::TransportFailure)?
+        .map_err(capture_error_to_agent)?;
+    let stderr = stderr_result
+        .ok_or(AgentError::TransportFailure)?
+        .map_err(capture_error_to_agent)?;
+    Ok(RawProcessOutput {
+        success: status.success(),
+        exit_status: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+    })
+}
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(_) => {
-                kill_and_join(&mut child, stdout, stderr);
-                return Err(AgentError::TransportFailure);
-            }
-        }
-        if stdout.too_large.load(Ordering::Acquire) || stderr.too_large.load(Ordering::Acquire) {
-            kill_and_join(&mut child, stdout, stderr);
-            return Err(AgentError::ResponseTooLarge);
-        }
-        if stdout.failed.load(Ordering::Acquire) || stderr.failed.load(Ordering::Acquire) {
-            kill_and_join(&mut child, stdout, stderr);
-            return Err(AgentError::TransportFailure);
-        }
-        if Instant::now() >= deadline {
-            kill_and_join(&mut child, stdout, stderr);
-            return Err(AgentError::Timeout);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-
-    let output = finish_capture(stdout).map_err(|error| match error {
-        CaptureError::TooLarge => AgentError::ResponseTooLarge,
-        CaptureError::Io => AgentError::TransportFailure,
-    })?;
-    let stderr = finish_capture(stderr).map_err(|error| match error {
-        CaptureError::TooLarge => AgentError::ResponseTooLarge,
-        CaptureError::Io => AgentError::TransportFailure,
-    })?;
-    if !status.success() {
+fn run_bounded_process(
+    command: &[String],
+    prompt: &[u8],
+    cwd: Option<&Path>,
+    deadline: Instant,
+) -> Result<ModelInvocationOutput, AgentError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| AgentError::TransportFailure)?;
+    let output = runtime.block_on(run_bounded_process_async(
+        command,
+        prompt,
+        cwd,
+        deadline,
+        MODEL_STDOUT_LIMIT,
+        MODEL_STDERR_LIMIT,
+    ))?;
+    if !output.success {
         return Err(AgentError::NonZeroExit);
     }
-    if output.iter().all(u8::is_ascii_whitespace) {
+    if output.stdout.iter().all(u8::is_ascii_whitespace) {
         return Err(AgentError::EmptyResponse);
     }
     Ok(ModelInvocationOutput::new(
-        output,
-        safe_diagnostic(&stderr),
-        status.code().unwrap_or_default(),
+        output.stdout,
+        safe_diagnostic(&output.stderr),
+        output.exit_status,
     ))
+}
+
+pub(crate) async fn run_bounded_host_process(
+    command: &[String],
+    prompt: &[u8],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<sandbox::Output, AgentError> {
+    let output = run_bounded_process_async(
+        command,
+        prompt,
+        Some(cwd),
+        Instant::now() + timeout,
+        MODEL_STDOUT_LIMIT,
+        MODEL_STDERR_LIMIT,
+    )
+    .await?;
+    Ok(raw_output_to_sandbox(output))
+}
+
+#[cfg(test)]
+pub(crate) async fn run_bounded_process_async_for_test(
+    command: &[String],
+    prompt: &[u8],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<sandbox::Output, AgentError> {
+    let output = run_bounded_process_async(
+        command,
+        prompt,
+        Some(cwd),
+        Instant::now() + timeout,
+        MODEL_STDOUT_LIMIT,
+        MODEL_STDERR_LIMIT,
+    )
+    .await?;
+    Ok(raw_output_to_sandbox(output))
 }
 
 #[cfg(test)]
@@ -486,7 +757,7 @@ pub(crate) fn run_bounded_process_for_test(
     prompt: &[u8],
     timeout: Duration,
 ) -> Result<ModelInvocationOutput, AgentError> {
-    run_bounded_process(command, prompt, Instant::now() + timeout)
+    run_bounded_process(command, prompt, None, Instant::now() + timeout)
 }
 
 #[cfg(test)]
@@ -505,4 +776,48 @@ pub(crate) fn require_approval_for_test(approved: bool) -> Result<(), AgentError
 #[cfg(all(test, unix))]
 pub(crate) fn safe_diagnostic_for_test(bytes: &[u8]) -> String {
     safe_diagnostic(bytes)
+}
+
+#[cfg(test)]
+mod abort_on_drop_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::oneshot;
+
+    use super::AbortOnDrop;
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_aborts_and_releases_task() {
+        let state = Arc::new(());
+        let weak = Arc::downgrade(&state);
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (dropped_sender, dropped_receiver) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _state = state;
+            let _signal = DropSignal(Some(dropped_sender));
+            let _ = started_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        let task = AbortOnDrop::new(handle);
+        started_receiver.await.unwrap();
+        drop(task);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            dropped_receiver.await.unwrap();
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
