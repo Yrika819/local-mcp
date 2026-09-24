@@ -30,24 +30,45 @@ it has no equivalent process sandbox, so host-native command and file mutation p
 are explicitly described and approval-gated. Windows named pipes reject remote clients
 and are created with an explicit current-user-only DACL (owner and sole allow ACE are
 the current Windows user SID; no Everyone, Anonymous, Authenticated Users, SYSTEM, or
-Administrators grant). Unix uses 0600 sockets/0700 state directories.
-`without_sandbox` always means host-native execution with network and mutation capability.
+Administrators grant). On Unix, Local MCP-owned state directories are explicitly
+restricted to mode 0700 and session/Goal JSON, atomic temporary files, and Goal lock
+files to mode 0600. Unix approval sockets are 0600 inside a 0700 per-user directory.
+Creation, open, load, and save paths establish or tighten owned state without relying
+on a permissive process umask and fail closed when private state cannot be established.
+Windows POSIX-mode claims do not apply; the named-pipe DACL remains the Windows IPC
+boundary. `without_sandbox` always means host-native execution with network and mutation capability.
 
-## Dependency advisory status (2026-09-23)
+## Dependency advisory status (2026-09-25)
 
 The locked upstream Codex dependency graph includes `quick-xml 0.38.4`
 (RUSTSEC-2026-0194 and RUSTSEC-2026-0195) and `hickory-proto 0.25.2`
-(RUSTSEC-2026-0118 and RUSTSEC-2026-0119). The pinned Codex protocol manifest
-requires `quick-xml 0.38.4`, and its Rama DNS dependency requires the Hickory
-0.25 series, so the fixed versions are not selectable without an upstream pin or
+(RUSTSEC-2026-0118 and RUSTSEC-2026-0119). It also includes `lru 0.16.4`
+(RUSTSEC-2026-0253, an unsound `LruCache::pop()` panic-safety issue fixed in
+0.18.2) and unmaintained transitive packages: `derivative 2.2.0`
+(RUSTSEC-2024-0388), `fxhash 0.2.1` (RUSTSEC-2025-0057), and `paste 1.0.15`
+(RUSTSEC-2024-0436). The pinned Codex protocol manifest requires
+`quick-xml 0.38.4`, and its Rama DNS dependency requires the Hickory 0.25
+series, so those fixed versions are not selectable without an upstream pin or
 manifest change. Local MCP does not call Codex's XML hook-prompt parser, does not
 configure the Codex-managed network proxy for sandboxed execution, and does not
-enable Hickory DNSSEC validation features. These advisories remain in the lockfile
-and should be reassessed with any Codex/Rama dependency migration; this status is
-not a claim that the upstream crates are generally safe for other callers.
+enable Hickory DNSSEC validation features. These inherited findings remain in
+the lockfile and should be reassessed with any Codex/Rama/Starlark dependency
+migration; this status is not a claim that the upstream crates are generally safe
+for other callers.
 
-Codex fallback is public diagnose-only. Platform and safety refusals are terminal;
-remote mutations with ambiguous side effects are not retried. Activity and approval messages can include caller-supplied command arguments, paths,
+Public MCP operation metadata describes requested intent only. Legacy caller fields
+named `authorized` or `side_effect_state` are not advertised and are ignored as
+authority when older requests are parsed. The only automatic executable fallback is
+exact `git_stage_paths`: the host validates literal paths, repository scope, and a
+host-resolved Git identity, then explicit local approval is required before the
+host-built staging mutation. The staged Git snapshot is revalidated after approval,
+after any agent preflight, and immediately before the primary sandboxed command. A
+same-user process can still race the final filesystem, Git-config, and executable
+checks because Git provides no shared atomic snapshot; these checks reduce but do
+not eliminate that TOCTOU window. Read-only operation labels never enable
+executable fallback, and public `codex_fallback` is diagnose-only. Platform and
+safety refusals are terminal; remote mutations with ambiguous side effects are not retried.
+Activity and approval messages can include caller-supplied command arguments, paths,
 and file-diff content. Do not place secrets in commands or files being edited when
 those messages are visible to the local approval UI; Local MCP does not promise
 redaction of user-supplied values.
