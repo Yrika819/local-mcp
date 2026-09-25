@@ -4,8 +4,12 @@ include!("mcp.rs");
 async fn phase0_execution_wait_for_pid(path: &Path) -> libc::pid_t {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Ok(pid) = std::fs::read_to_string(path) {
-                break pid.trim().parse::<libc::pid_t>().unwrap();
+            // The fixture writes its pid with a non-atomic redirect, so the file
+            // can exist while still empty. Only a parseable pid is readiness.
+            if let Ok(pid) = std::fs::read_to_string(path)
+                && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+            {
+                break pid;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -43,7 +47,10 @@ fn phase0_public_git(cwd: &Path, args: &[&str]) -> std::process::Output {
 #[cfg(unix)]
 #[tokio::test]
 async fn public_execute_and_start_command_reject_linked_worktree_filter_before_git() {
-    let base = std::env::temp_dir().join(format!("local-mcp-public-worktree-filter-{}", Uuid::new_v4()));
+    let base = std::env::temp_dir().join(format!(
+        "local-mcp-public-worktree-filter-{}",
+        Uuid::new_v4()
+    ));
     let repository = base.join("repository");
     let worktree = base.join("worktree");
     std::fs::create_dir_all(&repository).unwrap();
@@ -80,10 +87,7 @@ async fn public_execute_and_start_command_reject_linked_worktree_filter_before_g
     );
     std::fs::write(worktree.join(".gitattributes"), "*.txt filter=marker\n").unwrap();
     std::fs::write(worktree.join("safe.txt"), "safe").unwrap();
-    let worktree_git_dir = phase0_public_git(
-        &worktree,
-        &["rev-parse", "--absolute-git-dir"],
-    );
+    let worktree_git_dir = phase0_public_git(&worktree, &["rev-parse", "--absolute-git-dir"]);
     let worktree_git_dir =
         std::fs::canonicalize(String::from_utf8_lossy(&worktree_git_dir.stdout).trim()).unwrap();
     let common_git_dir = std::fs::canonicalize(repository.join(".git")).unwrap();
@@ -99,20 +103,12 @@ async fn public_execute_and_start_command_reject_linked_worktree_filter_before_g
             "paths": ["safe.txt"]
         }
     });
-    let before = phase0_public_git(
-        &worktree,
-        &["diff", "--cached", "--name-only"],
-    )
-    .stdout;
+    let before = phase0_public_git(&worktree, &["diff", "--cached", "--name-only"]).stdout;
     let execute_error = execute(&args, &session).await.unwrap_err();
     assert!(execute_error.to_string().contains("filter-driver"));
     let start_error = start_command(&args, &session).await.unwrap_err();
     assert!(start_error.to_string().contains("filter-driver"));
-    let after = phase0_public_git(
-        &worktree,
-        &["diff", "--cached", "--name-only"],
-    )
-    .stdout;
+    let after = phase0_public_git(&worktree, &["diff", "--cached", "--name-only"]).stdout;
     assert_eq!(before, after);
     assert!(!marker.exists());
     let _ = std::fs::remove_dir_all(base);

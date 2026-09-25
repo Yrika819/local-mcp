@@ -29,8 +29,12 @@ fn script_command(path: &Path) -> Vec<String> {
 async fn wait_for_pid(path: &Path) -> libc::pid_t {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(pid) = std::fs::read_to_string(path) {
-                break pid.trim().parse::<libc::pid_t>().unwrap();
+            // The fixture writes its pid with a non-atomic redirect, so the file
+            // can exist while still empty. Only a parseable pid is readiness.
+            if let Ok(pid) = std::fs::read_to_string(path)
+                && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+            {
+                break pid;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -120,8 +124,7 @@ async fn bounded_clean_runner_kills_hanging_child_promptly() {
     let error = result.expect_err("hanging child must time out");
     assert!(error.command_started);
     assert!(started.elapsed() < Duration::from_secs(4));
-    let pid = std::fs::read_to_string(&pid_path).unwrap();
-    let pid = pid.trim().parse::<libc::pid_t>().unwrap();
+    let pid = wait_for_pid(&pid_path).await;
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -129,7 +132,8 @@ async fn bounded_clean_runner_kills_hanging_child_promptly() {
 #[cfg(unix)]
 #[tokio::test]
 async fn bounded_clean_runner_kills_descendant_retaining_pipes() {
-    let root = std::env::temp_dir().join(format!("local-mcp-bounded-descendant-{}", Uuid::new_v4()));
+    let root =
+        std::env::temp_dir().join(format!("local-mcp-bounded-descendant-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let pid_path = root.join("descendant.pid");
     let script = executable_script(
@@ -158,8 +162,7 @@ async fn bounded_clean_runner_kills_descendant_retaining_pipes() {
         started.elapsed()
             < timeout + sandbox::TRUSTED_GIT_CLEANUP_GRACE + Duration::from_millis(250)
     );
-    let pid = std::fs::read_to_string(&pid_path).unwrap();
-    let pid = pid.trim().parse::<libc::pid_t>().unwrap();
+    let pid = wait_for_pid(&pid_path).await;
     let mut alive = true;
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } == -1 {
@@ -175,8 +178,7 @@ async fn bounded_clean_runner_kills_descendant_retaining_pipes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn bounded_clean_runner_cancellation_kills_group_and_joins_parent() {
-    let root =
-        std::env::temp_dir().join(format!("local-mcp-bounded-cancel-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("local-mcp-bounded-cancel-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let pid_path = root.join("descendant.pid");
     let script = executable_script(

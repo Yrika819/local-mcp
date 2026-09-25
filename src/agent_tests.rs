@@ -22,6 +22,23 @@ use crate::agent::{
 };
 
 #[cfg(unix)]
+/// How long a fixture descendant may take to publish its pid before the fixture
+/// is treated as never having started.
+const DESCENDANT_READINESS: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+/// Seconds a fixture descendant stays alive. It outlives every lifecycle
+/// deadline below, so "the run timed out while the descendant still held the
+/// inherited pipes" is unambiguous rather than a race against a sleep.
+const DESCENDANT_LIFETIME_SECS: u64 = 10;
+
+#[cfg(unix)]
+/// Deadline for the bounded-lifecycle fixtures. It only has to outlast fixture
+/// scheduling under load; the retained-pipe and blocked-stdin conditions, not
+/// the deadline length, are what these tests assert.
+const LIFECYCLE_TEST_DEADLINE: Duration = Duration::from_secs(3);
+
+#[cfg(unix)]
 fn temporary_script(root: &Path, name: &str, body: &str) -> PathBuf {
     let path = root.join(name);
     std::fs::write(&path, body).unwrap();
@@ -113,6 +130,30 @@ async fn wait_for_process_exit(pid: libc::pid_t) -> bool {
     false
 }
 
+/// Bounded readiness protocol for a fixture descendant.
+///
+/// A bare `read_to_string` on a fixture pid file is unsound: the fixture writes
+/// it with a non-atomic redirect, so the file can be observed before it holds
+/// any content, and a fixture the scheduler has not run yet writes nothing at
+/// all. This returns only once the file holds a parseable pid, which is the
+/// fixture recording the pid of the process it actually forked, so a caller can
+/// never credit cleanup with killing a descendant that was never observed.
+#[cfg(unix)]
+async fn wait_for_descendant_pid(path: &Path) -> libc::pid_t {
+    tokio::time::timeout(DESCENDANT_READINESS, async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture descendant never published a parseable pid before the deadline")
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
@@ -174,30 +215,27 @@ async fn bounded_host_launcher_kills_descendant_retaining_pipes() {
     let root = std::env::temp_dir().join(format!("local-mcp-agent-descendant-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let pid_path = root.join("descendant.pid");
+    // The descendant outlives the run deadline and keeps the inherited stdout and
+    // stderr open, so the run cannot finish before cleanup. That retained-pipe
+    // condition, not the deadline length, is what this test asserts.
     let script = temporary_script(
         &root,
         "descendant.sh",
         &format!(
-            "#!/bin/sh\n/bin/sleep 3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            "#!/bin/sh\n/bin/sleep {} &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            DESCENDANT_LIFETIME_SECS,
             pid_path.display()
         ),
     );
     let started = Instant::now();
-    let timeout = Duration::from_secs(1);
-    let result = run_bounded_host_process(
-        &[script.to_string_lossy().into_owned()],
-        b"prompt",
-        &root,
-        timeout,
-    )
-    .await;
+    let timeout = LIFECYCLE_TEST_DEADLINE;
+    let command = [script.to_string_lossy().into_owned()];
+    let (result, pid) = tokio::join!(
+        run_bounded_host_process(&command, b"prompt", &root, timeout),
+        wait_for_descendant_pid(&pid_path),
+    );
     assert_eq!(result.unwrap_err(), AgentError::Timeout);
     assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
-    let pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse::<libc::pid_t>()
-        .unwrap();
     let mut alive = true;
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } == -1 {
@@ -271,26 +309,22 @@ async fn async_launcher_cleans_retained_pipe_tasks_by_deadline_plus_grace() {
         &root,
         "retained-pipes.sh",
         &format!(
-            "#!/bin/sh\n/bin/sleep 3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            "#!/bin/sh\n/bin/sleep {} &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            DESCENDANT_LIFETIME_SECS,
             pid_path.display()
         ),
     );
-    let timeout = Duration::from_millis(500);
+    let timeout = LIFECYCLE_TEST_DEADLINE;
     let started = Instant::now();
-    let result = run_bounded_process_async_for_test(
-        &[script.to_string_lossy().into_owned()],
-        b"prompt",
-        &root,
-        timeout,
-    )
-    .await;
+    // The descendant is observed while the run is still in flight, so the
+    // cleanup assertions below are always about a process that really existed.
+    let command = [script.to_string_lossy().into_owned()];
+    let (result, pid) = tokio::join!(
+        run_bounded_process_async_for_test(&command, b"prompt", &root, timeout),
+        wait_for_descendant_pid(&pid_path),
+    );
     assert_eq!(result.unwrap_err(), AgentError::Timeout);
     assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
-    let pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse::<libc::pid_t>()
-        .unwrap();
     let mut alive = true;
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } == -1 {
@@ -310,33 +344,36 @@ async fn child_exit_kills_group_before_blocked_stdin_cleanup() {
     std::fs::create_dir_all(&root).unwrap();
     let pid_path = root.join("descendant.pid");
     let marker = root.join("descendant.marker");
+    let release_path = root.join("descendant.release");
+    // The descendant holds the inherited stdin open, so the launcher's write
+    // cannot finish on its own. It only reaches the marker once this test
+    // releases it, so the marker assertion below measures whether the group kill
+    // landed instead of racing a fixed fixture delay.
     let script = temporary_script(
         &root,
         "exit-with-descendant.sh",
         &format!(
-            "#!/bin/sh\nexec 3<&0\n/bin/sh -c 'sleep 0.2; touch \"$1\"; sleep 3' sh '{}' <&3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            "#!/bin/sh\nexec 3<&0\n/bin/sh -c 'while [ ! -e \"$1\" ]; do sleep 0.05; done; touch \"$2\"; sleep {}' sh '{}' '{}' <&3 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            DESCENDANT_LIFETIME_SECS,
+            release_path.display(),
             marker.display(),
             pid_path.display()
         ),
     );
     let prompt = vec![b'x'; 1024 * 1024];
-    let timeout = Duration::from_millis(500);
+    let timeout = LIFECYCLE_TEST_DEADLINE;
     let started = Instant::now();
-    let result = run_bounded_host_process(
-        &[script.to_string_lossy().into_owned()],
-        &prompt,
-        &root,
-        timeout,
-    )
-    .await;
+    // The launcher ends this run as soon as the fixture exits while its stdin
+    // write is still blocked, so cleanup lands within a millisecond of the pid
+    // being published. Observing the pid concurrently is what makes the causal
+    // ordering explicit instead of assumed.
+    let command = [script.to_string_lossy().into_owned()];
+    let (result, pid) = tokio::join!(
+        run_bounded_host_process(&command, &prompt, &root, timeout),
+        wait_for_descendant_pid(&pid_path),
+    );
     assert_eq!(result.unwrap_err(), AgentError::Timeout);
     assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
-    assert!(!marker.exists());
-    let pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse::<libc::pid_t>()
-        .unwrap();
     let mut alive = true;
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } == -1 {
@@ -345,7 +382,24 @@ async fn child_exit_kills_group_before_blocked_stdin_cleanup() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!alive);
+    assert!(
+        !alive,
+        "the group kill must reap the stdin-holding descendant"
+    );
+    // Release the gate. A descendant that outlived cleanup would now run its
+    // work and create the marker, so its continued absence is a liveness proof
+    // rather than an assumption.
+    std::fs::write(&release_path, "released").unwrap();
+    for _ in 0..50 {
+        if marker.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !marker.exists(),
+        "a released descendant must not outlive cleanup"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
