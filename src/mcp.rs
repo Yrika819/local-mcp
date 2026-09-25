@@ -1121,6 +1121,8 @@ mod tests {
                 status: 1,
                 stdout: String::new(),
                 stderr: String::new(),
+                // The requested command provably started and exited.
+                command_start: sandbox::CommandStart::Proven,
             }),
         )
         .await
@@ -1150,6 +1152,8 @@ mod tests {
                 status: 0,
                 stdout: "stdout".into(),
                 stderr: "stderr".into(),
+                // The requested command provably started and finished.
+                command_start: sandbox::CommandStart::Proven,
             }),
         )
         .await
@@ -1187,6 +1191,8 @@ mod tests {
                 status: 1,
                 stdout: "Test Run Failed. Failed tests: 1".into(),
                 stderr: String::new(),
+                // The requested command provably started and exited.
+                command_start: sandbox::CommandStart::Proven,
             }),
         )
         .await

@@ -816,24 +816,40 @@ async fn process_sandboxed_attempt_with_codex_override(
     attempt: std::result::Result<sandbox::Output, sandbox::RunError>,
     codex_command_override: Option<Vec<String>>,
 ) -> Result<String> {
-    let (lifecycle, exit_code, stdout, stderr, execution_error) = match attempt {
+    // The sandboxed attempt reports two separate lifecycles: the lifecycle of the
+    // process that carried the sandbox, and the lifecycle of the requested
+    // command. Only the latter grants fallback authority, and only host-owned
+    // evidence may establish it. A sandbox helper that rejected setup and exited
+    // is a helper lifecycle, not a command lifecycle.
+    let (lifecycle, exit_code, stdout, stderr, execution_error, setup_rejection) = match attempt {
         Ok(output) => (
-            fallback::LifecycleEvidence::completed(),
+            fallback::LifecycleEvidence::completed_with_start_proof(output.command_start),
             Some(output.status),
             output.stdout,
             output.stderr,
+            None,
             None,
         ),
         Err(error) => (
             fallback::LifecycleEvidence {
                 host_reached: true,
-                command_started: error.command_started,
-                command_finished: error.command_finished,
+                // The executed process starting is not evidence that the requested
+                // command started: where a wrapper is used the wrapper is the
+                // process. Only a process that provably never started proves the
+                // requested command never started.
+                command_start: if error.command_started {
+                    sandbox::CommandStart::Unproven
+                } else {
+                    sandbox::CommandStart::Refuted
+                },
+                command_finished: false,
+                process_finished: error.command_finished,
             },
             None,
             String::new(),
             String::new(),
             Some(format!("{:#}", error.error)),
+            error.setup_rejection,
         ),
     };
 
@@ -849,6 +865,7 @@ async fn process_sandboxed_attempt_with_codex_override(
         execution_error: execution_error.as_deref(),
         side_effect_class,
         authoritative_platform_safety: false,
+        authoritative_setup_rejection: setup_rejection,
     });
 
     let local_not_performed_proof = if let Some(stage) = policy.validated_git_stage_paths.as_ref()
@@ -1239,6 +1256,19 @@ async fn execute_exact_git_stage(
     Ok((output, true))
 }
 
+/// Render the host-owned requested-command start proof for audit payloads.
+///
+/// `command_started` in the payload is exactly `PROVEN`; `REFUTED` and
+/// `UNPROVEN` are both reported as `command_started: false` so absence of proof
+/// can never be read as proof of absence.
+fn command_start_proof(command_start: sandbox::CommandStart) -> &'static str {
+    match command_start {
+        sandbox::CommandStart::Proven => "PROVEN",
+        sandbox::CommandStart::Refuted => "REFUTED",
+        sandbox::CommandStart::Unproven => "UNPROVEN",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execution_payload(
     policy: &ExecutionPolicy,
@@ -1260,8 +1290,10 @@ fn execution_payload(
         "operation_type": policy.operation.as_ref().map(|operation| operation.kind.as_str()).unwrap_or("unstructured"),
         "primary_execution_mode": policy.primary_execution_mode.as_str(),
         "host_reached": lifecycle.host_reached,
-        "command_started": lifecycle.command_started,
+        "command_started": lifecycle.command_started(),
+        "command_start_proof": command_start_proof(lifecycle.command_start),
         "command_finished": lifecycle.command_finished,
+        "sandbox_process_finished": lifecycle.process_finished,
         "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
@@ -1312,8 +1344,10 @@ async fn emit_fallback_trace(
         "operation_type": policy.operation.as_ref().map(|operation| operation.kind.as_str()).unwrap_or("unstructured"),
         "primary_execution_mode": policy.primary_execution_mode.as_str(),
         "host_reached": lifecycle.host_reached,
-        "command_started": lifecycle.command_started,
+        "command_started": lifecycle.command_started(),
+        "command_start_proof": command_start_proof(lifecycle.command_start),
         "command_finished": lifecycle.command_finished,
+        "sandbox_process_finished": lifecycle.process_finished,
         "exit_code": exit_code,
         "failure_class": failure_class.as_str(),
         "side_effect_class": side_effect_class.as_str(),
@@ -1372,11 +1406,7 @@ pub(crate) async fn codex_fallback(
         command: &[],
         accepted_exit_codes: &[0],
         primary_execution_mode: primary_execution_mode(),
-        lifecycle: fallback::LifecycleEvidence {
-            host_reached: true,
-            command_started: false,
-            command_finished: false,
-        },
+        lifecycle: fallback::LifecycleEvidence::not_started(),
         exit_code: None,
         stdout: "",
         stderr: "",
@@ -1384,6 +1414,7 @@ pub(crate) async fn codex_fallback(
         side_effect_class: fallback::SideEffectClass::Unknown,
         authoritative_platform_safety: explicit_failure_class
             == Some(fallback::FailureClass::PlatformSafety),
+        authoritative_setup_rejection: None,
     });
 
     if safety_probe.safety_signal
@@ -2110,6 +2141,9 @@ mod tests {
                     stdout: String::new(),
                     stderr: "fatal: Unable to create '.git/index.lock': Operation not permitted"
                         .to_owned(),
+                    // These tests model a sandboxed `git add` that provably
+                    // started and then failed on a sandbox write restriction.
+                    command_start: sandbox::CommandStart::Proven,
                 }),
                 vec![
                     fixture.codex.to_string_lossy().into_owned(),
@@ -2168,6 +2202,9 @@ mod tests {
                     stdout: String::new(),
                     stderr: "fatal: Unable to create '.git/index.lock': Operation not permitted"
                         .to_owned(),
+                    // These tests model a sandboxed `git add` that provably
+                    // started and then failed on a sandbox write restriction.
+                    command_start: sandbox::CommandStart::Proven,
                 }),
                 vec![
                     fixture.codex.to_string_lossy().into_owned(),
@@ -2189,6 +2226,185 @@ mod tests {
         assert_eq!(payload["remaining_side_effect_budget"], 1);
         assert_eq!(payload["exit_code"], 128);
         assert!(!fixture.sentinel.exists());
+    }
+
+    /// Create a fake `bwrap` on a private `PATH` that reports `version`.
+    ///
+    /// This emulates an unsupported system Bubblewrap without depending on the
+    /// version installed on the host, and never touches the real
+    /// `/usr/bin/bwrap`.
+    #[cfg(target_os = "linux")]
+    fn write_fixture_bwrap(root: &Path, version: &str) -> PathBuf {
+        let bin = root.join("fixture-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bwrap = bin.join("bwrap");
+        std::fs::write(
+            &bwrap,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'bubblewrap {version}\\n'\n  exit 0\nfi\nprintf 'fixture bwrap must not be launched for --version-only detection\\n' >&2\nexit 97\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&bwrap).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bwrap, permissions).unwrap();
+        bin.into_os_string().into()
+    }
+
+    /// A Bubblewrap version below the supported minimum must fail sandbox setup
+    /// in the host, before the sandbox helper or the requested command run, and
+    /// must never authorise an executable host fallback.
+    ///
+    /// Regression for the Security V2.1 sandbox lifecycle boundary: the helper
+    /// already refused to start the requested command, but the shared lifecycle
+    /// model reported the *helper* as the *command*, so the exact GitStagePaths
+    /// host fallback executed and mutated the real Git index.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unsupported_bubblewrap_never_authorises_executable_host_fallback() {
+        let fixture = StageFixture::new().await;
+        let path = write_fixture_bwrap(&fixture.root, "0.11.1");
+        let sentinel = fixture.root.join("requested-command-ran");
+        let command = vec![
+            "git".to_owned(),
+            "add".to_owned(),
+            "--".to_owned(),
+            "staged.txt".to_owned(),
+        ];
+        // The requested command must not be able to start at all. Use a command
+        // that would create a sentinel so "command started" is observable.
+        let attempted = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf started > '{}'", sentinel.display()),
+        ];
+
+        let attempt = sandbox::run_tracked_with_path(
+            &attempted,
+            &fixture.root,
+            &[],
+            None,
+            Some(path.as_os_str()),
+        )
+        .await;
+
+        // The requested command never started.
+        assert!(
+            !sentinel.exists(),
+            "requested command started despite unsupported Bubblewrap"
+        );
+
+        // The reported lifecycle must not claim the requested command started.
+        let error = match attempt {
+            Ok(_) => panic!(
+                "unsupported Bubblewrap must be a host-owned setup failure, not a completed run"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            !error.command_started,
+            "requested command start must be refuted, not assumed from helper start"
+        );
+        assert!(!error.command_finished);
+
+        // And no executable fallback may follow from that attempt.
+        let policy = fixture.policy();
+        let error = process_sandboxed_attempt_with_test_codex(
+            &fixture.session.id,
+            &command,
+            &fixture.root,
+            &policy,
+            Some(fixture.before.clone()),
+            Err(error),
+            vec![
+                fixture.codex.to_string_lossy().into_owned(),
+                "-s".to_owned(),
+                "read-only".to_owned(),
+            ],
+        )
+        .await
+        .expect_err("unsupported Bubblewrap must not report a successful execution");
+        let payload: Value = serde_json::from_str(&error.to_string()).unwrap();
+        assert_eq!(payload["command_started"], false);
+        assert_ne!(payload["fallback_decision"]["action"], "EXECUTE");
+        assert_ne!(payload["fallback_mode"], "EXECUTE_AUTHORIZED_OPERATION");
+        assert!(
+            !fixture.sentinel.exists(),
+            "Codex preflight must not run for an unsupported Bubblewrap"
+        );
+        assert_eq!(
+            fixture.index_snapshot().await,
+            fixture.before,
+            "unsupported Bubblewrap must not mutate the Git index"
+        );
+    }
+
+    /// A model-authored requested command must not be able to manufacture a
+    /// sandbox setup rejection, and with it an executable host fallback.
+    ///
+    /// The requested command fully controls its own stdout, stderr and exit
+    /// value, so it can print exactly what the helper prints and exit exactly
+    /// what the helper exits. Authority comes only from host-owned evidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn requested_command_cannot_forge_setup_rejection_into_host_fallback() {
+        let fixture = StageFixture::new().await;
+        let policy = fixture.policy();
+        let command = vec![
+            "git".to_owned(),
+            "add".to_owned(),
+            "--".to_owned(),
+            "staged.txt".to_owned(),
+        ];
+        // Exactly the text and status the Linux helper uses to refuse an
+        // unsupported Bubblewrap, produced by the requested command itself.
+        let attempt = Ok(sandbox::Output {
+            status: 126,
+            stdout: String::new(),
+            stderr: "Linux sandbox setup rejected: bubblewrap 0.11.1 is unsupported; install \
+                     upstream bubblewrap 0.12.0 or newer (the first release fixing \
+                     CVE-2026-87766)\nfatal: Unable to create '.git/index.lock': Operation not \
+                     permitted"
+                .to_owned(),
+            // The realistic wrapper outcome: the executed process finished, the
+            // requested command's start is not host-proven.
+            command_start: sandbox::CommandStart::Unproven,
+        });
+
+        let error = process_sandboxed_attempt_with_test_codex(
+            &fixture.session.id,
+            &command,
+            &fixture.root,
+            &policy,
+            Some(fixture.before.clone()),
+            attempt,
+            vec![
+                fixture.codex.to_string_lossy().into_owned(),
+                "-s".to_owned(),
+                "read-only".to_owned(),
+            ],
+        )
+        .await
+        .expect_err("a forged setup rejection must not be reported as success");
+        let payload: Value = serde_json::from_str(&error.to_string()).unwrap();
+        assert_eq!(payload["command_started"], false);
+        assert_eq!(payload["command_start_proof"], "UNPROVEN");
+        assert_ne!(payload["failure_class"], "PLATFORM_SAFETY");
+        assert_ne!(payload["failure_class"], "SANDBOX_SETUP");
+        assert_ne!(payload["fallback_decision"]["action"], "EXECUTE");
+        assert_eq!(
+            payload["fallback_decision"]["reason_code"],
+            "FALLBACK_DENIED_LIFECYCLE"
+        );
+        assert!(
+            !fixture.sentinel.exists(),
+            "forged output must not reach the Codex preflight"
+        );
+        assert_eq!(
+            fixture.index_snapshot().await,
+            fixture.before,
+            "forged output must not reach host Git"
+        );
     }
 
     #[tokio::test]
@@ -2283,6 +2499,9 @@ mod tests {
                     stdout: String::new(),
                     stderr: "fatal: Unable to create '.git/index.lock': Operation not permitted"
                         .to_owned(),
+                    // These tests model a sandboxed `git add` that provably
+                    // started and then failed on a sandbox write restriction.
+                    command_start: sandbox::CommandStart::Proven,
                 }),
                 vec![
                     fixture.codex.to_string_lossy().into_owned(),

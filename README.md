@@ -145,13 +145,27 @@ side-effect class and state, fallback decision/reason code, fallback depth, budg
 and verification
 status.
 
-The host records only evidence it can know truthfully:
+The host records only evidence it can know truthfully, and it keeps the
+lifecycle of the **sandbox process** separate from the lifecycle of the
+**requested command**:
 
 - `host_reached=true` means the Local MCP host received and processed the tool
   request.
-- `command_started` is set only after the sandbox process was successfully
-  spawned.
-- `command_finished` is set only after process completion was observed.
+- `command_start_proof` describes the requested command and is one of `PROVEN`,
+  `REFUTED`, or `UNPROVEN`. `command_started` is `true` only for `PROVEN`.
+- `sandbox_process_finished` means the process the host waited on exited and its
+  result was observed. Where a sandbox wrapper carries the request, this
+  describes the wrapper.
+- `command_finished` means the requested command provably ran to completion, and
+  is therefore `true` only when `command_start_proof` is `PROVEN`.
+
+A sandbox helper, `sandbox-exec`, or any other launcher starting is **not** a
+requested command starting. A wrapper can fail before exec'ing the requested
+command — an absent or version-vulnerable runtime, a namespace, mount, or seccomp
+setup failure, or an exec failure — and it reports all of these the same way,
+through its own exit status and output. The requested command also fully controls
+its own output and exit value. Neither is evidence that the requested command
+started, so an unproven start stays `UNPROVEN` and absence of proof fails closed.
 
 The host cannot infer that a request which never arrived was blocked by the
 OpenAI platform. A known outer platform rejection must remain outside the host
@@ -165,11 +179,12 @@ operation to Codex.
 | `SUCCESS` | no fallback |
 | `EXPECTED_STATE` | normal result; no fallback |
 | `SEMANTIC_FAILURE` | return semantic result; no executable fallback |
-| `SANDBOX_PERMISSION` | executable fallback only for a sandboxed primary when every structured authority/scope/state/budget rule passes |
+| `SANDBOX_PERMISSION` | executable fallback only for a sandboxed primary, with a host-proven requested-command start, when every structured authority/scope/state/budget rule passes |
 | `HOST_ENVIRONMENT` | diagnose-only at most |
 | `TOOL_MISSING` | diagnose-only at most |
 | `UNKNOWN` | diagnose-only at most |
 | `PLATFORM_SAFETY` | terminal block |
+| `SANDBOX_SETUP` | terminal block; the requested command never started |
 | remote mutation + `UNKNOWN` side effect | terminal block pending read-only reconciliation |
 | remote mutation already performed | no retry; budget consumed |
 
@@ -189,6 +204,31 @@ normal push into a force push, or inventing additional mutations.
 The initial automatic execute allowlist is intentionally small:
 
 - exact-path `git_stage_paths` using canonical `git add -- <paths...>` scope.
+
+### Requested-command start proof and the Unix fallback posture
+
+Executable fallback requires host-owned proof that the **requested command
+actually started**. On Linux and macOS the sandbox is provided by a separate
+wrapper process (a Bubblewrap-backed helper, and `sandbox-exec` respectively), and
+that wrapper provides the host no evidence about whether it exec'd the requested
+command. Bubblewrap in particular passes only `stdin`/`stdout`/`stderr` into the
+sandboxed process, so no start-proof channel can cross the wrapper boundary, and
+the helper's exit status cannot distinguish a setup failure from the requested
+command's own exit value.
+
+Public v1 therefore treats a completed wrapper attempt as `UNPROVEN` and fails
+closed, which means the automatic executable fallback is effectively unavailable
+on Linux and macOS and those failures remain diagnose-only
+(`FALLBACK_DENIED_LIFECYCLE`). This is deliberate: safety takes precedence over
+feature retention, and a start proof must not be weakened to preserve
+functionality. The fallback machinery, its authority rules, and its exact-scope
+staging path remain fully enforced and tested for the case where a start proof
+does exist, which today is host-native execution with no wrapper.
+
+Restoring automatic executable fallback on a wrapper platform requires a
+host-owned pre-exec handshake that the requested command cannot forge. That is an
+architecture change, not a configuration change, and it is deliberately not part
+of this release.
 
 `read_only_command` is intentionally not in the executable fallback allowlist:
 a caller-supplied read-only label cannot grant host-native execution.

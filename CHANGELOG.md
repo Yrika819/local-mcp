@@ -14,6 +14,16 @@
 - Hardened session filesystem and execution-cwd authority checks.
 - Removed public executable Codex fallback; `codex_fallback` is diagnose-only.
 - Prevented `read_only_command` labels from granting host-native fallback.
+- Separated sandbox-wrapper lifecycle from requested-command lifecycle. A wrapper
+  that starts, exits nonzero, or reports a setup failure no longer implies the
+  requested command started, and executable fallback now requires host-owned
+  proof of that start.
+- Refused an unsupported or unusable sandbox runtime in the trusted parent before
+  the sandbox helper or any requested command is spawned, classifying the refusal
+  from typed host-owned evidence as a terminal block rather than a permission
+  failure.
+- Automatic executable fallback is diagnose-only on Linux and macOS, where the
+  sandbox wrapper cannot report whether the requested command started.
 - Documented safety, approval, Windows, and credential boundaries.
 
 Formatting and lint-only cleanup is intentionally not listed as a behavioral

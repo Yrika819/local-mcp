@@ -5,6 +5,8 @@
 
 mod agent;
 mod approvals;
+#[cfg(target_os = "linux")]
+mod bubblewrap_support;
 mod config;
 mod execution;
 mod fallback;

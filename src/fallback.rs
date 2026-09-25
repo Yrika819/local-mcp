@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::sandbox::{CommandStart, SetupRejection};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FailureClass {
@@ -15,6 +17,9 @@ pub enum FailureClass {
     NetworkRemote,
     SemanticFailure,
     PlatformSafety,
+    /// The sandbox could not be established, so the requested command was never
+    /// started. Terminal: the request must not be retried outside the sandbox.
+    SandboxSetup,
     TransportFailure,
     Unknown,
 }
@@ -30,6 +35,7 @@ impl FailureClass {
             Self::NetworkRemote => "NETWORK_REMOTE",
             Self::SemanticFailure => "SEMANTIC_FAILURE",
             Self::PlatformSafety => "PLATFORM_SAFETY",
+            Self::SandboxSetup => "SANDBOX_SETUP",
             Self::TransportFailure => "TRANSPORT_FAILURE",
             Self::Unknown => "UNKNOWN",
         }
@@ -135,6 +141,7 @@ pub enum ReasonCode {
     FallbackDeniedAutoExecuteDisabled,
     FallbackDeniedLifecycle,
     FallbackDeniedPrimaryExecutionMode,
+    NoFallbackSandboxSetupRejected,
 }
 
 impl ReasonCode {
@@ -162,6 +169,7 @@ impl ReasonCode {
             Self::FallbackDeniedAutoExecuteDisabled => "FALLBACK_DENIED_AUTO_EXECUTE_DISABLED",
             Self::FallbackDeniedLifecycle => "FALLBACK_DENIED_LIFECYCLE",
             Self::FallbackDeniedPrimaryExecutionMode => "FALLBACK_DENIED_PRIMARY_EXECUTION_MODE",
+            Self::NoFallbackSandboxSetupRejected => "NO_FALLBACK_SANDBOX_SETUP_REJECTED",
         }
     }
 }
@@ -369,11 +377,29 @@ fn is_git_executable_name(value: &str) -> bool {
     value == "git" || (cfg!(windows) && value.eq_ignore_ascii_case("git.exe"))
 }
 
+/// Host-owned evidence about the execution lifecycle of a requested command.
+///
+/// `command_start` describes the **requested command**, never the process that
+/// carried it. A sandbox helper, a `sandbox-exec` wrapper or any other launcher
+/// starting says nothing about whether the requested command was ever exec'd, and
+/// the requested command fully controls its own output and exit value. The
+/// lifecycle therefore distinguishes three states instead of collapsing
+/// "unproven" into "started".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleEvidence {
     pub host_reached: bool,
-    pub command_started: bool,
+    /// Host-owned evidence about the **requested command**.
+    pub command_start: CommandStart,
+    /// Whether the **requested command** provably ran to completion. Never true
+    /// unless its start was proven.
     pub command_finished: bool,
+    /// Whether the **executed process** ran to completion and the host observed
+    /// its result.
+    ///
+    /// Where the sandbox is provided by a separate wrapper, this describes the
+    /// wrapper. It is an observation, never an authority: it says the process the
+    /// host waited on exited, not that the requested command inside it ran.
+    pub process_finished: bool,
 }
 
 impl LifecycleEvidence {
@@ -384,17 +410,47 @@ impl LifecycleEvidence {
     pub fn host_received() -> Self {
         Self {
             host_reached: true,
-            command_started: false,
+            command_start: CommandStart::Refuted,
             command_finished: false,
+            process_finished: false,
         }
     }
 
-    pub fn completed() -> Self {
+    /// The host proved the requested command was never started.
+    pub fn not_started() -> Self {
         Self {
             host_reached: true,
-            command_started: true,
-            command_finished: true,
+            command_start: CommandStart::Refuted,
+            command_finished: false,
+            process_finished: false,
         }
+    }
+
+    /// A sandboxed attempt whose executed process ran to completion, given the
+    /// host-owned requested-command start proof the sandbox layer reported.
+    ///
+    /// The process outcome is observed either way, but the requested command's
+    /// completion is only asserted when its start was proven.
+    pub fn completed_with_start_proof(command_start: CommandStart) -> Self {
+        Self {
+            host_reached: true,
+            command_start,
+            command_finished: command_start.is_proven(),
+            process_finished: true,
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Fully-proven lifecycle evidence is retained for the frozen fallback state model."
+    )]
+    pub fn completed() -> Self {
+        Self::completed_with_start_proof(CommandStart::Proven)
+    }
+
+    /// Whether the requested command is host-proven to have started.
+    pub fn command_started(&self) -> bool {
+        self.command_start.is_proven()
     }
 }
 
@@ -431,6 +487,13 @@ pub struct ClassificationInput<'a> {
     pub execution_error: Option<&'a str>,
     pub side_effect_class: SideEffectClass,
     pub authoritative_platform_safety: bool,
+    /// A sandbox setup refusal decided by trusted host code, before the sandbox
+    /// helper or the requested command could run.
+    ///
+    /// This is the only authority for classifying a setup failure. Sandbox helper
+    /// output is deliberately not consulted: the helper and the requested command
+    /// are both untrusted with respect to fallback authority.
+    pub authoritative_setup_rejection: Option<SetupRejection>,
 }
 
 pub fn classify(input: ClassificationInput<'_>) -> Classification {
@@ -438,6 +501,21 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
         return Classification {
             failure_class: FailureClass::PlatformSafety,
             safety_signal: true,
+        };
+    }
+
+    // A host-owned setup refusal is terminal and is never re-derived from text.
+    if let Some(rejection) = input.authoritative_setup_rejection {
+        return match rejection {
+            // A version-vulnerable sandbox runtime is a platform safety refusal.
+            SetupRejection::PlatformSafety => Classification {
+                failure_class: FailureClass::PlatformSafety,
+                safety_signal: true,
+            },
+            SetupRejection::Environment => Classification {
+                failure_class: FailureClass::SandboxSetup,
+                safety_signal: false,
+            },
         };
     }
 
@@ -539,7 +617,7 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
         };
     }
 
-    if (!input.lifecycle.command_started
+    if (!input.lifecycle.command_started()
         && contains_any(
             &combined,
             &[
@@ -574,7 +652,7 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
         };
     }
 
-    if input.lifecycle.command_finished && input.exit_code.is_some() {
+    if input.lifecycle.process_finished && input.exit_code.is_some() {
         return Classification {
             failure_class: FailureClass::SemanticFailure,
             safety_signal: false,
@@ -854,6 +932,14 @@ pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
                 false,
             );
         }
+        FailureClass::SandboxSetup => {
+            return decision(
+                FallbackAction::Block,
+                ReasonCode::NoFallbackSandboxSetupRejected,
+                None,
+                false,
+            );
+        }
         _ => {}
     }
 
@@ -899,7 +985,12 @@ pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
                     false,
                 );
             }
-            if !input.lifecycle.host_reached || !input.lifecycle.command_started {
+            // Executable fallback requires host-owned proof that the requested
+            // command actually started. A sandbox wrapper that ran, or a setup
+            // failure, proves nothing about the requested command, and the
+            // requested command controls its own output and exit value, so an
+            // unproven start fails closed here.
+            if !input.lifecycle.host_reached || !input.lifecycle.command_started() {
                 return decision(
                     FallbackAction::Block,
                     ReasonCode::FallbackDeniedLifecycle,
@@ -1011,7 +1102,8 @@ pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
         FailureClass::Success
         | FailureClass::ExpectedState
         | FailureClass::SemanticFailure
-        | FailureClass::PlatformSafety => unreachable!(),
+        | FailureClass::PlatformSafety
+        | FailureClass::SandboxSetup => unreachable!(),
     }
 }
 
@@ -1203,7 +1295,11 @@ pub fn infer_side_effect_state(
     if side_effect_class == SideEffectClass::None {
         return SideEffectState::ConfirmedNotPerformed;
     }
-    if !lifecycle.command_started {
+    // Only a host-proven "never started" may assert that no side effect happened
+    // without consulting the local postcondition proof. An unproven start must
+    // fall through to that proof, because the requested command may have run and
+    // partially applied its effect.
+    if lifecycle.command_start == CommandStart::Refuted {
         return SideEffectState::ConfirmedNotPerformed;
     }
     if failure_class == FailureClass::Success {
@@ -1356,6 +1452,7 @@ mod tests {
             execution_error: None,
             side_effect_class: SideEffectClass::None,
             authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
         });
         assert_eq!(classification.failure_class, FailureClass::ExpectedState);
         let decision = decision_for(
@@ -1393,6 +1490,7 @@ mod tests {
             execution_error: None,
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
         });
         assert_eq!(
             classification.failure_class,
@@ -1439,6 +1537,7 @@ mod tests {
             execution_error: None,
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
         });
         assert_eq!(classification.failure_class, FailureClass::HostEnvironment);
     }
@@ -1469,6 +1568,251 @@ mod tests {
         );
     }
 
+    /// The executable fallback gate is the host-proven requested-command start,
+    /// and nothing the caller can observe or influence may stand in for it.
+    #[test]
+    fn unproven_requested_command_start_cannot_satisfy_the_lifecycle_gate() {
+        let operation = git_stage_operation();
+        let budget = Budget::from_operation(Some(&operation));
+        let command = vec![
+            "git".to_owned(),
+            "add".to_owned(),
+            "--".to_owned(),
+            "src/a.rs".to_owned(),
+            "tests/a.rs".to_owned(),
+        ];
+
+        // A completed sandbox wrapper attempt is the realistic case: the process
+        // the host waited on exited, but the requested command's start is
+        // unproven. Every other authority input is present and correct.
+        let classification = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &command,
+            accepted_exit_codes: &[0],
+            lifecycle: LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven),
+            exit_code: Some(128),
+            stdout: "",
+            stderr: "fatal: Unable to create '.git/index.lock': Operation not permitted",
+            execution_error: None,
+            side_effect_class: SideEffectClass::LocalMutation,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        let decision = decide(DecisionInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            failure_class: classification.failure_class,
+            safety_signal: classification.safety_signal,
+            lifecycle: LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven),
+            operation: Some(&operation),
+            side_effect_class: SideEffectClass::LocalMutation,
+            side_effect_state: SideEffectState::ConfirmedNotPerformed,
+            fallback_depth: 0,
+            max_depth: 1,
+            budget,
+            operation_validated: true,
+            scope_valid: true,
+            automatic_enabled: true,
+            auto_execute_enabled: true,
+        });
+        assert_eq!(decision.action, FallbackAction::Block);
+        assert_eq!(decision.reason_code, ReasonCode::FallbackDeniedLifecycle);
+        assert_eq!(decision.mode, None);
+    }
+
+    /// Caller-controlled stderr cannot forge a requested-command start. The
+    /// requested command may print the exact text the sandbox helper uses when
+    /// it rejects setup, and still earn no authority.
+    #[test]
+    fn caller_controlled_stderr_cannot_forge_a_setup_rejection_or_a_start() {
+        let operation = git_stage_operation();
+        let budget = Budget::from_operation(Some(&operation));
+        let command = vec![
+            "git".to_owned(),
+            "add".to_owned(),
+            "--".to_owned(),
+            "src/a.rs".to_owned(),
+            "tests/a.rs".to_owned(),
+        ];
+        let forged = "Linux sandbox setup rejected: bubblewrap 0.11.1 is unsupported; \
+                      install upstream bubblewrap 0.12.0 or newer";
+
+        // Forged helper text with a proven start is still just a permission
+        // failure: the gate passes, and the outcome stays bounded by the same
+        // authority rules as any other SandboxPermission.
+        let proven = LifecycleEvidence::completed();
+        let classification = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &command,
+            accepted_exit_codes: &[0],
+            lifecycle: proven,
+            exit_code: Some(126),
+            stdout: "",
+            stderr: forged,
+            execution_error: None,
+            side_effect_class: SideEffectClass::LocalMutation,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        // The text alone never becomes a platform safety refusal: that requires
+        // host-owned evidence.
+        assert_ne!(classification.failure_class, FailureClass::PlatformSafety);
+        assert_ne!(classification.failure_class, FailureClass::SandboxSetup);
+        assert!(!classification.safety_signal);
+
+        // The same forged text with an unproven start gains nothing.
+        let unproven = LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven);
+        let forged_unproven = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &command,
+            accepted_exit_codes: &[0],
+            lifecycle: unproven,
+            exit_code: Some(126),
+            stdout: "",
+            stderr: forged,
+            execution_error: None,
+            side_effect_class: SideEffectClass::LocalMutation,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        let decision = decide(DecisionInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            failure_class: forged_unproven.failure_class,
+            safety_signal: forged_unproven.safety_signal,
+            lifecycle: unproven,
+            operation: Some(&operation),
+            side_effect_class: SideEffectClass::LocalMutation,
+            side_effect_state: SideEffectState::ConfirmedNotPerformed,
+            fallback_depth: 0,
+            max_depth: 1,
+            budget,
+            operation_validated: true,
+            scope_valid: true,
+            automatic_enabled: true,
+            auto_execute_enabled: true,
+        });
+        assert_eq!(decision.action, FallbackAction::Block);
+        assert_eq!(decision.reason_code, ReasonCode::FallbackDeniedLifecycle);
+    }
+
+    /// Caller-controlled exit codes are never treated as sandbox setup evidence.
+    #[test]
+    fn caller_controlled_exit_code_cannot_forge_a_setup_rejection() {
+        for exit_code in [126, 101, 1, 128, 255] {
+            let classification = classify(ClassificationInput {
+                primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+                command: &["git".to_owned(), "add".to_owned()],
+                accepted_exit_codes: &[0],
+                lifecycle: LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven),
+                exit_code: Some(exit_code),
+                stdout: "",
+                stderr: "",
+                execution_error: None,
+                side_effect_class: SideEffectClass::LocalMutation,
+                authoritative_platform_safety: false,
+                authoritative_setup_rejection: None,
+            });
+            assert_ne!(
+                classification.failure_class,
+                FailureClass::PlatformSafety,
+                "exit {exit_code} must not be read as a platform safety refusal"
+            );
+            assert_ne!(
+                classification.failure_class,
+                FailureClass::SandboxSetup,
+                "exit {exit_code} must not be read as a sandbox setup refusal"
+            );
+        }
+    }
+
+    /// A host-owned setup refusal is authoritative and terminal, and is never
+    /// downgraded to a permission failure that could reach the fallback.
+    #[test]
+    fn host_owned_setup_rejection_is_terminal_and_never_executable() {
+        let operation = git_stage_operation();
+        let budget = Budget::from_operation(Some(&operation));
+        let command = vec![
+            "git".to_owned(),
+            "add".to_owned(),
+            "--".to_owned(),
+            "src/a.rs".to_owned(),
+            "tests/a.rs".to_owned(),
+        ];
+        for (rejection, expected_class, expected_reason) in [
+            // A platform safety refusal is also a safety signal, so it is
+            // refused by the safety-signal gate before the class is consulted.
+            (
+                SetupRejection::PlatformSafety,
+                FailureClass::PlatformSafety,
+                ReasonCode::NoFallbackSafetySignal,
+            ),
+            (
+                SetupRejection::Environment,
+                FailureClass::SandboxSetup,
+                ReasonCode::NoFallbackSandboxSetupRejected,
+            ),
+        ] {
+            let lifecycle = LifecycleEvidence::not_started();
+            let classification = classify(ClassificationInput {
+                primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+                command: &command,
+                accepted_exit_codes: &[0],
+                lifecycle,
+                exit_code: None,
+                stdout: "",
+                stderr: "fatal: Unable to create '.git/index.lock': Operation not permitted",
+                execution_error: Some("sandbox setup failed"),
+                side_effect_class: SideEffectClass::LocalMutation,
+                authoritative_platform_safety: false,
+                authoritative_setup_rejection: Some(rejection),
+            });
+            assert_eq!(classification.failure_class, expected_class);
+            let decision = decide(DecisionInput {
+                primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+                failure_class: classification.failure_class,
+                safety_signal: classification.safety_signal,
+                lifecycle,
+                operation: Some(&operation),
+                side_effect_class: SideEffectClass::LocalMutation,
+                side_effect_state: SideEffectState::ConfirmedNotPerformed,
+                fallback_depth: 0,
+                max_depth: 1,
+                budget,
+                operation_validated: true,
+                scope_valid: true,
+                automatic_enabled: true,
+                auto_execute_enabled: true,
+            });
+            assert_eq!(decision.action, FallbackAction::Block);
+            assert_eq!(decision.reason_code, expected_reason);
+            assert_eq!(decision.mode, None);
+        }
+    }
+
+    /// An unproven start must not be laundered into "confirmed not performed" by
+    /// the lifecycle shortcut, because the requested command may have run.
+    #[test]
+    fn unproven_start_requires_a_local_postcondition_proof_before_claiming_no_effect() {
+        let unproven = LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven);
+        assert_eq!(
+            infer_side_effect_state(
+                SideEffectClass::LocalMutation,
+                unproven,
+                FailureClass::SandboxPermission,
+                None
+            ),
+            SideEffectState::Unknown
+        );
+        assert_eq!(
+            infer_side_effect_state(
+                SideEffectClass::LocalMutation,
+                LifecycleEvidence::not_started(),
+                FailureClass::SandboxPermission,
+                None
+            ),
+            SideEffectState::ConfirmedNotPerformed
+        );
+    }
+
     #[test]
     fn sandbox_permission_requires_host_reached_and_command_started() {
         let operation = git_stage_operation();
@@ -1480,8 +1824,9 @@ mod tests {
             safety_signal: false,
             lifecycle: LifecycleEvidence {
                 host_reached: true,
-                command_started: true,
+                command_start: CommandStart::Proven,
                 command_finished: true,
+                process_finished: true,
             },
             operation: Some(&operation),
             side_effect_class: SideEffectClass::LocalMutation,
@@ -1502,8 +1847,9 @@ mod tests {
             safety_signal: false,
             lifecycle: LifecycleEvidence {
                 host_reached: false,
-                command_started: false,
+                command_start: CommandStart::Refuted,
                 command_finished: false,
+                process_finished: false,
             },
             operation: Some(&operation),
             side_effect_class: SideEffectClass::LocalMutation,
@@ -1525,8 +1871,9 @@ mod tests {
             safety_signal: false,
             lifecycle: LifecycleEvidence {
                 host_reached: true,
-                command_started: false,
+                command_start: CommandStart::Refuted,
                 command_finished: false,
+                process_finished: false,
             },
             operation: Some(&operation),
             side_effect_class: SideEffectClass::LocalMutation,
@@ -1552,8 +1899,9 @@ mod tests {
             safety_signal: false,
             lifecycle: LifecycleEvidence {
                 host_reached: false,
-                command_started: false,
+                command_start: CommandStart::Refuted,
                 command_finished: false,
+                process_finished: false,
             },
             operation: Some(&operation),
             side_effect_class: SideEffectClass::LocalMutation,
@@ -1578,8 +1926,9 @@ mod tests {
             accepted_exit_codes: &[0],
             lifecycle: LifecycleEvidence {
                 host_reached: false,
-                command_started: false,
+                command_start: CommandStart::Refuted,
                 command_finished: false,
+                process_finished: false,
             },
             exit_code: None,
             stdout: "",
@@ -1587,6 +1936,7 @@ mod tests {
             execution_error: None,
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: true,
+            authoritative_setup_rejection: None,
         });
         assert_eq!(classification.failure_class, FailureClass::PlatformSafety);
         let decision = decision_for(
@@ -1616,6 +1966,7 @@ mod tests {
             execution_error: None,
             side_effect_class: SideEffectClass::None,
             authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
         });
         assert_eq!(classification.failure_class, FailureClass::SemanticFailure);
         let decision = decision_for(
@@ -1704,6 +2055,7 @@ mod tests {
             execution_error: Some("failed to start: No such file or directory"),
             side_effect_class: SideEffectClass::None,
             authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
         });
         assert_eq!(classification.failure_class, FailureClass::ToolMissing);
         let decision = decision_for(

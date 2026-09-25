@@ -30,6 +30,13 @@ pub struct Output {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Host-owned evidence about whether the **requested command** started.
+    ///
+    /// This is deliberately not derived from `status`, `stdout` or `stderr`.
+    /// When the sandbox is provided by a wrapper process, the wrapper's
+    /// completion is not evidence that the requested command was ever exec'd,
+    /// and the requested command controls its own output and exit value.
+    pub command_start: CommandStart,
 }
 
 fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
@@ -41,11 +48,57 @@ fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(path).map_err(|error| anyhow::anyhow!(error))
 }
 
+/// Host-owned evidence about whether the **requested command** started.
+///
+/// The sandbox helper is a separate process. Its exit status, stdout and stderr
+/// describe the *helper*, never the requested command, and the requested command
+/// fully controls its own output and exit value. No caller-visible text or code
+/// can therefore establish [`CommandStart::Proven`]. Absence of host-owned proof
+/// is always [`CommandStart::Unproven`], never an assumption that the command ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommandStart {
+    /// The host spawned the requested command itself and observed it start.
+    Proven,
+    /// The host proved the requested command was never started.
+    Refuted,
+    /// A sandbox wrapper ran to completion, but the wrapper provides the host no
+    /// evidence about whether it exec'd the requested command. The requested
+    /// command may or may not have started.
+    Unproven,
+}
+
+impl CommandStart {
+    /// Whether the requested command is host-proven to have started.
+    ///
+    /// Only [`CommandStart::Proven`] satisfies the lifecycle gate that guards
+    /// executable host fallback.
+    pub fn is_proven(self) -> bool {
+        self == Self::Proven
+    }
+}
+
+/// A sandbox setup refusal decided by trusted host code, before the sandbox
+/// helper or the requested command could run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupRejection {
+    /// A platform safety gate refused to establish the sandbox. Terminal: the
+    /// request must not proceed, in or out of the sandbox.
+    PlatformSafety,
+    /// The sandbox environment could not be established. The requested command
+    /// never started and must not be retried outside the sandbox.
+    Environment,
+}
+
 #[derive(Debug)]
 pub struct RunError {
     pub error: anyhow::Error,
     pub command_started: bool,
     pub command_finished: bool,
+    /// Typed host-owned setup refusal, when the failure happened before the
+    /// requested command could start. This is the authoritative signal the
+    /// fallback classifier consumes; the message text is diagnostic only.
+    pub setup_rejection: Option<SetupRejection>,
 }
 
 impl RunError {
@@ -54,6 +107,27 @@ impl RunError {
             error,
             command_started,
             command_finished,
+            setup_rejection: None,
+        }
+    }
+
+    /// A failure the host proved happened before the requested command started.
+    fn not_started(error: anyhow::Error) -> Self {
+        Self::new(error, false, false)
+    }
+
+    /// A host-owned refusal to establish the sandbox at all.
+    ///
+    /// Only platforms that gate their sandbox runtime up front produce this; on
+    /// other platforms the refusal is made by the wrapper and is unproven rather
+    /// than typed here.
+    #[cfg(target_os = "linux")]
+    fn setup_rejected(error: anyhow::Error, rejection: SetupRejection) -> Self {
+        Self {
+            error,
+            command_started: false,
+            command_finished: false,
+            setup_rejection: Some(rejection),
         }
     }
 }
@@ -135,11 +209,36 @@ impl Drop for UnixProcessGroupGuard {
     }
 }
 
+/// Host-owned evidence about the requested command after a sandboxed process
+/// exits.
+///
+/// Where the platform sandbox is a separate wrapper process, the wrapper can
+/// fail at any point before exec'ing the requested command: an absent or
+/// version-vulnerable runtime, a namespace or mount setup failure, a seccomp
+/// setup failure, or an exec failure. The wrapper reports all of these the same
+/// way, through its own exit status and output, and the requested command
+/// controls its own output and exit value. There is therefore no host-owned
+/// evidence that the requested command started, and the lifecycle must stay
+/// unproven rather than being inferred from the wrapper having run.
+///
+/// Where no wrapper is involved the host spawns the requested command itself,
+/// so its start is host-proven.
+const fn completed_command_start() -> CommandStart {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        CommandStart::Unproven
+    } else {
+        CommandStart::Proven
+    }
+}
+
 fn sandbox_process(
     command: &[String],
     cwd: &Path,
     writable_roots: &[PathBuf],
     stdin_present: bool,
+    #[allow(unused_variables, reason = "Only Linux setup preflight reads a PATH.")] path: Option<
+        &std::ffi::OsStr,
+    >,
 ) -> Result<(PathBuf, Command)> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
@@ -245,7 +344,7 @@ fn sandbox_process(
         .kill_on_drop(true)
         .current_dir(&cwd)
         .env_clear()
-        .envs(safe_environment())
+        .envs(safe_environment_with_path(path))
         .stdin(if stdin_present {
             Stdio::piped()
         } else {
@@ -263,14 +362,35 @@ pub async fn run_tracked(
     writable_roots: &[PathBuf],
     stdin: Option<&[u8]>,
 ) -> std::result::Result<Output, RunError> {
-    let (_, mut process) = sandbox_process(command, cwd, writable_roots, stdin.is_some())
-        .map_err(|error| RunError::new(error, false, false))?;
+    run_tracked_with_path(command, cwd, writable_roots, stdin, None).await
+}
+
+/// Same as [`run_tracked`] but with the `PATH` the sandbox helper will search
+/// for its platform sandbox runtime supplied explicitly.
+///
+/// Production always passes `None` and uses the ambient `PATH`. Tests pass a
+/// fixture directory so an unsupported Bubblewrap version can be emulated
+/// without depending on the version installed on the host.
+pub(crate) async fn run_tracked_with_path(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<Output, RunError> {
+    // Trusted parent-side setup gate. The Linux sandbox runtime is validated
+    // here, before the helper is spawned, so an unusable runtime produces a
+    // typed host-owned setup refusal while the requested command provably has
+    // not started. The helper keeps its own identical gate as defence in depth.
+    verify_platform_sandbox_support(path)?;
+    let (_, mut process) = sandbox_process(command, cwd, writable_roots, stdin.is_some(), path)
+        .map_err(RunError::not_started)?;
     #[cfg(unix)]
     process.process_group(0);
     let mut child = process
         .spawn()
         .context("failed to start primary command")
-        .map_err(|error| RunError::new(error, false, false))?;
+        .map_err(RunError::not_started)?;
     #[cfg(unix)]
     let _process_group_guard = UnixProcessGroupGuard::new(child.id().unwrap_or(0));
 
@@ -291,7 +411,58 @@ pub async fn run_tracked(
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        command_start: completed_command_start(),
     })
+}
+
+/// Validate that the platform sandbox runtime can be established, before any
+/// sandbox helper or requested command process is started.
+///
+/// On Linux the sandbox is implemented by bubblewrap, so an absent, unusable or
+/// version-vulnerable runtime is refused here. Refusing a vulnerable runtime is
+/// a platform safety decision: it is terminal, and the requested command must
+/// not be retried outside the sandbox.
+fn verify_platform_sandbox_support(
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<(), RunError> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::bubblewrap_support::{self, BubblewrapSupport};
+        let path = path
+            .map(std::borrow::ToOwned::to_owned)
+            .or_else(|| std::env::var_os("PATH"));
+        let Some(path) = path else {
+            return Err(RunError::setup_rejected(
+                anyhow::anyhow!(
+                    "{}",
+                    bubblewrap_support::rejection_message(BubblewrapSupport::Unavailable)
+                ),
+                SetupRejection::Environment,
+            ));
+        };
+        match bubblewrap_support::check(&path) {
+            BubblewrapSupport::Supported => Ok(()),
+            BubblewrapSupport::UnsupportedVersion => Err(RunError::setup_rejected(
+                anyhow::anyhow!(
+                    "{}",
+                    bubblewrap_support::rejection_message(BubblewrapSupport::UnsupportedVersion)
+                ),
+                SetupRejection::PlatformSafety,
+            )),
+            BubblewrapSupport::Unavailable => Err(RunError::setup_rejected(
+                anyhow::anyhow!(
+                    "{}",
+                    bubblewrap_support::rejection_message(BubblewrapSupport::Unavailable)
+                ),
+                SetupRejection::Environment,
+            )),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -570,6 +741,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         status: status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        command_start: CommandStart::Proven,
     })
 }
 
@@ -756,11 +928,16 @@ async fn run_unrestricted_inner(
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        command_start: CommandStart::Proven,
     })
 }
 
 fn safe_environment() -> HashMap<String, String> {
-    [
+    safe_environment_with_path(None)
+}
+
+fn safe_environment_with_path(path: Option<&std::ffi::OsStr>) -> HashMap<String, String> {
+    let mut environment: HashMap<String, String> = [
         "PATH",
         "LANG",
         "LC_ALL",
@@ -776,7 +953,11 @@ fn safe_environment() -> HashMap<String, String> {
             .ok()
             .map(|value| (name.to_owned(), value))
     })
-    .collect()
+    .collect();
+    if let Some(path) = path {
+        environment.insert("PATH".to_owned(), path.to_string_lossy().into_owned());
+    }
+    environment
 }
 
 fn clean_git_environment() -> HashMap<String, String> {
@@ -982,6 +1163,146 @@ mod linux_tests {
             None,
         )
         .await
+    }
+
+    /// Write a fake `bwrap` onto a private `PATH` that reports `version`.
+    fn fixture_bwrap(root: &Path, version: &str) -> PathBuf {
+        let bin = root.join("fixture-bin");
+        std::fs::create_dir_all(&bin).expect("create fixture bin");
+        let bwrap = bin.join("bwrap");
+        std::fs::write(
+            &bwrap,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'bubblewrap {version}\\n'; exit 0; fi\nexit 97\n"
+            ),
+        )
+        .expect("write fixture bwrap");
+        let mut permissions = std::fs::metadata(&bwrap)
+            .expect("stat fixture bwrap")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&bwrap, permissions).expect("chmod fixture bwrap");
+        bin
+    }
+
+    /// A completed sandbox attempt proves the executed process ran, never that
+    /// the requested command was exec'd inside the wrapper.
+    ///
+    /// This is the boundary that the executable fallback gate depends on: on a
+    /// wrapper platform the requested command's start stays unproven even when
+    /// the command provably ran and produced its own output.
+    #[tokio::test]
+    async fn completed_sandbox_run_leaves_requested_command_start_unproven() -> Result<()> {
+        let root = test_directory();
+        std::fs::create_dir_all(&root)?;
+        let marker = root.join("requested-command-ran");
+        let output = run(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf started > '{}'", marker.display()),
+            ],
+            &root,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert!(marker.is_file(), "the requested command really did run");
+        assert_eq!(output.command_start, CommandStart::Unproven);
+        assert!(!output.command_start.is_proven());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The trusted parent refuses an unsupported sandbox runtime before the
+    /// sandbox helper is spawned, with a typed setup refusal and no proof that
+    /// the requested command started.
+    #[tokio::test]
+    async fn unsupported_runtime_is_refused_before_the_helper_is_spawned() -> Result<()> {
+        let root = test_directory();
+        std::fs::create_dir_all(&root)?;
+        let marker = root.join("requested-command-ran");
+        let path = fixture_bwrap(&root, "0.11.1");
+        let error = run_tracked_with_path(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf started > '{}'", marker.display()),
+            ],
+            &root,
+            &[],
+            None,
+            Some(path.as_os_str()),
+        )
+        .await
+        .expect_err("an unsupported runtime must not produce a completed run");
+        assert_eq!(error.setup_rejection, Some(SetupRejection::PlatformSafety));
+        assert!(!error.command_started);
+        assert!(!error.command_finished);
+        assert!(
+            !marker.exists(),
+            "the requested command must not start under an unsupported runtime"
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// An absent sandbox runtime is an environment fault, not a platform safety
+    /// refusal, and is still terminal: the requested command never starts.
+    #[tokio::test]
+    async fn missing_runtime_is_an_environment_setup_rejection() -> Result<()> {
+        let root = test_directory();
+        std::fs::create_dir_all(&root)?;
+        let empty = root.join("empty-path");
+        std::fs::create_dir_all(&empty)?;
+        let error = run_tracked_with_path(
+            &["/bin/true".into()],
+            &root,
+            &[],
+            None,
+            Some(empty.as_os_str()),
+        )
+        .await
+        .expect_err("an absent runtime must not produce a completed run");
+        assert_eq!(error.setup_rejection, Some(SetupRejection::Environment));
+        assert!(!error.command_started);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Failing to build the sandbox process is a pre-start failure, so the
+    /// requested command provably never started.
+    #[tokio::test]
+    async fn unconstructible_sandbox_refutes_requested_command_start() -> Result<()> {
+        let root = test_directory();
+        std::fs::create_dir_all(&root)?;
+        let error = run_tracked(
+            &["/bin/true".into()],
+            &root.join("does-not-exist"),
+            &[],
+            None,
+        )
+        .await
+        .expect_err("an unresolvable cwd must fail before the command starts");
+        assert!(!error.command_started);
+        assert!(!error.command_finished);
+        assert_eq!(error.setup_rejection, None);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Host-native execution spawns the requested command directly, so its
+    /// start is host-proven.
+    #[tokio::test]
+    async fn host_native_execution_proves_requested_command_start() -> Result<()> {
+        let root = test_directory();
+        std::fs::create_dir_all(&root)?;
+        let output = run_unrestricted(&["/bin/true".into()], &root, None).await?;
+        assert_eq!(output.command_start, CommandStart::Proven);
+        assert!(output.command_start.is_proven());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]

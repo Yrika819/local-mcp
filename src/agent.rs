@@ -478,6 +478,8 @@ fn raw_output_to_sandbox(output: RawProcessOutput) -> sandbox::Output {
         status: output.exit_status,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: safe_diagnostic(&output.stderr),
+        // The host spawned this process directly, so its start is host-proven.
+        command_start: sandbox::CommandStart::Proven,
     }
 }
 

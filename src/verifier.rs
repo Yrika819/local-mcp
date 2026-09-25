@@ -1061,8 +1061,12 @@ fn parse_execution_payload(text: &str) -> Result<CommandObservation, VerifierErr
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        // The verifier judges the exit status the host observed. Where a sandbox
+        // wrapper carries the request, that is the executed process outcome, not
+        // the requested command's own lifecycle; the command lifecycle is
+        // reported separately and deliberately fails closed.
         command_finished: value
-            .get("command_finished")
+            .get("sandbox_process_finished")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         execution_error: value

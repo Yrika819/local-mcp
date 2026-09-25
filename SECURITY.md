@@ -68,6 +68,18 @@ checks because Git provides no shared atomic snapshot; these checks reduce but d
 not eliminate that TOCTOU window. Read-only operation labels never enable
 executable fallback, and public `codex_fallback` is diagnose-only. Platform and
 safety refusals are terminal; remote mutations with ambiguous side effects are not retried.
+
+Executable fallback additionally requires host-owned proof that the requested
+command started. A sandbox wrapper starting, exiting nonzero, or printing a
+setup-rejection message is not such proof: the wrapper's exit status cannot
+distinguish a setup failure from the requested command's own exit value, and the
+requested command controls its own output and exit value. On Linux and macOS the
+sandbox is provided by such a wrapper, so a completed attempt leaves the
+requested command's start unproven and fails closed to diagnose-only
+(`FALLBACK_DENIED_LIFECYCLE`). Sandbox setup refusals decided by the host itself,
+including the Bubblewrap minimum-version gate for CVE-2026-87766, are classified
+from typed host-owned evidence and are terminal blocks (`PLATFORM_SAFETY` or
+`SANDBOX_SETUP`) rather than as permission failures.
 Activity and approval messages can include caller-supplied command arguments, paths,
 and file-diff content. Do not place secrets in commands or files being edited when
 those messages are visible to the local approval UI; Local MCP does not promise
