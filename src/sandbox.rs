@@ -80,7 +80,21 @@ impl CommandStart {
 
 /// A sandbox setup refusal decided by trusted host code, before the sandbox
 /// helper or the requested command could run.
+///
+/// Only Linux verifies its sandbox runtime in parent code before spawning
+/// anything, so only Linux constructs a typed rejection. Every other platform
+/// learns about a setup failure from the wrapper, which is unproven lifecycle
+/// evidence rather than a host-owned refusal, so it produces no value here.
+/// The type itself stays platform-independent because `fallback::classify`
+/// consumes it as the authoritative setup authority on every target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "typed setup rejection is constructed by the parent-side runtime gate, which only Linux performs"
+    )
+)]
 pub enum SetupRejection {
     /// A platform safety gate refused to establish the sandbox. Terminal: the
     /// request must not proceed, in or out of the sandbox.
