@@ -233,6 +233,36 @@ fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
 
 #[cfg(unix)]
 #[test]
+fn a_momentarily_busy_executable_is_started_once_it_stops_being_written() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-busy-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = draining_script(&root, "busy.sh", "printf ready");
+    // Hold the executable open for writing, exactly as another process that has
+    // just created or is still updating a program leaves it. The kernel refuses
+    // to exec a file with an outstanding writer, so a launcher that treated the
+    // refusal as a missing or unusable command would fail a request that is
+    // perfectly valid a moment later.
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .expect("the fixture must stay open for writing");
+    // Released from another thread, because the launcher is being driven
+    // synchronously on this one.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        drop(writer);
+    });
+    let output =
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .expect("a momentarily busy executable must still be started");
+    release.join().expect("the writer must be released");
+    assert_eq!(output.stdout(), b"ready");
+    assert_eq!(output.exit_status(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
 fn bounded_process_maps_exit_with_unconsumed_stdin_to_timeout() {
     let root = std::env::temp_dir().join(format!("local-mcp-agent-unread-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
