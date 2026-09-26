@@ -58,6 +58,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
+use crate::exec_ready::BusyProgramRetry;
+
 /// First poll interval used when waiting for a group leader to terminate.
 ///
 /// The leader is reaped by the runtime only after this lease is dropped, so
@@ -68,15 +70,6 @@ const TERMINATION_POLL_START: Duration = Duration::from_micros(200);
 
 /// Upper bound on the termination poll interval.
 const TERMINATION_POLL_MAX: Duration = Duration::from_millis(4);
-
-/// How long a start is retried while the requested executable is momentarily
-/// still open for writing somewhere else.
-#[cfg(unix)]
-const EXEC_BUSY_RETRY_BUDGET: Duration = Duration::from_millis(100);
-
-/// Gap between retries of a momentarily busy executable.
-#[cfg(unix)]
-const EXEC_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A launched process group whose identifier Local MCP owns for the lifetime of
 /// this value.
@@ -222,39 +215,14 @@ where
 
 /// Start the command, tolerating a momentarily busy executable.
 ///
-/// The kernel refuses to `execve` a file that some process still has open for
-/// writing, and reports it as `ETXTBSY`. That refusal is transient and
-/// side-effect free: no process is started and nothing about the requested
-/// command is decided, so retrying cannot double-start anything and cannot turn
-/// a refusal into a weaker one. It is worth tolerating because writing an
-/// executable and then running it is an ordinary thing to do — a caller may
-/// legitimately hand Local MCP a script that was just written — and because a
-/// busy executable must not be reported as a missing or unusable one.
-///
-/// Only `ETXTBSY` is retried. Every other error, including a missing or
-/// non-executable program, is returned immediately and unchanged, so a genuinely
-/// unusable command still fails closed and is still classified as pre-start.
-///
-/// The retry is bounded by [`EXEC_BUSY_RETRY_BUDGET`], so a permanently busy
-/// executable fails as before, just after that budget instead of instantly.
+/// See [`crate::exec_ready`] for why that refusal is retried, and why no other
+/// spawn error is.
 fn spawn_ready_to_exec(command: &mut Command) -> io::Result<Child> {
-    #[cfg(not(unix))]
-    {
-        command.spawn()
-    }
-    #[cfg(unix)]
-    {
-        let deadline = std::time::Instant::now() + EXEC_BUSY_RETRY_BUDGET;
-        loop {
-            match command.spawn() {
-                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(error);
-                    }
-                    std::thread::sleep(EXEC_BUSY_RETRY_INTERVAL);
-                }
-                result => return result,
-            }
+    let retry = BusyProgramRetry::new();
+    loop {
+        match command.spawn() {
+            Err(error) if retry.retry(&error) => {}
+            result => return result,
         }
     }
 }

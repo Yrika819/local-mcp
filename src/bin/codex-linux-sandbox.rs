@@ -1,6 +1,10 @@
 // The Bubblewrap gate is Linux-only. Gating the module keeps it out of the
 // build on other platforms rather than leaving it compiled but unused.
 #[cfg(target_os = "linux")]
+#[path = "../exec_ready.rs"]
+mod exec_ready;
+
+#[cfg(target_os = "linux")]
 #[path = "../bubblewrap_support.rs"]
 mod bubblewrap_support;
 

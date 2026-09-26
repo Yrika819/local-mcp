@@ -8,6 +8,7 @@ mod approvals;
 #[cfg(target_os = "linux")]
 mod bubblewrap_support;
 mod config;
+mod exec_ready;
 mod execution;
 mod fallback;
 mod goal;

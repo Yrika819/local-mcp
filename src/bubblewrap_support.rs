@@ -39,7 +39,22 @@ impl BubblewrapSupport {
     ///
     /// Returns `None` when the runtime could not be interrogated at all.
     fn probe(path: &std::ffi::OsStr) -> (BubblewrapSupport, Option<String>) {
-        let output = match std::process::Command::new(path).arg("--version").output() {
+        // The runtime is interrogated synchronously and before anything is
+        // spawned, so the probe is the one place where a momentarily busy
+        // runtime must not change the gate's answer. A package manager replacing
+        // `bwrap` is exactly when that happens, and it is the worst moment for a
+        // platform safety decision to start reporting an unusable runtime
+        // instead of the version it is actually refusing. Only a momentary busy
+        // refusal is retried, so a missing, non-executable or failing runtime is
+        // still `Unavailable` and the gate still fails closed.
+        let retry = crate::exec_ready::BusyProgramRetry::new();
+        let output = loop {
+            match std::process::Command::new(path).arg("--version").output() {
+                Err(error) if retry.retry(&error) => {}
+                result => break result,
+            }
+        };
+        let output = match output {
             Ok(output) => output,
             Err(_) => return (BubblewrapSupport::Unavailable, None),
         };
@@ -178,6 +193,32 @@ mod tests {
         assert_eq!(check(&old), BubblewrapSupport::UnsupportedVersion);
         let new = write_fake_bwrap(&root, "0.12.0");
         assert_eq!(check(&new), BubblewrapSupport::Supported);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_momentarily_busy_runtime_is_still_reported_by_version() {
+        let root = std::env::temp_dir().join(format!("local-mcp-bwrap-busy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = write_fake_bwrap(&root, "0.11.1");
+        let bwrap = Path::new(&bin).join("bwrap");
+        // Hold the runtime open for writing, as a package manager replacing it
+        // would. The gate must keep reporting the version it is refusing: a
+        // momentarily busy file must not turn a platform safety refusal into an
+        // environment fault, because the two are classified differently and the
+        // refusal must stay terminal.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bwrap)
+            .expect("the fixture must stay open for writing");
+        // Released from another thread, because `check` runs synchronously here.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(writer);
+        });
+        let support = check(Path::new(&bin).as_os_str());
+        release.join().expect("the writer must be released");
+        assert_eq!(support, BubblewrapSupport::UnsupportedVersion);
         let _ = std::fs::remove_dir_all(root);
     }
 
