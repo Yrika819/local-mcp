@@ -58,6 +58,8 @@ mod phase11_goal_run_tests;
 #[cfg(all(test, unix))]
 mod process_group_ownership_tests;
 #[cfg(all(test, unix))]
+mod process_group_stress_tests;
+#[cfg(all(test, unix))]
 mod secure_fs_tests;
 #[cfg(test)]
 mod verifier_tests;
