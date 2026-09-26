@@ -23,6 +23,7 @@
 
 #![cfg(all(test, unix))]
 
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
@@ -42,31 +43,105 @@ const NEGATIVE_SETTLE: Duration = Duration::from_millis(500);
 /// How long a terminated group is given to release the witness pipe.
 const TEARDOWN_SETTLE: Duration = Duration::from_secs(5);
 
+/// Create a pipe whose two descriptors are owned by this process and are not
+/// inherited across `exec`.
+///
+/// `pipe2(O_CLOEXEC)` would be the obvious spelling, but it is Linux-specific:
+/// Darwin's libc does not provide it, so a V2.1.2 harness written against it
+/// could not even be compiled for macOS. `pipe` plus an explicit
+/// `F_SETFD`/`FD_CLOEXEC` on both ends is the portable Unix spelling and gives
+/// the same guarantee: the descriptors stay out of every other process this test
+/// binary spawns, and the child under test clears the flag again on the single
+/// descriptor it is supposed to inherit.
+///
+/// The residual difference from `pipe2` is the two-syscall window in which the
+/// descriptors are not yet close-on-exec. It is two adjacent `fcntl` calls wide
+/// and is accepted deliberately: the alternative is an Apple-only `syscall`
+/// shim, which would make the harness less portable than the production code it
+/// is meant to test.
+fn controlled_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // Safety: `pipe` only writes the two descriptors into the array it is given.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let [read_end, write_end] = fds;
+    for descriptor in [read_end, write_end] {
+        // Safety: both descriptors are open and owned by this function, so
+        // `fcntl` may be applied to either of them.
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            let error = io::Error::last_os_error();
+            // Safety: this function owns both descriptors and has not yet
+            // transferred either, so a partial failure closes each exactly once
+            // and leaks neither.
+            unsafe {
+                libc::close(read_end);
+                libc::close(write_end);
+            }
+            return Err(error);
+        }
+    }
+    // Safety: ownership of both open descriptors transfers to the returned
+    // `OwnedFd`s, which close them on drop.
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(read_end),
+            OwnedFd::from_raw_fd(write_end),
+        )
+    })
+}
+
+/// Whether `pid` has terminated without being reaped yet.
+///
+/// This reports the leader's termination with `WNOWAIT`, so observing it here
+/// does not consume the exit status. That distinction is the whole point: a
+/// zombie still occupies a slot in its process group, so it is exactly the state
+/// a "no group member remains" measurement has to be able to tolerate.
+fn is_unreaped_zombie(pid: libc::pid_t) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // Safety: `waitid` only fills in the `siginfo_t` it is handed, and `P_PID`
+    // restricts the query to one direct child of this process.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result == -1 {
+        return false;
+    }
+    // `libc` exposes the same C union either as plain fields (Apple) or as
+    // accessor methods (Linux and most other targets).
+    #[cfg(target_os = "macos")]
+    let child = info.si_pid;
+    #[cfg(not(target_os = "macos"))]
+    let child = unsafe { info.si_pid() };
+    child == pid
+}
+
 /// Observes whether a process group is still alive.
 ///
 /// The pipe write end is installed as the group leader's stdout, so it stays
-/// open for exactly as long as some member of the group is alive. `signalled()`
-/// therefore resolves to `true` when the group was terminated and `false` when
-/// it was left running. Both outcomes are decided by the kernel, not by a timer.
+/// open for exactly as long as some *live* member of the group exists: a process
+/// that has exited has already had its descriptors closed by the kernel, even
+/// while it remains an unreaped zombie. `signalled_within` therefore resolves to
+/// `true` when no live member remains and `false` when the group was left
+/// running. Both outcomes are decided by the kernel, not by a timer.
 struct GroupWitness {
     read_end: tokio::fs::File,
 }
 
 impl GroupWitness {
     fn new() -> (GroupWitness, OwnedFd) {
-        // O_CLOEXEC on both ends keeps the descriptors out of every other process
-        // this test binary spawns; the child clears it again on its own stdout.
-        let mut fds = [0 as libc::c_int; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0,
-            "controlled group pipe must be created"
-        );
+        let (read_end, write_end) =
+            controlled_pipe().expect("the controlled group pipe must be created");
         (
             GroupWitness {
-                read_end: tokio::fs::File::from_std(unsafe { OwnedFd::from_raw_fd(fds[0]) }.into()),
+                read_end: tokio::fs::File::from_std(read_end.into()),
             },
-            unsafe { OwnedFd::from_raw_fd(fds[1]) },
+            write_end,
         )
     }
 
@@ -162,9 +237,13 @@ async fn unowned_group(script: &str) -> (u32, GroupWitness, tokio::process::Chil
 }
 
 async fn shutdown_unowned(group_id: u32, mut child: tokio::process::Child) {
-    if unsafe { libc::kill(-(group_id as libc::pid_t), 0) } == 0 {
-        let _ = unsafe { libc::kill(-(group_id as libc::pid_t), libc::SIGKILL) };
-    }
+    // The signal is unconditional, and that is the safe direction: this scope
+    // still holds the group leader unreaped, so the kernel cannot have handed
+    // the identifier to anything else. The V2.1.2 spelling consulted
+    // `kill(-pgid, 0)` first, which is a group-occupancy probe rather than a
+    // liveness measurement, and would have silently skipped the cleanup on any
+    // host that answers it with an error other than success.
+    let _ = unsafe { libc::kill(-(group_id as libc::pid_t), libc::SIGKILL) };
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -294,6 +373,42 @@ async fn a_terminated_leader_is_never_reaped_while_the_lease_holds_its_group() {
         observed_unreaped,
         "a terminated group leader must be observed as an unreaped zombie"
     );
+    drop(lease);
+    assert_collected(leader).await;
+}
+
+#[tokio::test]
+async fn the_witness_reports_cleanup_while_only_an_unreaped_zombie_remains() {
+    // The leader exits at once and is deliberately left unreaped, so an
+    // unreaped zombie occupies the group for the whole of this test. That is the
+    // state a negative-group existence probe cannot express: the group still
+    // exists, but nothing in it is running.
+    let (mut lease, mut witness) = owned_group("/bin/sleep 300 & exec /bin/sleep 0").await;
+    let leader = lease.leader_id() as libc::pid_t;
+    let status = tokio::time::timeout(Duration::from_secs(5), lease.wait_termination())
+        .await
+        .expect("the group leader must terminate")
+        .expect("the termination report must succeed");
+    assert!(status.success(), "the controlled leader exits successfully");
+
+    // While a live descendant holds the witness, cleanup is not complete even
+    // though the leader is already a zombie.
+    assert!(
+        is_unreaped_zombie(leader),
+        "the group leader must be a zombie this test has not reaped"
+    );
+    witness.assert_intact(leader as u32).await;
+
+    // Terminating the group kills the descendant. The witness then reports
+    // cleanup complete even though the leader is still an unreaped zombie, which
+    // is the distinction this harness exists to make.
+    lease.terminate();
+    witness.assert_terminated().await;
+    assert!(
+        is_unreaped_zombie(leader),
+        "the witness reported cleanup while the leader is still an unreaped zombie"
+    );
+
     drop(lease);
     assert_collected(leader).await;
 }
