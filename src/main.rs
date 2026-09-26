@@ -23,6 +23,7 @@ mod orchestrator_error;
 #[cfg(windows)]
 mod pipe_security;
 mod planner;
+mod process_group;
 mod readonly_worker;
 mod replanner;
 mod sandbox;
@@ -54,6 +55,8 @@ mod phase0_fallback_tests;
 mod phase0_tests;
 #[cfg(test)]
 mod phase11_goal_run_tests;
+#[cfg(all(test, unix))]
+mod process_group_ownership_tests;
 #[cfg(all(test, unix))]
 mod secure_fs_tests;
 #[cfg(test)]
