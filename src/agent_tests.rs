@@ -39,6 +39,11 @@ const DESCENDANT_LIFETIME_SECS: u64 = 10;
 const LIFECYCLE_TEST_DEADLINE: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
+/// Deadline for the outcome-mapping fixtures. Every one of them completes on the
+/// fixture's own behaviour, never on this deadline.
+const SLOW: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
 fn temporary_script(root: &Path, name: &str, body: &str) -> PathBuf {
     let path = root.join(name);
     std::fs::write(&path, body).unwrap();
@@ -155,14 +160,33 @@ async fn wait_for_descendant_pid(path: &Path) -> libc::pid_t {
 }
 
 #[cfg(unix)]
+/// A fixture that satisfies the launcher's process contract deterministically.
+///
+/// The launcher writes the prompt on stdin, and the process contract is that a
+/// direct child which exits while its stdin writer is still unfinished is a
+/// timeout. A fixture that exits without reading stdin therefore races the
+/// writer's completion, and the race is decided by scheduling rather than by the
+/// behaviour under test. Draining stdin to end-of-file removes the race
+/// outright: the writer can only finish and close the pipe before the child can
+/// observe EOF, so a draining fixture can never exit first.
+fn draining_script(root: &Path, name: &str, body: &str) -> PathBuf {
+    temporary_script(
+        root,
+        name,
+        &format!("#!/bin/sh\n/bin/cat > /dev/null\n{body}\n"),
+    )
+}
+
+#[cfg(unix)]
 #[test]
 fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
-    let output = run_bounded_process_for_test(
-        &command("/usr/bin/printf", &["exact"]),
-        b"prompt",
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-limits-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let success = draining_script(&root, "success.sh", "printf exact\nexit 0");
+    let output =
+        run_bounded_process_for_test(&command(&success.to_string_lossy(), &[]), b"prompt", SLOW)
+            .unwrap();
     assert_eq!(output.stdout(), b"exact");
     assert_eq!(output.exit_status(), 0);
     assert_eq!(output.safe_stderr(), "");
@@ -171,24 +195,22 @@ fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
     assert!(safe.contains("diagnostic"));
     assert!(!safe.contains('\u{1b}'));
 
+    let nonzero = draining_script(&root, "nonzero.sh", "exit 3");
     assert_eq!(
-        run_bounded_process_for_test(
-            &command("/usr/bin/false", &[]),
-            b"prompt",
-            Duration::from_secs(2),
-        )
-        .unwrap_err(),
+        run_bounded_process_for_test(&command(&nonzero.to_string_lossy(), &[]), b"prompt", SLOW)
+            .unwrap_err(),
         AgentError::NonZeroExit
     );
+
+    // A process that consumes its prompt, produces no output and exits cleanly
+    // is an empty response, not a timeout.
+    let empty = draining_script(&root, "empty.sh", "exit 0");
     assert_eq!(
-        run_bounded_process_for_test(
-            &command("/usr/bin/true", &[]),
-            b"prompt",
-            Duration::from_secs(2),
-        )
-        .unwrap_err(),
+        run_bounded_process_for_test(&command(&empty.to_string_lossy(), &[]), b"prompt", SLOW)
+            .unwrap_err(),
         AgentError::EmptyResponse
     );
+
     assert_eq!(
         run_bounded_process_for_test(
             &command("/bin/sleep", &["1"]),
@@ -198,15 +220,51 @@ fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
         .unwrap_err(),
         AgentError::Timeout
     );
+
+    let flood = draining_script(&root, "flood.sh", "exec /usr/bin/yes");
+    assert_eq!(
+        run_bounded_process_for_test(&command(&flood.to_string_lossy(), &[]), b"prompt", SLOW)
+            .unwrap_err(),
+        AgentError::ResponseTooLarge
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_process_maps_exit_with_unconsumed_stdin_to_timeout() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-unread-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // The direct child exits immediately without ever reading stdin, and a
+    // descendant keeps the inherited read end open. The prompt therefore cannot
+    // be written and the writer stays blocked for the whole run, which is the
+    // documented condition the launcher maps to a timeout: a direct child that
+    // exited while its stdin writer had not finished.
+    //
+    // Holding the read end open in a surviving descendant is what makes this
+    // deterministic. Without it the write would fail with a broken pipe once the
+    // child was gone, and the outcome would depend on which branch the launcher
+    // happened to observe first.
+    let script = temporary_script(
+        &root,
+        "unread-stdin.sh",
+        "#!/bin/sh\nexec 3<&0\n/bin/sleep 300 <&3 &\nexit 0\n",
+    );
+    let prompt = vec![b'x'; 1024 * 1024];
+    let started = Instant::now();
     assert_eq!(
         run_bounded_process_for_test(
-            &command("/usr/bin/yes", &[]),
-            b"prompt",
+            &command(&script.to_string_lossy(), &[]),
+            &prompt,
             Duration::from_secs(2),
         )
         .unwrap_err(),
-        AgentError::ResponseTooLarge
+        AgentError::Timeout
     );
+    // The run ends when the child exits, not when the deadline expires.
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[cfg(unix)]

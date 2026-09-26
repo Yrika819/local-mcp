@@ -1794,9 +1794,16 @@ mod tests {
                 .await
                 .expect("fixture index snapshot");
             let codex = root.join("codex");
+            // Models the real read-only preflight contract rather than only its
+            // exit value. The launcher delivers the preflight prompt on stdin
+            // and treats a direct child which exits while that writer is still
+            // unfinished as a timeout, so a fixture that validated argv and
+            // exited without reading stdin raced the launcher's own contract.
+            // Draining the prompt first, and only then creating the sentinel,
+            // makes the preflight's success depend on the contract being met.
             std::fs::write(
                 &codex,
-                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-s\" ] && [ \"$2\" = \"read-only\" ]; then\n    : > \"$0.sentinel\"\n    exit 0\n  fi\n  shift\ndone\nexit 17\n",
+                "#!/bin/sh\nmode=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-s\" ] && [ \"$2\" = \"read-only\" ]; then\n    mode=read-only\n  fi\n  shift\ndone\n/bin/cat > /dev/null\nif [ \"$mode\" = read-only ]; then\n  : > \"$0.sentinel\"\n  exit 0\nfi\nexit 17\n",
             )
             .unwrap();
             let mut permissions = std::fs::metadata(&codex).unwrap().permissions();
@@ -2084,6 +2091,10 @@ mod tests {
     async fn started_trusted_git_failure_is_not_a_verified_success() {
         let root = std::env::temp_dir().join(format!("local-mcp-failed-git-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        // The test-owned Git records the fact that it started before it fails,
+        // so the "started" precondition this scenario depends on is established
+        // by the process itself rather than by the scheduler having a spare
+        // moment to start it.
         let executable = root.join("git");
         std::fs::write(&executable, "#!/bin/sh\n: > \"$0.sentinel\"\nexit 17\n").unwrap();
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
@@ -2102,8 +2113,47 @@ mod tests {
         let result =
             execute_exact_git_stage(HostExecutionAuthority::granted(), &stage, &root, Some(""))
                 .await;
-        assert!(result.is_err());
+        let error = result.expect_err("a failed staging attempt must not be a verified success");
+        // The stage command provably started: the test-owned Git wrote its
+        // sentinel as its first action.
         assert!(root.join("git.sentinel").exists());
+        // A stage command that started and then failed leaves the mutation
+        // ambiguous, which is the only condition the payload maps to UNKNOWN.
+        assert!(
+            error.downcast_ref::<TrustedGitFailure>().is_some(),
+            "a trusted Git failure after start must be reported as an ambiguous mutation"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unstarted_trusted_git_failure_is_not_an_ambiguous_mutation() {
+        let root = std::env::temp_dir().join(format!("local-mcp-absent-git-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // The trusted executable cannot be started at all. This is a different
+        // lifecycle from a started command that then failed: the mutation was
+        // never attempted, so claiming an ambiguous side effect would lock the
+        // budgets for something that provably did not happen.
+        let absent = root.join("git");
+        let stage = GitStagePaths {
+            cwd: root.clone(),
+            permitted_roots: vec![root.clone()],
+            repository_root: root.clone(),
+            git_dir: root.clone(),
+            common_git_dir: root.clone(),
+            trusted_executable: absent.clone(),
+            trusted_executable_arg: absent.to_string_lossy().into_owned(),
+            paths: vec!["safe.txt".to_owned()],
+        };
+        let result =
+            execute_exact_git_stage(HostExecutionAuthority::granted(), &stage, &root, Some(""))
+                .await;
+        let error = result.expect_err("an absent trusted Git must fail");
+        assert!(
+            error.downcast_ref::<TrustedGitFailure>().is_none(),
+            "a trusted Git that never started must not be reported as an ambiguous mutation"
+        );
+        assert!(!absent.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2160,6 +2210,17 @@ mod tests {
         let result = result.expect("fallback process timed out");
         let error = result.unwrap_err();
         let payload: Value = serde_json::from_str(&error.to_string()).unwrap();
+        // Host-owned proof that the stage command started, captured by the host
+        // from the trusted Git process itself. A stage command that never started
+        // cannot produce this text, so this scenario never depends on the
+        // scheduler having found room to start Git for the UNKNOWN verdict below
+        // to be the right one.
+        assert!(
+            payload["stderr"]
+                .as_str()
+                .is_some_and(|stderr| stderr.contains("index.lock")),
+            "the trusted Git stage command must have started and reported its own failure: {error}"
+        );
         assert_eq!(payload["side_effect_state"], "UNKNOWN");
         assert_eq!(payload["budget_locked"], true);
         assert_eq!(payload["remaining_attempt_budget"], 0);
@@ -2465,7 +2526,7 @@ mod tests {
         std::fs::write(
             &fixture.codex,
             format!(
-                "#!/bin/sh\n'{git}' config --local filter.marker.clean \"touch '{marker_text}'\"\nprintf '%s\\n' '*.txt filter=marker' > .gitattributes\nexit 0\n"
+                "#!/bin/sh\n/bin/cat > /dev/null\n'{git}' config --local filter.marker.clean \"touch '{marker_text}'\"\nprintf '%s\\n' '*.txt filter=marker' > .gitattributes\nexit 0\n"
             ),
         )
         .unwrap();

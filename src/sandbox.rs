@@ -14,9 +14,11 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+use crate::process_group::ProcessGroup;
 
 pub(crate) const TRUSTED_GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const TRUSTED_GIT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -200,29 +202,6 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-#[cfg(unix)]
-struct UnixProcessGroupGuard {
-    process_group_id: libc::pid_t,
-}
-
-#[cfg(unix)]
-impl UnixProcessGroupGuard {
-    fn new(process_group_id: u32) -> Self {
-        Self {
-            process_group_id: process_group_id as libc::pid_t,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for UnixProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.process_group_id > 0 {
-            let _ = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
-        }
-    }
-}
-
 /// Host-owned evidence about the requested command after a sandboxed process
 /// exits.
 ///
@@ -399,17 +378,12 @@ pub(crate) async fn run_tracked_with_path(
     verify_platform_sandbox_support(path)?;
     let (_, mut process) = sandbox_process(command, cwd, writable_roots, stdin.is_some(), path)
         .map_err(RunError::not_started)?;
-    #[cfg(unix)]
-    process.process_group(0);
-    let mut child = process
-        .spawn()
+    let mut group = ProcessGroup::spawn(&mut process)
         .context("failed to start primary command")
         .map_err(RunError::not_started)?;
-    #[cfg(unix)]
-    let _process_group_guard = UnixProcessGroupGuard::new(child.id().unwrap_or(0));
 
     if let Some(bytes) = stdin
-        && let Some(mut child_stdin) = child.stdin.take()
+        && let Some(mut child_stdin) = group.take_stdin()
     {
         child_stdin
             .write_all(bytes)
@@ -417,8 +391,8 @@ pub(crate) async fn run_tracked_with_path(
             .map_err(|error| RunError::new(error.into(), true, false))?;
     }
 
-    let output = child
-        .wait_with_output()
+    let output = group
+        .terminate_and_capture()
         .await
         .map_err(|error| RunError::new(error.into(), true, false))?;
     Ok(Output {
@@ -576,21 +550,14 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    process.process_group(0);
-    let mut child = process
-        .spawn()
+    let mut group = ProcessGroup::spawn(&mut process)
         .context("failed to start bounded Git command")
         .map_err(|error| RunError::new(error, false, false))?;
-    let process_group_id = child.id().unwrap_or(0);
-    #[cfg(unix)]
-    let _process_group_guard = UnixProcessGroupGuard::new(process_group_id);
     let mut stdout_task: Option<CaptureTask> = None;
     let mut stderr_task: Option<CaptureTask> = None;
-    let Some(stdout) = child.stdout.take() else {
+    let Some(stdout) = group.take_stdout() else {
         let finished = cleanup_bounded_child(
-            &mut child,
-            process_group_id,
+            &mut group,
             &mut stdout_task,
             &mut stderr_task,
             cleanup_deadline,
@@ -602,10 +569,9 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
             finished,
         ));
     };
-    let Some(stderr) = child.stderr.take() else {
+    let Some(stderr) = group.take_stderr() else {
         let finished = cleanup_bounded_child(
-            &mut child,
-            process_group_id,
+            &mut group,
             &mut stdout_task,
             &mut stderr_task,
             cleanup_deadline,
@@ -629,10 +595,9 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         Arc::clone(&state),
     ))));
     if let Some(bytes) = stdin {
-        let Some(mut child_stdin) = child.stdin.take() else {
+        let Some(mut child_stdin) = group.take_stdin() else {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -649,8 +614,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
             Ok(Ok(()))
         ) {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -663,7 +627,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
             ));
         }
     }
-    drop(child.stdin.take());
+    drop(group.take_stdin());
     let wait_result = loop {
         if state.too_large.load(Ordering::Acquire) {
             break Err(anyhow::anyhow!("bounded Git command output limit exceeded"));
@@ -672,7 +636,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
             break Err(anyhow::anyhow!("bounded Git command output capture failed"));
         }
         tokio::select! {
-            result = child.wait() => break result.map_err(anyhow::Error::from),
+            result = group.wait_termination() => break result.map_err(anyhow::Error::from),
             _ = tokio::time::sleep_until(deadline) => {
                 break Err(anyhow::anyhow!("bounded Git command timed out"));
             }
@@ -682,8 +646,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
     let status = match wait_result {
         Ok(_status) if state.too_large.load(Ordering::Acquire) => {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -697,8 +660,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         }
         Ok(_status) if state.failed.load(Ordering::Acquire) => {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -713,8 +675,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         Ok(status) => status,
         Err(error) => {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -727,8 +688,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         Ok(value) => value,
         Err(error) => {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -741,8 +701,7 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
         Ok(value) => value,
         Err(error) => {
             let finished = cleanup_bounded_child(
-                &mut child,
-                process_group_id,
+                &mut group,
                 &mut stdout_task,
                 &mut stderr_task,
                 cleanup_deadline,
@@ -856,32 +815,18 @@ async fn abort_capture_task(task: &mut Option<CaptureTask>) {
     task.take();
 }
 
-#[cfg(unix)]
-fn kill_bounded_child(child: &mut Child, process_group_id: u32) {
-    if process_group_id != 0 {
-        let _ = unsafe { libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL) };
-    }
-    let _ = child.start_kill();
-}
-
-#[cfg(not(unix))]
-fn kill_bounded_child(child: &mut Child, _process_group_id: u32) {
-    let _ = child.start_kill();
-}
-
 async fn cleanup_bounded_child(
-    child: &mut Child,
-    process_group_id: u32,
+    group: &mut ProcessGroup,
     stdout_task: &mut Option<CaptureTask>,
     stderr_task: &mut Option<CaptureTask>,
     cleanup_deadline: tokio::time::Instant,
 ) -> bool {
-    kill_bounded_child(child, process_group_id);
+    group.terminate();
     let finished = matches!(
-        tokio::time::timeout_at(cleanup_deadline, child.wait()).await,
+        tokio::time::timeout_at(cleanup_deadline, group.wait_termination()).await,
         Ok(Ok(_))
     );
-    kill_bounded_child(child, process_group_id);
+    group.terminate();
     abort_capture_task(stdout_task).await;
     abort_capture_task(stderr_task).await;
     finished
@@ -918,24 +863,19 @@ async fn run_unrestricted_inner(
     if clean_environment {
         process.env_clear().envs(clean_git_environment());
     }
-    #[cfg(unix)]
-    process.process_group(0);
-    let mut child = process
-        .spawn()
+    let mut group = ProcessGroup::spawn(&mut process)
         .context("failed to start unsandboxed command")
         .map_err(|error| RunError::new(error, false, false))?;
-    #[cfg(unix)]
-    let _process_group_guard = UnixProcessGroupGuard::new(child.id().unwrap_or(0));
     if let Some(bytes) = stdin
-        && let Some(mut child_stdin) = child.stdin.take()
+        && let Some(mut child_stdin) = group.take_stdin()
     {
         child_stdin
             .write_all(bytes)
             .await
             .map_err(|error| RunError::new(error.into(), true, false))?;
     }
-    let output = child
-        .wait_with_output()
+    let output = group
+        .terminate_and_capture()
         .await
         .map_err(|error| RunError::new(error.into(), true, false))?;
     Ok(Output {

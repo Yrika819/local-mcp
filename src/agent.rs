@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::task::JoinHandle;
 
+use crate::process_group::ProcessGroup;
 use crate::{approvals, fallback, sandbox};
 
 pub(crate) const MODEL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -390,42 +391,6 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-#[cfg(unix)]
-struct UnixProcessGroupGuard {
-    process_group_id: libc::pid_t,
-}
-
-#[cfg(unix)]
-impl UnixProcessGroupGuard {
-    fn new(process_group_id: u32) -> Self {
-        Self {
-            process_group_id: process_group_id as libc::pid_t,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for UnixProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.process_group_id > 0 {
-            let _ = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
-        }
-    }
-}
-
-#[cfg(unix)]
-fn kill_child(child: &mut Child, process_group_id: u32) {
-    if process_group_id != 0 {
-        let _ = unsafe { libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL) };
-    }
-    let _ = child.start_kill();
-}
-
-#[cfg(not(unix))]
-fn kill_child(child: &mut Child, _process_group_id: u32) {
-    let _ = child.start_kill();
-}
-
 async fn abort_and_join<T>(task: &mut Option<AbortOnDrop<T>>) {
     if let Some(task) = task.as_mut() {
         task.abort_and_join().await;
@@ -434,20 +399,19 @@ async fn abort_and_join<T>(task: &mut Option<AbortOnDrop<T>>) {
 }
 
 async fn cleanup_async_process(
-    child: &mut Child,
-    process_group_id: u32,
+    group: &mut ProcessGroup,
     stdin_task: &mut Option<AbortOnDrop<io::Result<()>>>,
     stdout_task: &mut Option<AbortOnDrop<Result<Vec<u8>, CaptureError>>>,
     stderr_task: &mut Option<AbortOnDrop<Result<Vec<u8>, CaptureError>>>,
     cleanup_deadline: Instant,
 ) {
-    kill_child(child, process_group_id);
+    group.terminate();
     let _ = tokio::time::timeout_at(
         tokio::time::Instant::from_std(cleanup_deadline),
-        child.wait(),
+        group.wait_termination(),
     )
     .await;
-    kill_child(child, process_group_id);
+    group.terminate();
     abort_and_join(stdin_task).await;
     abort_and_join(stdout_task).await;
     abort_and_join(stderr_task).await;
@@ -508,41 +472,36 @@ async fn run_bounded_process_async(
     if let Some(cwd) = cwd.as_deref() {
         process.current_dir(cwd);
     }
-    #[cfg(unix)]
-    process.process_group(0);
-    let mut child = process.spawn().map_err(|error| {
+    let mut group = ProcessGroup::spawn(&mut process).map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
             AgentError::ExecutableUnavailable
         } else {
             AgentError::SpawnFailed
         }
     })?;
-    let process_group_id = child.id().unwrap_or(0);
-    #[cfg(unix)]
-    let _process_group_guard = UnixProcessGroupGuard::new(process_group_id);
-    let Some(stdin) = child.stdin.take() else {
-        kill_child(&mut child, process_group_id);
+    let Some(stdin) = group.take_stdin() else {
+        group.terminate();
         let _ = tokio::time::timeout_at(
             tokio::time::Instant::from_std(cleanup_deadline),
-            child.wait(),
+            group.wait_termination(),
         )
         .await;
         return Err(AgentError::SpawnFailed);
     };
-    let Some(stdout) = child.stdout.take() else {
-        kill_child(&mut child, process_group_id);
+    let Some(stdout) = group.take_stdout() else {
+        group.terminate();
         let _ = tokio::time::timeout_at(
             tokio::time::Instant::from_std(cleanup_deadline),
-            child.wait(),
+            group.wait_termination(),
         )
         .await;
         return Err(AgentError::SpawnFailed);
     };
-    let Some(stderr) = child.stderr.take() else {
-        kill_child(&mut child, process_group_id);
+    let Some(stderr) = group.take_stderr() else {
+        group.terminate();
         let _ = tokio::time::timeout_at(
             tokio::time::Instant::from_std(cleanup_deadline),
-            child.wait(),
+            group.wait_termination(),
         )
         .await;
         return Err(AgentError::SpawnFailed);
@@ -575,7 +534,7 @@ async fn run_bounded_process_async(
             break;
         }
         tokio::select! {
-            result = child.wait(), if status.is_none() => {
+            result = group.wait_termination(), if status.is_none() => {
                 match result {
                     Ok(exit_status) => {
                         status = Some(exit_status);
@@ -657,8 +616,7 @@ async fn run_bounded_process_async(
     }
     if let Some(error) = failure {
         cleanup_async_process(
-            &mut child,
-            process_group_id,
+            &mut group,
             &mut stdin_task,
             &mut stdout_task,
             &mut stderr_task,
