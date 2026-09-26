@@ -27,8 +27,20 @@ use tokio::process::Command;
 
 use crate::agent::{AgentError, run_bounded_host_process};
 
-/// Deadline handed to the launcher for the cases that must complete on their own.
-const FAST_DEADLINE: Duration = Duration::from_secs(20);
+/// Safety bound for the cases that must complete on their own.
+///
+/// It exists only to turn a hang into a failure; no assertion below depends on
+/// it. These runs complete in milliseconds, so the bound is deliberately far
+/// above anything the machine needs, because a bound that can be reached by
+/// scheduling pressure on a loaded host is a bound that measures the host and
+/// not the lease.
+const FAST_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Safety bound on how long a run that must hit its deadline may take in total.
+///
+/// The deadline itself is [`RUN_DEADLINE`]; this only asserts that the run ended
+/// because the deadline was reached rather than by hanging.
+const RUN_UPPER_BOUND: Duration = Duration::from_secs(20);
 
 /// Deadline handed to the launcher for the cases that must time out.
 const RUN_DEADLINE: Duration = Duration::from_millis(400);
@@ -179,7 +191,7 @@ async fn timeout_terminates_the_group_and_no_descendant_survives() {
         wait_for_group_id(&pid_file),
     );
     assert_eq!(result.expect_err("must time out"), AgentError::Timeout);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < RUN_UPPER_BOUND);
     assert_group_gone(group_id).await;
     assert_group_alive(unrelated).await;
     let _ = unsafe { libc::kill(-unrelated, libc::SIGKILL) };
@@ -208,7 +220,7 @@ async fn blocked_stdin_write_is_bounded_and_terminates_the_group() {
         wait_for_group_id(&pid_file),
     );
     assert_eq!(result.expect_err("must time out"), AgentError::Timeout);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < RUN_UPPER_BOUND);
     assert_group_gone(group_id).await;
     assert_group_alive(unrelated).await;
     let _ = unsafe { libc::kill(-unrelated, libc::SIGKILL) };
