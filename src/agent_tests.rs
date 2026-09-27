@@ -162,13 +162,11 @@ async fn wait_for_descendant_pid(path: &Path) -> libc::pid_t {
 #[cfg(unix)]
 /// A fixture that satisfies the launcher's process contract deterministically.
 ///
-/// The launcher writes the prompt on stdin, and the process contract is that a
-/// direct child which exits while its stdin writer is still unfinished is a
-/// timeout. A fixture that exits without reading stdin therefore races the
-/// writer's completion, and the race is decided by scheduling rather than by the
-/// behaviour under test. Draining stdin to end-of-file removes the race
-/// outright: the writer can only finish and close the pipe before the child can
-/// observe EOF, so a draining fixture can never exit first.
+/// The launcher writes the prompt on stdin, so a fixture that consumes it to end
+/// of file resolves the writer before the fixture can exit. That keeps the
+/// outcome-mapping fixtures below about the mapping they are named for rather
+/// than about prompt completion, and it is why a short-lived fixture is only
+/// ordered against its writer deliberately in the completion cases.
 fn draining_script(root: &Path, name: &str, body: &str) -> PathBuf {
     temporary_script(
         root,
@@ -262,39 +260,200 @@ fn a_momentarily_busy_executable_is_started_once_it_stops_being_written() {
 }
 
 #[cfg(unix)]
+/// A fixture whose direct child exits at once and whose descendant holds the
+/// prompt's read end for exactly `seconds`, and no longer.
+///
+/// The child never reads the prompt. Its descendant is the only remaining reader
+/// and it is released on a schedule this test chooses, so the writer is
+/// guaranteed to still be unfinished when the child is observed and to resolve
+/// at a moment this test also chooses. That makes the completion ordering a
+/// property of the fixture rather than of the scheduler.
+///
+/// The descendant's own stdout and stderr are redirected away from the
+/// launcher's pipes, so it retains the read end and nothing else: the child's
+/// output is complete as soon as the child is gone, and only the prompt is
+/// outstanding.
+fn released_read_end_script(root: &Path, name: &str, body: &str, seconds: &str) -> PathBuf {
+    temporary_script(
+        root,
+        name,
+        &format!("#!/bin/sh\nexec 3<&0\n/bin/sleep {seconds} <&3 > /dev/null 2>&1 &\n{body}\n"),
+    )
+}
+
+#[cfg(unix)]
+/// A prompt far larger than any pipe buffer.
+///
+/// A child that never reads the prompt would let the writer finish if the prompt
+/// fitted in the buffer, and that is the one ordering these cases must not
+/// depend on: the writer has to still be unfinished when the child exits.
+fn oversized_prompt() -> Vec<u8> {
+    vec![b'x'; 1024 * 1024]
+}
+
+#[cfg(unix)]
 #[test]
-fn bounded_process_maps_exit_with_unconsumed_stdin_to_timeout() {
-    let root = std::env::temp_dir().join(format!("local-mcp-agent-unread-{}", Uuid::new_v4()));
+fn a_child_that_exits_before_its_prompt_is_written_still_reports_its_own_result() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-exit-first-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
-    // The direct child exits immediately without ever reading stdin, and a
-    // descendant keeps the inherited read end open. The prompt therefore cannot
-    // be written and the writer stays blocked for the whole run, which is the
-    // documented condition the launcher maps to a timeout: a direct child that
-    // exited while its stdin writer had not finished.
+    // The child exits at once, and the prompt is still unwritten at that moment.
+    // The launcher records the exit and keeps driving the remaining IO, so the
+    // writer resolves as a broken pipe once the descendant releases the read end
+    // and the run reports the child's own result.
     //
-    // Holding the read end open in a surviving descendant is what makes this
-    // deterministic. Without it the write would fail with a broken pipe once the
-    // child was gone, and the outcome would depend on which branch the launcher
-    // happened to observe first.
-    let script = temporary_script(
-        &root,
-        "unread-stdin.sh",
-        "#!/bin/sh\nexec 3<&0\n/bin/sleep 300 <&3 &\nexit 0\n",
-    );
-    let prompt = vec![b'x'; 1024 * 1024];
+    // A launcher that turns an unfinished writer into a timeout the moment it
+    // observes the child cannot distinguish this run from one whose prompt is
+    // still genuinely blocked, and it answers both with the same wrong verdict.
+    let script = released_read_end_script(&root, "exit-first.sh", "printf exact\nexit 0", "0.3");
     let started = Instant::now();
+    let output = run_bounded_process_for_test(
+        &command(&script.to_string_lossy(), &[]),
+        &oversized_prompt(),
+        SLOW,
+    )
+    .expect("a child that exits before its prompt is written must not be a timeout");
+    assert_eq!(output.stdout(), b"exact");
+    assert_eq!(output.exit_status(), 0);
+    assert_eq!(output.safe_stderr(), "");
+    // The run ends when the read end is released, so it is bounded by the
+    // fixture rather than by the deadline.
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_exits_with_no_output_is_an_empty_response_and_not_a_timeout() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-exit-silent-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // A successful child with nothing to say is an empty response. Exiting before
+    // the prompt is written does not change that into a timeout.
+    let script = released_read_end_script(&root, "exit-silent.sh", "exit 0", "0.3");
     assert_eq!(
         run_bounded_process_for_test(
             &command(&script.to_string_lossy(), &[]),
-            &prompt,
-            Duration::from_secs(2),
+            &oversized_prompt(),
+            SLOW
         )
         .unwrap_err(),
-        AgentError::Timeout
+        AgentError::EmptyResponse
     );
-    // The run ends when the child exits, not when the deadline expires.
-    assert!(started.elapsed() < Duration::from_secs(1));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_exits_unsuccessfully_before_its_prompt_is_written_is_a_nonzero_exit() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-exit-failed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // The child's own exit status decides the outcome, even when it is observed
+    // before the prompt could be written.
+    let script = released_read_end_script(&root, "exit-failed.sh", "printf exact\nexit 7", "0.3");
+    assert_eq!(
+        run_bounded_process_for_test(
+            &command(&script.to_string_lossy(), &[]),
+            &oversized_prompt(),
+            SLOW
+        )
+        .unwrap_err(),
+        AgentError::NonZeroExit
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_closes_its_own_prompt_reports_a_broken_pipe_as_a_completed_write() {
+    let root =
+        std::env::temp_dir().join(format!("local-mcp-agent-closed-prompt-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // The child closes its own read end without consuming the prompt and then
+    // exits, so the writer can only end as a broken pipe. A closed prompt is the
+    // child's own decision rather than a transport failure, so the run reports
+    // what the child produced.
+    let script = temporary_script(
+        &root,
+        "closed-prompt.sh",
+        "#!/bin/sh\nexec 0<&-\nprintf exact\n/bin/sleep 0.3\nexit 0\n",
+    );
+    let output = run_bounded_process_for_test(
+        &command(&script.to_string_lossy(), &[]),
+        &oversized_prompt(),
+        SLOW,
+    )
+    .expect("a child that closes its own prompt is not a transport failure");
+    assert_eq!(output.stdout(), b"exact");
+    assert_eq!(output.exit_status(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_drains_its_prompt_and_exits_reports_its_own_output() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-drains-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // The ordinary ordering: the prompt is consumed to end of file, and the
+    // child's own output and exit status are reported unchanged.
+    let script = draining_script(&root, "drains.sh", "printf exact\nexit 0");
+    let output =
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .expect("a child that drains its prompt must complete");
+    assert_eq!(output.stdout(), b"exact");
+    assert_eq!(output.exit_status(), 0);
+    assert_eq!(output.safe_stderr(), "");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_prompt_that_stays_blocked_after_the_child_exits_times_out_at_the_deadline() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-blocked-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    // The direct child exits at once without reading the prompt, and a
+    // descendant holds the inherited read end for far longer than the run's
+    // deadline. Nothing ever resolves the writer, so this is the condition the
+    // deadline exists for: the run ends as a timeout, and it ends at the
+    // deadline rather than at the child's exit, because until the deadline the
+    // prompt is merely outstanding rather than resolved.
+    let script = temporary_script(
+        &root,
+        "blocked-prompt.sh",
+        &format!(
+            "#!/bin/sh\nexec 3<&0\n/bin/sleep {} <&3 > /dev/null 2>&1 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            DESCENDANT_LIFETIME_SECS,
+            pid_path.display()
+        ),
+    );
+    let timeout = LIFECYCLE_TEST_DEADLINE;
+    let started = Instant::now();
+    let command = [script.to_string_lossy().into_owned()];
+    let prompt = oversized_prompt();
+    // The descendant is observed while the run is still in flight, so the cleanup
+    // assertion below is always about a process that really existed.
+    let (result, pid) = tokio::join!(
+        run_bounded_process_async_for_test(&command, &prompt, &root, timeout),
+        wait_for_descendant_pid(&pid_path),
+    );
+    assert_eq!(result.unwrap_err(), AgentError::Timeout);
+    assert!(
+        started.elapsed() >= timeout,
+        "unresolved prompt IO is a timeout at the deadline, not at the child's exit"
+    );
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_secs(1));
+    let mut alive = true;
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !alive,
+        "the timeout must reap the descendant holding the prompt"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -323,7 +482,9 @@ async fn bounded_host_launcher_kills_descendant_retaining_pipes() {
         wait_for_descendant_pid(&pid_path),
     );
     assert_eq!(result.unwrap_err(), AgentError::Timeout);
-    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
+    // The retained pipes are bounded by the run deadline and then bounded again
+    // by the cleanup grace, so the run cannot outlive its own budget.
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_secs(1));
     let mut alive = true;
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } == -1 {
@@ -451,17 +612,17 @@ async fn child_exit_kills_group_before_blocked_stdin_cleanup() {
     let prompt = vec![b'x'; 1024 * 1024];
     let timeout = LIFECYCLE_TEST_DEADLINE;
     let started = Instant::now();
-    // The launcher ends this run as soon as the fixture exits while its stdin
-    // write is still blocked, so cleanup lands within a millisecond of the pid
-    // being published. Observing the pid concurrently is what makes the causal
-    // ordering explicit instead of assumed.
+    // The launcher drives this run until its own deadline expires, then
+    // terminates the group, so cleanup lands immediately after the deadline
+    // rather than at the fixture's exit. Observing the pid concurrently is what
+    // makes the causal ordering explicit instead of assumed.
     let command = [script.to_string_lossy().into_owned()];
     let (result, pid) = tokio::join!(
         run_bounded_host_process(&command, &prompt, &root, timeout),
         wait_for_descendant_pid(&pid_path),
     );
     assert_eq!(result.unwrap_err(), AgentError::Timeout);
-    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_millis(500));
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_secs(1));
     let mut alive = true;
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } == -1 {

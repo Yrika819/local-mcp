@@ -352,10 +352,6 @@ impl<T> AbortOnDrop<T> {
         }
     }
 
-    fn is_finished(&self) -> bool {
-        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
-    }
-
     async fn abort_and_join(&mut self) {
         if let Some(handle) = self.handle.as_ref() {
             handle.abort();
@@ -537,14 +533,24 @@ async fn run_bounded_process_async(
             result = group.wait_termination(), if status.is_none() => {
                 match result {
                     Ok(exit_status) => {
+                        // A child that has exited is not a timeout, and the
+                        // writer's completion is not what decides that. The
+                        // prompt is still outstanding here, and the launcher's
+                        // contract is that an outstanding write resolves as
+                        // `Ok`, as a broken pipe, or as a real IO failure,
+                        // whichever happens first. Converting the observation
+                        // itself into a timeout made the verdict a function of
+                        // the order in which the scheduler happened to report a
+                        // child exit and a task completion, so a child that had
+                        // already exited successfully was reported as a timeout
+                        // purely because its exit was seen first.
+                        //
+                        // The run's own deadline is what still ends a run whose
+                        // IO never resolves, and that is the only condition that
+                        // is a timeout: a prompt still blocked because another
+                        // live process holds the read end, or output a
+                        // surviving descendant keeps open.
                         status = Some(exit_status);
-                        if stdin_task
-                            .as_ref()
-                            .is_some_and(|task| !task.is_finished())
-                        {
-                            failure = Some(AgentError::Timeout);
-                            break;
-                        }
                     }
                     Err(_) => {
                         failure = Some(AgentError::TransportFailure);
