@@ -144,6 +144,42 @@ fn goal_tool_catalog_is_exactly_additive() {
         rejection["properties"]["replan_policy"]["enum"],
         json!(["NORMAL", "REQUIRE_READONLY_REASSESSMENT"])
     );
+
+    // The durable failed-task replan request must be reachable from the tool
+    // surface, not only from the host API. `additionalProperties:false` would
+    // otherwise make the whole replacement mechanism uninvocable by a client.
+    let replan_requests = &resume["inputSchema"]["properties"]["failed_task_replan_requests"];
+    assert_eq!(replan_requests["type"], "array");
+    assert_eq!(replan_requests["maxItems"], 8);
+    let request = &replan_requests["items"];
+    assert_eq!(request["type"], "object");
+    assert_eq!(request["additionalProperties"], false);
+    assert_eq!(
+        request["required"],
+        json!([
+            "request_id",
+            "expected_goal_revision",
+            "expected_plan_revision",
+            "trigger_task_id",
+            "reason"
+        ])
+    );
+    assert_eq!(request["properties"]["request_id"]["maxLength"], 128);
+    assert_eq!(request["properties"]["trigger_task_id"]["format"], "uuid");
+    assert_eq!(request["properties"]["reason"]["maxLength"], 8192);
+    assert_eq!(
+        request["properties"]["policy"]["enum"],
+        json!(["REQUIRE_REPLACEMENT", "REQUIRE_DECOMPOSITION"])
+    );
+    assert_eq!(
+        request["properties"]["trigger_kind"]["enum"],
+        json!(["POST_ATTEMPT_FAILURE", "PRE_EXECUTION_REJECTION"])
+    );
+    assert_eq!(
+        request["properties"]["authority_request_id"]["maxLength"],
+        128
+    );
+
     let result = tools
         .iter()
         .find(|tool| tool["name"] == "goal_result")
@@ -154,7 +190,10 @@ fn goal_tool_catalog_is_exactly_additive() {
         json!(["session_id", "goal_id"])
     );
 
-    let run = tools.iter().find(|tool| tool["name"] == "goal_run").unwrap();
+    let run = tools
+        .iter()
+        .find(|tool| tool["name"] == "goal_run")
+        .unwrap();
     assert_eq!(run["inputSchema"]["additionalProperties"], false);
     assert_eq!(
         run["inputSchema"]["required"],
@@ -226,7 +265,8 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
         completed = Some(value);
         break;
     }
-    let completed = completed.expect("released background job must complete within the bounded poll");
+    let completed =
+        completed.expect("released background job must complete within the bounded poll");
     assert_eq!(completed["exit_code"], 0);
     assert_eq!(completed["stdout"], "done");
     assert!(

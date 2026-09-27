@@ -235,7 +235,7 @@ pub(crate) fn tools() -> Value {
         {"name":"goal_start","description":"Create one durable non-terminal Goal for this Local MCP session. This does not execute tasks or repository work in Phase 3.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"objective":{"type":"string","minLength":1,"maxLength":131072},"title":{"type":"string","maxLength":256},"constraints":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"completion_criteria":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"idempotency_key":{"type":"string","maxLength":128}},"required":["session_id","objective"]}},
         {"name":"goal_status","description":"Read the current durable Goal status without recovery, execution, or mutation. Omit goal_id to resolve the unique non-terminal Goal for the session.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"}},"required":["session_id"]}},
         {"name":"goal_pause","description":"Request the durable Goal pause transition only. No legacy Job or execution worker is stopped by this tool.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"reason":{"type":"string","maxLength":8192}},"required":["session_id"]}},
-        {"name":"goal_resume","description":"Recover stale durable Goal task state and make resumable state ready for future orchestration. This does not execute work in Phase 3. An optional explicit pre-execution plan rejection may durably enter the existing Replanner path without executing a Worker.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"pre_execution_plan_rejection":{"type":"object","additionalProperties":false,"properties":{"request_id":{"type":"string","minLength":1,"maxLength":128},"expected_goal_revision":{"type":"integer","minimum":1},"expected_plan_revision":{"type":"integer","minimum":1},"trigger_task_id":{"type":"string","format":"uuid","maxLength":36},"reason":{"type":"string","minLength":1,"maxLength":8192},"replan_policy":{"type":"string","enum":["NORMAL","REQUIRE_READONLY_REASSESSMENT"],"default":"NORMAL"}},"required":["request_id","expected_goal_revision","expected_plan_revision","trigger_task_id","reason"]}},"required":["session_id"]}},
+        {"name":"goal_resume","description":"Recover stale durable Goal task state and make resumable state ready for future orchestration. This does not execute work in Phase 3. An optional explicit pre-execution plan rejection may durably enter the existing Replanner path without executing a Worker. An optional failed_task_replan_requests array durably requests replacement of structurally invalid Tasks with bounded replacement closures; it never executes a Worker and never consumes the trigger's remaining retry.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"pre_execution_plan_rejection":{"type":"object","additionalProperties":false,"properties":{"request_id":{"type":"string","minLength":1,"maxLength":128},"expected_goal_revision":{"type":"integer","minimum":1},"expected_plan_revision":{"type":"integer","minimum":1},"trigger_task_id":{"type":"string","format":"uuid","maxLength":36},"reason":{"type":"string","minLength":1,"maxLength":8192},"replan_policy":{"type":"string","enum":["NORMAL","REQUIRE_READONLY_REASSESSMENT"],"default":"NORMAL"}},"required":["request_id","expected_goal_revision","expected_plan_revision","trigger_task_id","reason"]}},"required":["session_id"]}},
         {"name":"goal_cancel","description":"Request cancellation of durable Goal authority only. This does not stop unrelated legacy Local MCP Jobs or revert repository state.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"reason":{"type":"string","maxLength":8192}},"required":["session_id"]}},
         {"name":"goal_result","description":"Return the best durable result state for one explicit Goal ID. Non-terminal Goals return NOT_TERMINAL rather than fabricated success.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"}},"required":["session_id","goal_id"]}}
         ,{"name":"goal_run","description":"Run one existing Goal in the foreground for a bounded number of host-controlled Scheduler/Finalizer steps. Model calls, if needed, use the host-configured read-only Codex model.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"max_steps":{"type":"integer","minimum":1,"maximum":256}},"required":["session_id","goal_id","max_steps"]}}
@@ -270,6 +270,42 @@ pub(crate) fn tools() -> Value {
         },
         "required": ["type"]
     });
+    // Built separately from the tool literal: this schema nests deeply enough
+    // that inlining it exceeds the `json!` macro recursion limit.
+    let failed_task_replan_request_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "expected_goal_revision": {"type": "integer", "minimum": 1},
+            "expected_plan_revision": {"type": "integer", "minimum": 1},
+            "trigger_task_id": {"type": "string", "format": "uuid", "maxLength": 36},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 8192},
+            "policy": {
+                "type": "string",
+                "enum": ["REQUIRE_REPLACEMENT", "REQUIRE_DECOMPOSITION"],
+                "default": "REQUIRE_REPLACEMENT"
+            },
+            "trigger_kind": {
+                "type": "string",
+                "enum": ["POST_ATTEMPT_FAILURE", "PRE_EXECUTION_REJECTION"],
+                "default": "POST_ATTEMPT_FAILURE"
+            },
+            "authority_request_id": {"type": "string", "maxLength": 128}
+        },
+        "required": [
+            "request_id",
+            "expected_goal_revision",
+            "expected_plan_revision",
+            "trigger_task_id",
+            "reason"
+        ]
+    });
+    let failed_task_replan_requests_schema = json!({
+        "type": "array",
+        "maxItems": 8,
+        "items": failed_task_replan_request_schema
+    });
     for tool in tools.as_array_mut().unwrap() {
         if matches!(
             tool.get("name").and_then(Value::as_str),
@@ -277,6 +313,21 @@ pub(crate) fn tools() -> Value {
         ) && let Some(operation) = tool.pointer_mut("/inputSchema/properties/operation")
         {
             *operation = operation_schema.clone();
+        }
+        // The durable failed-task replan request must be reachable from the
+        // tool surface. `additionalProperties:false` would otherwise make the
+        // whole replacement mechanism uninvocable by any client.
+        if matches!(
+            tool.get("name").and_then(Value::as_str),
+            Some("goal_resume")
+        ) && let Some(properties) = tool
+            .pointer_mut("/inputSchema/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "failed_task_replan_requests".to_owned(),
+                failed_task_replan_requests_schema.clone(),
+            );
         }
         if let Some(session_id) = tool
             .pointer_mut("/inputSchema/properties/session_id")
