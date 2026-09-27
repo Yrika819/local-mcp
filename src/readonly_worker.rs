@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::AgentError;
 use crate::config;
+use crate::failure_class::FailureClass;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::orchestrator_error::OrchestratorError;
@@ -17,10 +18,10 @@ use crate::task::{
 use crate::task_store::TaskStore;
 
 const MAX_READONLY_RESULT_BYTES: usize = 256 * 1024;
-const MAX_READONLY_SUMMARY_BYTES: usize = 16 * 1024;
-const MAX_READONLY_EVIDENCE_ITEMS: usize = 32;
-const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = 8 * 1024;
-const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
+const MAX_READONLY_SUMMARY_BYTES: usize = crate::planner::MAX_READONLY_SUMMARY_BYTES;
+const MAX_READONLY_EVIDENCE_ITEMS: usize = crate::planner::MAX_READONLY_EVIDENCE_ITEMS;
+const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = crate::planner::MAX_READONLY_EVIDENCE_FIELD_BYTES;
+const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize = crate::planner::MAX_READONLY_EVIDENCE_TOTAL_BYTES;
 
 #[derive(Debug)]
 #[expect(
@@ -222,6 +223,7 @@ pub(crate) fn run_readonly_attempt<B: ReadonlyBackend>(
                     &request,
                     "READONLY_BACKEND_ERROR",
                     &error.to_string(),
+                    FailureClass::TransientModelFailure,
                 )?;
             } else {
                 persist_retryable_failure(
@@ -232,6 +234,10 @@ pub(crate) fn run_readonly_attempt<B: ReadonlyBackend>(
                     &request,
                     "READONLY_BACKEND_ERROR",
                     &error.to_string(),
+                    match &error {
+                        ReadonlyError::Model(model) => Some(FailureClass::from_agent_error(*model)),
+                        _ => None,
+                    },
                 )?;
             }
             return Err(error);
@@ -248,6 +254,7 @@ pub(crate) fn run_readonly_attempt<B: ReadonlyBackend>(
                 &request,
                 "READONLY_OUTPUT_REJECTED",
                 &error.to_string(),
+                Some(FailureClass::SemanticFailure),
             )?;
             return Err(error);
         }
@@ -430,6 +437,10 @@ fn persist_valid_result(
         .map_err(ReadonlyError::from)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Read-only failure persistence keeps store, session, goal, task, request, and report channels explicit."
+)]
 fn persist_transport_interruption(
     store: &TaskStore,
     session: &config::Session,
@@ -438,6 +449,7 @@ fn persist_transport_interruption(
     request: &ReadonlyRequest,
     code: &str,
     detail: &str,
+    failure_class: FailureClass,
 ) -> Result<Goal, ReadonlyError> {
     store
         .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
@@ -446,6 +458,7 @@ fn persist_transport_interruption(
                 task_id,
                 WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
             )?;
+            goal.task_record_latest_attempt_failure_class(task_id, failure_class)?;
             record_non_mutating_metadata(goal, task_id, true)?;
             goal.task_mark_latest_attempt_interrupted(task_id, now)?;
             let attempt_id = goal.tasks()[task_id]
@@ -493,6 +506,17 @@ fn persist_transport_interruption(
         .map_err(ReadonlyError::from)
 }
 
+/// Persist a failed read-only attempt together with the host-owned structured
+/// classification observed at the model boundary.
+///
+/// The next state is chosen from that classification, not from prose: a
+/// failure whose class forbids replaying the identical Task shape is routed
+/// into `NEEDS_REPLAN` so the Replanner must change the shape, while its
+/// remaining attempt budget stays untouched and unusable.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Read-only failure persistence keeps store, session, goal, task, request, report, and structured class channels explicit."
+)]
 fn persist_retryable_failure(
     store: &TaskStore,
     session: &config::Session,
@@ -501,6 +525,7 @@ fn persist_retryable_failure(
     request: &ReadonlyRequest,
     code: &str,
     detail: &str,
+    failure_class: Option<FailureClass>,
 ) -> Result<Goal, ReadonlyError> {
     store
         .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
@@ -510,10 +535,17 @@ fn persist_retryable_failure(
                 task_id,
                 WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
             )?;
-            let next = if goal.tasks()[task_id].semantic_attempts_remaining() > 0 {
+            if let Some(class) = failure_class {
+                goal.task_record_latest_attempt_failure_class(task_id, class)?;
+            }
+            let budget_remains = goal.tasks()[task_id].semantic_attempts_remaining() > 0;
+            let unchanged_retry_permitted = goal.tasks()[task_id].unchanged_retry_permitted();
+            let next = if !budget_remains {
+                TaskStatus::Failed
+            } else if unchanged_retry_permitted {
                 TaskStatus::Retryable
             } else {
-                TaskStatus::Failed
+                TaskStatus::NeedsReplan
             };
             goal.transition_task(task_id, next, TaskTransitionContext::default(), now)
         })

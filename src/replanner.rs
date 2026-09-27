@@ -7,8 +7,10 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::AgentError;
 use crate::config;
+use crate::failure_class::FailureClass;
 use crate::goal::{
-    CheckpointReason, CompletionCriterionId, Goal, GoalId, GoalStatus, GoalVerificationRequirement,
+    CheckpointReason, CompletionCriterionId, FailedTaskReplacementMutation, FailedTaskReplanPolicy,
+    FailedTaskReplanTriggerKind, Goal, GoalId, GoalStatus, GoalVerificationRequirement,
     PreExecutionPlanReplanPolicy, ReplanMutation,
 };
 use crate::orchestrator_error::OrchestratorError;
@@ -36,9 +38,85 @@ pub(crate) struct ReplannerRequest {
     consecutive_pre_execution_plan_rejection_count: usize,
     goal_blockers: Vec<ReplannerBlocker>,
     eligible_needs_replan_task_ids: Vec<String>,
+    /// Durable failed-task replacement authorities the host will accept a
+    /// `replace_tasks` proposal against. Typed, not prose.
+    failed_task_replan_requests: Vec<ReplannerFailedTaskReplanRequest>,
+    /// Host-derived, deterministic Task-sizing risk. The model must size work
+    /// against these numbers instead of guessing token budgets.
+    sizing: ReplannerSizingProfile,
+    /// Host-visible compact read-only output contract for decomposition work.
+    readonly_output_contract: ReadonlyOutputContract,
     allowed_worker_kinds: Vec<WorkerKind>,
     allowed_operation_kinds: Vec<TaskOperationKind>,
     prohibited_operations: Vec<&'static str>,
+}
+
+/// A durable host authority to replace one structurally invalid Task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ReplannerFailedTaskReplanRequest {
+    replan_request_id: String,
+    trigger_task_id: String,
+    trigger_plan_revision: u32,
+    policy: FailedTaskReplanPolicy,
+    trigger_kind: FailedTaskReplanTriggerKind,
+    trigger_failure_class: FailureClass,
+    trigger_side_effect_state: Option<crate::fallback::SideEffectState>,
+    remaining_attempt_budget: Option<u32>,
+    reason: String,
+}
+
+/// Deterministic, host-derived sizing risk. These are conservative structural
+/// bounds, never token predictions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct TaskSizingProfile {
+    pub(crate) independent_entity_count: usize,
+    pub(crate) evidence_dimension_count: usize,
+    pub(crate) evidence_shape_estimate: usize,
+    pub(crate) max_single_readonly_task_records: usize,
+    pub(crate) over_budget: bool,
+    pub(crate) guidance: Vec<&'static str>,
+}
+
+impl TaskSizingProfile {
+    /// Derive a sizing profile from bounded structural counts only. No token
+    /// estimation and no model involvement: the same inputs always yield the
+    /// same profile.
+    pub(crate) fn derive(entity_count: usize, dimension_count: usize) -> Self {
+        let evidence_shape_estimate = entity_count.saturating_mul(dimension_count);
+        let over_budget = evidence_shape_estimate > planner::MAX_SINGLE_READONLY_TASK_RECORDS;
+        let mut guidance = vec![
+            "size one read-only Task per bounded evidence dimension, not per cross-product",
+            "prefer compact structured evidence, artifact references, and short synthesis",
+            "state explicit unknowns instead of repeating large source excerpts",
+        ];
+        if over_budget {
+            guidance.push(
+                "a single read-only Task covering the full cross-product is structurally too broad: split it",
+            );
+            guidance.push(
+                "add a compact join/synthesis Task that depends on the bounded read-only Tasks",
+            );
+        }
+        Self {
+            independent_entity_count: entity_count,
+            evidence_dimension_count: dimension_count,
+            evidence_shape_estimate,
+            max_single_readonly_task_records: planner::MAX_SINGLE_READONLY_TASK_RECORDS,
+            over_budget,
+            guidance,
+        }
+    }
+}
+
+type ReplannerSizingProfile = TaskSizingProfile;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ReadonlyOutputContract {
+    max_evidence_items: usize,
+    max_summary_bytes: usize,
+    max_evidence_field_bytes: usize,
+    max_evidence_total_bytes: usize,
+    guidance: &'static str,
 }
 
 const REPLANNER_PRE_EXECUTION_REJECTION_HISTORY_LIMIT: usize = 8;
@@ -91,6 +169,12 @@ struct ReplannerAttemptSummary {
     attempt_id: String,
     worker: WorkerKind,
     outcome: Option<crate::task::AttemptOutcome>,
+    /// Host-owned structured failure classification. Recovery policy reads
+    /// this, never the human-readable report prose.
+    failure_class: Option<FailureClass>,
+    /// Effective classification including the legacy-report fallback, so the
+    /// model never has to infer a class from prose.
+    effective_failure_class: Option<FailureClass>,
     operation_id: Option<String>,
     scope_identity: Option<String>,
     side_effect_state: Option<crate::fallback::SideEffectState>,
@@ -132,6 +216,15 @@ pub(crate) fn replanner_request_for_model_backend_test(cwd: PathBuf) -> Replanne
         consecutive_pre_execution_plan_rejection_count: 0,
         goal_blockers: Vec::new(),
         eligible_needs_replan_task_ids: Vec::new(),
+        failed_task_replan_requests: Vec::new(),
+        sizing: TaskSizingProfile::derive(0, 0),
+        readonly_output_contract: ReadonlyOutputContract {
+            max_evidence_items: planner::MAX_READONLY_EVIDENCE_ITEMS,
+            max_summary_bytes: planner::MAX_READONLY_SUMMARY_BYTES,
+            max_evidence_field_bytes: planner::MAX_READONLY_EVIDENCE_FIELD_BYTES,
+            max_evidence_total_bytes: planner::MAX_READONLY_EVIDENCE_TOTAL_BYTES,
+            guidance: planner::READONLY_OUTPUT_CONTRACT_GUIDANCE,
+        },
         allowed_worker_kinds: Vec::new(),
         allowed_operation_kinds: Vec::new(),
         prohibited_operations: Vec::new(),
@@ -222,6 +315,24 @@ struct ReplanProposal {
     resolve_needs_replan: Vec<String>,
     #[serde(default)]
     pristine_plan_supersession: Option<PristinePlanSupersessionProposal>,
+    #[serde(default)]
+    replace_tasks: Vec<TaskReplacementProposal>,
+}
+
+/// A generic, host-validated failed-task replacement.
+///
+/// This is a *different durable concept* from `pristine_plan_supersession`,
+/// which supersedes an entire pre-execution-rejected plan revision. Here the
+/// model names one structurally invalid Task, the replacement closure it must be
+/// replaced by, and the criteria that must follow the closure. The host
+/// independently derives the downstream rewiring and every invariant check.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskReplacementProposal {
+    replan_request_id: String,
+    old_task_id: String,
+    completion_closure_task_refs: Vec<TaskRefProposal>,
+    criterion_rebindings: Vec<CriterionReplacementProposal>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -300,6 +411,17 @@ struct ValidatedReplan {
     resolve_needs_replan: Vec<TaskId>,
     reconcile_exhausted_readonly: Vec<TaskId>,
     pristine_plan_supersession: Option<ValidatedPristinePlanSupersession>,
+    task_replacements: Vec<ValidatedTaskReplacement>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedTaskReplacement {
+    replan_request_id: String,
+    old_task_id: TaskId,
+    committed_plan_revision: u32,
+    canonical_proposal_digest: String,
+    completion_closure_refs: Vec<ValidatedTaskRef>,
+    criterion_rebindings: Vec<(CompletionCriterionId, Vec<ValidatedTaskRef>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +509,8 @@ pub(crate) fn replanner_request_for_goal(
                     attempt_id: attempt.id().as_str().to_owned(),
                     worker: attempt.worker(),
                     outcome: attempt.outcome(),
+                    failure_class: attempt.failure_class(),
+                    effective_failure_class: Some(attempt.effective_failure_class()),
                     operation_id: attempt.operation_id().map(str::to_owned),
                     scope_identity: attempt.scope_identity().map(str::to_owned),
                     side_effect_state: attempt.side_effect_state(),
@@ -476,6 +600,36 @@ pub(crate) fn replanner_request_for_goal(
             })
             .collect(),
         eligible_needs_replan_task_ids,
+        failed_task_replan_requests: goal
+            .failed_task_replan_requests()
+            .iter()
+            .filter(|request| {
+                goal.find_failed_task_replacement(request.request_id())
+                    .is_none()
+            })
+            .map(|request| ReplannerFailedTaskReplanRequest {
+                replan_request_id: request.request_id().to_owned(),
+                trigger_task_id: request.trigger_task_id().as_str().to_owned(),
+                trigger_plan_revision: request.trigger_plan_revision(),
+                policy: request.policy(),
+                trigger_kind: request.trigger_kind(),
+                trigger_failure_class: request.trigger_failure_class(),
+                trigger_side_effect_state: request.trigger_side_effect_state(),
+                remaining_attempt_budget: goal
+                    .tasks()
+                    .get(request.trigger_task_id())
+                    .map(|task| task.semantic_attempts_remaining()),
+                reason: request.reason().to_owned(),
+            })
+            .collect(),
+        sizing: planner::task_sizing_profile_for_goal(goal),
+        readonly_output_contract: ReadonlyOutputContract {
+            max_evidence_items: planner::MAX_READONLY_EVIDENCE_ITEMS,
+            max_summary_bytes: planner::MAX_READONLY_SUMMARY_BYTES,
+            max_evidence_field_bytes: planner::MAX_READONLY_EVIDENCE_FIELD_BYTES,
+            max_evidence_total_bytes: planner::MAX_READONLY_EVIDENCE_TOTAL_BYTES,
+            guidance: planner::READONLY_OUTPUT_CONTRACT_GUIDANCE,
+        },
         allowed_worker_kinds: worker_capability::production_plannable_worker_kinds().to_vec(),
         allowed_operation_kinds: vec![
             TaskOperationKind::ReadOnly,
@@ -559,6 +713,20 @@ pub(crate) fn materialize_replan_output(
             }
             return Err(ReplannerError::ReplanAuthorityViolation(
                 "replayed supersession rejection ID has a different effective proposal digest"
+                    .to_owned(),
+            ));
+        }
+    }
+    // Replaying the same accepted replacement identity with the same effective
+    // proposal returns the already-materialized result. The same identity with
+    // a different effective proposal is rejected.
+    for replacement in &proposal.replace_tasks {
+        if let Some(record) = current.find_failed_task_replacement(&replacement.replan_request_id) {
+            if record.canonical_proposal_digest() == canonical_proposal_digest(&raw) {
+                return Ok(current);
+            }
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "replayed failed-task replacement ID has a different effective proposal digest"
                     .to_owned(),
             ));
         }
@@ -724,6 +892,13 @@ fn parse_and_validate_proposal(
         || !proposal.strengthen_mandatory.is_empty()
         || !proposal.strengthen_criterion_bindings.is_empty()
         || !proposal.resolve_needs_replan.is_empty();
+    // Captured before the validation loops consume the proposal fields.
+    let replacement_has_other_changes = has_monotonic_changes
+        || !proposal.add_dependencies.is_empty()
+        || !proposal.strengthen_verification.is_empty()
+        || !proposal.strengthen_mandatory.is_empty()
+        || !proposal.strengthen_criterion_bindings.is_empty()
+        || !proposal.resolve_needs_replan.is_empty();
 
     let change_count = proposal.add_tasks.len()
         + proposal.add_dependencies.len()
@@ -731,7 +906,8 @@ fn parse_and_validate_proposal(
         + proposal.strengthen_mandatory.len()
         + proposal.strengthen_criterion_bindings.len()
         + proposal.resolve_needs_replan.len()
-        + usize::from(pristine_plan_supersession.is_some());
+        + usize::from(pristine_plan_supersession.is_some())
+        + proposal.replace_tasks.len();
     if change_count == 0 {
         return Err(ReplannerError::ReplannerSchemaViolation(
             "replan must contain at least one monotonic change".to_owned(),
@@ -1151,9 +1327,9 @@ fn parse_and_validate_proposal(
     )?;
 
     let pristine_plan_supersession = if let Some(supersession) = pristine_plan_supersession {
-        if has_monotonic_changes {
+        if has_monotonic_changes || !proposal.replace_tasks.is_empty() {
             return Err(ReplannerError::ReplannerSchemaViolation(
-                "pristine-plan supersession cannot be mixed with ordinary monotonic replan changes"
+                "pristine-plan supersession cannot be mixed with ordinary monotonic replan changes or failed-task replacement"
                     .to_owned(),
             ));
         }
@@ -1164,11 +1340,20 @@ fn parse_and_validate_proposal(
             &new_by_id,
             &validated_add_dependencies,
             &validated_resolution,
-            proposal_digest,
+            proposal_digest.clone(),
         )?)
     } else {
         None
     };
+
+    let task_replacements = validate_task_replacements(
+        proposal.replace_tasks.clone(),
+        goal,
+        &validated_new_tasks,
+        &new_by_id,
+        replacement_has_other_changes || pristine_plan_supersession.is_some(),
+        proposal_digest,
+    )?;
 
     Ok(ValidatedReplan {
         new_tasks: validated_new_tasks,
@@ -1179,6 +1364,7 @@ fn parse_and_validate_proposal(
         resolve_needs_replan: validated_resolution,
         reconcile_exhausted_readonly,
         pristine_plan_supersession,
+        task_replacements,
     })
 }
 
@@ -1372,6 +1558,520 @@ fn validate_pristine_plan_supersession(
         affected_task_ids,
         criterion_rebindings: validated_rebindings,
     })
+}
+
+/// Independently validate a proposed generic failed-task replacement.
+///
+/// The model's proposal is advisory. This function re-derives every invariant
+/// from durable host state: the replacement authority, the trigger's
+/// eligibility and structured failure class, side-effect safety, the
+/// replacement closure's shape, downstream rewiring feasibility, criterion
+/// coverage, decomposition materiality, and host limits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Replacement validation keeps every host authority channel explicit."
+)]
+fn validate_task_replacements(
+    proposals: Vec<TaskReplacementProposal>,
+    goal: &Goal,
+    new_tasks: &[ValidatedNewTask],
+    new_by_id: &BTreeMap<String, &ValidatedNewTask>,
+    mixed_with_other_changes: bool,
+    digest: String,
+) -> Result<Vec<ValidatedTaskReplacement>, ReplannerError> {
+    if proposals.is_empty() {
+        return Ok(Vec::new());
+    }
+    if mixed_with_other_changes {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "failed-task replacement cannot be mixed with ordinary monotonic replan changes"
+                .to_owned(),
+        ));
+    }
+    if new_tasks.is_empty() {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "failed-task replacement requires new replacement Tasks in add_tasks".to_owned(),
+        ));
+    }
+    let local_ids = new_tasks
+        .iter()
+        .map(|task| task.proposal_id.clone())
+        .collect::<BTreeSet<_>>();
+    let next_plan_revision = goal.plan_revision().saturating_add(1);
+
+    let mut seen_requests = BTreeSet::new();
+    let mut replaced_ids = BTreeSet::new();
+    let mut validated = Vec::with_capacity(proposals.len());
+    for proposal in proposals {
+        if !seen_requests.insert(proposal.replan_request_id.clone()) {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "each failed-task replacement must use a distinct replan_request_id".to_owned(),
+            ));
+        }
+        let request = goal
+            .find_failed_task_replan_request(&proposal.replan_request_id)
+            .ok_or_else(|| {
+                ReplannerError::ReplanAuthorityViolation(
+                    "failed-task replacement requires an existing durable replan request authority"
+                        .to_owned(),
+                )
+            })?;
+        if goal
+            .find_failed_task_replacement(&proposal.replan_request_id)
+            .is_some()
+        {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "failed-task replacement replan request was already consumed".to_owned(),
+            ));
+        }
+        if request.trigger_plan_revision() != goal.plan_revision() {
+            return Err(ReplannerError::ReplanNotApplicable(
+                "the failed-task replan request does not target the current plan revision"
+                    .to_owned(),
+            ));
+        }
+
+        // 1. The old Task exists and is host-eligible for replacement.
+        let old_task_id = parse_existing_task_id(&proposal.old_task_id, goal)?;
+        if request.trigger_task_id() != &old_task_id {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "failed-task replacement must target the replan request's exact trigger Task"
+                    .to_owned(),
+            ));
+        }
+        if !replaced_ids.insert(old_task_id.clone()) {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "a Task may only be superseded once per replan proposal".to_owned(),
+            ));
+        }
+        let old_task = &goal.tasks()[&old_task_id];
+        if !matches!(
+            old_task.status(),
+            TaskStatus::Pending
+                | TaskStatus::Ready
+                | TaskStatus::Retryable
+                | TaskStatus::Blocked
+                | TaskStatus::NeedsReplan
+        ) {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "only a non-terminal, non-active Task may be superseded by replacement".to_owned(),
+            ));
+        }
+        if old_task.has_unknown_side_effect() {
+            return Err(ReplannerError::NoSafeReplan(
+                "UNKNOWN side-effect state must be reconciled before replacement".to_owned(),
+            ));
+        }
+
+        // 2. The trigger kind and structured failure class are host-derived and
+        //    must both admit replacement. Authority, platform-safety, and
+        //    unclassified failures can never be repaired by decomposition.
+        let failure_class = match request.trigger_kind() {
+            FailedTaskReplanTriggerKind::PostAttemptFailure => {
+                let attempt = old_task.latest_attempt().ok_or_else(|| {
+                    ReplannerError::ReplanAuthorityViolation(
+                        "post-attempt replacement requires a consumed durable attempt".to_owned(),
+                    )
+                })?;
+                let effective = attempt.effective_failure_class();
+                if effective != request.trigger_failure_class() {
+                    return Err(ReplannerError::ReplanAuthorityViolation(
+                        "durable failure evidence no longer matches the recorded replan request"
+                            .to_owned(),
+                    ));
+                }
+                if !effective.allows_task_replacement() {
+                    return Err(ReplannerError::NoSafeReplan(format!(
+                        "structured failure class {effective:?} does not admit task replacement"
+                    )));
+                }
+                effective
+            }
+            FailedTaskReplanTriggerKind::PreExecutionRejection => {
+                let rejection_id = request.authority_request_id().ok_or_else(|| {
+                    ReplannerError::ReplanAuthorityViolation(
+                        "pre-execution replacement requires a rejection authority".to_owned(),
+                    )
+                })?;
+                let rejection = goal
+                    .find_pre_execution_plan_rejection(rejection_id)
+                    .ok_or_else(|| {
+                        ReplannerError::ReplanAuthorityViolation(
+                            "pre-execution replacement references a missing rejection".to_owned(),
+                        )
+                    })?;
+                if rejection.trigger_task_id() != &old_task_id
+                    || !old_task.attempts().is_empty()
+                    || old_task.evidence_count() != 0
+                    || !old_task.verification_results().is_empty()
+                    || !old_task.blockers().is_empty()
+                {
+                    return Err(ReplannerError::ReplanAuthorityViolation(
+                        "pre-execution replacement requires a pristine, exactly-named trigger Task"
+                            .to_owned(),
+                    ));
+                }
+                request.trigger_failure_class()
+            }
+        };
+
+        // 3. The replacement closure must not widen the superseded Task's
+        //    authority. Scope containment is checked per replacement cone
+        //    below, once each replacement owns its Tasks.
+
+        // 4. The completion closure must name distinct, new, mandatory,
+        //    mechanically verified Tasks, and must be exactly the maximal nodes
+        //    of the replacement sub-DAG so dependency semantics stay explicit.
+        if proposal.completion_closure_task_refs.is_empty() {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "replacement completion closure must name at least one Task".to_owned(),
+            ));
+        }
+        let mut closure_refs = Vec::new();
+        for reference in &proposal.completion_closure_task_refs {
+            let reference = reference.clone();
+            let validated = validate_task_ref(reference, goal, &local_ids)?;
+            let ValidatedTaskRef::New(proposal_id) = &validated else {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "replacement completion closure must reference new proposal Tasks".to_owned(),
+                ));
+            };
+            // `validate_task_ref` already guarantees the reference is a
+            // proposal-local id, and proposal-local ids are rejected if they
+            // collide with an existing durable Task ID, so the closure can
+            // never name the replaced Task.
+            let task = new_by_id.get(proposal_id).ok_or_else(|| {
+                ReplannerError::ReplannerSchemaViolation(
+                    "replacement completion closure references an unknown Task".to_owned(),
+                )
+            })?;
+            if !task.mandatory || task.verification.is_empty() {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "replacement completion closure requires mandatory mechanically verified Tasks"
+                        .to_owned(),
+                ));
+            }
+            if closure_refs.contains(&validated) {
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "replacement completion closure contains a duplicate Task".to_owned(),
+                ));
+            }
+            closure_refs.push(validated);
+        }
+        let closure_ids = closure_refs
+            .iter()
+            .filter_map(|reference| match reference {
+                ValidatedTaskRef::New(id) => Some(id.clone()),
+                ValidatedTaskRef::Existing(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let replaced_refs = replaced_ids
+            .iter()
+            .map(|id| ValidatedTaskRef::Existing(id.clone()))
+            .collect::<BTreeSet<_>>();
+        for task in new_tasks {
+            if task
+                .dependencies
+                .iter()
+                .any(|dependency| replaced_refs.contains(dependency))
+            {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "replacement Tasks cannot depend on a superseded Task".to_owned(),
+                ));
+            }
+        }
+
+        // Budget-aware decomposition: a size/budget failure may only be
+        //    repaired by materially smaller work units, never by prepending
+        //    another broad reassessment Task.
+        let requires_decomposition = failure_class.requires_decomposition()
+            || request.policy() == FailedTaskReplanPolicy::RequireDecomposition;
+        if requires_decomposition
+            && (new_tasks.len() < planner::MIN_DECOMPOSED_REPLACEMENT_TASKS
+                || closure_refs.len() >= new_tasks.len())
+        {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "a size or budget failure requires a materially decomposed replacement closure with a bounded join Task"
+                    .to_owned(),
+            ));
+        }
+        for task in new_tasks {
+            if task.objective.len() > planner::MAX_REPLACEMENT_OBJECTIVE_BYTES {
+                return Err(ReplannerError::ReplannerSchemaViolation(
+                    "replacement Task objective exceeds the compact replacement bound".to_owned(),
+                ));
+            }
+        }
+
+        // 5. Criterion rebinding must cover exactly the criteria that required
+        //    the replaced Task. A superseded Task can never satisfy
+        //    TASK_VERIFIED, so leaving the requirement would orphan it.
+        let current_spec = goal.final_verification_spec().ok_or_else(|| {
+            ReplannerError::ReplanAuthorityViolation(
+                "failed-task replacement requires a Goal final-verification contract".to_owned(),
+            )
+        })?;
+        let mut requested = proposal
+            .criterion_rebindings
+            .iter()
+            .map(|entry| {
+                (
+                    entry.criterion_id.clone(),
+                    entry.replacement_task_refs.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if requested.len() != proposal.criterion_rebindings.len() {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "criterion replacement bindings must be unique per criterion".to_owned(),
+            ));
+        }
+        let mut validated_rebindings = Vec::new();
+        for binding in current_spec.criterion_bindings() {
+            let replaced_count = binding
+                .requirements()
+                .iter()
+                .filter(|requirement| requirement.task_id() == &old_task_id)
+                .count();
+            let replacements = if replaced_count > 0 {
+                let mut entries = requested
+                    .remove(binding.criterion_id().as_str())
+                    .ok_or_else(|| {
+                        ReplannerError::ReplanAuthorityViolation(
+                            "every criterion bound to the replaced Task requires a replacement"
+                                .to_owned(),
+                        )
+                    })?;
+                // A criterion may require several Tasks superseded by the same
+                // transaction. Their rebindings union so the coverage check
+                // sees every replaced proof, and unrelated requirements are
+                // never dropped.
+                entries.sort();
+                entries.dedup();
+                if entries.is_empty() {
+                    return Err(ReplannerError::ReplanAuthorityViolation(
+                        "criterion replacement coverage is lower than the replaced proof coverage"
+                            .to_owned(),
+                    ));
+                }
+                let mut refs = Vec::new();
+                for reference in entries {
+                    let reference = reference.clone();
+                    let validated = validate_task_ref(reference, goal, &local_ids)?;
+                    let ValidatedTaskRef::New(proposal_id) = &validated else {
+                        return Err(ReplannerError::ReplanAuthorityViolation(
+                            "criterion replacement must reference new proposal Tasks".to_owned(),
+                        ));
+                    };
+                    if !closure_ids.contains(proposal_id) {
+                        return Err(ReplannerError::ReplanAuthorityViolation(
+                            "criterion replacement must name the declared completion closure"
+                                .to_owned(),
+                        ));
+                    }
+                    if refs.contains(&validated) {
+                        return Err(ReplannerError::ReplannerSchemaViolation(
+                            "criterion replacement contains a duplicate Task".to_owned(),
+                        ));
+                    }
+                    refs.push(validated);
+                }
+                refs
+            } else {
+                if requested.contains_key(binding.criterion_id().as_str()) {
+                    return Err(ReplannerError::ReplanAuthorityViolation(
+                        "criterion rebindings may only replace requirements bound to the replaced Task"
+                            .to_owned(),
+                    ));
+                }
+                Vec::new()
+            };
+            if replaced_count > 0 {
+                validated_rebindings.push((binding.criterion_id().clone(), replacements));
+            }
+        }
+        if !requested.is_empty() {
+            return Err(ReplannerError::ReplannerSchemaViolation(
+                "criterion rebindings must cover exactly the criteria bound to the replaced Task"
+                    .to_owned(),
+            ));
+        }
+
+        // A criterion requiring two Tasks that this transaction supersedes must
+        // still receive proof. The union above already covers both, so the only
+        // remaining requirement is that the replacement really is the declared
+        // completion authority.
+
+        validated.push(ValidatedTaskReplacement {
+            replan_request_id: proposal.replan_request_id,
+            old_task_id,
+            committed_plan_revision: next_plan_revision,
+            canonical_proposal_digest: digest.clone(),
+            completion_closure_refs: closure_refs,
+            criterion_rebindings: validated_rebindings,
+        });
+    }
+
+    // Closure shape is a property of the whole transaction, not of a single
+    // entry: the declared closure of each replacement must be exactly the
+    // maximal nodes of its own replacement cone, and the union of the cones
+    // must cover every new Task so nothing is left dangling or unowned.
+    let mut covered = BTreeSet::new();
+    for replacement in &validated {
+        let cone = ancestor_cone(new_tasks, &replacement.completion_closure_refs);
+        // Maximality: nothing else inside the cone may be upstream of a
+        // declared closure member, otherwise that member is not the closure.
+        for member in &replacement.completion_closure_refs {
+            for other in &cone {
+                if other != member && dependency_graph_reaches_between(new_tasks, other, member) {
+                    return Err(ReplannerError::ReplanAuthorityViolation(
+                        "the declared completion closure must be the maximal nodes of its replacement cone"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        // Authority containment: the model may narrow the superseded Task's
+        // scope but never widen it. Allowed paths may only shrink, forbidden
+        // paths may only grow, and the operation kind and replay safety are
+        // fixed. Checked per cone so a transaction replacing disjointly scoped
+        // Tasks is not over-constrained by the unrelated one.
+        let old_scope = &goal.tasks()[&replacement.old_task_id].scope();
+        for reference in &cone {
+            let ValidatedTaskRef::New(proposal_id) = reference else {
+                continue;
+            };
+            let task = new_tasks
+                .iter()
+                .find(|task| task.proposal_id == *proposal_id)
+                .expect("cone members are proposal-local");
+            let scope = &task.scope;
+            if scope.operation_kind() != old_scope.operation_kind()
+                || scope.replay_safety() != old_scope.replay_safety()
+            {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "replacement Tasks may not change the superseded Task's operation kind or replay safety"
+                        .to_owned(),
+                ));
+            }
+            if !is_path_subset(scope.allowed_paths(), old_scope.allowed_paths()) {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "replacement Task allowed paths may only narrow within the superseded Task's scope"
+                        .to_owned(),
+                ));
+            }
+            if !is_path_superset(scope.forbidden_paths(), old_scope.forbidden_paths()) {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "replacement Task forbidden paths may only grow within the superseded Task's scope"
+                        .to_owned(),
+                ));
+            }
+        }
+        covered.extend(cone);
+    }
+    for task in new_tasks {
+        let reference = ValidatedTaskRef::New(task.proposal_id.clone());
+        if !covered.contains(&reference) {
+            return Err(ReplannerError::ReplanAuthorityViolation(
+                "every replacement Task must be upstream of a declared completion closure"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    // A replacement Task may not simultaneously serve as a downstream
+    // dependent of another replaced Task in the same transaction: that would
+    // make the rewiring order-dependent. Every pair is compared, including the
+    // final replacement, which a `skip` window would otherwise omit.
+    for left in &validated {
+        for right in &validated {
+            if std::ptr::eq(left, right) {
+                continue;
+            }
+            if left
+                .completion_closure_refs
+                .iter()
+                .any(|reference| {
+                    let ValidatedTaskRef::New(id) = reference else {
+                        return false;
+                    };
+                    new_tasks
+                        .iter()
+                        .find(|task| task.proposal_id == *id)
+                        .is_some_and(|task| {
+                            task.dependencies.iter().any(|dependency| {
+                                matches!(dependency, ValidatedTaskRef::Existing(dep) if *dep == right.old_task_id)
+                            })
+                        })
+                })
+            {
+                return Err(ReplannerError::ReplanAuthorityViolation(
+                    "a replacement closure cannot also be a replacement trigger".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(validated)
+}
+
+/// Every new Task that the given completion closure transitively depends on,
+/// including the closure members themselves.
+fn ancestor_cone(
+    new_tasks: &[ValidatedNewTask],
+    closure: &[ValidatedTaskRef],
+) -> BTreeSet<ValidatedTaskRef> {
+    let mut cone = closure.iter().cloned().collect::<BTreeSet<_>>();
+    loop {
+        let mut extended = cone.clone();
+        for task in new_tasks {
+            let reference = ValidatedTaskRef::New(task.proposal_id.clone());
+            if !cone.contains(&reference) {
+                continue;
+            }
+            for dependency in &task.dependencies {
+                if let ValidatedTaskRef::New(_) = dependency {
+                    extended.insert(dependency.clone());
+                }
+            }
+        }
+        if extended == cone {
+            return cone;
+        }
+        cone = extended;
+    }
+}
+
+/// Whether every path in `narrower` is contained in `wider`.
+fn is_path_subset(narrower: &[PathBuf], wider: &[PathBuf]) -> bool {
+    narrower.iter().all(|path| {
+        wider
+            .iter()
+            .any(|candidate| path == candidate || path.starts_with(candidate))
+    })
+}
+
+/// Whether every path in `smaller` is covered by some path in `larger`.
+fn is_path_superset(larger: &[PathBuf], smaller: &[PathBuf]) -> bool {
+    is_path_subset(smaller, larger)
+}
+
+/// Whether `target` is reachable from `start` by walking hard dependencies
+/// (i.e. `start` transitively depends on `target`).
+fn dependency_graph_reaches_between(
+    new_tasks: &[ValidatedNewTask],
+    start: &ValidatedTaskRef,
+    target: &ValidatedTaskRef,
+) -> bool {
+    let graph = new_tasks
+        .iter()
+        .map(|task| {
+            (
+                ValidatedTaskRef::New(task.proposal_id.clone()),
+                task.dependencies.iter().cloned().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    dependency_graph_reaches(&graph, start, |node| node == target)
 }
 
 fn validate_readonly_reassessment_barrier(
@@ -1589,6 +2289,7 @@ fn materialize_validated_replan(
         .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
     let reconcile_exhausted_readonly = validated.reconcile_exhausted_readonly.clone();
     let pristine_plan_supersession = validated.pristine_plan_supersession.clone();
+    let task_replacements = validated.task_replacements.clone();
 
     let mut materialized = Vec::with_capacity(validated.new_tasks.len());
     let mut local_to_id = BTreeMap::<String, TaskId>::new();
@@ -1660,6 +2361,82 @@ fn materialize_validated_replan(
             },
             now,
         );
+    }
+
+    if !task_replacements.is_empty() {
+        // Every replacement closure is disjoint and together they cover all
+        // new Tasks, so the transaction supersedes each old Task and creates
+        // its own bounded closure in one durable mutation.
+        let mut claimed = BTreeSet::new();
+        let mut mutations = Vec::with_capacity(task_replacements.len());
+        for replacement in task_replacements {
+            let mut closure_ids = Vec::new();
+            for reference in &replacement.completion_closure_refs {
+                if let ValidatedTaskRef::New(local) = reference {
+                    closure_ids.push(local_to_id.get(local).cloned().ok_or_else(|| {
+                        OrchestratorError::InvalidDag(
+                            "validated replacement closure identity disappeared".to_owned(),
+                        )
+                    })?);
+                }
+            }
+            // This replacement owns every new Task in the transitive dependency
+            // cone of its closure, so multiple replacements never share a Task
+            // and no replacement Task is left dangling.
+            let mut owned = replacement
+                .completion_closure_refs
+                .iter()
+                .filter_map(|reference| match reference {
+                    ValidatedTaskRef::New(local) => Some(local.clone()),
+                    ValidatedTaskRef::Existing(_) => None,
+                })
+                .collect::<BTreeSet<_>>();
+            loop {
+                let mut extended = owned.clone();
+                for (proposal_id, dependencies, _) in &materialized {
+                    if !owned.contains(proposal_id) {
+                        continue;
+                    }
+                    for dependency in dependencies {
+                        if let ValidatedTaskRef::New(local) = dependency {
+                            extended.insert(local.clone());
+                        }
+                    }
+                }
+                if extended == owned {
+                    break;
+                }
+                owned = extended;
+            }
+            let criterion_rebindings = replacement
+                .criterion_rebindings
+                .iter()
+                .map(|(criterion_id, refs)| {
+                    let ids = refs
+                        .iter()
+                        .map(&resolve_reference)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((criterion_id.clone(), ids))
+                })
+                .collect::<Result<Vec<_>, OrchestratorError>>()?;
+            let mut new_tasks = Vec::new();
+            for (local, _, task) in &materialized {
+                if owned.contains(local) && claimed.insert(local.clone()) {
+                    new_tasks.push(task.clone());
+                }
+            }
+            mutations.push(FailedTaskReplacementMutation {
+                replan_request_id: replacement.replan_request_id,
+                replaced_task_id: replacement.old_task_id,
+                replaced_plan_revision: goal.plan_revision(),
+                committed_plan_revision: replacement.committed_plan_revision,
+                canonical_proposal_digest: replacement.canonical_proposal_digest,
+                completion_closure_task_ids: closure_ids,
+                criterion_rebindings,
+                new_tasks,
+            });
+        }
+        return goal.apply_task_replacements(mutations, now);
     }
 
     let mut existing_additions = BTreeMap::<TaskId, Vec<TaskId>>::new();

@@ -8,14 +8,16 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config;
+use crate::failure_class::FailureClass;
+use crate::fallback::SideEffectState;
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
-#[cfg(test)]
-use crate::task::{ReplaySafety, TaskScope, WorkerKind};
 use crate::task::{
-    Task, TaskDependency, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
+    AttemptId, Task, TaskDependency, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
     VerificationId, VerificationOutcome, VerificationResult, VerificationSpec, WorkerReport,
 };
+#[cfg(test)]
+use crate::task::{ReplaySafety, TaskScope, WorkerKind};
 
 pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
 pub(crate) const GOAL_SCHEMA_VERSION: u32 = 3;
@@ -408,6 +410,7 @@ pub(crate) enum CheckpointReason {
     PlanCommitted,
     ReplanCommitted,
     PreExecutionPlanRejected,
+    FailedTaskReplanRequested,
     Pause,
     Recovery,
     FinalVerification,
@@ -582,6 +585,201 @@ pub(crate) struct ReplanMutation {
         Vec<(CompletionCriterionId, Vec<GoalVerificationRequirement>)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum FailedTaskReplanAuthorityKind {
+    #[default]
+    GoalResume,
+}
+
+/// Why a Task is being routed into the failed-task replacement path.
+///
+/// The two kinds are distinct durable concepts. `PostAttemptFailure` is
+/// derived from structured failure evidence on a consumed attempt;
+/// `PreExecutionRejection` reuses an existing pre-execution plan rejection as
+/// its authority. Neither is a `pristine_plan_supersession`, which supersedes
+/// a whole rejected plan revision and remains a separate mechanism.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum FailedTaskReplanTriggerKind {
+    #[default]
+    PostAttemptFailure,
+    PreExecutionRejection,
+}
+
+/// Recovery policy requested for a failed Task.
+///
+/// `RequireDecomposition` additionally binds the host to accept only a
+/// materially decomposed replacement closure; `RequireReplacement` accepts any
+/// host-validated bounded closure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum FailedTaskReplanPolicy {
+    #[default]
+    RequireReplacement,
+    RequireDecomposition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FailedTaskReplanRequest {
+    request_id: String,
+    expected_goal_revision: u64,
+    observed_goal_revision: u64,
+    trigger_plan_revision: u32,
+    observed_plan_revision: u32,
+    trigger_task_id: TaskId,
+    reason: String,
+    policy: FailedTaskReplanPolicy,
+    trigger_kind: FailedTaskReplanTriggerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority_request_id: Option<String>,
+    trigger_failure_class: FailureClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trigger_side_effect_state: Option<SideEffectState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_attempt_id: Option<AttemptId>,
+    observed_consumed_attempts: u32,
+    observed_max_attempts: u32,
+    #[serde(default)]
+    authority: FailedTaskReplanAuthorityKind,
+    requested_at: String,
+}
+
+#[expect(
+    dead_code,
+    reason = "Failed-task replan request accessors back the staged MCP and replanner surfaces."
+)]
+impl FailedTaskReplanRequest {
+    pub(crate) fn matches(
+        &self,
+        request_id: &str,
+        trigger_task_id: &TaskId,
+        policy: FailedTaskReplanPolicy,
+        reason: &str,
+    ) -> bool {
+        self.request_id == request_id
+            && self.trigger_task_id == *trigger_task_id
+            && self.policy == policy
+            && self.reason == reason
+    }
+
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub(crate) fn trigger_task_id(&self) -> &TaskId {
+        &self.trigger_task_id
+    }
+
+    pub(crate) fn trigger_plan_revision(&self) -> u32 {
+        self.trigger_plan_revision
+    }
+
+    pub(crate) fn policy(&self) -> FailedTaskReplanPolicy {
+        self.policy
+    }
+
+    pub(crate) fn trigger_kind(&self) -> FailedTaskReplanTriggerKind {
+        self.trigger_kind
+    }
+
+    pub(crate) fn authority_request_id(&self) -> Option<&str> {
+        self.authority_request_id.as_deref()
+    }
+
+    pub(crate) fn trigger_failure_class(&self) -> FailureClass {
+        self.trigger_failure_class
+    }
+
+    pub(crate) fn trigger_side_effect_state(&self) -> Option<SideEffectState> {
+        self.trigger_side_effect_state
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub(crate) fn requested_at(&self) -> &str {
+        &self.requested_at
+    }
+}
+
+/// Durable record of one committed generic failed-task replacement.
+///
+/// The record is the replacement's replay identity: the same
+/// `replan_request_id` carrying the same canonical proposal digest is a no-op
+/// replay, and a different effective proposal under the same identity is
+/// rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FailedTaskReplacementRecord {
+    replan_request_id: String,
+    replaced_task_id: TaskId,
+    replaced_plan_revision: u32,
+    committed_plan_revision: u32,
+    canonical_proposal_digest: String,
+    replaced_attempt_ids: Vec<AttemptId>,
+    preserved_max_attempts: u32,
+    preserved_consumed_attempts: u32,
+    replacement_task_ids: Vec<TaskId>,
+    completion_closure_task_ids: Vec<TaskId>,
+    rewired_dependent_task_ids: Vec<TaskId>,
+    rebound_criterion_ids: Vec<CompletionCriterionId>,
+}
+
+#[expect(
+    dead_code,
+    reason = "Failed-task replacement accessors back the staged MCP and replanner surfaces."
+)]
+impl FailedTaskReplacementRecord {
+    pub(crate) fn replan_request_id(&self) -> &str {
+        &self.replan_request_id
+    }
+
+    pub(crate) fn canonical_proposal_digest(&self) -> &str {
+        &self.canonical_proposal_digest
+    }
+
+    pub(crate) fn replaced_task_id(&self) -> &TaskId {
+        &self.replaced_task_id
+    }
+
+    pub(crate) fn completion_closure_task_ids(&self) -> &[TaskId] {
+        &self.completion_closure_task_ids
+    }
+
+    pub(crate) fn preserved_max_attempts(&self) -> u32 {
+        self.preserved_max_attempts
+    }
+
+    pub(crate) fn preserved_consumed_attempts(&self) -> u32 {
+        self.preserved_consumed_attempts
+    }
+
+    pub(crate) fn replaced_attempt_ids(&self) -> &[AttemptId] {
+        &self.replaced_attempt_ids
+    }
+
+    pub(crate) fn rebound_criterion_ids(&self) -> &[CompletionCriterionId] {
+        &self.rebound_criterion_ids
+    }
+}
+
+/// One durable request to replace a structurally invalid Task with a bounded
+/// replacement closure.
+#[derive(Clone, Debug)]
+pub(crate) struct FailedTaskReplacementMutation {
+    pub(crate) replan_request_id: String,
+    pub(crate) replaced_task_id: TaskId,
+    pub(crate) replaced_plan_revision: u32,
+    pub(crate) committed_plan_revision: u32,
+    pub(crate) canonical_proposal_digest: String,
+    pub(crate) completion_closure_task_ids: Vec<TaskId>,
+    pub(crate) criterion_rebindings: Vec<(CompletionCriterionId, Vec<TaskId>)>,
+    pub(crate) new_tasks: Vec<Task>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PristinePlanSupersessionMutation {
     pub(crate) rejection_request_id: String,
@@ -627,6 +825,10 @@ pub(crate) struct Goal {
     pre_execution_plan_rejections: Vec<PreExecutionPlanRejection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pristine_plan_supersessions: Vec<PristinePlanSupersessionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed_task_replan_requests: Vec<FailedTaskReplanRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed_task_replacements: Vec<FailedTaskReplacementRecord>,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -713,6 +915,8 @@ impl Goal {
             legacy_final_verification: None,
             pre_execution_plan_rejections: Vec::new(),
             pristine_plan_supersessions: Vec::new(),
+            failed_task_replan_requests: Vec::new(),
+            failed_task_replacements: Vec::new(),
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -850,6 +1054,32 @@ impl Goal {
         self.pre_execution_plan_rejections
             .iter()
             .any(|record| record.rejected_plan_revision() == plan_revision)
+    }
+
+    pub(crate) fn failed_task_replan_requests(&self) -> &[FailedTaskReplanRequest] {
+        &self.failed_task_replan_requests
+    }
+
+    pub(crate) fn find_failed_task_replan_request(
+        &self,
+        request_id: &str,
+    ) -> Option<&FailedTaskReplanRequest> {
+        self.failed_task_replan_requests
+            .iter()
+            .find(|request| request.request_id() == request_id)
+    }
+
+    pub(crate) fn failed_task_replacements(&self) -> &[FailedTaskReplacementRecord] {
+        &self.failed_task_replacements
+    }
+
+    pub(crate) fn find_failed_task_replacement(
+        &self,
+        replan_request_id: &str,
+    ) -> Option<&FailedTaskReplacementRecord> {
+        self.failed_task_replacements
+            .iter()
+            .find(|record| record.replan_request_id() == replan_request_id)
     }
 
     pub(crate) fn created_at(&self) -> &str {
@@ -1484,21 +1714,546 @@ impl Goal {
                 rebound_criterion_ids,
             });
         for task_id in candidate.tasks.keys().cloned().collect::<Vec<_>>() {
-            if candidate.tasks[&task_id].status() == TaskStatus::Pending
-                && candidate.dependencies_satisfied(&task_id)?
+            if candidate.tasks[&task_id].status() != TaskStatus::Pending
+                || !candidate.dependencies_satisfied(&task_id)?
             {
-                candidate.tasks.get_mut(&task_id).unwrap().transition_to(
-                    TaskStatus::Ready,
-                    true,
-                    TaskTransitionContext::default(),
-                    now,
-                )?;
+                continue;
             }
+            // A Task whose structured failure forbids replaying the identical
+            // shape must be replaced, never re-armed.
+            if !candidate.tasks[&task_id].unchanged_retry_permitted() {
+                continue;
+            }
+            candidate.tasks.get_mut(&task_id).unwrap().transition_to(
+                TaskStatus::Ready,
+                true,
+                TaskTransitionContext::default(),
+                now,
+            )?;
         }
         if candidate.status == GoalStatus::Replanning {
             candidate.transition_to(GoalStatus::Running, now)?;
         }
         candidate.add_checkpoint(CheckpointReason::ReplanCommitted, now)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Commit one generic failed-task replacement as a single durable mutation.
+    ///
+    /// Everything below happens on a private candidate and is published only
+    /// after `validate()` passes, so no committed snapshot can ever observe a
+    /// superseded Task whose downstream still depends on it, a replacement
+    /// closure whose predecessor is still runnable, or a completion criterion
+    /// bound to a permanently unsatisfiable Task. Any validation failure
+    /// commits nothing.
+    pub(crate) fn apply_task_replacements(
+        &mut self,
+        mutations: Vec<FailedTaskReplacementMutation>,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.status.is_terminal()
+            || !matches!(self.status, GoalStatus::Running | GoalStatus::Replanning)
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replacement requires a non-terminal RUNNING or REPLANNING Goal"
+                    .to_owned(),
+            ));
+        }
+        let next_plan_revision = self
+            .plan_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchestratorError::InvalidDag("plan revision overflow".to_owned()))?;
+
+        let mut request_ids = BTreeSet::new();
+        let mut replaced_ids = BTreeSet::new();
+        for mutation in &mutations {
+            if mutation.replaced_plan_revision != self.plan_revision {
+                return Err(OrchestratorError::InvalidDag(
+                    "failed-task replacement must target the current plan revision".to_owned(),
+                ));
+            }
+            if mutation.committed_plan_revision != next_plan_revision {
+                return Err(OrchestratorError::InvalidDag(
+                    "failed-task replacement committed plan revision is not the next revision"
+                        .to_owned(),
+                ));
+            }
+            if !request_ids.insert(mutation.replan_request_id.clone()) {
+                return Err(OrchestratorError::InvalidDag(
+                    "failed-task replacement replan request IDs must be unique within a transaction"
+                        .to_owned(),
+                ));
+            }
+            if self
+                .find_failed_task_replacement(&mutation.replan_request_id)
+                .is_some()
+            {
+                return Err(OrchestratorError::InvalidDag(
+                    "failed-task replacement replan request was already consumed".to_owned(),
+                ));
+            }
+            if !replaced_ids.insert(mutation.replaced_task_id.clone()) {
+                return Err(OrchestratorError::InvalidDag(
+                    "a Task may only be superseded once per replacement transaction".to_owned(),
+                ));
+            }
+        }
+
+        let mut candidate = self.clone();
+        candidate.plan_revision = next_plan_revision;
+
+        // 1. Materialize every replacement Task as pristine PENDING authority.
+        let mut new_task_ids = BTreeSet::new();
+        for mutation in &mutations {
+            for task in mutation.new_tasks.clone() {
+                if task.created_plan_revision() != next_plan_revision
+                    || task.status() != TaskStatus::Pending
+                    || !task.attempts().is_empty()
+                    || task.evidence_count() != 0
+                    || !task.verification_results().is_empty()
+                    || !task.blockers().is_empty()
+                    || task.has_unknown_side_effect()
+                    || !task.mandatory()
+                    || task.verification_specs().is_empty()
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "replacement Tasks must begin as pristine mandatory mechanically verified PENDING authority"
+                            .to_owned(),
+                    ));
+                }
+                let id = task.id().clone();
+                if candidate.tasks.insert(id.clone(), task).is_some() || !new_task_ids.insert(id) {
+                    return Err(OrchestratorError::InvalidDag(
+                        "replacement Task identity is duplicated".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        // 2. Permanently supersede the replaced Tasks, preserving their full
+        //    attempt, evidence, budget, and verification history untouched.
+        for mutation in &mutations {
+            let task = candidate
+                .tasks
+                .get_mut(&mutation.replaced_task_id)
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidDag("replaced Task is missing".to_owned())
+                })?;
+            if !matches!(
+                task.status(),
+                TaskStatus::Pending
+                    | TaskStatus::Ready
+                    | TaskStatus::Retryable
+                    | TaskStatus::Blocked
+                    | TaskStatus::NeedsReplan
+            ) {
+                return Err(OrchestratorError::InvalidDag(
+                    "only a non-terminal, non-active Task may be superseded by replacement"
+                        .to_owned(),
+                ));
+            }
+            if task.has_unknown_side_effect() {
+                return Err(OrchestratorError::InvalidDag(
+                    "UNKNOWN side-effect state must be reconciled before replacement".to_owned(),
+                ));
+            }
+            task.supersede_for_host(now)?;
+        }
+
+        // 3. Rewire every surviving dependent off the superseded Task and onto
+        //    the replacement completion closure. These edges are host-derived,
+        //    so they are budgeted against the same global edge limit the
+        //    proposal validators enforce.
+        let existing_edge_count = candidate
+            .tasks
+            .values()
+            .map(|task| task.dependencies().len())
+            .sum::<usize>();
+        let mut added_edge_count = 0usize;
+        let mut rewired_dependent_ids = Vec::new();
+        for mutation in &mutations {
+            let closure = mutation.completion_closure_task_ids.clone();
+            if closure.is_empty()
+                || closure
+                    .iter()
+                    .any(|id| !new_task_ids.contains(id) || replaced_ids.contains(id))
+            {
+                return Err(OrchestratorError::InvalidDag(
+                    "replacement completion closure must name new, non-superseded Tasks".to_owned(),
+                ));
+            }
+            let dependents = candidate
+                .tasks
+                .iter()
+                .filter(|(id, task)| {
+                    task.is_active_plan_authority()
+                        && **id != mutation.replaced_task_id
+                        && task
+                            .dependencies()
+                            .iter()
+                            .any(|edge| edge.task_id() == &mutation.replaced_task_id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for dependent_id in dependents {
+                let before = candidate.tasks[&dependent_id].dependencies().len();
+                candidate
+                    .tasks
+                    .get_mut(&dependent_id)
+                    .expect("dependent exists")
+                    .rewire_dependencies_for_supersession(&mutation.replaced_task_id, &closure)?;
+                let after = candidate.tasks[&dependent_id].dependencies().len();
+                added_edge_count = added_edge_count.saturating_add(after.saturating_sub(before));
+                rewired_dependent_ids.push(dependent_id);
+            }
+        }
+        if existing_edge_count.saturating_add(added_edge_count)
+            > crate::planner::MAX_PLAN_DEPENDENCY_EDGES
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "replacement rewiring would exceed the host dependency-edge limit".to_owned(),
+            ));
+        }
+        rewired_dependent_ids.sort();
+        rewired_dependent_ids.dedup();
+
+        // 4. Rebind every completion criterion that required a replaced Task.
+        //    A superseded Task can never satisfy TASK_VERIFIED, so leaving the
+        //    requirement in place would orphan the criterion.
+        let old_spec = candidate.final_verification_spec.clone().ok_or_else(|| {
+            OrchestratorError::InvalidDag(
+                "failed-task replacement requires a structured Goal final-verification contract"
+                    .to_owned(),
+            )
+        })?;
+        // A criterion may require several Tasks superseded in the same
+        // transaction, so their rebindings must UNION here. Overwriting would
+        // silently drop one replaced proof from the contract.
+        let mut requested = BTreeMap::<CompletionCriterionId, Vec<TaskId>>::new();
+        for mutation in &mutations {
+            for (criterion_id, ids) in &mutation.criterion_rebindings {
+                requested
+                    .entry(criterion_id.clone())
+                    .or_default()
+                    .extend(ids.iter().cloned());
+            }
+        }
+        let mut rebound_criterion_ids = BTreeSet::new();
+        let mut new_bindings = Vec::new();
+        for binding in old_spec.criterion_bindings() {
+            let replaced_requirements = binding
+                .requirements()
+                .iter()
+                .filter(|requirement| replaced_ids.contains(requirement.task_id()))
+                .count();
+            let replacements = if replaced_requirements > 0 {
+                let mut entries = requested.remove(binding.criterion_id()).ok_or_else(|| {
+                    OrchestratorError::InvalidDag(
+                        "every criterion bound to a replaced Task requires a replacement"
+                            .to_owned(),
+                    )
+                })?;
+                // A criterion may require several Tasks superseded in the same
+                // transaction. Their rebindings union here so one transaction
+                // cannot silently drop a replaced proof.
+                entries.sort();
+                entries.dedup();
+                if entries.is_empty() {
+                    return Err(OrchestratorError::InvalidDag(
+                        "criterion replacement coverage is lower than the replaced proof coverage"
+                            .to_owned(),
+                    ));
+                }
+                let mut seen = BTreeSet::new();
+                for id in &entries {
+                    if !new_task_ids.contains(id) || !seen.insert(id.clone()) {
+                        return Err(OrchestratorError::InvalidDag(
+                            "criterion replacement must name distinct new replacement Tasks"
+                                .to_owned(),
+                        ));
+                    }
+                    let task = candidate.tasks.get(id).expect("replacement Task exists");
+                    if !task.is_active_plan_authority()
+                        || !task.mandatory()
+                        || task.verification_specs().is_empty()
+                    {
+                        return Err(OrchestratorError::InvalidDag(
+                            "criterion replacement requires a new mandatory mechanically verified Task"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                rebound_criterion_ids.insert(binding.criterion_id().clone());
+                entries
+            } else {
+                if requested.contains_key(binding.criterion_id()) {
+                    return Err(OrchestratorError::InvalidDag(
+                        "criterion rebindings may only replace requirements bound to a replaced Task"
+                            .to_owned(),
+                    ));
+                }
+                Vec::new()
+            };
+            let requirements = binding
+                .requirements()
+                .iter()
+                .filter(|requirement| !replaced_ids.contains(requirement.task_id()))
+                .cloned()
+                .chain(
+                    replacements
+                        .into_iter()
+                        .map(|task_id| GoalVerificationRequirement::TaskVerified { task_id }),
+                )
+                .collect::<Vec<_>>();
+            if requirements.is_empty() {
+                return Err(OrchestratorError::InvalidDag(
+                    "a required completion criterion may not be left without proof authority"
+                        .to_owned(),
+                ));
+            }
+            new_bindings.push(GoalCriterionBinding::new(
+                binding.criterion_id().clone(),
+                requirements,
+            ));
+        }
+        if !requested.is_empty() {
+            return Err(OrchestratorError::InvalidDag(
+                "criterion rebindings must cover exactly the criteria bound to replaced Tasks"
+                    .to_owned(),
+            ));
+        }
+        let mut spec = old_spec;
+        spec.plan_revision = next_plan_revision;
+        spec.criterion_bindings = new_bindings;
+        candidate.final_verification_spec = Some(spec);
+
+        // 5. Record durable replacement history: preserved budgets, attempts,
+        //    closure, rewiring, and rebound criteria.
+        for mutation in mutations {
+            let replaced = &candidate.tasks[&mutation.replaced_task_id];
+            let mut replaced_attempt_ids = replaced
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.id().clone())
+                .collect::<Vec<_>>();
+            replaced_attempt_ids.sort();
+            let mut replacement_task_ids = mutation
+                .new_tasks
+                .iter()
+                .map(|task| task.id().clone())
+                .collect::<Vec<_>>();
+            replacement_task_ids.sort();
+            let mut completion_closure_task_ids = mutation.completion_closure_task_ids.clone();
+            completion_closure_task_ids.sort();
+            let mut rebound = rebound_criterion_ids
+                .iter()
+                .filter(|criterion_id| {
+                    mutation
+                        .criterion_rebindings
+                        .iter()
+                        .any(|(id, _)| id == *criterion_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            rebound.sort();
+            candidate
+                .failed_task_replacements
+                .push(FailedTaskReplacementRecord {
+                    replan_request_id: mutation.replan_request_id,
+                    replaced_task_id: mutation.replaced_task_id,
+                    replaced_plan_revision: mutation.replaced_plan_revision,
+                    committed_plan_revision: mutation.committed_plan_revision,
+                    canonical_proposal_digest: mutation.canonical_proposal_digest,
+                    replaced_attempt_ids,
+                    preserved_max_attempts: replaced.max_attempts(),
+                    preserved_consumed_attempts: replaced.semantic_attempts_consumed(),
+                    replacement_task_ids,
+                    completion_closure_task_ids,
+                    rewired_dependent_task_ids: rewired_dependent_ids.clone(),
+                    rebound_criterion_ids: rebound,
+                });
+        }
+
+        // 6. Propagate readiness and close the replanning window. A Task whose
+        //    structured failure forbids replaying the identical shape stays
+        //    PENDING: it must be replaced, not re-armed, and its presence must
+        //    not fail an unrelated replacement transaction.
+        for task_id in candidate.tasks.keys().cloned().collect::<Vec<_>>() {
+            if candidate.tasks[&task_id].status() != TaskStatus::Pending
+                || !candidate.dependencies_satisfied(&task_id)?
+            {
+                continue;
+            }
+            let replay_forbidden = !candidate.tasks[&task_id].unchanged_retry_permitted();
+            if replay_forbidden {
+                continue;
+            }
+            candidate.tasks.get_mut(&task_id).unwrap().transition_to(
+                TaskStatus::Ready,
+                true,
+                TaskTransitionContext::default(),
+                now,
+            )?;
+        }
+        if candidate.status == GoalStatus::Replanning {
+            candidate.transition_to(GoalStatus::Running, now)?;
+        }
+        candidate.add_checkpoint(CheckpointReason::ReplanCommitted, now)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Record a durable request to replace a structurally invalid Task.
+    ///
+    /// This is a distinct mechanism from `reject_pre_execution_plan`: it is
+    /// driven by structured failure evidence on a consumed attempt (or by an
+    /// existing pre-execution rejection used purely as its authority), and it
+    /// never consumes the trigger's remaining retry budget.
+    pub(crate) fn request_failed_task_replan(
+        &mut self,
+        request_id: String,
+        expected_goal_revision: u64,
+        expected_plan_revision: u32,
+        trigger_task_id: TaskId,
+        reason: String,
+        policy: FailedTaskReplanPolicy,
+        trigger_kind: FailedTaskReplanTriggerKind,
+        authority_request_id: Option<String>,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.revision != expected_goal_revision {
+            return Err(OrchestratorError::RevisionConflict {
+                expected: expected_goal_revision,
+                actual: self.revision,
+            });
+        }
+        if self.plan_revision != expected_plan_revision {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replan request plan revision is stale".to_owned(),
+            ));
+        }
+        if self.status.is_terminal()
+            || !matches!(self.status, GoalStatus::Running | GoalStatus::Replanning)
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replan request requires a non-terminal RUNNING or REPLANNING Goal"
+                    .to_owned(),
+            ));
+        }
+        if self.has_active_tasks() || self.has_unknown_side_effects() {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replan request requires no active attempt or UNKNOWN side effect"
+                    .to_owned(),
+            ));
+        }
+        if let Some(rejection) = &authority_request_id
+            && self.find_pre_execution_plan_rejection(rejection).is_none()
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replan request references a missing pre-execution rejection"
+                    .to_owned(),
+            ));
+        }
+        if authority_request_id.is_some()
+            && trigger_kind != FailedTaskReplanTriggerKind::PreExecutionRejection
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "a pre-execution rejection may only authorize a pre-execution trigger kind"
+                    .to_owned(),
+            ));
+        }
+        if let (FailedTaskReplanTriggerKind::PreExecutionRejection, Some(rejection)) =
+            (trigger_kind, &authority_request_id)
+        {
+            let rejection = self
+                .find_pre_execution_plan_rejection(rejection)
+                .expect("rejection existence was checked above");
+            if rejection.trigger_task_id() != &trigger_task_id
+                || rejection.rejected_plan_revision() != expected_plan_revision
+            {
+                return Err(OrchestratorError::InvalidDag(
+                    "a pre-execution rejection may only authorize its own trigger Task at its own rejected plan revision"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let task = self.tasks.get(&trigger_task_id).ok_or_else(|| {
+            OrchestratorError::InvalidDag(
+                "failed-task replan request trigger Task is missing".to_owned(),
+            )
+        })?;
+        let attempt = task.latest_attempt();
+        let failure_class = match trigger_kind {
+            FailedTaskReplanTriggerKind::PostAttemptFailure => {
+                let attempt = attempt.ok_or_else(|| {
+                    OrchestratorError::InvalidDag(
+                        "post-attempt replan request requires a consumed durable attempt"
+                            .to_owned(),
+                    )
+                })?;
+                let class = attempt.effective_failure_class();
+                if !class.allows_replan_request() {
+                    return Err(OrchestratorError::InvalidDag(format!(
+                        "structured failure class {class:?} does not admit a failed-task replan request"
+                    )));
+                }
+                class
+            }
+            FailedTaskReplanTriggerKind::PreExecutionRejection => {
+                if !task.attempts().is_empty()
+                    || task.evidence_count() != 0
+                    || !task.verification_results().is_empty()
+                    || !task.blockers().is_empty()
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "pre-execution failed-task replan request requires a pristine trigger Task"
+                            .to_owned(),
+                    ));
+                }
+                FailureClass::TaskScopeTooBroad
+            }
+        };
+        if task.has_unknown_side_effect() {
+            return Err(OrchestratorError::InvalidDag(
+                "UNKNOWN side-effect state must be reconciled before replacement".to_owned(),
+            ));
+        }
+
+        let mut candidate = self.clone();
+        candidate
+            .tasks
+            .get_mut(&trigger_task_id)
+            .expect("trigger Task was checked above")
+            .request_failed_task_replan(now)?;
+        candidate
+            .failed_task_replan_requests
+            .push(FailedTaskReplanRequest {
+                request_id,
+                expected_goal_revision,
+                observed_goal_revision: expected_goal_revision,
+                trigger_plan_revision: expected_plan_revision,
+                observed_plan_revision: expected_plan_revision,
+                trigger_task_id,
+                reason,
+                policy,
+                trigger_kind,
+                authority_request_id,
+                trigger_failure_class: failure_class,
+                trigger_side_effect_state: attempt.and_then(|attempt| attempt.side_effect_state()),
+                observed_attempt_id: attempt.map(|attempt| attempt.id().clone()),
+                observed_consumed_attempts: task.semantic_attempts_consumed(),
+                observed_max_attempts: task.max_attempts(),
+                authority: FailedTaskReplanAuthorityKind::GoalResume,
+                requested_at: now.to_owned(),
+            });
+        if candidate.status == GoalStatus::Running {
+            candidate.transition_to(GoalStatus::Replanning, now)?;
+        }
+        candidate.add_checkpoint(CheckpointReason::FailedTaskReplanRequested, now)?;
         candidate.validate()?;
         *self = candidate;
         Ok(())
@@ -2009,6 +2764,17 @@ impl Goal {
             .get_mut(task_id)
             .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
             .record_latest_worker_report(report)
+    }
+
+    pub(crate) fn task_record_latest_attempt_failure_class(
+        &mut self,
+        task_id: &TaskId,
+        class: FailureClass,
+    ) -> Result<(), OrchestratorError> {
+        self.tasks
+            .get_mut(task_id)
+            .ok_or_else(|| OrchestratorError::InvalidDag("task is missing".to_owned()))?
+            .record_latest_attempt_failure_class(class)
     }
 
     pub(crate) fn task_add_evidence(
@@ -2651,6 +3417,7 @@ impl Goal {
                 ));
             }
         }
+        self.validate_failed_task_replacement_history()?;
         self.validate_dag()?;
         if self.status.is_terminal() != self.completed_at.is_some() {
             return Err(OrchestratorError::CorruptGoal(
@@ -2673,13 +3440,206 @@ impl Goal {
         Ok(())
     }
 
+    /// Validate the durable failed-task replan/replacement history.
+    ///
+    /// These invariants are the durable half of the replacement contract: a
+    /// superseded Task must remain permanently non-runnable, its attempt and
+    /// retry accounting must be preserved exactly, no active Task may still
+    /// depend on it, and no completion criterion may still require it.
+    fn validate_failed_task_replacement_history(&self) -> Result<(), OrchestratorError> {
+        let mut request_ids = BTreeSet::new();
+        for request in &self.failed_task_replan_requests {
+            if request.request_id.trim().is_empty()
+                || request.request_id.chars().count() > 128
+                || !request_ids.insert(request.request_id.clone())
+                || request.expected_goal_revision == 0
+                || request.expected_goal_revision > self.revision
+                || request.observed_goal_revision != request.expected_goal_revision
+                || request.trigger_plan_revision == 0
+                || request.trigger_plan_revision > self.plan_revision
+                || request.observed_plan_revision != request.trigger_plan_revision
+                || request.reason.trim().is_empty()
+                || request.reason.chars().count() > 8_192
+                || request.authority != FailedTaskReplanAuthorityKind::GoalResume
+                || request.observed_consumed_attempts > request.observed_max_attempts
+                || request.requested_at.trim().is_empty()
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "Goal failed-task replan request history contains an invalid or duplicate record"
+                        .to_owned(),
+                ));
+            }
+            match (
+                request.trigger_kind,
+                request.authority_request_id.as_deref(),
+            ) {
+                (FailedTaskReplanTriggerKind::PostAttemptFailure, None) => {}
+                (FailedTaskReplanTriggerKind::PreExecutionRejection, Some(authority)) => {
+                    let rejection = self.find_pre_execution_plan_rejection(authority).ok_or_else(
+                        || {
+                            OrchestratorError::CorruptGoal(
+                                "pre-execution failed-task replan request references a missing rejection"
+                                    .to_owned(),
+                            )
+                        },
+                    )?;
+                    if rejection.trigger_task_id() != &request.trigger_task_id {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "pre-execution failed-task replan request trigger does not match its rejection"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "failed-task replan request trigger kind and authority are inconsistent"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let task = self.tasks.get(&request.trigger_task_id).ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "failed-task replan request references a missing trigger Task".to_owned(),
+                )
+            })?;
+            if matches!(
+                task.status(),
+                TaskStatus::Completed
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Running
+                    | TaskStatus::Verifying
+            ) {
+                return Err(OrchestratorError::CorruptGoal(
+                    "failed-task replan request trigger Task is not a replaceable state".to_owned(),
+                ));
+            }
+        }
+
+        let mut consumed_request_ids = BTreeSet::new();
+        let mut replaced_task_ids = BTreeSet::new();
+        for record in &self.failed_task_replacements {
+            if record.canonical_proposal_digest.len() != 64
+                || !record
+                    .canonical_proposal_digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+                || record.replaced_plan_revision == 0
+                || record.replaced_plan_revision >= record.committed_plan_revision
+                || record.committed_plan_revision > self.plan_revision
+                || !consumed_request_ids.insert(record.replan_request_id.clone())
+                || !replaced_task_ids.insert(record.replaced_task_id.clone())
+                || self
+                    .find_failed_task_replan_request(&record.replan_request_id)
+                    .is_none()
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "Goal failed-task replacement history contains an invalid or duplicate record"
+                        .to_owned(),
+                ));
+            }
+            let replaced = self.tasks.get(&record.replaced_task_id).ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "failed-task replacement references a missing replaced Task".to_owned(),
+                )
+            })?;
+            let attempt_ids = replaced
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.id().clone())
+                .collect::<BTreeSet<_>>();
+            let recorded_attempt_ids = record
+                .replaced_attempt_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if replaced.status() != TaskStatus::Superseded
+                || replaced.max_attempts() != record.preserved_max_attempts
+                || replaced.semantic_attempts_consumed() != record.preserved_consumed_attempts
+                || attempt_ids != recorded_attempt_ids
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "failed-task replacement did not preserve the replaced Task's durable history"
+                        .to_owned(),
+                ));
+            }
+            // The closure is transaction-scoped: one transaction may supersede
+            // several Tasks against a single shared committed closure.
+            let committed_tasks = self
+                .tasks
+                .values()
+                .filter(|task| task.created_plan_revision() == record.committed_plan_revision)
+                .map(|task| task.id().clone())
+                .collect::<BTreeSet<_>>();
+            if record.completion_closure_task_ids.is_empty()
+                || record
+                    .completion_closure_task_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != record.completion_closure_task_ids.len()
+                || record
+                    .completion_closure_task_ids
+                    .iter()
+                    .any(|id| !committed_tasks.contains(id))
+                || record
+                    .replacement_task_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != record.replacement_task_ids.len()
+                || record
+                    .replacement_task_ids
+                    .iter()
+                    .any(|id| !committed_tasks.contains(id))
+            {
+                return Err(OrchestratorError::CorruptGoal(
+                    "failed-task replacement closure is not bound to its committed replacement Tasks"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        if !replaced_task_ids.is_empty() {
+            for task in self.tasks.values() {
+                if !task.is_active_plan_authority() {
+                    continue;
+                }
+                if task
+                    .dependencies()
+                    .iter()
+                    .any(|edge| replaced_task_ids.contains(edge.task_id()))
+                {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "an active Task still depends on a superseded replacement target"
+                            .to_owned(),
+                    ));
+                }
+            }
+            if let Some(spec) = self.final_verification_spec.as_ref() {
+                for binding in spec.criterion_bindings() {
+                    if binding
+                        .requirements()
+                        .iter()
+                        .any(|requirement| replaced_task_ids.contains(requirement.task_id()))
+                    {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "completion-criterion authority remains bound to a superseded Task"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_legacy_schema1_terminal(&self) -> Result<(), OrchestratorError> {
         if !self.status.is_terminal() {
             return Err(OrchestratorError::SchemaUpgradeRequired(1));
         }
         if self.revision == 0 {
             return Err(OrchestratorError::CorruptGoal(
-                "legacy Goal revision must start at 1".to_owned(),
+                "goal revision must start at 1".to_owned(),
             ));
         }
         self.id.validate()?;

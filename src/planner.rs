@@ -36,6 +36,27 @@ pub(crate) const MAX_COMMAND_ARGS: usize = 64;
 pub(crate) const MAX_COMMAND_ARG_BYTES: usize = 8192;
 pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize = 128;
 
+/// Host-visible compact read-only output contract. Reused verbatim by the
+/// read-only worker so the declared contract and the enforced bounds cannot
+/// drift apart.
+pub(crate) const MAX_READONLY_EVIDENCE_ITEMS: usize = 32;
+pub(crate) const MAX_READONLY_SUMMARY_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
+pub(crate) const READONLY_OUTPUT_CONTRACT_GUIDANCE: &str = "return at most 32 compact structured evidence records, each at most 8 KiB and 64 KiB in total, with a summary of at most 16 KiB; prefer artifact/file references and short synthesis over repeated large source excerpts";
+
+/// Deterministic conservative bound on the structured records one bounded
+/// read-only Task may be expected to return. Above this, a single Task is
+/// treated as structurally too broad and must be decomposed.
+pub(crate) const MAX_SINGLE_READONLY_TASK_RECORDS: usize = 24;
+
+/// Minimum number of Tasks in a size/budget-triggered replacement closure.
+pub(crate) const MIN_DECOMPOSED_REPLACEMENT_TASKS: usize = 3;
+
+/// Tighter objective bound for replacement Tasks, so a decomposition cannot
+/// reintroduce one giant broad objective.
+pub(crate) const MAX_REPLACEMENT_OBJECTIVE_BYTES: usize = 4 * 1024;
+
 const INITIAL_PLAN_REVISION: u32 = 1;
 pub(crate) const READ_ONLY_MAX_ATTEMPTS: u32 = 2;
 pub(crate) const EFFECTFUL_MAX_ATTEMPTS: u32 = 1;
@@ -51,9 +72,20 @@ pub(crate) struct PlannerRequest {
     cwd: PathBuf,
     permitted_roots: Vec<PathBuf>,
     existing_blockers: Vec<PlannerBlocker>,
+    sizing: crate::replanner::TaskSizingProfile,
+    readonly_output_contract: PlannerReadonlyOutputContract,
     allowed_worker_kinds: Vec<WorkerKind>,
     allowed_operation_kinds: Vec<TaskOperationKind>,
     prohibited_operations: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PlannerReadonlyOutputContract {
+    max_evidence_items: usize,
+    max_summary_bytes: usize,
+    max_evidence_field_bytes: usize,
+    max_evidence_total_bytes: usize,
+    guidance: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -245,7 +277,48 @@ pub(crate) fn planner_request_for_goal(
             "automatic commit, push, merge, release, or publication",
             "planner-authored durable IDs, revisions, statuses, attempts, evidence, or verification results",
         ],
+        sizing: task_sizing_profile_for_goal(goal),
+        readonly_output_contract: PlannerReadonlyOutputContract {
+            max_evidence_items: MAX_READONLY_EVIDENCE_ITEMS,
+            max_summary_bytes: MAX_READONLY_SUMMARY_BYTES,
+            max_evidence_field_bytes: MAX_READONLY_EVIDENCE_FIELD_BYTES,
+            max_evidence_total_bytes: MAX_READONLY_EVIDENCE_TOTAL_BYTES,
+            guidance: READONLY_OUTPUT_CONTRACT_GUIDANCE,
+        },
     })
+}
+
+/// Derive the deterministic, host-owned Task-sizing profile for a Goal.
+///
+/// The counts are purely structural: independent entities come from the
+/// distinct requested-evidence requirements across the Goal's criteria, and
+/// evidence dimensions come from the distinct host-owned evidence/verification
+/// requirements. Nothing here predicts tokens, so the result is reproducible
+/// and auditable. A Goal that has not been planned yet falls back to its
+/// criteria, which is the only sizing signal available at planning time.
+pub(crate) fn task_sizing_profile_for_goal(goal: &Goal) -> crate::replanner::TaskSizingProfile {
+    let entity_count = goal
+        .completion_criteria()
+        .iter()
+        .map(|criterion| criterion.description().trim())
+        .filter(|description| !description.is_empty())
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1);
+    let dimension_count = goal
+        .tasks()
+        .values()
+        .flat_map(|task| task.verification_specs().iter())
+        .filter_map(|spec| match spec {
+            VerificationSpec::StructuredEvidence { requirement_id } => {
+                Some(requirement_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1);
+    crate::replanner::TaskSizingProfile::derive(entity_count, dimension_count)
 }
 
 #[allow(

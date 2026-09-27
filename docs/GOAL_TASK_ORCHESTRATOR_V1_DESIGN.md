@@ -2603,3 +2603,122 @@ The repository already contains the difficult low-level primitives the Orchestra
 The required new work is a durable higher-level control plane with strict authority reuse and recovery semantics.
 
 **GOAL_ORCHESTRATOR_V1_DESIGN_READY**
+
+---
+
+## 27. Failed-task replacement and budget-aware decomposition (maintenance)
+
+This section is additive. It does not reopen any frozen contract above: the MCP
+catalog remains exactly 18 tools, `pre_execution_plan_rejection` and
+`pristine_plan_supersession` keep their existing semantics, and
+`pristine_plan_supersession` remains the only whole-plan-revision rejection
+path.
+
+### 27.1 Structured failure classification
+
+Every durable `TaskAttempt` may carry a host-owned `FailureClass`:
+`TRANSIENT_MODEL_FAILURE`, `HOST_OUTPUT_LIMIT`, `CONTEXT_LIMIT`,
+`TASK_SCOPE_TOO_BROAD`, `SEMANTIC_FAILURE`, `AUTHORITY_FAILURE`,
+`PLATFORM_SAFETY`, `UNKNOWN`.
+
+The class is produced at the narrowest trustworthy boundary: `FailureClass::
+from_agent_error` runs in `readonly_worker` while the typed `AgentError` is
+still in hand, never parsed back out of prose. Recovery policy reads the
+class. The only string comparison in the taxonomy is an exact-equality match
+against two host-authored legacy report constants, used solely so Goals
+durably written before the field existed remain classifiable; anything
+unrecognised classifies as `UNKNOWN` and therefore fails closed.
+
+Policy is not collapsed:
+
+| Failure class | Unchanged retry | Failed-task replacement |
+| --- | --- | --- |
+| `TRANSIENT_MODEL_FAILURE` | permitted (bounded) | refused |
+| `SEMANTIC_FAILURE` | permitted (bounded) | refused |
+| `HOST_OUTPUT_LIMIT` | refused | required |
+| `CONTEXT_LIMIT` | refused | required |
+| `TASK_SCOPE_TOO_BROAD` | refused | required |
+| `AUTHORITY_FAILURE` | refused | refused |
+| `PLATFORM_SAFETY` | refused | refused |
+| `UNKNOWN` | refused | refused |
+
+A Task whose class forbids replay can never become `READY` again through any
+edge, not just an ordinary retry.
+
+### 27.2 Generic failed-task replacement
+
+`ReplanProposal` gains `replace_tasks`, a general replacement primitive
+distinct from `pristine_plan_supersession`:
+
+```json
+"replace_tasks": [{
+  "replan_request_id": "<durable request id>",
+  "old_task_id": "<existing Task UUID>",
+  "completion_closure_task_refs": [{ "ref_kind": "NEW", "proposal_id": "join" }],
+  "criterion_rebindings": [
+    { "criterion_id": "...", "replacement_task_refs": [{ "ref_kind": "NEW", "proposal_id": "join" }] }
+  ]
+}]
+```
+
+`replace_tasks` is exclusive with `add_dependencies`,
+`strengthen_verification`, `strengthen_mandatory`,
+`strengthen_criterion_bindings`, `resolve_needs_replan`, and
+`pristine_plan_supersession`; the closure lives in `add_tasks`.
+
+One transaction atomically: marks each old Task `SUPERSEDED` (preserving its
+attempts, evidence, `max_attempts`, and consumed-attempt count byte for byte),
+creates the replacement closure, rewires every active dependent off the
+superseded Task and onto the declared completion closure, rebinds every
+completion criterion that required a replaced Task, increments
+`plan_revision` exactly once, and appends a `ReplanCommitted` checkpoint. It is
+built on a private candidate and published only after `Goal::validate()`
+passes, so no committed snapshot can show a superseded Task that is still
+runnable, a dependency on superseded work, or a criterion bound to
+permanently unsatisfiable proof. Any validation failure commits nothing.
+
+Authority the host re-derives independently of the model: durable replan
+request authority, trigger eligibility, side-effect safety, closure
+maximality, scope non-widening (allowed paths may only narrow, forbidden paths
+may only grow, operation kind and replay safety are fixed), acyclicity,
+dependency/completion-closure semantics, writer serialization, host task, edge,
+path and verification limits, and criterion coverage.
+
+Replay is safe: the same `replan_request_id` with the same canonical proposal
+digest returns the already-materialized result without a write or a revision
+bump; the same identity with a different effective proposal is rejected.
+
+### 27.3 Budget-aware task sizing
+
+`PlannerRequest` and `ReplannerRequest` expose a deterministic,
+host-derived `sizing` profile (`independent_entity_count`,
+`evidence_dimension_count`, `evidence_shape_estimate`,
+`max_single_readonly_task_records`, `over_budget`, `guidance`) and the
+`readonly_output_contract` (32 evidence items, 8 KiB per field, 64 KiB total,
+16 KiB summary). These are conservative structural bounds, never token
+predictions. When a size or budget failure triggers a replacement, the host
+requires a materially decomposed closure of at least three Tasks with a bounded
+join Task, and bounds each replacement objective to 4 KiB, so a size failure
+cannot be repaired by prepending another broad reassessment Task.
+
+### 27.4 Transition matrix
+
+`goal_resume` gains an optional `failed_task_replan_requests` array (bounded
+to 8). It is a sibling of `pre_execution_plan_rejection`, not an expansion of
+it, and the exposed MCP tool count is unchanged.
+
+| Trigger Task state | Side effects | Admitted path |
+| --- | --- | --- |
+| `READY`, pristine, no attempts | none | `pre_execution_plan_rejection` remains valid; a `PRE_EXECUTION_REJECTION` replacement request may then name that rejection as its authority |
+| `RETRYABLE`/`PENDING`/`NEEDS_REPLAN`, structured size or budget class | `CONFIRMED_NOT_PERFORMED` | replacement request admitted; the Replanner may supersede without replaying, and the remaining retry stays unconsumed |
+| any state, `TRANSIENT_MODEL_FAILURE` or `SEMANTIC_FAILURE` | `CONFIRMED_NOT_PERFORMED` | replacement refused; the bounded unchanged retry is preserved |
+| `AUTHORITY_FAILURE` or `PLATFORM_SAFETY` | any | replacement refused; authority/escalation handling only |
+| any state with `UNKNOWN` side effects | unresolved | replacement and replay prohibited until reconciliation proves safety |
+| `RUNNING` / `VERIFYING` | any | refused |
+
+Both request kinds enter `NEEDS_REPLAN` and the Goal enters `REPLANNING` in
+one durable mutation. The request itself never consumes retry budget, and
+`pre_execution_plan_rejection` retains its existing one-per-plan-revision
+limitation and pristine-trigger rules.
+
+**GOAL_ORCHESTRATOR_V1_FAILED_TASK_REPLACEMENT_FROZEN**

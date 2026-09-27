@@ -6,8 +6,12 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::config;
+use crate::failure_class::{FailureClass, LEGACY_READONLY_RESPONSE_LIMIT_REPORT};
 use crate::fallback::{SideEffectClass, SideEffectState};
-use crate::goal::{CheckpointReason, Goal, GoalId, GoalStatus, PreExecutionPlanReplanPolicy};
+use crate::goal::{
+    CheckpointReason, FailedTaskReplanPolicy, FailedTaskReplanTriggerKind, Goal, GoalId,
+    GoalStatus, PreExecutionPlanReplanPolicy,
+};
 use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -16,7 +20,12 @@ use crate::task::{
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
-const READONLY_RESPONSE_LIMIT_REPORT: &str = "READONLY_BACKEND_ERROR: readonly model invocation failed: model response exceeded the host limit";
+/// Bounded number of failed-task replan requests accepted in one `goal_resume`
+/// call, so a single request can supersede a small, explicitly named set of
+/// structurally invalid Tasks but never an unbounded one.
+pub(crate) const MAX_FAILED_TASK_REPLAN_REQUESTS: usize = 8;
+
+const READONLY_RESPONSE_LIMIT_REPORT: &str = LEGACY_READONLY_RESPONSE_LIMIT_REPORT;
 
 pub(crate) struct ReadonlyTransportRecoveryAuthority {
     _private: (),
@@ -95,6 +104,14 @@ impl GoalApiError {
                 "expected plan revision {expected}, current plan revision is {}",
                 goal.plan_revision()
             ),
+            active_goal: Some(identity_view(goal)),
+        }
+    }
+
+    fn failed_task_replan_conflict(goal: &Goal) -> Self {
+        Self {
+            code: "IDEMPOTENCY_CONFLICT",
+            message: "failed-task replan request conflicts with durable history".to_owned(),
             active_goal: Some(identity_view(goal)),
         }
     }
@@ -200,6 +217,26 @@ struct GoalResumeRequest {
     goal_id: Option<String>,
     #[serde(default)]
     pre_execution_plan_rejection: Option<PreExecutionPlanRejectionRequest>,
+    /// Durable requests to replace structurally invalid Tasks. This is a
+    /// sibling of, and not an expansion of, `pre_execution_plan_rejection`.
+    #[serde(default)]
+    failed_task_replan_requests: Vec<FailedTaskReplanRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailedTaskReplanRequest {
+    request_id: String,
+    expected_goal_revision: u64,
+    expected_plan_revision: u32,
+    trigger_task_id: String,
+    reason: String,
+    #[serde(default)]
+    policy: FailedTaskReplanPolicy,
+    #[serde(default)]
+    trigger_kind: FailedTaskReplanTriggerKind,
+    #[serde(default)]
+    authority_request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,6 +289,17 @@ pub(crate) struct TaskSummaryView {
     blocker_count: usize,
     verification_results: usize,
     evidence_items: usize,
+    attempts_consumed: u32,
+    remaining_attempt_budget: u32,
+    /// Host-owned structured classification of the latest attempt, plus the
+    /// effective class including the legacy-report fallback. Recovery policy
+    /// and operators read this instead of parsing report prose.
+    latest_attempt_outcome: Option<crate::task::AttemptOutcome>,
+    latest_attempt_failure_class: Option<FailureClass>,
+    latest_attempt_effective_failure_class: Option<FailureClass>,
+    latest_attempt_side_effect_state: Option<SideEffectState>,
+    durable_replan_request_ids: Vec<String>,
+    superseded_by_replacement: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -452,6 +500,16 @@ pub(crate) fn goal_resume(
     let current = resolve_goal(store, &session.id, request.goal_id.as_deref())?;
     let goal_id = current.id().clone();
 
+    if !request.failed_task_replan_requests.is_empty() {
+        return record_failed_task_replan_requests(
+            store,
+            session,
+            &goal_id,
+            &current,
+            &request.failed_task_replan_requests,
+        );
+    }
+
     if let Some(rejection) = request.pre_execution_plan_rejection {
         let trigger_task_id = validate_pre_execution_plan_rejection(&rejection)?;
         if let Some(existing) = current.find_pre_execution_plan_rejection(&rejection.request_id) {
@@ -519,6 +577,142 @@ pub(crate) fn goal_resume(
         })
         .map_err(GoalApiError::from_orchestrator)?;
     Ok(status_view(&durable))
+}
+
+/// Record one or more durable failed-task replan requests, then continue the
+/// ordinary resume reconciliation.
+///
+/// The whole batch is validated against durable host state and committed inside
+/// a single `mutate_goal_snapshot`, so a request that is not admissible for its
+/// trigger's current state commits nothing at all.
+fn record_failed_task_replan_requests(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    current: &Goal,
+    requests: &[FailedTaskReplanRequest],
+) -> Result<GoalStatusView, GoalApiError> {
+    if requests.len() > MAX_FAILED_TASK_REPLAN_REQUESTS {
+        return Err(GoalApiError::invalid(format!(
+            "at most {MAX_FAILED_TASK_REPLAN_REQUESTS} failed-task replan requests may be submitted at once"
+        )));
+    }
+    let mut parsed = Vec::with_capacity(requests.len());
+    for request in requests {
+        let trigger_task_id = validate_failed_task_replan_request(request)?;
+        if let Some(existing) = current.find_failed_task_replan_request(&request.request_id) {
+            if existing.matches(
+                &request.request_id,
+                &trigger_task_id,
+                request.policy,
+                &request.reason,
+            ) {
+                continue;
+            }
+            return Err(GoalApiError::failed_task_replan_conflict(current));
+        }
+        if current
+            .find_failed_task_replacement(&request.request_id)
+            .is_some()
+        {
+            return Err(GoalApiError::failed_task_replan_conflict(current));
+        }
+        if current.revision() != request.expected_goal_revision {
+            return Err(GoalApiError::from_orchestrator(
+                OrchestratorError::RevisionConflict {
+                    expected: request.expected_goal_revision,
+                    actual: current.revision(),
+                },
+            ));
+        }
+        if current.plan_revision() != request.expected_plan_revision {
+            return Err(GoalApiError::pre_execution_plan_revision_conflict(
+                current,
+                request.expected_plan_revision,
+            ));
+        }
+        parsed.push((
+            request.request_id.clone(),
+            request.expected_goal_revision,
+            request.expected_plan_revision,
+            trigger_task_id,
+            request.reason.clone(),
+            request.policy,
+            request.trigger_kind,
+            request.authority_request_id.clone(),
+        ));
+    }
+    if parsed.is_empty() {
+        return Ok(status_view(current));
+    }
+
+    let durable = store
+        .mutate_goal_snapshot(&session.id, goal_id, current.revision(), |goal, now| {
+            for (
+                request_id,
+                expected_goal_revision,
+                expected_plan_revision,
+                trigger_task_id,
+                reason,
+                policy,
+                trigger_kind,
+                authority_request_id,
+            ) in &parsed
+            {
+                if goal.revision() != *expected_goal_revision {
+                    return Err(OrchestratorError::RevisionConflict {
+                        expected: *expected_goal_revision,
+                        actual: goal.revision(),
+                    });
+                }
+                goal.request_failed_task_replan(
+                    request_id.clone(),
+                    *expected_goal_revision,
+                    *expected_plan_revision,
+                    trigger_task_id.clone(),
+                    reason.clone(),
+                    *policy,
+                    *trigger_kind,
+                    authority_request_id.clone(),
+                    now,
+                )?;
+            }
+            // Re-run the ordinary resume reconciliation so the replan request and
+            // recovery bookkeeping land in the same durable mutation.
+            resume_recovery_only(goal, now)
+        })
+        .map_err(GoalApiError::from_orchestrator)?;
+    Ok(status_view(&durable))
+}
+
+fn validate_failed_task_replan_request(
+    request: &FailedTaskReplanRequest,
+) -> Result<crate::task::TaskId, GoalApiError> {
+    if request.expected_goal_revision == 0 || request.expected_plan_revision == 0 {
+        return Err(GoalApiError::invalid(
+            "expected Goal and plan revisions must be positive",
+        ));
+    }
+    if request.request_id.trim().is_empty() {
+        return Err(GoalApiError::invalid("request_id must not be empty"));
+    }
+    ensure_max_chars("request_id", &request.request_id, 128)?;
+    if request.reason.trim().is_empty() {
+        return Err(GoalApiError::invalid("reason must not be empty"));
+    }
+    ensure_max_chars("reason", &request.reason, 8_192)?;
+    ensure_max_chars("trigger_task_id", &request.trigger_task_id, 36)?;
+    if let Some(authority) = &request.authority_request_id {
+        ensure_max_chars("authority_request_id", authority, 128)?;
+    }
+    let task_id = crate::task::TaskId::parse(&request.trigger_task_id)
+        .map_err(GoalApiError::from_orchestrator)?;
+    if task_id.as_str() != request.trigger_task_id {
+        return Err(GoalApiError::invalid(
+            "trigger_task_id must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(task_id)
 }
 
 fn validate_pre_execution_plan_rejection(
@@ -764,17 +958,7 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
         ));
     }
 
-    let mutation_reconciled = mutation_recovery::reconcile_goal_mutations(goal, now)?;
-    goal.recover_stale_running(now)?;
-    reconcile_legacy_readonly_timeout_failures(goal, now)?;
-    reconcile_safe_readonly_blocked_tasks(goal, now)?;
-    let legacy_writer_reconciled = reconcile_legacy_writer_blocked_tasks(goal, now)?;
-    reconcile_safe_writer_blocked_tasks(goal, now)?;
-    reconcile_readonly_transport_retryable_tasks(goal, now)?;
-    let readonly_plan_reconciled = reconcile_readonly_plan_contract_failures(goal, now)?;
-    if mutation_reconciled || legacy_writer_reconciled || readonly_plan_reconciled {
-        goal.add_checkpoint(CheckpointReason::Recovery, now)?;
-    }
+    resume_recovery_only(goal, now)?;
 
     match goal.status() {
         GoalStatus::Paused => resume_from_paused(goal, now)?,
@@ -797,6 +981,23 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
         | GoalStatus::Verifying
         | GoalStatus::Cancelling => {}
         GoalStatus::Completed | GoalStatus::Failed | GoalStatus::Cancelled => unreachable!(),
+    }
+    Ok(())
+}
+
+/// The reconciliation half of a resume, shared by the ordinary resume path and
+/// the failed-task replan request path.
+fn resume_recovery_only(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
+    let mutation_reconciled = mutation_recovery::reconcile_goal_mutations(goal, now)?;
+    goal.recover_stale_running(now)?;
+    reconcile_legacy_readonly_timeout_failures(goal, now)?;
+    reconcile_safe_readonly_blocked_tasks(goal, now)?;
+    let legacy_writer_reconciled = reconcile_legacy_writer_blocked_tasks(goal, now)?;
+    reconcile_safe_writer_blocked_tasks(goal, now)?;
+    reconcile_readonly_transport_retryable_tasks(goal, now)?;
+    let readonly_plan_reconciled = reconcile_readonly_plan_contract_failures(goal, now)?;
+    if mutation_reconciled || legacy_writer_reconciled || readonly_plan_reconciled {
+        goal.add_checkpoint(CheckpointReason::Recovery, now)?;
     }
     Ok(())
 }
@@ -856,6 +1057,12 @@ fn reconcile_readonly_transport_retryable_tasks(
     Ok(())
 }
 
+/// Route a read-only attempt whose *shape* is deterministically too large into
+/// `NEEDS_REPLAN`.
+///
+/// The decision reads the host-owned structured failure class. Only Goals
+/// durably written before that field existed fall back to an exact match
+/// against the host-authored legacy report constant; prose is never parsed.
 fn reconcile_readonly_plan_contract_failures(
     goal: &mut Goal,
     now: &str,
@@ -872,17 +1079,46 @@ fn reconcile_readonly_plan_contract_failures(
                 && attempt.scope_identity().is_none()
                 && attempt.side_effect_class() == Some(SideEffectClass::None)
                 && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed);
-            let response_limit = attempt
-                .worker_report()
-                .is_some_and(|report| report.summary() == READONLY_RESPONSE_LIMIT_REPORT);
             (task.status() == TaskStatus::Retryable
                 && task.blockers().is_empty()
                 && safe_scope
                 && safe_attempt
-                && response_limit)
+                && attempt
+                    .failure_class()
+                    .is_some_and(FailureClass::requires_decomposition))
+            .then(|| task_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let legacy_task_ids = goal
+        .tasks()
+        .iter()
+        .filter_map(|(task_id, task)| {
+            let attempt = task.latest_attempt()?;
+            let safe_scope = task.worker() == WorkerKind::CodexReadonly
+                && task.scope().operation_kind() == TaskOperationKind::ReadOnly
+                && task.scope().replay_safety() == ReplaySafety::SafeReadOnly;
+            let safe_attempt = attempt.operation_id().is_none()
+                && attempt.scope_identity().is_none()
+                && attempt.side_effect_class() == Some(SideEffectClass::None)
+                && attempt.side_effect_state() == Some(SideEffectState::ConfirmedNotPerformed);
+            let legacy_response_limit = attempt.failure_class().is_none()
+                && attempt
+                    .worker_report()
+                    .is_some_and(|report| report.summary() == READONLY_RESPONSE_LIMIT_REPORT);
+            (task.status() == TaskStatus::Retryable
+                && task.blockers().is_empty()
+                && safe_scope
+                && safe_attempt
+                && legacy_response_limit)
                 .then(|| task_id.clone())
         })
         .collect::<Vec<_>>();
+
+    let mut task_ids = task_ids;
+    task_ids.extend(legacy_task_ids);
+    task_ids.sort();
+    task_ids.dedup();
 
     for task_id in &task_ids {
         goal.transition_task(
@@ -1153,19 +1389,40 @@ fn result_view(goal: &Goal) -> GoalResultView {
 fn task_views(goal: &Goal) -> Vec<TaskSummaryView> {
     goal.tasks()
         .iter()
-        .map(|(id, task)| TaskSummaryView {
-            task_id: id.as_str().to_owned(),
-            title: task.title().to_owned(),
-            status: task.status(),
-            mandatory: task.mandatory(),
-            dependencies: task
-                .dependencies()
-                .iter()
-                .map(|dependency| dependency.task_id().as_str().to_owned())
-                .collect(),
-            blocker_count: task.blockers().len(),
-            verification_results: task.verification_results().len(),
-            evidence_items: task.evidence_count(),
+        .map(|(id, task)| {
+            let attempt = task.latest_attempt();
+            TaskSummaryView {
+                task_id: id.as_str().to_owned(),
+                title: task.title().to_owned(),
+                status: task.status(),
+                mandatory: task.mandatory(),
+                dependencies: task
+                    .dependencies()
+                    .iter()
+                    .map(|dependency| dependency.task_id().as_str().to_owned())
+                    .collect(),
+                blocker_count: task.blockers().len(),
+                verification_results: task.verification_results().len(),
+                evidence_items: task.evidence_count(),
+                attempts_consumed: task.semantic_attempts_consumed(),
+                remaining_attempt_budget: task.semantic_attempts_remaining(),
+                latest_attempt_outcome: attempt.and_then(|attempt| attempt.outcome()),
+                latest_attempt_failure_class: attempt.and_then(|attempt| attempt.failure_class()),
+                latest_attempt_effective_failure_class: attempt
+                    .map(|attempt| attempt.effective_failure_class()),
+                latest_attempt_side_effect_state: attempt
+                    .and_then(|attempt| attempt.side_effect_state()),
+                durable_replan_request_ids: goal
+                    .failed_task_replan_requests()
+                    .iter()
+                    .filter(|request| request.trigger_task_id() == id)
+                    .map(|request| request.request_id().to_owned())
+                    .collect(),
+                superseded_by_replacement: goal
+                    .failed_task_replacements()
+                    .iter()
+                    .any(|record| record.replaced_task_id() == id),
+            }
         })
         .collect()
 }

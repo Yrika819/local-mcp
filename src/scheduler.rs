@@ -2232,16 +2232,56 @@ mod tests {
     #[tokio::test]
     async fn only_agent_timeout_gets_free_transport_classification() {
         use crate::agent::AgentError;
-        for error in [
-            AgentError::ApprovalDenied,
-            AgentError::ExecutableUnavailable,
-            AgentError::SpawnFailed,
-            AgentError::NonZeroExit,
-            AgentError::EmptyResponse,
-            AgentError::ResponseTooLarge,
-            AgentError::TransportFailure,
-            AgentError::Cancelled,
-            AgentError::InvalidConfiguration,
+        use crate::failure_class::FailureClass;
+        // Only a model timeout is a free transport interruption. Every other
+        // failure is classified structurally and routed by that class: a
+        // deterministic size/budget failure must not be retried unchanged.
+        for (error, expected_class, expected_outcome) in [
+            (
+                AgentError::ApprovalDenied,
+                FailureClass::AuthorityFailure,
+                AttemptOutcome::NeedsReplan,
+            ),
+            (
+                AgentError::ExecutableUnavailable,
+                FailureClass::PlatformSafety,
+                AttemptOutcome::NeedsReplan,
+            ),
+            (
+                AgentError::SpawnFailed,
+                FailureClass::TransientModelFailure,
+                AttemptOutcome::Retryable,
+            ),
+            (
+                AgentError::NonZeroExit,
+                FailureClass::TransientModelFailure,
+                AttemptOutcome::Retryable,
+            ),
+            (
+                AgentError::EmptyResponse,
+                FailureClass::SemanticFailure,
+                AttemptOutcome::Retryable,
+            ),
+            (
+                AgentError::ResponseTooLarge,
+                FailureClass::HostOutputLimit,
+                AttemptOutcome::NeedsReplan,
+            ),
+            (
+                AgentError::TransportFailure,
+                FailureClass::TransientModelFailure,
+                AttemptOutcome::Retryable,
+            ),
+            (
+                AgentError::Cancelled,
+                FailureClass::PlatformSafety,
+                AttemptOutcome::NeedsReplan,
+            ),
+            (
+                AgentError::InvalidConfiguration,
+                FailureClass::AuthorityFailure,
+                AttemptOutcome::NeedsReplan,
+            ),
         ] {
             let fixture = fixture();
             let readonly = task(
@@ -2284,10 +2324,20 @@ mod tests {
                 "error={error:?}"
             );
             assert_eq!(
-                task.attempts()[0].outcome(),
-                Some(AttemptOutcome::Retryable),
+                task.attempts()[0].failure_class(),
+                Some(expected_class),
                 "error={error:?}"
             );
+            assert_eq!(
+                task.attempts()[0].outcome(),
+                Some(expected_outcome),
+                "error={error:?}"
+            );
+            // A failure that forbids replaying the identical shape must never
+            // leave the Task replayable.
+            if !expected_class.allows_unchanged_retry() {
+                assert!(!task.unchanged_retry_permitted(), "error={error:?}");
+            }
             assert_eq!(backend.calls.get(), 1);
         }
     }

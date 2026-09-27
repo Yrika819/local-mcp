@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::failure_class::FailureClass;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
@@ -316,8 +317,7 @@ impl WorkerReport {
 
 pub(crate) const MAX_READONLY_TRANSPORT_INTERRUPTS_PER_TASK: u32 = 3;
 pub(crate) const MAX_READONLY_REPLAN_RECONCILIATIONS_PER_TASK: u32 = 2;
-const LEGACY_READONLY_TIMEOUT_REPORT: &str =
-    "READONLY_BACKEND_ERROR: readonly model invocation failed: model invocation timed out";
+use crate::failure_class::LEGACY_READONLY_TIMEOUT_REPORT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -383,6 +383,8 @@ pub(crate) struct TaskAttempt {
     worker_report: Option<WorkerReport>,
     outcome: Option<AttemptOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_class: Option<FailureClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mutation_intent: Option<MutationIntent>,
 }
 
@@ -409,6 +411,7 @@ impl TaskAttempt {
             remaining_side_effect_budget: None,
             worker_report: None,
             outcome: None,
+            failure_class: None,
             mutation_intent: None,
         }
     }
@@ -443,6 +446,28 @@ impl TaskAttempt {
 
     pub(crate) fn outcome(&self) -> Option<AttemptOutcome> {
         self.outcome
+    }
+
+    /// The host-owned structured failure classification recorded when the
+    /// attempt failed, or `None` for a durable attempt written before the
+    /// structured field existed.
+    pub(crate) fn failure_class(&self) -> Option<FailureClass> {
+        self.failure_class
+    }
+
+    /// The effective classification for policy purposes: the structured value
+    /// when present, otherwise an exact-match classification of the
+    /// host-authored legacy worker report, otherwise
+    /// [`FailureClass::Unknown`].
+    pub(crate) fn effective_failure_class(&self) -> FailureClass {
+        self.failure_class.unwrap_or_else(|| {
+            FailureClass::from_legacy_worker_report(
+                self.worker_report
+                    .as_ref()
+                    .map(WorkerReport::summary)
+                    .unwrap_or_default(),
+            )
+        })
     }
 
     pub(crate) fn remaining_attempt_budget(&self) -> Option<u32> {
@@ -758,6 +783,19 @@ impl Task {
     pub(crate) fn latest_is_readonly_transport_interruption(&self) -> bool {
         self.latest_attempt()
             .is_some_and(|attempt| self.is_readonly_transport_attempt(attempt.id()))
+    }
+
+    /// Whether the latest attempt's structured failure class still permits
+    /// replaying the *identical* Task shape.
+    ///
+    /// Attempts written before the structured field existed keep the
+    /// pre-existing policy so historical Goals are not silently reclassified.
+    pub(crate) fn unchanged_retry_permitted(&self) -> bool {
+        self.latest_attempt().is_none_or(|attempt| {
+            attempt
+                .failure_class
+                .is_none_or(FailureClass::allows_unchanged_retry)
+        })
     }
 
     fn is_readonly_transport_attempt(&self, attempt_id: &AttemptId) -> bool {
@@ -1294,6 +1332,17 @@ impl Task {
                     "retry policy/budget does not permit another attempt",
                 ));
             }
+            // Entering RETRYABLE is a resting state, not a replay decision. The
+            // structured failure class is consulted at every edge into READY, so
+            // a deterministically-too-large Task can never be re-armed as
+            // runnable by any path, not just an ordinary RETRYABLE retry.
+            if !self.unchanged_retry_permitted() {
+                return Err(invalid_task_transition(
+                    from,
+                    next,
+                    "structured failure class forbids replaying the identical Task shape",
+                ));
+            }
         }
         if from == TaskStatus::Ready && next == TaskStatus::Running {
             if !dependencies_satisfied {
@@ -1688,6 +1737,132 @@ impl Task {
             ));
         }
         attempt.worker_report = Some(report);
+        Ok(())
+    }
+
+    /// Record the host-owned structured classification of this attempt's
+    /// failure, exactly once, at the boundary that observed it.
+    pub(crate) fn record_latest_attempt_failure_class(
+        &mut self,
+        class: FailureClass,
+    ) -> Result<(), OrchestratorError> {
+        let attempt = self.attempts.last_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal("task lacks a durable attempt".to_owned())
+        })?;
+        if attempt.failure_class.is_some() {
+            return Err(OrchestratorError::InvalidDag(
+                "attempt failure classification cannot be rewritten".to_owned(),
+            ));
+        }
+        if attempt.side_effect_state == Some(SideEffectState::Unknown) {
+            return Err(OrchestratorError::InvalidDag(
+                "UNKNOWN side-effect state must remain blocked for reconciliation".to_owned(),
+            ));
+        }
+        attempt.failure_class = Some(class);
+        Ok(())
+    }
+
+    /// Host-owned entry into the replacement/replan path for a Task whose
+    /// *shape* is invalid.
+    ///
+    /// This deliberately bypasses the ordinary V1 state table (as
+    /// [`Task::reject_pre_execution_plan`] already does) because
+    /// `PENDING -> NEEDS_REPLAN` and `READY -> NEEDS_REPLAN` are not ordinary
+    /// worker transitions. It only ever moves a Task *away* from runnable
+    /// states: no attempt, evidence, budget, or dependency is touched.
+    pub(crate) fn request_failed_task_replan(
+        &mut self,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.status == TaskStatus::NeedsReplan {
+            return Ok(());
+        }
+        if self.status.is_terminal() {
+            return Err(OrchestratorError::InvalidDag(
+                "terminal Task cannot enter the failed-task replacement path".to_owned(),
+            ));
+        }
+        if !matches!(
+            self.status,
+            TaskStatus::Pending
+                | TaskStatus::Ready
+                | TaskStatus::Retryable
+                | TaskStatus::Blocked
+                | TaskStatus::NeedsReplan
+        ) {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replacement requires PENDING, READY, RETRYABLE, BLOCKED, or NEEDS_REPLAN"
+                    .to_owned(),
+            ));
+        }
+        if self.has_unknown_side_effect() {
+            return Err(OrchestratorError::InvalidDag(
+                "UNKNOWN side-effect state must be reconciled before replacement".to_owned(),
+            ));
+        }
+        if self.scope().operation_kind() != TaskOperationKind::ReadOnly
+            || self.scope().replay_safety() != ReplaySafety::SafeReadOnly
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "failed-task replacement requires a READ_ONLY + SAFE_READ_ONLY trigger scope"
+                    .to_owned(),
+            ));
+        }
+        self.blockers.clear();
+        self.status = TaskStatus::NeedsReplan;
+        self.updated_at = now.to_owned();
+        Ok(())
+    }
+
+    /// Rewire this Task's hard dependencies away from a Task that is about to
+    /// be permanently superseded, onto the replacement completion closure.
+    ///
+    /// This is the one dependency *removal* the V1 model permits, and it is
+    /// only reachable from the host-owned atomic supersession path. Every other
+    /// dependency is preserved and no existing edge may be duplicated.
+    pub(crate) fn rewire_dependencies_for_supersession(
+        &mut self,
+        removed: &TaskId,
+        added: &[TaskId],
+    ) -> Result<(), OrchestratorError> {
+        if !self
+            .dependencies
+            .iter()
+            .any(|edge| edge.task_id() == removed)
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "supersession rewiring requires the superseded Task to be a hard dependency"
+                    .to_owned(),
+            ));
+        }
+        for dependency in added {
+            if dependency == &self.id {
+                return Err(OrchestratorError::InvalidDag(
+                    "task cannot depend on itself".to_owned(),
+                ));
+            }
+        }
+        let mut dependencies = self
+            .dependencies
+            .iter()
+            .filter(|edge| edge.task_id() != removed)
+            .cloned()
+            .collect::<Vec<_>>();
+        for dependency in added {
+            if dependencies.iter().any(|edge| edge.task_id() == dependency) {
+                return Err(OrchestratorError::InvalidDag(
+                    "supersession rewiring would duplicate an existing dependency edge".to_owned(),
+                ));
+            }
+            dependencies.push(TaskDependency::completed(dependency.clone()));
+        }
+        if dependencies.len() > crate::planner::MAX_DEPENDENCIES_PER_TASK {
+            return Err(OrchestratorError::InvalidDag(
+                "task exceeds the hard dependency limit after supersession rewiring".to_owned(),
+            ));
+        }
+        self.dependencies = dependencies;
         Ok(())
     }
 
