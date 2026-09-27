@@ -53,6 +53,7 @@
 
 use std::io;
 use std::process::ExitStatus;
+#[cfg(unix)]
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -66,9 +67,11 @@ use crate::exec_ready::BusyProgramRetry;
 /// waiting for it is a poll rather than a signal-driven wait. The interval
 /// starts small so a short-lived child is observed almost immediately, then
 /// grows so a long-running child costs very few wakeups.
+#[cfg(unix)]
 const TERMINATION_POLL_START: Duration = Duration::from_micros(200);
 
 /// Upper bound on the termination poll interval.
+#[cfg(unix)]
 const TERMINATION_POLL_MAX: Duration = Duration::from_millis(4);
 
 /// A launched process group whose identifier Local MCP owns for the lifetime of
@@ -104,7 +107,7 @@ impl ProcessGroup {
     }
 
     /// The group leader's process identifier, which is also the group identifier.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn leader_id(&self) -> u32 {
         self.child.id().unwrap_or(0)
     }
@@ -174,7 +177,7 @@ impl ProcessGroup {
     }
 
     /// Whether a negative process-group signal is currently permitted.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn owns_process_group(&self) -> bool {
         self.ownership.is_proven()
     }
@@ -184,7 +187,7 @@ impl ProcessGroup {
     /// Models the moment the group identifier stops being this lease's, and is
     /// used by the ownership regression to show that a group signal is gated on
     /// the proof rather than on the lease still being alive.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn release_process_group(&mut self) {
         self.ownership.release();
     }
@@ -368,7 +371,7 @@ fn reported_child(info: &libc::siginfo_t) -> libc::pid_t {
     info.si_pid
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn reported_child(info: &libc::siginfo_t) -> libc::pid_t {
     // Safety: reading a field of a `siginfo_t` that `waitid` has just filled in.
     unsafe { info.si_pid() }
@@ -380,7 +383,7 @@ fn reported_status(info: &libc::siginfo_t) -> libc::c_int {
     info.si_status
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn reported_status(info: &libc::siginfo_t) -> libc::c_int {
     // Safety: reading a field of a `siginfo_t` that `waitid` has just filled in.
     unsafe { info.si_status() }

@@ -75,8 +75,7 @@ async fn sandbox_prestart_and_missing_executable_lifecycle_are_frozen() {
     {
         let error = sandbox::run_tracked(&command, &cwd, &[], None)
             .await
-            .err()
-            .expect("host-native missing target must fail before process start");
+            .expect_err("host-native missing target must fail before process start");
         assert!(!error.command_started);
         assert!(!error.command_finished);
     }

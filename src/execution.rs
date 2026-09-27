@@ -57,6 +57,7 @@ pub(crate) async fn write_file_content(
             status: 0,
             stdout: String::new(),
             stderr: String::new(),
+            command_start: sandbox::CommandStart::Proven,
         })
     }
 }

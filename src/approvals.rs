@@ -18,6 +18,7 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
+#[cfg(unix)]
 use crate::secure_fs;
 
 trait SessionIo: AsyncRead + AsyncWrite + Unpin + Send {}

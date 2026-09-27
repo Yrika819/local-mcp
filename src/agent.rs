@@ -698,7 +698,7 @@ pub(crate) async fn run_bounded_host_process(
     Ok(raw_output_to_sandbox(output))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn run_bounded_process_async_for_test(
     command: &[String],
     prompt: &[u8],
