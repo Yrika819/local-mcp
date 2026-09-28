@@ -101,12 +101,18 @@ host property, not something you can configure around.
 
 ### Other requirements
 
-The Linux executables dynamically link against the GNU/Linux runtime; the
-release job records the exact `ldd` output and highest required GLIBC symbol
-for each architecture. Install on a distribution whose glibc provides at least
-the reported symbol version. That ABI floor can differ between the x86_64 and
-aarch64 assets because they are built on different native Ubuntu runners. The
-vendored OpenSSL does not require a separate system OpenSSL library.
+The Linux executables dynamically link against the GNU/Linux runtime. The
+release build measured these highest required GLIBC symbol versions for both
+executables in each archive:
+
+| Architecture | Required glibc | Build runner | Status |
+| --- | --- | --- | --- |
+| x86_64 | `GLIBC_2.34` or newer | Ubuntu 22.04 (glibc 2.35) | Supported target |
+| aarch64 | `GLIBC_2.39` or newer | Ubuntu 24.04 ARM (glibc 2.39) | Experimental; sandbox closure not validated |
+
+Use a distribution that provides at least the listed glibc symbol version. The
+vendored OpenSSL does not require a separate system OpenSSL library. Exact
+`ldd` output and the symbol checks are in the linked public Release Actions run.
 
 ## macOS
 

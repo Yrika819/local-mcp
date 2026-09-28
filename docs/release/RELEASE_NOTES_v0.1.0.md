@@ -38,10 +38,11 @@ access:
   helper. **Linux aarch64 is experimental**: it builds natively in CI, but the
   repository's Linux sandbox evidence documents x86_64 and does not establish
   ARM64 sandbox closure. Both architectures' executables dynamically link to
-  the host GNU/Linux runtime; the release build records each binary's `ldd`
-  dependencies and highest required GLIBC symbol in its Actions job log. No
-  compatibility claim is made for distributions older than the ABI those
-  checks report.
+  both architectures' executables dynamically link to the host GNU/Linux
+  runtime. The measured highest required GLIBC symbols are `GLIBC_2.34` for
+  x86_64 and `GLIBC_2.39` for aarch64; use a distribution providing at least
+  that version. The release build also records each binary's `ldd`
+  dependencies in its Actions job log.
 - **macOS** uses the system **Seatbelt** (`sandbox-exec`); the release build
   records system library dependencies with `otool -L`. Native release-closure
   evidence is Intel x86_64 only; Apple Silicon is a remote CI target and is not

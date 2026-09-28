@@ -98,9 +98,13 @@ nix develop
 nix build
 ```
 
-This release metadata does not promise a crates.io package or a prebuilt GitHub
-download. Use the source build above or the optional Nix flake. On Linux, the
-release build also includes the `codex-linux-sandbox` helper described below.
+Public v1 binary downloads are distributed as versioned GitHub Release assets;
+there is no crates.io package or package-manager publication. When a GitHub
+Release is available, use the matching archive and verify it against `SHA256SUMS`;
+see [the installation guide](docs/release/INSTALL.md) for platform-specific
+instructions. Until the formal release is published, use the source build above
+or the optional Nix flake. On Linux, the release archive includes the required
+`codex-linux-sandbox` sibling helper.
 
 The session working directory is the directory where `local-mcp start` was run;
 there is no separate persistent cwd setting. On Linux and macOS, sandboxed calls are
