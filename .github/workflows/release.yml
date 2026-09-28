@@ -1,21 +1,29 @@
 name: Release
 
-# Two entry points, with a hard separation between them:
+# Three entry points, with a hard separation between them:
 #
-#   * `push` on a `v*` tag is the real release path. It is the only trigger that
-#     can reach the `publish` job.
-#   * `workflow_dispatch` is the dry-run path. It builds the real, final-form
-#     archives and uploads them as Actions artifacts, and nothing else.
+#   * `push` on a `v*` tag is the real release path. It is the only trigger
+#     that can reach the `publish` job.
+#   * `push` to this repository's dry-run branch builds the real, final-form
+#     archives and uploads them as Actions artifacts, and nothing else. This
+#     exists because `workflow_dispatch` only works for workflows that already
+#     exist on the default branch, and this workflow is deliberately not
+#     merged yet.
+#   * `workflow_dispatch` behaves identically to the dry-run branch push, for
+#     runs after the workflow reaches the default branch.
 #
 # The dry-run/publish split is enforced by job-level `if:` conditions rather
 # than by a boolean input, so "dry run" is not a setting a mistake can flip:
-# the publish job requires `github.event_name == 'push'` *and* a `refs/tags/v*`
-# ref, and a `workflow_dispatch` run can satisfy neither.
+# the publish job requires `github.event_name == 'push'` *and* a
+# `refs/tags/v*` ref, and neither a branch push nor a `workflow_dispatch` run
+# can satisfy both.
 
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - "release/public-v1-dry-run"
   workflow_dispatch:
     inputs:
       version:
@@ -65,11 +73,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The tag is the only source of truth on the release path; a
-          # dispatch supplies it explicitly. Either way it is checked against
-          # Cargo.toml so an asset can never be named for one version while
-          # being built from another.
-          if [ "${{ github.event_name }}" = "push" ]; then
+          # The tag is the only source of truth on the release path; every
+          # other trigger supplies a version explicitly. Either way it is
+          # checked against Cargo.toml so an asset can never be named for one
+          # version while being built from another.
+          if [ "${{ github.event_name }}" = "push" ] && \
+             [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             tag="${GITHUB_REF_NAME}"
             case "$tag" in
               v[0-9]*) ;;
@@ -77,8 +86,14 @@ jobs:
             esac
             version="${tag#v}"
             dry_run="false"
-          else
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             version="${{ inputs.version }}"
+            dry_run="true"
+          else
+            # A push to a branch is always a dry run, by construction: the
+            # version comes from Cargo.toml because there is no tag to read it
+            # from.
+            version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
             dry_run="true"
           fi
 
@@ -92,13 +107,30 @@ jobs:
             exit 1
           fi
 
+          # A dry run must never be able to reach publication, no matter what
+          # any input says. This mirrors the condition the publish job uses, so
+          # a mistake surfaces as a failed plan step here rather than as a
+          # skipped job that nobody notices.
+          if [ "$dry_run" = "true" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::internal guard: a dry run resolved to a tag ref"
+            exit 1
+          fi
+          if [ "$dry_run" = "true" ]; then
+            echo "mode=DRY RUN - no tag, release, or package publication will occur"
+          else
+            echo "mode=RELEASE - tag ${GITHUB_REF} will publish"
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
           echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
           {
-            echo "version=$version"
-            echo "dry_run=$dry_run"
-            echo "cargo_version=$cargo_version"
+            echo "### Release plan"
+            echo ""
+            echo "- version: \`$version\`"
+            echo "- dry run: \`$dry_run\`"
+            echo "- ref: \`${GITHUB_REF}\`"
+            echo "- Cargo.toml version: \`$cargo_version\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run release-script self-tests

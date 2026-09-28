@@ -119,6 +119,24 @@ class WorkflowPolicyTest(unittest.TestCase):
                     f"release.yml job {name!r} mentions write; only the publish job may"
                 )
 
+    def test_release_dry_run_branch_cannot_reach_publish(self) -> None:
+        # The dry-run branch is a push trigger, so the publish guard has to
+        # exclude branch pushes explicitly. `refs/tags/v` does not match a
+        # `refs/heads/...` ref, which is what keeps this safe; assert the guard
+        # is written in a way that depends on the ref, not on an input.
+        text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        publish = re.search(
+            r"\n  publish:\n(.*?)(?=\n  [a-z_]+:\n|\Z)", text, flags=re.DOTALL
+        )
+        self.assertIsNotNone(publish)
+        guard = re.search(r"^\s{4}if:\s*(.+)$", publish.group(1), flags=re.MULTILINE)
+        self.assertIsNotNone(guard)
+        self.assertIn("refs/tags/v", guard.group(1))
+
+    def test_dry_run_branch_is_the_sanctioned_dry_run_trigger(self) -> None:
+        text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("release/public-v1-dry-run", text)
+
     def test_release_jobs_declare_timeouts(self) -> None:
         # An unbounded job can hang a release run until the platform's own
         # limit, so every job states its own bound.
