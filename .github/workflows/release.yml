@@ -51,6 +51,12 @@ env:
   # Keeps absolute build paths out of the distributed binaries.
   RUSTFLAGS: -C debuginfo=0
 
+defaults:
+  run:
+    # Every run block below is POSIX. GitHub-hosted Windows images include
+    # Git Bash, so state it explicitly rather than silently selecting pwsh.
+    shell: bash
+
 jobs:
   # ---------------------------------------------------------------------
   # Resolve the version and prove this run is not a dry run.
@@ -236,9 +242,9 @@ jobs:
           set -euo pipefail
           IFS=',' read -ra names <<< "$BINARIES"
           for name in "${names[@]}"; do
-            printf '--- %s --version ---\n' "$name"
+            printf '%s\n' "--- $name --version ---"
             "target/release/$name" --version
-            printf '--- %s --help ---\n' "$name"
+            printf '%s\n' "--- $name --help ---"
             "target/release/$name" --help
           done
 
@@ -352,6 +358,14 @@ jobs:
               "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')" "$(sha256sum "$f" | cut -d' ' -f1)"
           done
 
+      - name: Add release notes to the release bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp "docs/release/RELEASE_NOTES_v${VERSION}.md" dist/RELEASE_NOTES.md
+
       - name: Generate SHA256SUMS
         shell: bash
         env:
@@ -430,8 +444,8 @@ jobs:
           # Refuse to continue unless every expected asset is present.
           python3 scripts/release/checksums.py verify --dist dist --version "$VERSION"
           notes="dist/RELEASE_NOTES.md"
-          if [ -f "$notes" ]; then
-            gh release create "$TAG" dist/* --title "local-mcp $TAG" --notes-file "$notes"
-          else
-            gh release create "$TAG" dist/* --title "local-mcp $TAG" --generate-notes
-          fi
+          test -f "$notes"
+          gh release create "$TAG" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --title "local-mcp $TAG (Public v1)" \
+            --notes-file "$notes"

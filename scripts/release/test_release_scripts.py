@@ -24,7 +24,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
@@ -97,7 +97,7 @@ def write_target_binary(target: targets.Target, name: str, path: Path) -> None:
         write_pe(path, machine)
 
 
-def stage_target(target: targets.Target, version: str, out: Path) -> Dict[str, Path]:
+def stage_target(target: targets.Target, version: str, out: Path) -> None:
     """Create fake built binaries and the docs a target needs, then package."""
     stage = out / f"stage-{target.key}"
     stage.mkdir(parents=True, exist_ok=True)
@@ -120,10 +120,9 @@ def stage_target(target: targets.Target, version: str, out: Path) -> Dict[str, P
         str(out),
         *binary_args,
     ]
-    result = subprocess.run(argv, capture_output=True, text=True)
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise AssertionError(f"package.py failed for {target.key}: {result.stderr}")
-    return binary_args
 
 
 class TargetMatrixTest(unittest.TestCase):

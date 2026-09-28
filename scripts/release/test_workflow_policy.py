@@ -18,10 +18,8 @@ representation would obscure.
 from __future__ import annotations
 
 import re
-import sys
 import unittest
 from pathlib import Path
-from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
@@ -30,7 +28,7 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
 
 
-def workflow_files() -> List[Path]:
+def workflow_files() -> list[Path]:
     return sorted(WORKFLOW_DIR.glob("*.yml")) + sorted(WORKFLOW_DIR.glob("*.yaml"))
 
 
@@ -102,11 +100,13 @@ class WorkflowPolicyTest(unittest.TestCase):
         publish = re.search(
             r"\n  publish:\n(.*?)(?=\n  [a-z_]+:\n|\Z)", text, flags=re.DOTALL
         )
-        self.assertIsNotNone(publish, "release.yml has no publish job")
+        if publish is None:
+            raise AssertionError("release.yml has no publish job")
         body = publish.group(1)
 
         condition = re.search(r"^\s{4}if:\s*(.+)$", body, flags=re.MULTILINE)
-        self.assertIsNotNone(condition, "the publish job has no `if:` guard")
+        if condition is None:
+            raise AssertionError("the publish job has no `if:` guard")
 
         guard = condition.group(1)
         self.assertIn("github.event_name == 'push'", guard)
@@ -128,14 +128,33 @@ class WorkflowPolicyTest(unittest.TestCase):
         publish = re.search(
             r"\n  publish:\n(.*?)(?=\n  [a-z_]+:\n|\Z)", text, flags=re.DOTALL
         )
-        self.assertIsNotNone(publish)
+        if publish is None:
+            raise AssertionError("release.yml has no publish job")
         guard = re.search(r"^\s{4}if:\s*(.+)$", publish.group(1), flags=re.MULTILINE)
-        self.assertIsNotNone(guard)
+        if guard is None:
+            raise AssertionError("the publish job has no `if:` guard")
         self.assertIn("refs/tags/v", guard.group(1))
 
     def test_dry_run_branch_is_the_sanctioned_dry_run_trigger(self) -> None:
         text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
         self.assertIn("release/public-v1-dry-run", text)
+
+    def test_release_workflow_runs_posix_scripts_with_bash(self) -> None:
+        # The matrix includes Windows, whose runner default is PowerShell.
+        # Every workflow script uses POSIX syntax, so the workflow-level
+        # default must select the runner's Git Bash explicitly.
+        text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        defaults = re.search(r"^defaults:\n(.*?)(?=^jobs:)", text, flags=re.MULTILINE | re.DOTALL)
+        if defaults is None:
+            raise AssertionError("release workflow is missing defaults")
+        self.assertRegex(defaults.group(1), r"(?m)^\s+shell:\s+bash\s*$")
+
+    def test_release_notes_are_bundled_but_not_published_as_an_asset(self) -> None:
+        text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("Add release notes to the release bundle", text)
+        self.assertIn('cp "docs/release/RELEASE_NOTES_v${VERSION}.md" dist/RELEASE_NOTES.md', text)
+        self.assertIn('--notes-file "$notes"', text)
+        self.assertIn("dist/*.tar.gz dist/*.zip dist/SHA256SUMS", text)
 
     def test_release_jobs_declare_timeouts(self) -> None:
         # An unbounded job can hang a release run until the platform's own
