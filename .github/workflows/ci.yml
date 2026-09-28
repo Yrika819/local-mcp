@@ -83,6 +83,16 @@ jobs:
   # ---------------------------------------------------------------------
   test:
     name: test (${{ matrix.name }})
+    # The Linux entry runs on ubuntu-22.04, not ubuntu-24.04. The sandbox needs
+    # a user namespace, and that is the one thing the hosted images disagree on:
+    # the 6.8 kernel in the 22.04 image lets an unprivileged process write
+    # /proc/<pid>/uid_map, and the 6.17 and 7.0 kernels in the 24.04 and 26.04
+    # images refuse it. Upstream has removed the setuid alternative outright, so
+    # on those images the sandbox cannot be built at all and every sandboxed
+    # test fails during setup. Running the suite where the sandbox actually
+    # works is strictly more coverage than skipping those tests, and 24.04 still
+    # gets the full `quality` job — fmt, check, and both clippy passes over all
+    # targets, tests included.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -90,7 +100,7 @@ jobs:
       matrix:
         include:
           - name: ubuntu-x64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             runner_arch: X64
             uname: x86_64
             rust_host: x86_64-unknown-linux-gnu
@@ -180,19 +190,21 @@ jobs:
           meson compile -C "$RUNNER_TEMP/bubblewrap/build"
           meson install -C "$RUNNER_TEMP/bubblewrap/build"
           # Keep the runtime out of any directory the invoking user can write,
-          # and record the one capability the suite depends on. Upstream removed
-          # setuid support outright ("setuid use of bubblewrap is not supported"),
-          # so a user namespace is the only route to privileges, and a host that
-          # refuses an unprivileged write to /proc/<pid>/uid_map cannot build
-          # this sandbox at all. Report what this runner can do rather than
-          # finding out from sixteen tests.
+          # and state the one capability the suite depends on. Upstream removed
+          # setuid support outright ("setuid use of bubblewrap is not
+          # supported"), so a user namespace is the only route to privileges,
+          # and a host that refuses an unprivileged write to /proc/<pid>/uid_map
+          # cannot build this sandbox at all. Report what this runner can do
+          # rather than leaving sixteen tests to find out.
           sudo install -m 0755 -o root -g root \
             "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" /usr/local/bin/bwrap
           echo "$RUNNER_TEMP/bubblewrap-prefix/bin" >> "$GITHUB_PATH"
           command -v bwrap
           bwrap --version
-          if unshare -Ur -- true 2>/dev/null; then
-            echo "sandbox_capability=user_namespace_available"
+          if "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" --new-session --die-with-parent \
+            --unshare-user --unshare-pid --unshare-net --ro-bind / / --proc /proc \
+            -- /bin/true 2>/dev/null; then
+            echo "sandbox_capability=restricted_sandbox_available"
           else
             echo "sandbox_capability=unavailable"
           fi

@@ -51,16 +51,42 @@ separate approval boundary described in the main README.
 
 ## Host capability for restricted networking
 
-A restricted-network profile needs the helper to own an isolated network
-namespace whose loopback device it can bring up, which requires privileges
-inside the user namespace the helper just created. A host that refuses an
-unprivileged process's write to `/proc/<pid>/uid_map` grants the namespaces but
-not the privileges, so the helper fails during setup and the requested command
-never runs. The GitHub-hosted Ubuntu images are such a host: a plain
-`unshare -Ur -- true`, with no helper involved, fails the same way. Installing
-Bubblewrap the way distributions install it — owned by root and setuid, the mode
-the upstream project tests — gives the helper the privileges it needs, and is
-the stronger of the two configurations rather than a relaxation of it.
+Restricted networking needs the helper to own an isolated network namespace
+whose loopback device it can bring up, which requires privileges inside the user
+namespace the helper just created. The only route to those privileges is a user
+namespace: upstream removed setuid support outright, and the helper now dies
+with `setuid use of bubblewrap is not supported` as soon as the real and
+effective uids differ. A host that refuses an unprivileged write to
+`/proc/<pid>/uid_map` therefore cannot build this sandbox at all — the
+namespaces are created but the privileges never arrive, and every sandboxed
+request fails during setup with `setting up uid map: Permission denied` or, when
+a network namespace is also requested, with
+`loopback: Failed RTM_NEWADDR: Operation not permitted`.
+
+This is a kernel property, not a Bubblewrap property, and the hosted Linux
+images disagree about it. Measured with the pinned upstream runtime, built from
+source and run unprivileged:
+
+| image | kernel | filesystem sandbox | restricted network |
+| --- | --- | --- | --- |
+| `ubuntu-22.04` | 6.8.0-1064-azure | works | works |
+| `ubuntu-24.04` | 6.17.0-1022-azure | refused | refused |
+| `ubuntu-24.04-arm` | 6.17.0-1022-azure | refused | refused |
+| `ubuntu-26.04` | 7.0.0-1012-azure | refused | refused |
+
+The same table holds for the `v0.12.0` and `v0.13.0` release tags, so it is not
+a regression in one upstream revision, and the distribution's own Bubblewrap
+0.11.1 on `ubuntu-26.04` succeeds where the pinned build fails — which is why a
+`unshare -Ur` probe is not a usable proxy for the capability either.
+
+The Linux test job therefore runs on `ubuntu-22.04`, the hosted image that can
+build the sandbox. Running the suite on a host that can do it is more coverage
+than skipping the sandboxed tests on one that cannot, and `ubuntu-24.04` keeps
+the full `quality` job: formatting, `cargo check`, and both clippy passes over
+all targets, tests included. The Bubblewrap build step also reports
+`sandbox_capability=restricted_sandbox_available` or `sandbox_capability=unavailable`
+so the log states what the runner can do instead of leaving the suite to
+discover it.
 
 Production is restricted on every platform and cannot be configured otherwise.
 The test build is the only place that can answer differently, and it answers
