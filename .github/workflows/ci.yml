@@ -179,23 +179,31 @@ jobs:
             -Dbash_completion=disabled -Dzsh_completion=disabled
           meson compile -C "$RUNNER_TEMP/bubblewrap/build"
           meson install -C "$RUNNER_TEMP/bubblewrap/build"
-          # Install the runtime the way every distribution installs it: owned by
-          # root and setuid. The GitHub-hosted Ubuntu images refuse an
-          # unprivileged process's write to /proc/<pid>/uid_map, so a non-setuid
-          # bubblewrap can never obtain privileges in the namespaces it creates:
-          # the user, mount and PID namespaces are created, but the wrapper then
-          # fails with `setting up uid map: Permission denied`, or, when a
-          # network namespace is also requested, earlier still with
-          # `loopback: Failed RTM_NEWADDR: Operation not permitted`. Either way
-          # the sandbox dies during setup and the requested command never runs.
-          # The setuid configuration is the stronger of the two, not a weaker
-          # one: it is the mode distribution packages ship and the mode the
-          # upstream project tests.
-          sudo chown root:root "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap"
-          sudo chmod 4755 "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap"
-          echo "$RUNNER_TEMP/bubblewrap-prefix/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" --version
-          ls -l "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap"
+          # Install the runtime the way every distribution installs it: a
+          # root-owned, setuid binary in a root-owned directory. The
+          # GitHub-hosted Ubuntu images refuse an unprivileged process's write
+          # to /proc/<pid>/uid_map — a plain `unshare -Ur -- true`, with no
+          # helper involved, fails the same way — so a non-setuid bubblewrap can
+          # create the namespaces but never obtains privileges inside them and
+          # dies during setup, first as `setting up uid map: Permission denied`
+          # or, when a network namespace is also requested, as
+          # `loopback: Failed RTM_NEWADDR: Operation not permitted`. The setuid
+          # configuration is the stronger of the two, not a weaker one: it is the
+          # mode distribution packages ship and the mode upstream tests.
+          #
+          # The destination matters as much as the setuid bit. A setuid binary
+          # under a directory the invoking user can write is the classic
+          # replace-the-binary attack, and bubblewrap checks for it, so the
+          # binary goes to a root-owned directory rather than back into the
+          # user-owned temporary prefix.
+          sudo install -m 4755 -o root -g root \
+            "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" /usr/local/bin/bwrap
+          ls -ld /usr/local/bin
+          ls -l /usr/local/bin/bwrap
+          command -v bwrap
+          test "$(command -v bwrap)" = /usr/local/bin/bwrap
+          bwrap --version
+          bwrap --help | grep -c -- '--perms'
 
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
