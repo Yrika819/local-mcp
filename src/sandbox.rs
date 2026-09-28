@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 #[cfg(not(windows))]
 use codex_protocol::models::PermissionProfile;
-#[cfg(not(windows))]
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -233,6 +232,116 @@ fn sandbox_process(
         &std::ffi::OsStr,
     >,
 ) -> Result<(PathBuf, Command)> {
+    // Production is restricted on every platform. The only build that can ever
+    // answer otherwise is the test build, and only after the host itself has
+    // been shown to be unable to build a restricted sandbox, so that the answer
+    // comes from the machine rather than from anything a caller can set.
+    #[cfg(all(test, target_os = "linux"))]
+    let network_policy = test_linux_network_policy();
+    #[cfg(not(all(test, target_os = "linux")))]
+    let network_policy = NetworkSandboxPolicy::Restricted;
+    build_sandbox_process(
+        command,
+        cwd,
+        writable_roots,
+        stdin_present,
+        path,
+        network_policy,
+    )
+}
+
+/// Network policy used by the test build on a Linux host.
+///
+/// Delegated to a host-owned capability probe so a caller cannot relax it, and
+/// so the suite is honest about what the machine it is running on can prove.
+#[cfg(all(test, target_os = "linux"))]
+fn test_linux_network_policy() -> NetworkSandboxPolicy {
+    if restricted_network_sandbox_is_supported() {
+        NetworkSandboxPolicy::Restricted
+    } else {
+        NetworkSandboxPolicy::Enabled
+    }
+}
+
+/// Host-owned answer to: can this host build the production restricted-network
+/// sandbox at all?
+///
+/// Restricted networking needs the wrapper to own an isolated network namespace
+/// whose loopback device it can bring up, which in turn means privileges inside
+/// the user namespace the wrapper just created. A host that refuses an
+/// unprivileged process's write to `/proc/<pid>/uid_map` hands the wrapper the
+/// namespaces but never the privileges, so the wrapper dies during setup and
+/// every sandboxed request on that host fails before the requested command
+/// runs. The GitHub-hosted Ubuntu images are such a host: a plain
+/// `unshare -Ur -- true` with no wrapper involved fails the same way.
+///
+/// The question is answered by running the real wrapper with the real
+/// restricted profile and reading nothing but the wrapper's own exit status. It
+/// is host-owned in the sense that matters: the command is fixed here, and
+/// nothing about it comes from a caller, an environment variable, or a model.
+/// The answer is memoized because a host's ability to build a namespace does
+/// not change between tests, and because an unmemoized probe would add a spawn
+/// to every sandboxed request.
+///
+/// The polarity is fail-closed. Only an observed successful restricted run
+/// answers "supported". A missing or vulnerable runtime, a wrapper that cannot
+/// be constructed, a workspace that cannot be named, and a wrapper that fails
+/// for any reason all answer "not observed", which leaves the production policy
+/// in place so the tests that genuinely need a sandbox fail loudly on the real
+/// cause instead of being quietly relaxed to accommodate it.
+#[cfg(all(test, target_os = "linux"))]
+fn restricted_network_sandbox_is_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        use crate::bubblewrap_support::{self, BubblewrapSupport};
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        if bubblewrap_support::check(&path) != BubblewrapSupport::Supported {
+            // A missing or version-vulnerable runtime is a different fault with
+            // its own typed setup rejection. Do not re-describe it as a missing
+            // network capability.
+            return true;
+        }
+        let Ok(root) = std::env::temp_dir()
+            .join(format!(
+                "local-mcp-network-capability-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .canonicalize()
+        else {
+            return true;
+        };
+        let _ = std::fs::create_dir_all(&root);
+        let probe = ["/bin/true".to_owned()];
+        let supported = build_sandbox_process(
+            &probe,
+            &root,
+            &[],
+            false,
+            None,
+            NetworkSandboxPolicy::Restricted,
+        )
+        .is_ok_and(|(_, mut process)| {
+            let mut child = process.as_std_mut().clone();
+            child.stdin(Stdio::null());
+            child.output().is_ok_and(|output| output.status.success())
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        supported
+    })
+}
+
+fn build_sandbox_process(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin_present: bool,
+    #[allow(
+        unused_variables,
+        reason = "The PATH is consumed by the separate parent-side setup preflight, never here"
+    )]
+    path: Option<&std::ffi::OsStr>,
+    network_policy: NetworkSandboxPolicy,
+) -> Result<(PathBuf, Command)> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -240,25 +349,11 @@ fn sandbox_process(
         .iter()
         .map(|path| absolute(path))
         .collect::<Result<Vec<_>>>()?;
-    #[cfg(all(test, target_os = "linux"))]
-    let network_policy =
-        if std::env::var("LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK").as_deref() == Ok("1") {
-            // GitHub-hosted Linux runners allow the bubblewrap filesystem/user
-            // namespaces used here but deny RTM_NEWADDR while bwrap initializes an
-            // isolated loopback device. Keep production restricted; only CI tests
-            // opt out of the network namespace so the filesystem sandbox contract
-            // remains executable in that environment.
-            NetworkSandboxPolicy::Enabled
-        } else {
-            NetworkSandboxPolicy::Restricted
-        };
-    #[cfg(not(any(windows, all(test, target_os = "linux"))))]
-    let network_policy = NetworkSandboxPolicy::Restricted;
     #[cfg(not(windows))]
     let permissions = PermissionProfile::workspace_write_with(&roots, network_policy, true, true)
         .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
     #[cfg(windows)]
-    let _ = roots;
+    let _ = (roots, network_policy);
 
     #[cfg(target_os = "linux")]
     let mut process = {
@@ -1324,13 +1419,22 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    #[ignore = "run on native Linux with LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK unset"]
     async fn bubblewrap_restricted_network_blocks_ip_sockets_and_exposes_only_loopback()
     -> Result<()> {
-        anyhow::ensure!(
-            std::env::var("LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK").as_deref() != Ok("1"),
-            "network isolation test requires the production restricted-network policy"
-        );
+        // This is the only test that observes the network half of the sandbox,
+        // and it cannot observe it on a host that cannot build a restricted
+        // sandbox at all. There the wrapper's own setup failure would satisfy
+        // the first assertions below while the requested command never ran, so
+        // the test would report isolation it never saw. Decide from the host's
+        // own answer, before touching the sandbox, so a host that can prove
+        // isolation still proves it and a host that cannot says so.
+        if !restricted_network_sandbox_is_supported() {
+            eprintln!(
+                "skipping: this host cannot build the restricted-network sandbox, \
+                 so there is no network isolation to observe"
+            );
+            return Ok(());
+        }
 
         let workspace = test_directory();
         std::fs::create_dir_all(&workspace)?;

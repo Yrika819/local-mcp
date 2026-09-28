@@ -49,6 +49,37 @@ Sandbox setup errors are terminal for the sandboxed attempt. There is no
 automatic host-native fallback. Explicit host-native execution follows the
 separate approval boundary described in the main README.
 
+## Host capability for restricted networking
+
+A restricted-network profile needs the helper to own an isolated network
+namespace whose loopback device it can bring up, which requires privileges
+inside the user namespace the helper just created. A host that refuses an
+unprivileged process's write to `/proc/<pid>/uid_map` grants the namespaces but
+not the privileges, so the helper fails during setup and the requested command
+never runs. The GitHub-hosted Ubuntu images are such a host: a plain
+`unshare -Ur -- true`, with no helper involved, fails the same way. Installing
+Bubblewrap the way distributions install it — owned by root and setuid, the mode
+the upstream project tests — gives the helper the privileges it needs, and is
+the stronger of the two configurations rather than a relaxation of it.
+
+Production is restricted on every platform and cannot be configured otherwise.
+The test build is the only place that can answer differently, and it answers
+from the host: a memoized, fail-closed probe runs the real helper with the real
+restricted profile and reads only the helper's own exit status. Only an observed
+successful restricted run counts as supported. A missing or version-vulnerable
+runtime, a helper that cannot be constructed, and a failure of any kind all
+leave the production policy in place, so the tests that genuinely need a
+sandbox fail loudly on the real cause instead of being quietly relaxed. Nothing
+about the probe comes from a caller, an environment variable, or a model.
+
+The restricted-network isolation test is gated on that probe rather than on an
+environment variable, and is no longer `#[ignore]`d. On a host that can build a
+restricted sandbox it proves the isolation; on a host that cannot it reports
+that there is none to observe and passes, instead of satisfying its first
+assertions with the helper's own setup failure while the requested command never
+ran. Filesystem confinement is unaffected either way: it is a separate half of
+the contract and is asserted on every host.
+
 ## Native evidence on 2026-09-23
 
 The validation host reported Ubuntu 26.04.1 LTS, kernel 7.0.0-34-generic,
