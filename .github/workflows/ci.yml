@@ -193,55 +193,62 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          set -uo pipefail
+          # GitHub invokes `shell: bash` as `bash -eo pipefail`, so every probe
+          # below would abort the step at the first failure. Disable that: a
+          # failing probe is a result, not a reason to stop measuring.
+          set +e
           bwrap_bin="$(command -v bwrap || true)"
-          printf '### bwrap_path=%s\n' "$bwrap_bin"
-          if [ -n "$bwrap_bin" ]; then
-            ls -l "$bwrap_bin"
-            readlink -f "$bwrap_bin"
-            getcap "$bwrap_bin" 2>/dev/null || true
-            "$bwrap_bin" --version 2>&1 || true
-          fi
+          printf '### bwrap\n'
+          ls -l "$bwrap_bin"
+          "$bwrap_bin" --version
+          findmnt -no OPTIONS -T "$bwrap_bin"
           printf '### host\n'
           uname -a
-          cat /etc/os-release 2>/dev/null | head -3
-          systemd-detect-virt 2>/dev/null || true
-          printf '### namespaces\n'
-          printf 'uid_map='; cat /proc/self/uid_map
-          printf 'gid_map='; cat /proc/self/gid_map
-          readlink /proc/self/ns/user /proc/self/ns/net /proc/self/ns/mnt /proc/self/ns/pid
-          grep -E '^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp|Seccomp_filters):' /proc/self/status
-          cat /proc/sys/user/max_user_namespaces 2>/dev/null
-          cat /proc/sys/user/max_net_namespaces 2>/dev/null
-          sysctl kernel.unprivileged_userns_clone 2>&1 | head -2
-          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 | head -2
+          systemd-detect-virt 2>/dev/null
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>&1
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>&1
           printf 'apparmor_self='; cat /proc/self/attr/current 2>&1
-          printf '### A userns+pidns, no netns\n'
-          bwrap --new-session --die-with-parent --unshare-user --unshare-pid \
-            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo A_OK' 2>&1
-          printf 'A_rc=%s\n' "$?"
-          printf '### B userns+pidns+netns (the failing combination)\n'
-          bwrap --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
-            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo B_OK' 2>&1
-          printf 'B_rc=%s\n' "$?"
-          printf '### C bare --unshare-net\n'
-          bwrap --unshare-user --unshare-net --ro-bind / / /bin/true 2>&1
-          printf 'C_rc=%s\n' "$?"
-          printf '### D kernel-native netlink, no bubblewrap\n'
-          unshare -Urn -- ip link set lo up 2>&1
-          printf 'D_link_rc=%s\n' "$?"
-          unshare -Urn -- ip addr add 127.0.0.1/8 dev lo 2>&1
-          printf 'D_addr_rc=%s\n' "$?"
-          unshare -Urip -- true 2>&1
-          printf 'D_ctrl_rc=%s\n' "$?"
-          printf '### E netns ids bwrap reports\n'
-          bwrap --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
-            --json-status-fd 3 --ro-bind / / --proc /proc -- /bin/true 3>/tmp/bw-status.json 2>&1
-          printf 'E_rc=%s\n' "$?"
-          cat /tmp/bw-status.json 2>/dev/null
-          printf '\n### F capabilities inside the new userns+netns\n'
-          unshare -Urn -- sh -c 'grep -E "^Cap(Eff|Bnd):" /proc/self/status; ip -o link 2>&1 | head' 2>&1
-          printf 'F_rc=%s\n' "$?"
+          printf 'uid_map='; cat /proc/self/uid_map
+          grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status
+          printf '### P1 userns only, kernel-native\n'
+          unshare -Ur -- id -u; printf 'P1_rc=%s\n' "$?"
+          printf '### P2 userns+netns, kernel-native loopback\n'
+          unshare -Urn -- ip link set lo up; printf 'P2_link_rc=%s\n' "$?"
+          unshare -Urn -- ip addr add 127.0.0.1/8 dev lo; printf 'P2_addr_rc=%s\n' "$?"
+          unshare -Urn -- sh -c 'grep -E "^Cap(Eff|Bnd):" /proc/self/status; ip -o link'
+          printf 'P2_caps_rc=%s\n' "$?"
+          printf '### B1 bwrap userns+pidns, NO netns\n'
+          "$bwrap_bin" --new-session --die-with-parent --unshare-user --unshare-pid \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo B1_OK'
+          printf 'B1_rc=%s\n' "$?"
+          printf '### B2 bwrap userns+pidns+netns\n'
+          "$bwrap_bin" --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo B2_OK'
+          printf 'B2_rc=%s\n' "$?"
+          printf '### B3 bwrap auto-detect (no explicit --unshare-user)\n'
+          "$bwrap_bin" --new-session --die-with-parent --unshare-net \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo B3_OK'
+          printf 'B3_rc=%s\n' "$?"
+          printf '### B4 bwrap namespace ids from --json-status-fd\n'
+          "$bwrap_bin" --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
+            --json-status-fd 3 --ro-bind / / --proc /proc -- /bin/true 3>/tmp/bw.json
+          printf 'B4_rc=%s\n' "$?"
+          cat /tmp/bw.json 2>/dev/null
+          printf '\n### S1 reinstall bubblewrap setuid root\n'
+          sudo meson configure "$RUNNER_TEMP/bubblewrap/build" -Dsetuid=true
+          printf 'S1_configure_rc=%s\n' "$?"
+          sudo meson compile -C "$RUNNER_TEMP/bubblewrap/build" >/dev/null
+          sudo meson install -C "$RUNNER_TEMP/bubblewrap/build" >/dev/null
+          printf 'S1_install_rc=%s\n' "$?"
+          ls -l "$bwrap_bin"
+          printf '### S2 bwrap setuid, userns+pidns NO netns\n'
+          "$bwrap_bin" --new-session --die-with-parent --unshare-user --unshare-pid \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo S2_OK'
+          printf 'S2_rc=%s\n' "$?"
+          printf '### S3 bwrap setuid, userns+pidns+netns\n'
+          "$bwrap_bin" --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo S3_OK'
+          printf 'S3_rc=%s\n' "$?"
           exit 0
 
       - name: Run tests
