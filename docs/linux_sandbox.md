@@ -126,6 +126,13 @@ and passed. Formatting and production/all-target clippy checks passed on both
 toolchains; `cargo check --locked` passed on 1.98.1. Release compilation and CLI
 version/help inspection passed on Rust 1.96.0.
 
+This section records a single dated run and is not current guidance. The
+restricted-network test it describes as ignored is no longer `#[ignore]`d, and
+`LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK` no longer exists: the policy that test runs
+under is now chosen by the host-owned probe described above, which reads no
+environment variable. See "Host capability for restricted networking" for how
+the suite behaves now.
+
 ## CVE-2026-87766 applicability
 
 This issue applies to the sandbox setup path. The pinned Codex Bubblewrap builder
