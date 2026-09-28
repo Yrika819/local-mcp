@@ -98,7 +98,7 @@ fn add_dependency(task: &mut Task, dependency: &TaskId) {
     .unwrap();
 }
 
-/// Build the PokéCPU-shaped durable fixture: an oversized read-only Task A that
+/// Build the production-shaped durable fixture: an oversized read-only Task A that
 /// failed with a deterministic host output limit, a broad reassessment
 /// workaround W that was prepended downstream of nothing, a downstream Task B,
 /// a Writer C downstream of B, and a completion criterion requiring A.
@@ -372,7 +372,7 @@ fn new_ref(proposal_id: &str) -> Value {
 
 /// A materially decomposed replacement: three bounded read-only research Tasks
 /// plus a compact join/synthesis Task, exactly as a budget-aware Replanner must
-/// produce. The domain split is arbitrary; nothing here is PokéCPU-specific.
+/// produce. The domain split is arbitrary; nothing here is project-specific.
 fn decomposed_proposal(fixture: &Fixture, request_id: &str) -> Value {
     let goal = load(fixture);
     json!({
