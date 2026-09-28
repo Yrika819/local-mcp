@@ -179,31 +179,23 @@ jobs:
             -Dbash_completion=disabled -Dzsh_completion=disabled
           meson compile -C "$RUNNER_TEMP/bubblewrap/build"
           meson install -C "$RUNNER_TEMP/bubblewrap/build"
-          # Install the runtime the way every distribution installs it: a
-          # root-owned, setuid binary in a root-owned directory. The
-          # GitHub-hosted Ubuntu images refuse an unprivileged process's write
-          # to /proc/<pid>/uid_map — a plain `unshare -Ur -- true`, with no
-          # helper involved, fails the same way — so a non-setuid bubblewrap can
-          # create the namespaces but never obtains privileges inside them and
-          # dies during setup, first as `setting up uid map: Permission denied`
-          # or, when a network namespace is also requested, as
-          # `loopback: Failed RTM_NEWADDR: Operation not permitted`. The setuid
-          # configuration is the stronger of the two, not a weaker one: it is the
-          # mode distribution packages ship and the mode upstream tests.
-          #
-          # The destination matters as much as the setuid bit. A setuid binary
-          # under a directory the invoking user can write is the classic
-          # replace-the-binary attack, and bubblewrap checks for it, so the
-          # binary goes to a root-owned directory rather than back into the
-          # user-owned temporary prefix.
-          sudo install -m 4755 -o root -g root \
+          # Keep the runtime out of any directory the invoking user can write,
+          # and record the one capability the suite depends on. Upstream removed
+          # setuid support outright ("setuid use of bubblewrap is not supported"),
+          # so a user namespace is the only route to privileges, and a host that
+          # refuses an unprivileged write to /proc/<pid>/uid_map cannot build
+          # this sandbox at all. Report what this runner can do rather than
+          # finding out from sixteen tests.
+          sudo install -m 0755 -o root -g root \
             "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" /usr/local/bin/bwrap
-          ls -ld /usr/local/bin
-          ls -l /usr/local/bin/bwrap
+          echo "$RUNNER_TEMP/bubblewrap-prefix/bin" >> "$GITHUB_PATH"
           command -v bwrap
-          test "$(command -v bwrap)" = /usr/local/bin/bwrap
           bwrap --version
-          bwrap --help | grep -c -- '--perms'
+          if unshare -Ur -- true 2>/dev/null; then
+            echo "sandbox_capability=user_namespace_available"
+          else
+            echo "sandbox_capability=unavailable"
+          fi
 
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'

@@ -1,0 +1,78 @@
+# TEMPORARY (ci/public-matrix-closure-v1): capability survey.
+#
+# The `test (ubuntu-x64)` job cannot build the Linux sandbox: the hosted image
+# refuses an unprivileged write to /proc/<pid>/uid_map, and the pinned upstream
+# Bubblewrap has removed setuid support, so a user namespace is the only route
+# to the privileges the sandbox needs. This survey answers one question across
+# the hosted images so the suite is placed on a runner that can actually run
+# it, instead of skipping tests on one that cannot.
+#
+# Dispatch manually; delete the file once the answer is recorded.
+name: TEMP sandbox capability survey
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-sandbox-survey
+  cancel-in-progress: true
+
+jobs:
+  survey:
+    name: survey (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            runner: ubuntu-22.04
+          - name: ubuntu-24.04
+            runner: ubuntu-24.04
+          - name: ubuntu-24.04-arm
+            runner: ubuntu-24.04-arm
+          - name: ubuntu-26.04
+            runner: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Probe the sandbox prerequisites
+        shell: bash
+        run: |
+          set +e
+          printf '### host\n'
+          uname -a
+          cat /etc/os-release 2>/dev/null | head -2
+          printf 'id='; id
+          printf 'apparmor='; cat /proc/self/attr/current 2>&1
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>&1
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>&1
+          cat /proc/sys/user/max_user_namespaces 2>&1
+          printf '### P1 unprivileged user namespace (no bubblewrap)\n'
+          unshare -Ur -- id -u 2>&1
+          printf 'P1_rc=%s\n' "$?"
+          printf '### P2 unprivileged user namespace + mount + pid\n'
+          unshare -Urmpf -- /bin/true 2>&1
+          printf 'P2_rc=%s\n' "$?"
+          printf '### P3 user namespace + netns + loopback\n'
+          unshare -Urn -- ip addr add 127.0.0.1/8 dev lo 2>&1
+          printf 'P3_rc=%s\n' "$?"
+          printf '### P4 the distribution bubblewrap, if any\n'
+          if command -v bwrap >/dev/null 2>&1; then
+            bwrap --version 2>&1
+            bwrap --new-session --die-with-parent --unshare-user --unshare-pid \
+              --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo P4_OK' 2>&1
+            printf 'P4_rc=%s\n' "$?"
+            bwrap --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
+              --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo P5_OK' 2>&1
+            printf 'P5_rc=%s\n' "$?"
+          else
+            echo 'no distribution bwrap'
+          fi
+          exit 0
