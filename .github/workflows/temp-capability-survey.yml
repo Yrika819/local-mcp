@@ -12,6 +12,11 @@ name: TEMP sandbox capability survey
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ci/public-matrix-closure-v1
+    paths:
+      - .github/workflows/temp-capability-survey.yml
 
 permissions:
   contents: read
