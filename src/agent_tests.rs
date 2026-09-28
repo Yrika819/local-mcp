@@ -230,6 +230,343 @@ fn bounded_process_maps_success_empty_exit_timeout_and_output_limits() {
 }
 
 #[cfg(unix)]
+/// A diagnostic volume past the host's retention budget.
+///
+/// Twice the budget is enough to be unambiguously over the cap while keeping the
+/// fixture cheap, because a flood competes for the same machine as the
+/// timing-sensitive lifecycle tests running beside it.
+const DIAGNOSTIC_FLOOD_BYTES: usize = MODEL_STDERR_LIMIT * 2;
+
+#[cfg(unix)]
+/// A diagnostic volume far past any pipe buffer.
+///
+/// A host that stops reading stderr once its retention cap is reached leaves the
+/// child blocked on a full pipe, so this volume only completes if the host keeps
+/// draining to end of file. It is many times both the retention cap and a typical
+/// pipe buffer, so the child cannot finish without a reader that stays on the
+/// pipe.
+const DIAGNOSTIC_PIPE_FLOOD_BYTES: usize = 1024 * 1024;
+
+#[cfg(unix)]
+/// Block size the byte-volume fixtures below are written in.
+const FLOOD_BLOCK_BYTES: usize = 64 * 1024;
+
+#[cfg(unix)]
+/// A shell command writing a bounded flood of at least `bytes` bytes to stdout.
+///
+/// The volume comes from a bounded `dd` read rather than an unbounded flood, so
+/// how much output crossed the pipe is a fact about the fixture rather than about
+/// how much a scheduler happened to run before a deadline. stdout is pointed at
+/// the real pipe first, and only then is `dd`'s own transfer statistics report
+/// discarded: reversing those two redirections would send the flood itself to
+/// `/dev/null` rather than to the host. The volume is a whole number of blocks,
+/// so it is exact.
+fn stdout_flood(bytes: usize) -> String {
+    format!(
+        "/bin/dd if=/dev/zero bs={FLOOD_BLOCK_BYTES} count={} 2>/dev/null",
+        bytes.div_ceil(FLOOD_BLOCK_BYTES)
+    )
+}
+
+#[cfg(unix)]
+/// A shell command writing a bounded flood of at least `bytes` bytes to stderr.
+/// See [`stdout_flood`] for why the volume is produced this way.
+fn stderr_flood(bytes: usize) -> String {
+    format!(
+        "/bin/dd if=/dev/zero bs={FLOOD_BLOCK_BYTES} count={} 1>&2 2>/dev/null",
+        bytes.div_ceil(FLOOD_BLOCK_BYTES)
+    )
+}
+
+#[cfg(unix)]
+/// A fixture that consumes its prompt, writes `stdout` and then `payload` to
+/// stderr byte for byte, and exits cleanly.
+///
+/// The payload is written by the test rather than produced by a shell filter
+/// because this stream carries arbitrary bytes, not text. A filter asked to emit
+/// invalid UTF-8 would be doing exactly the decoding this capture must never
+/// require, and it would be slow enough to make the run depend on how quickly a
+/// character-oriented tool happened to run.
+fn binary_diagnostic_fixture(root: &Path, name: &str, stdout: &str, payload: &[u8]) -> PathBuf {
+    let path = root.join(format!("{name}.payload"));
+    std::fs::write(&path, payload).unwrap();
+    draining_script(
+        root,
+        name,
+        &format!(
+            "printf '{stdout}'\n/bin/cat '{}' >&2\nexit 0",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn verbose_diagnostic_stderr_does_not_fail_a_valid_bounded_response() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-diag-flood-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // A model whose diagnostic stream is several times the host's retention
+    // budget, with a small and perfectly valid response on stdout. The
+    // diagnostic budget bounds retention, not correctness: a chatty CLI must not
+    // be able to kill an otherwise valid bounded response, because the host
+    // validates stdout and discards stderr.
+    let script = draining_script(
+        &root,
+        "diagnostic-flood.sh",
+        &format!(
+            "printf exact\n{}\nexit 0",
+            stderr_flood(DIAGNOSTIC_FLOOD_BYTES)
+        ),
+    );
+    let started = Instant::now();
+    let output =
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .expect("a verbose diagnostic stream must not fail a valid bounded response");
+    assert_eq!(output.stdout(), b"exact");
+    assert_eq!(output.exit_status(), 0);
+    // Retention is capped even though the child produced several times that much,
+    // the shortfall is recorded explicitly, and the run is bounded by the fixture
+    // rather than by the deadline.
+    assert_eq!(output.stderr_bytes_retained(), MODEL_STDERR_LIMIT);
+    assert_eq!(output.stderr_total_bytes(), DIAGNOSTIC_FLOOD_BYTES);
+    assert!(output.stderr_truncated());
+    assert_eq!(output.safe_stderr().len(), MODEL_STDERR_LIMIT);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_large_but_legal_stdout_is_delivered_whole() {
+    let root =
+        std::env::temp_dir().join(format!("local-mcp-agent-stdout-whole-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // Far larger than a pipe buffer and comfortably inside the semantic bound.
+    // The strict capture promises the host either the whole bounded response or
+    // a failure, so this pins the half of that promise the overflow case does
+    // not cover: a long response must arrive intact rather than shortened at a
+    // read boundary.
+    let bytes = MODEL_STDOUT_LIMIT / 2;
+    let script = draining_script(
+        &root,
+        "stdout-whole.sh",
+        &format!("{}\nexit 0", stdout_flood(bytes)),
+    );
+    let output =
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .expect("a bounded stdout response must be delivered whole");
+    assert_eq!(output.stdout().len(), bytes);
+    assert!(output.stdout().iter().all(|byte| *byte == 0));
+    assert_eq!(output.exit_status(), 0);
+    // The quiet stream stays quiet, and nothing about it is reported as dropped.
+    assert!(output.safe_stderr().is_empty());
+    assert_eq!(output.stderr_bytes_retained(), 0);
+    assert_eq!(output.stderr_total_bytes(), 0);
+    assert!(!output.stderr_truncated());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_stdout_past_its_bound_is_still_a_fatal_response_too_large() {
+    let root =
+        std::env::temp_dir().join(format!("local-mcp-agent-stdout-flood-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // Stdout is the model's semantic response. Exceeding its bound is a real
+    // transport failure, and the retained-diagnostic change must never have
+    // turned it into a silent truncation.
+    let script = draining_script(
+        &root,
+        "stdout-flood.sh",
+        &format!("{}\nexit 0", stdout_flood(MODEL_STDOUT_LIMIT * 2)),
+    );
+    assert_eq!(
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .unwrap_err(),
+        AgentError::ResponseTooLarge
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn verbose_diagnostic_stderr_does_not_mask_a_nonzero_exit() {
+    let root =
+        std::env::temp_dir().join(format!("local-mcp-agent-diag-nonzero-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // Truncating a diagnostic stream must not convert a failed process into a
+    // successful one, and must not reclassify it as an output-limit failure: the
+    // child's own exit status is the outcome.
+    let script = draining_script(
+        &root,
+        "diagnostic-flood-nonzero.sh",
+        &format!(
+            "printf exact\n{}\nexit 7",
+            stderr_flood(DIAGNOSTIC_FLOOD_BYTES)
+        ),
+    );
+    assert_eq!(
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .unwrap_err(),
+        AgentError::NonZeroExit
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_stderr_far_past_a_pipe_buffer_drains_instead_of_blocking_the_child() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-drain-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // Far past both the retention budget and any pipe buffer. Two regressions are
+    // discriminated here. A host that treats overflow as fatal fails this run
+    // immediately with an output-limit error. A host that truncates but then
+    // stops reading blocks this child on a full pipe, and the run ends at the
+    // deadline with the diagnostic volume short of what the child actually wrote.
+    let script = draining_script(
+        &root,
+        "diagnostic-drain.sh",
+        &format!(
+            "printf exact\n{}\nexit 0",
+            stderr_flood(DIAGNOSTIC_PIPE_FLOOD_BYTES)
+        ),
+    );
+    let started = Instant::now();
+    let output =
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .expect("a drained diagnostic stream must not end the run at the deadline");
+    assert_eq!(output.stdout(), b"exact");
+    assert_eq!(output.stderr_bytes_retained(), MODEL_STDERR_LIMIT);
+    // The whole volume crossed the pipe and was accounted for even though only
+    // the retention budget was kept.
+    assert_eq!(output.stderr_total_bytes(), DIAGNOSTIC_PIPE_FLOOD_BYTES);
+    assert!(output.stderr_truncated());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_diagnostic_flood_behind_a_retained_pipe_is_bounded_by_the_deadline() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-flood-pipe-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    // A descendant keeps the inherited stderr write end open after the child
+    // exits, so the drain never reaches end of file. Because draining is
+    // unconditional, what bounds this run is the run's own deadline, exactly as
+    // it is for a retained pipe carrying no flood at all. It used to be reported
+    // as an output-limit failure instead, purely because the flood tripped the
+    // old retention cap before the retained pipe was ever noticed, which is the
+    // diagnostic noise being mistaken for a semantic failure all over again.
+    let script = temporary_script(
+        &root,
+        "flood-retained-pipe.sh",
+        &format!(
+            "#!/bin/sh\n/bin/sleep {} &\nprintf '%s' \"$!\" > '{}'\n{}\nexit 0\n",
+            DESCENDANT_LIFETIME_SECS,
+            pid_path.display(),
+            stderr_flood(DIAGNOSTIC_PIPE_FLOOD_BYTES),
+        ),
+    );
+    let timeout = LIFECYCLE_TEST_DEADLINE;
+    let started = Instant::now();
+    let command = [script.to_string_lossy().into_owned()];
+    // The descendant is observed while the run is still in flight, so the
+    // cleanup assertion below is always about a process that really existed.
+    let (result, pid) = tokio::join!(
+        run_bounded_process_async_for_test(&command, b"prompt", &root, timeout),
+        wait_for_descendant_pid(&pid_path),
+    );
+    assert_eq!(result.unwrap_err(), AgentError::Timeout);
+    assert!(started.elapsed() < timeout + PROCESS_CLEANUP_GRACE + Duration::from_secs(1));
+    let mut alive = true;
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !alive,
+        "the deadline must still reap the group holding the pipe"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_diagnostic_stderr_stays_bounded_and_sanitizable() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-diag-binary-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // Two byte classes the sanitizer has to survive: 0xFF is never valid UTF-8, so
+    // every one of them is a decoding boundary, and 0x1B is a control byte that
+    // must not reach a report as itself.
+    let payload: Vec<u8> = [0xff_u8, 0x1b].repeat(DIAGNOSTIC_FLOOD_BYTES / 2);
+    let script = binary_diagnostic_fixture(&root, "diagnostic-binary.sh", "exact", &payload);
+    let output =
+        run_bounded_process_for_test(&command(&script.to_string_lossy(), &[]), b"prompt", SLOW)
+            .expect("arbitrary diagnostic bytes must not fail a valid bounded response");
+    // The semantic response is untouched by any of this.
+    assert_eq!(output.stdout(), b"exact");
+    assert_eq!(output.stderr_bytes_retained(), MODEL_STDERR_LIMIT);
+    assert_eq!(output.stderr_total_bytes(), payload.len());
+    assert!(output.stderr_truncated());
+    // Only the retained prefix is decoded, each raw byte becomes exactly one
+    // sanitized character, and no control byte survives as itself.
+    let expected: String = (0..MODEL_STDERR_LIMIT / 2)
+        .flat_map(|_| ['\u{fffd}', '?'])
+        .collect();
+    assert_eq!(output.safe_stderr(), expected);
+    assert!(!output.safe_stderr().chars().any(char::is_control));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn both_streams_past_their_bounds_keep_the_semantic_limit_authoritative_and_reap() {
+    let root = std::env::temp_dir().join(format!("local-mcp-agent-both-flood-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let pid_path = root.join("descendant.pid");
+    // Both streams are past their bounds and a descendant holds the inherited
+    // pipes, so the semantic stdout failure has to stay authoritative while the
+    // group is still reaped: a launcher that leaked the descendant here would
+    // leave an orphan behind every time a noisy model failed.
+    let script = temporary_script(
+        &root,
+        "both-flood.sh",
+        &format!(
+            "#!/bin/sh\n/bin/sleep {} &\nprintf '%s' \"$!\" > '{}'\n{}\n{}\nexit 0\n",
+            DESCENDANT_LIFETIME_SECS,
+            pid_path.display(),
+            stdout_flood(MODEL_STDOUT_LIMIT + FLOOD_BLOCK_BYTES),
+            stderr_flood(DIAGNOSTIC_FLOOD_BYTES),
+        ),
+    );
+    let command = [script.to_string_lossy().into_owned()];
+    // The descendant is observed while the run is still in flight, so the
+    // cleanup assertion below is always about a process that really existed.
+    let (result, pid) = tokio::join!(
+        run_bounded_process_async_for_test(&command, b"prompt", &root, SLOW),
+        wait_for_descendant_pid(&pid_path),
+    );
+    assert_eq!(result.unwrap_err(), AgentError::ResponseTooLarge);
+    let mut alive = true;
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !alive,
+        "the failure path must still reap the whole process group"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
 #[test]
 fn a_momentarily_busy_executable_is_started_once_it_stops_being_written() {
     let root = std::env::temp_dir().join(format!("local-mcp-agent-busy-{}", Uuid::new_v4()));

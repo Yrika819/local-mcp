@@ -85,6 +85,9 @@ pub(crate) struct ModelInvocationOutput {
     stdout: Vec<u8>,
     safe_stderr: String,
     exit_status: i32,
+    stderr_bytes_retained: usize,
+    stderr_total_bytes: usize,
+    stderr_truncated: bool,
 }
 
 #[allow(
@@ -92,11 +95,44 @@ pub(crate) struct ModelInvocationOutput {
     reason = "Frozen model-output accessors are retained for the staged Goal Orchestrator backend interface."
 )]
 impl ModelInvocationOutput {
+    /// Builds an output from an injected diagnostic string, as a test transport
+    /// supplies.
+    ///
+    /// An injected transport never crossed a capture, so the host holds exactly
+    /// the diagnostic it was handed and nothing was dropped: retained and total
+    /// are that string's length and it is not truncated. Only
+    /// [`Self::from_bounded_run`] has a raw byte count to report.
     pub(crate) fn new(stdout: Vec<u8>, safe_stderr: String, exit_status: i32) -> Self {
         Self {
             stdout,
+            stderr_bytes_retained: safe_stderr.len(),
+            stderr_total_bytes: safe_stderr.len(),
+            stderr_truncated: false,
             safe_stderr,
             exit_status,
+        }
+    }
+
+    /// Builds an output from a real bounded run, recording what the diagnostic
+    /// stream's bounding did.
+    ///
+    /// An injected transport supplies a diagnostic string directly and never
+    /// crossed a capture, so [`Self::new`] reports it as wholly retained. A real
+    /// run reports the raw retained byte count, the full observed byte count, and
+    /// whether the retention budget was passed, so the host can report the
+    /// bounding without ever exposing the discarded bytes.
+    fn from_bounded_run(
+        stdout: Vec<u8>,
+        stderr: BoundedDiagnosticCapture,
+        exit_status: i32,
+    ) -> Self {
+        Self {
+            stdout,
+            safe_stderr: safe_diagnostic(&stderr.retained),
+            exit_status,
+            stderr_bytes_retained: stderr.retained.len(),
+            stderr_total_bytes: stderr.total_bytes,
+            stderr_truncated: stderr.truncated,
         }
     }
 
@@ -110,6 +146,18 @@ impl ModelInvocationOutput {
 
     pub(crate) fn exit_status(&self) -> i32 {
         self.exit_status
+    }
+
+    pub(crate) fn stderr_bytes_retained(&self) -> usize {
+        self.stderr_bytes_retained
+    }
+
+    pub(crate) fn stderr_total_bytes(&self) -> usize {
+        self.stderr_total_bytes
+    }
+
+    pub(crate) fn stderr_truncated(&self) -> bool {
+        self.stderr_truncated
     }
 
     pub(crate) fn into_stdout(self) -> Vec<u8> {
@@ -261,15 +309,26 @@ fn joined_model_invocation(request: &ModelInvocation) -> Result<ModelInvocationO
 
     match &result {
         Ok(output) => eprintln!(
-            "goal_model_invocation role={} outcome=SUCCESS duration_ms={} stdout_bytes={} stderr_bytes={} exit_status={}",
+            "goal_model_invocation role={} outcome=SUCCESS duration_ms={} stdout_bytes_retained={} stderr_bytes_retained={} stderr_total_bytes={} stderr_truncated={} exit_status={}",
             request.role().as_str(),
             started.elapsed().as_millis(),
             output.stdout.len(),
-            output.safe_stderr.len(),
+            output.stderr_bytes_retained(),
+            output.stderr_total_bytes(),
+            output.stderr_truncated(),
             output.exit_status
         ),
+        // Naming the stream keeps the overflow diagnosable without changing the
+        // display text that legacy durable host-limit reports are matched
+        // against. Only semantic stdout can reach this verdict.
+        Err(AgentError::ResponseTooLarge) => eprintln!(
+            "goal_model_invocation role={} outcome=ResponseTooLarge overflow_stream=STDOUT stdout_limit_bytes={} duration_ms={}",
+            request.role().as_str(),
+            MODEL_STDOUT_LIMIT,
+            started.elapsed().as_millis()
+        ),
         Err(error) => eprintln!(
-            "goal_model_invocation role={} outcome={error:?} duration_ms={}",
+            "goal_model_invocation role={} outcome={error:?} overflow_stream=NONE duration_ms={}",
             request.role().as_str(),
             started.elapsed().as_millis()
         ),
@@ -305,13 +364,60 @@ fn require_approval(approved: bool) -> Result<(), AgentError> {
     }
 }
 
+/// A failure of a STRICT capture.
+///
+/// This is reachable only from the strict semantic capture below, so `TooLarge`
+/// means a stream whose bytes the host actually validates overflowed its bound.
+/// The diagnostic capture cannot produce this type at all.
 #[derive(Debug)]
 enum CaptureError {
     TooLarge,
     Io,
 }
 
-async fn capture_bounded<R>(mut reader: R, limit: usize) -> Result<Vec<u8>, CaptureError>
+/// A failure of a bounded DIAGNOSTIC capture.
+///
+/// Overflow is deliberately not representable here. A diagnostic stream that
+/// passes its retention budget is truncated and the run continues, so the only
+/// way this capture can fail is a real IO failure. Keeping overflow out of the
+/// type is what makes `ResponseTooLarge` mean semantic stdout overflow and
+/// nothing else: a noisy stderr has no path to that verdict.
+#[derive(Debug)]
+enum DiagnosticCaptureError {
+    Io,
+}
+
+/// A bounded diagnostic stream, together with what its bounding did.
+///
+/// `retained` never exceeds the configured retention limit. `total_bytes`
+/// counts everything the child actually produced, including the bytes that were
+/// read off the pipe and discarded, and `truncated` records that the two differ.
+/// The discarded bytes themselves are not retained and are not reported.
+#[derive(Debug)]
+struct BoundedDiagnosticCapture {
+    retained: Vec<u8>,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+/// STRICT capture: the semantic stdout stream.
+///
+/// stdout carries the model's response and the payload the host validates, so
+/// passing `limit` is a real transport failure. The caller stops the run,
+/// cleans the process up per the bounded lifecycle, and reports
+/// `ResponseTooLarge`. Nothing is ever silently truncated here, because a
+/// truncated proposal is not a proposal the host can validate.
+///
+/// This is deliberately a different function from the diagnostic capture below,
+/// with a different error type, rather than one parameterized capture with a
+/// policy flag. The security property is that a reader cannot tell this stream is
+/// safe to truncate by looking at the code: there is no spelling of "truncate
+/// stdout" to reach for, and the only capture that can report an overflow is
+/// this one.
+async fn capture_strict_semantic_stdout<R>(
+    mut reader: R,
+    limit: usize,
+) -> Result<Vec<u8>, CaptureError>
 where
     R: AsyncRead + Unpin,
 {
@@ -330,6 +436,60 @@ where
     }
 }
 
+/// DIAGNOSTIC capture: the non-authoritative stderr stream.
+///
+/// stderr is progress and diagnostic transport output that the host only
+/// sanitizes for reporting, so `limit` is a retention budget rather than a
+/// correctness bound. Bytes past the budget are counted and discarded, and the
+/// read loop runs on to end of file regardless of how far over the budget it
+/// is: stopping at the cap would leave a verbose child blocked on a full pipe
+/// and turn its own progress output into a false timeout. Memory stays bounded
+/// regardless of how much the child writes, because `retained` stops growing at
+/// the cap and the read buffer is a fixed-size array.
+///
+/// The trade this makes is deliberate and worth stating: a child that emits
+/// unbounded diagnostics no longer fails fast on a limit, it runs until the
+/// process ends or the run's own deadline ends it. That is the correct verdict,
+/// because such a child genuinely did not finish, and the alternative — a cap on
+/// how long the host is willing to keep draining — is the same blocked-pipe
+/// deadlock this function exists to prevent.
+async fn capture_diagnostic_stderr_truncate_and_drain<R>(
+    mut reader: R,
+    limit: usize,
+) -> Result<BoundedDiagnosticCapture, DiagnosticCaptureError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut total_bytes = 0_usize;
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                return Ok(BoundedDiagnosticCapture {
+                    retained,
+                    total_bytes,
+                    truncated,
+                });
+            }
+            Ok(read) => {
+                // Saturating, so a child that could out-count a `usize` across a
+                // long drain still reports a bounded, non-wrapping total.
+                total_bytes = total_bytes.saturating_add(read);
+                let room = limit.saturating_sub(retained.len());
+                let keep = read.min(room);
+                retained.extend_from_slice(&buffer[..keep]);
+                if keep < read {
+                    truncated = true;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(DiagnosticCaptureError::Io),
+        }
+    }
+}
+
 async fn write_stdin(mut stdin: ChildStdin, prompt: Vec<u8>) -> io::Result<()> {
     stdin.write_all(&prompt).await
 }
@@ -338,6 +498,14 @@ fn capture_error_to_agent(error: CaptureError) -> AgentError {
     match error {
         CaptureError::TooLarge => AgentError::ResponseTooLarge,
         CaptureError::Io => AgentError::TransportFailure,
+    }
+}
+
+/// The diagnostic capture has no overflow failure to map, so a diagnostic stream
+/// can only ever contribute a genuine transport failure.
+fn diagnostic_capture_error_to_agent(error: DiagnosticCaptureError) -> AgentError {
+    match error {
+        DiagnosticCaptureError::Io => AgentError::TransportFailure,
     }
 }
 
@@ -398,7 +566,7 @@ async fn cleanup_async_process(
     group: &mut ProcessGroup,
     stdin_task: &mut Option<AbortOnDrop<io::Result<()>>>,
     stdout_task: &mut Option<AbortOnDrop<Result<Vec<u8>, CaptureError>>>,
-    stderr_task: &mut Option<AbortOnDrop<Result<Vec<u8>, CaptureError>>>,
+    stderr_task: &mut Option<AbortOnDrop<Result<BoundedDiagnosticCapture, DiagnosticCaptureError>>>,
     cleanup_deadline: Instant,
 ) {
     group.terminate();
@@ -430,19 +598,34 @@ struct RawProcessOutput {
     success: bool,
     exit_status: i32,
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stderr: BoundedDiagnosticCapture,
 }
 
 fn raw_output_to_sandbox(output: RawProcessOutput) -> sandbox::Output {
     sandbox::Output {
         status: output.exit_status,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: safe_diagnostic(&output.stderr),
+        // Only the retained portion is exposed. The discarded remainder is never
+        // reconstructed, so a verbose diagnostic stream cannot inflate a report.
+        // This path does not surface the truncation flag: it feeds tool
+        // execution, whose stderr is diagnostic text only, and `sandbox::Output`
+        // is a serialized contract that must not change for a bounding change.
+        stderr: safe_diagnostic(&output.stderr.retained),
         // The host spawned this process directly, so its start is host-proven.
         command_start: sandbox::CommandStart::Proven,
     }
 }
 
+/// Runs `command` under the bounded-process lifecycle, with one bound per stream
+/// and one policy per stream.
+///
+/// `stdout_limit` is a strict semantic bound: passing it fails the run with
+/// `ResponseTooLarge`, because the bytes on that stream are the response the
+/// host validates. `stderr_limit` is a diagnostic retention budget: passing it
+/// truncates what is retained and the run continues, because the bytes on that
+/// stream are non-authoritative output the host only sanitizes for reporting.
+/// The two are read concurrently and independently, so one stream's policy can
+/// never decide the other's verdict.
 async fn run_bounded_process_async(
     command: &[String],
     prompt: &[u8],
@@ -506,14 +689,15 @@ async fn run_bounded_process_async(
         stdin,
         prompt.to_vec(),
     ))));
-    let mut stdout_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
-        stdout,
-        stdout_limit,
-    ))));
-    let mut stderr_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
-        stderr,
-        stderr_limit,
-    ))));
+    // STRICT: the semantic response. Overflow is fatal and is never truncated.
+    let mut stdout_task = Some(AbortOnDrop::new(tokio::spawn(
+        capture_strict_semantic_stdout(stdout, stdout_limit),
+    )));
+    // DIAGNOSTIC: non-authoritative output. Overflow truncates and drains to end
+    // of file, so it is bounded in memory but never fatal on its own.
+    let mut stderr_task = Some(AbortOnDrop::new(tokio::spawn(
+        capture_diagnostic_stderr_truncate_and_drain(stderr, stderr_limit),
+    )));
     let mut status = None;
     let mut stdin_result = None;
     let mut stdout_result = None;
@@ -603,9 +787,9 @@ async fn run_bounded_process_async(
             }, if stderr_task.is_some() => {
                 stderr_task = None;
                 match result {
-                    Ok(Ok(output)) => stderr_result = Some(Ok(output)),
+                    Ok(Ok(capture)) => stderr_result = Some(Ok(capture)),
                     Ok(Err(error)) => {
-                        failure = Some(capture_error_to_agent(error));
+                        failure = Some(diagnostic_capture_error_to_agent(error));
                         break;
                     }
                     Err(_) => {
@@ -640,7 +824,7 @@ async fn run_bounded_process_async(
         .map_err(capture_error_to_agent)?;
     let stderr = stderr_result
         .ok_or(AgentError::TransportFailure)?
-        .map_err(capture_error_to_agent)?;
+        .map_err(diagnostic_capture_error_to_agent)?;
     Ok(RawProcessOutput {
         success: status.success(),
         exit_status: status.code().unwrap_or(-1),
@@ -673,9 +857,9 @@ fn run_bounded_process(
     if output.stdout.iter().all(u8::is_ascii_whitespace) {
         return Err(AgentError::EmptyResponse);
     }
-    Ok(ModelInvocationOutput::new(
+    Ok(ModelInvocationOutput::from_bounded_run(
         output.stdout,
-        safe_diagnostic(&output.stderr),
+        output.stderr,
         output.exit_status,
     ))
 }
