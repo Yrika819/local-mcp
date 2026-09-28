@@ -20,6 +20,17 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
+# Every `run:` block in this workflow is a POSIX script, so bash is the
+# workflow-wide default. Without it a step that omits `shell:` silently
+# defaults to PowerShell on Windows runners and fails on the first `set -euo
+# pipefail` before any Rust validation runs. On Windows runners `shell: bash`
+# is the Git-for-Windows bash that every Windows image ships. The two
+# Windows-only PE header checks declare `shell: pwsh` explicitly and are the
+# only steps that are not POSIX.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # ---------------------------------------------------------------------
   # Tier 1 - FAST / PRIMARY
@@ -174,6 +185,64 @@ jobs:
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
         run: cargo build --locked --bin codex-linux-sandbox
+
+      # TEMPORARY (ci/public-matrix-closure-v1): capability evidence for the
+      # `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` failure.
+      # Removed once the host-owned capability probe lands.
+      - name: TEMP sandbox capability diagnostics
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          bwrap_bin="$(command -v bwrap || true)"
+          printf '### bwrap_path=%s\n' "$bwrap_bin"
+          if [ -n "$bwrap_bin" ]; then
+            ls -l "$bwrap_bin"
+            readlink -f "$bwrap_bin"
+            getcap "$bwrap_bin" 2>/dev/null || true
+            "$bwrap_bin" --version 2>&1 || true
+          fi
+          printf '### host\n'
+          uname -a
+          cat /etc/os-release 2>/dev/null | head -3
+          systemd-detect-virt 2>/dev/null || true
+          printf '### namespaces\n'
+          printf 'uid_map='; cat /proc/self/uid_map
+          printf 'gid_map='; cat /proc/self/gid_map
+          readlink /proc/self/ns/user /proc/self/ns/net /proc/self/ns/mnt /proc/self/ns/pid
+          grep -E '^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp|Seccomp_filters):' /proc/self/status
+          cat /proc/sys/user/max_user_namespaces 2>/dev/null
+          cat /proc/sys/user/max_net_namespaces 2>/dev/null
+          sysctl kernel.unprivileged_userns_clone 2>&1 | head -2
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 | head -2
+          printf 'apparmor_self='; cat /proc/self/attr/current 2>&1
+          printf '### A userns+pidns, no netns\n'
+          bwrap --new-session --die-with-parent --unshare-user --unshare-pid \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo A_OK' 2>&1
+          printf 'A_rc=%s\n' "$?"
+          printf '### B userns+pidns+netns (the failing combination)\n'
+          bwrap --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
+            --ro-bind / / --proc /proc -- /bin/sh -c 'id -u; echo B_OK' 2>&1
+          printf 'B_rc=%s\n' "$?"
+          printf '### C bare --unshare-net\n'
+          bwrap --unshare-user --unshare-net --ro-bind / / /bin/true 2>&1
+          printf 'C_rc=%s\n' "$?"
+          printf '### D kernel-native netlink, no bubblewrap\n'
+          unshare -Urn -- ip link set lo up 2>&1
+          printf 'D_link_rc=%s\n' "$?"
+          unshare -Urn -- ip addr add 127.0.0.1/8 dev lo 2>&1
+          printf 'D_addr_rc=%s\n' "$?"
+          unshare -Urip -- true 2>&1
+          printf 'D_ctrl_rc=%s\n' "$?"
+          printf '### E netns ids bwrap reports\n'
+          bwrap --new-session --die-with-parent --unshare-user --unshare-pid --unshare-net \
+            --json-status-fd 3 --ro-bind / / --proc /proc -- /bin/true 3>/tmp/bw-status.json 2>&1
+          printf 'E_rc=%s\n' "$?"
+          cat /tmp/bw-status.json 2>/dev/null
+          printf '\n### F capabilities inside the new userns+netns\n'
+          unshare -Urn -- sh -c 'grep -E "^Cap(Eff|Bnd):" /proc/self/status; ip -o link 2>&1 | head' 2>&1
+          printf 'F_rc=%s\n' "$?"
+          exit 0
 
       - name: Run tests
         run: cargo test --locked --all-targets

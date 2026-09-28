@@ -103,10 +103,43 @@ fn add_dependency(task: &mut Task, dependency: &TaskId) {
 /// workaround W that was prepended downstream of nothing, a downstream Task B,
 /// a Writer C downstream of B, and a completion criterion requiring A.
 fn fixture(failure_class: FailureClass) -> Fixture {
-    let root = std::env::temp_dir().join(format!("local-mcp-replace-{}", Uuid::new_v4()));
+    fixture_under_root(
+        std::env::temp_dir().join(format!("local-mcp-replace-{}", Uuid::new_v4())),
+        failure_class,
+    )
+}
+
+/// Build the same fixture underneath a root that is only reachable through a
+/// symlink.
+///
+/// macOS reaches its temporary directory through a symlink, so a fixture built
+/// from the raw `std::env::temp_dir()` prefix stores one spelling of the
+/// workspace while the Replanner normalizes the replacement's scope against
+/// the canonical Goal cwd and holds another. Creating the alias explicitly
+/// reproduces that shape on every host, so the guarantee that a genuine
+/// narrowing is accepted is checked rather than assumed.
+#[cfg(unix)]
+fn symlinked_fixture(failure_class: FailureClass) -> Fixture {
+    let real = std::env::temp_dir().join(format!("local-mcp-replace-{}", Uuid::new_v4()));
+    fs::create_dir_all(&real).unwrap();
+    let alias = std::env::temp_dir().join(format!("local-mcp-replace-alias-{}", Uuid::new_v4()));
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    fixture_under_root(alias, failure_class)
+}
+
+fn fixture_under_root(root: PathBuf, failure_class: FailureClass) -> Fixture {
+    fs::create_dir_all(root.join("repo").join("src")).unwrap();
+    // Resolve the root before any of it reaches the Goal. The Planner
+    // canonicalizes a Goal cwd and normalizes every Task scope path against
+    // that canonical root, so a stored Goal only ever holds canonical absolute
+    // paths. A raw temporary-directory prefix is not one on a host where the
+    // temporary directory is itself reached through a symlink (`/tmp` links to
+    // `/private/tmp` and `/var` to `/private/var` on macOS), and comparing an
+    // aliased superseded scope against a canonical replacement scope would
+    // refuse a replacement that really is a narrowing.
+    let root = fs::canonicalize(&root).unwrap();
     let repo = root.join("repo");
     let state = root.join("state");
-    fs::create_dir_all(repo.join("src")).unwrap();
     fs::write(repo.join("sentinel.txt"), b"unchanged\n").unwrap();
     let session = crate::config::Session {
         id: format!("replace-{}", Uuid::new_v4()),
@@ -1118,9 +1151,13 @@ impl Drop for ClosureFixture {
 /// behind both of them.
 fn closure_fixture(with_unrelated: bool, filler_edges: usize) -> ClosureFixture {
     let root = std::env::temp_dir().join(format!("local-mcp-closure-{}", Uuid::new_v4()));
+    fs::create_dir_all(root.join("repo").join("src")).unwrap();
+    // Canonicalize for the same reason `fixture_under_root` does: every stored
+    // scope path is compared against a path the Replanner normalized from the
+    // canonical Goal cwd, so the fixture has to hold the real path too.
+    let root = fs::canonicalize(&root).unwrap();
     let repo = root.join("repo");
     let state = root.join("state");
-    fs::create_dir_all(repo.join("src")).unwrap();
     fs::write(repo.join("sentinel.txt"), b"unchanged\n").unwrap();
     let session = crate::config::Session {
         id: format!("closure-{}", Uuid::new_v4()),
@@ -2364,6 +2401,30 @@ fn a_replacement_closure_may_not_widen_the_superseded_scope() {
     let mut relaxed = decomposed_proposal(&fixture, REQUEST_ID);
     relaxed["add_tasks"][0]["scope"]["replay_safety"] = json!("VERIFY_BEFORE_RETRY");
     expect_rejected(&fixture, &relaxed);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_workspace_root_evaluates_narrowing_on_the_real_path() {
+    // The Replanner compares the superseded Task's stored scope against a
+    // replacement scope it normalized from the canonical Goal cwd. Those two
+    // spellings are the same directory only when both are the real path, which
+    // is not automatic on a host whose temporary directory is itself reached
+    // through a symlink. Build the fixture that way explicitly so a genuine
+    // narrowing is exercised rather than left to the host's path layout.
+    let fixture = symlinked_fixture(FailureClass::HostOutputLimit);
+    request_replan(&fixture, REQUEST_ID, &fixture.a, "REQUIRE_DECOMPOSITION");
+    let after = apply(&fixture, &decomposed_proposal(&fixture, REQUEST_ID)).expect(
+        "a replacement that really narrows the superseded scope must be accepted through a symlinked workspace root",
+    );
+    assert!(!has_dependency(&after, &fixture.b, &fixture.a));
+    assert_no_partial_replacement(&after, &fixture.a);
+
+    // The alias is not an escape hatch in the other direction either: a scope
+    // that reaches past the superseded Task is still refused.
+    let mut widened = decomposed_proposal(&fixture, REQUEST_ID);
+    widened["add_tasks"][0]["scope"]["allowed_paths"] = json!(["."]);
+    expect_rejected(&fixture, &widened);
 }
 
 #[test]
