@@ -127,9 +127,11 @@ jobs:
             echo "mode=RELEASE - tag ${GITHUB_REF} will publish"
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
-          echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "dry_run=$dry_run"
+            echo "release_tag=v$version"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "### Release plan"
             echo ""
@@ -386,10 +388,12 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          echo "### Packaged release artifacts" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| artifact | bytes | sha256 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Packaged release artifacts"
+            echo ""
+            echo "| artifact | bytes | sha256 |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
           for f in dist/*; do
             printf 'artifact=%s bytes=%s sha256=%s\n' \
               "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')" "$(sha256sum "$f" | cut -d' ' -f1)"
