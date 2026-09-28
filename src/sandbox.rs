@@ -320,8 +320,23 @@ fn restricted_network_sandbox_is_supported() -> bool {
             None,
             NetworkSandboxPolicy::Restricted,
         )
-        .is_ok_and(|(_, mut process)| {
-            let mut child = process.as_std_mut().clone();
+        .is_ok_and(|(_, process)| {
+            // `std::process::Command` is not `Clone`, so rebuild an equivalent
+            // child from the helper invocation the real run would have used.
+            // The probe blocks rather than awaits so it stays usable from the
+            // synchronous construction path, and it is memoized so it runs once.
+            let helper = process.as_std();
+            let mut child = std::process::Command::new(helper.get_program());
+            child.args(helper.get_args());
+            if let Some(directory) = helper.get_current_dir() {
+                child.current_dir(directory);
+            }
+            for (key, value) in helper.get_envs() {
+                match value {
+                    Some(value) => child.env(key, value),
+                    None => child.env_remove(key),
+                };
+            }
             child.stdin(Stdio::null());
             child.output().is_ok_and(|output| output.status.success())
         });
