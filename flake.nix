@@ -49,7 +49,7 @@
 
             meta = {
               description = "Sandboxed local-machine MCP server with out-of-band approvals";
-              homepage = "https://github.com/nakasyou/local-mcp";
+              homepage = "https://github.com/Yrika819/local-mcp";
               license = pkgs.lib.licenses.mit;
               mainProgram = "local-mcp";
               platforms = supportedSystems;

@@ -1,0 +1,19 @@
+# actionlint configuration for local workflow validation.
+#
+# actionlint 1.7.7 ships a built-in runner-label list that predates several
+# currently supported GitHub-hosted images. The labels below are confirmed
+# against the "Available Images" table in
+# https://github.com/actions/runner-images:
+#
+#   Ubuntu 26.04 x64   -> ubuntu-26.04
+#   macOS 26 Arm64     -> macos-26
+#   macOS 15 x64       -> macos-15-intel
+#   Windows 11 Arm64   -> windows-11-arm
+#
+# These are hosted-runner labels, not self-hosted ones.
+self-hosted-runner:
+  labels:
+    - macos-15-intel
+    - macos-26
+    - ubuntu-26.04
+    - windows-11-arm

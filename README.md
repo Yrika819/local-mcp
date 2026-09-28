@@ -4,6 +4,17 @@ Local MCP is released under the MIT License. OpenAI Codex dependencies retain
 their own upstream licenses and notices. Local MCP is an independent project and is
 not affiliated with or endorsed by OpenAI.
 
+## Upstream and attribution
+
+`local-mcp` originates from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp),
+which is distributed under the MIT License. This repository is an independent
+downstream continuation that carries substantial rework of the goal/task
+orchestrator, sandbox, and fallback boundaries described in `SECURITY.md` and
+`CHANGELOG.md`. It is not an official continuation of the upstream project, and it
+is not endorsed by or affiliated with the upstream maintainers. The original
+upstream copyright notice is preserved in [`LICENSE`](LICENSE), and dependency
+license evidence is recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 This project is not a tool for bypassing OpenAI safety, policy, usage, or rate-limit decisions.
 Safety and policy refusals are terminal: Local MCP does not reroute them to another
 model, shell, retry, or host-native execution path.
@@ -82,7 +93,7 @@ substitute the pinned Nixpkgs Bubblewrap package because it is older than the
 security fix:
 
 ```sh
-nix run github:nakasyou/local-mcp
+nix run github:Yrika819/local-mcp
 nix develop
 nix build
 ```

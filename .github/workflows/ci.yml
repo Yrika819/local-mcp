@@ -4,10 +4,72 @@ on:
   push:
   pull_request:
 
+# Least privilege for every job, including pull requests opened from forks.
+# No job in this workflow requires repository secrets, environment secrets, or
+# write scopes, so a fork pull request runs the exact same validation.
 permissions:
   contents: read
 
+# Cancel superseded runs for the same ref to avoid wasting runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
 jobs:
+  # ---------------------------------------------------------------------
+  # Tier 1 - FAST / PRIMARY
+  # Formatting, type checking, and linting on one pinned Linux runner.
+  # Fails fast and cheaply before the expensive matrix jobs start.
+  # ---------------------------------------------------------------------
+  quality:
+    name: quality (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            quality-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install the pinned toolchain and components
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          # rust-toolchain.toml pins `profile = "minimal"`, which installs only
+          # rustc/cargo/rust-std. CI additionally needs rustfmt and clippy.
+          rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Run production clippy
+        run: cargo clippy --locked -- -D warnings
+
+      - name: Run all-targets clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # ---------------------------------------------------------------------
+  # Tier 1 - PRIMARY
+  # Full locked test suite, release build, CLI smoke, and architecture
+  # verification on the currently supported primary platforms.
+  # ---------------------------------------------------------------------
   test:
     name: test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -21,50 +83,80 @@ jobs:
             runner_arch: X64
             uname: x86_64
             rust_host: x86_64-unknown-linux-gnu
-          - name: macos-intel
-            runner: macos-15-intel
-            runner_arch: X64
-            uname: x86_64
-            rust_host: x86_64-apple-darwin
+            release: local-mcp
+            bubblewrap: "true"
           - name: macos-arm64
             runner: macos-15
             runner_arch: ARM64
             uname: arm64
             rust_host: aarch64-apple-darwin
+            release: local-mcp
+            bubblewrap: "false"
+          - name: macos-intel
+            runner: macos-15-intel
+            runner_arch: X64
+            uname: x86_64
+            rust_host: x86_64-apple-darwin
+            release: local-mcp
+            bubblewrap: "false"
           - name: windows-x64
             runner: windows-2025
             runner_arch: X64
-            uname: x86_64
+            uname: ""
             rust_host: x86_64-pc-windows-msvc
+            release: local-mcp.exe
+            bubblewrap: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Log runner and toolchain
-        shell: bash
+
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            test-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install the pinned toolchain and components
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          # rust-toolchain.toml pins `profile = "minimal"`, which installs only
+          # rustc/cargo/rust-std. CI additionally needs rustfmt and clippy.
+          rustup component add rustfmt clippy
+
+      - name: Verify runner and toolchain architecture
+        shell: bash
+        env:
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          EXPECTED_UNAME: ${{ matrix.uname }}
+          EXPECTED_RUST_HOST: ${{ matrix.rust_host }}
+        run: |
+          set -euo pipefail
           printf 'runner_os=%s\n' "$RUNNER_OS"
           printf 'runner_arch=%s\n' "$RUNNER_ARCH"
-          printf 'uname_m=%s\n' "$(uname -m)"
           rustc --version --verbose
           cargo --version
-          test "$RUNNER_ARCH" = '${{ matrix.runner_arch }}'
-          test "$(uname -m)" = '${{ matrix.uname }}'
+          test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH"
+          # Windows Git Bash may report the emulated process architecture, so the
+          # uname assertion is only meaningful on Linux and macOS hosts.
+          if [ "$RUNNER_OS" != Windows ] && [ -n "$EXPECTED_UNAME" ]; then
+            printf 'uname_m=%s\n' "$(uname -m)"
+            test "$(uname -m)" = "$EXPECTED_UNAME"
+          fi
           host=$(rustc -vV | awk -F': ' '/^host:/{print $2}')
           printf 'rust_host=%s\n' "$host"
-          test "$host" = '${{ matrix.rust_host }}'
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run production clippy
-        run: cargo clippy --locked -- -D warnings
-      - name: Run all-targets clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+          test "$host" = "$EXPECTED_RUST_HOST"
+
       - name: Build fixed upstream Bubblewrap for Linux validation
-        if: runner.os == 'Linux'
+        if: matrix.bubblewrap == 'true'
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y meson ninja-build libcap-dev
           git clone --quiet https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap"
@@ -78,36 +170,196 @@ jobs:
           meson install -C "$RUNNER_TEMP/bubblewrap/build"
           echo "$RUNNER_TEMP/bubblewrap-prefix/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bubblewrap-prefix/bin/bwrap" --version
+
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
         run: cargo build --locked --bin codex-linux-sandbox
+
       - name: Run tests
         run: cargo test --locked --all-targets
+
       - name: Run native Linux restricted-network sandbox test
         if: runner.os == 'Linux'
         shell: bash
         run: env -u LOCAL_MCP_TEST_ALLOW_LINUX_NETWORK cargo test --locked sandbox::linux_tests::bubblewrap_restricted_network_blocks_ip_sockets_and_exposes_only_loopback -- --ignored --exact
+
       - name: Build release
         run: cargo build --release --locked
-      - name: Log release binary architecture
+
+      - name: CLI smoke
+        shell: bash
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          binary="target/release/$RELEASE_BINARY"
+          "$binary" --version
+          "$binary" --help
+
+      - name: Record release binary digest
+        shell: bash
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          binary="target/release/$RELEASE_BINARY"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$binary" | tee release-digest.txt
+          else
+            shasum -a 256 "$binary" | tee release-digest.txt
+          fi
+
+      - name: Verify release binary architecture
         if: runner.os != 'Windows'
         shell: bash
-        run: file target/release/local-mcp
-      - name: Log Windows release binary architecture
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          file "target/release/$RELEASE_BINARY"
+          file "target/release/$RELEASE_BINARY" | grep -F "$RELEASE_BINARY"
+
+      - name: Verify Windows release binary architecture
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
         run: |
-          $path = (Resolve-Path 'target/release/local-mcp.exe').Path
+          $path = (Resolve-Path "target/release/$env:RELEASE_BINARY").Path
           $bytes = [System.IO.File]::ReadAllBytes($path)
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
           Write-Output "release_pe_machine=0x$($machine.ToString('X4'))"
           if ($machine -ne 0x8664) { throw "Unexpected PE machine: 0x$($machine.ToString('X4'))" }
+
+      - name: Upload release digest evidence
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: release-digest-${{ matrix.name }}
+          path: release-digest.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Tier 2 - COMPATIBILITY
+  # Compile and smoke validation only, on the wider supported runner set.
+  # These confirm the tree still builds and the CLI still runs on additional
+  # images and architectures without paying for the full suite everywhere.
+  # ---------------------------------------------------------------------
+  compat:
+    name: compat (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            runner: ubuntu-22.04
+            runner_arch: X64
+            rust_host: x86_64-unknown-linux-gnu
+            release: local-mcp
+          - name: ubuntu-26.04
+            runner: ubuntu-26.04
+            runner_arch: X64
+            rust_host: x86_64-unknown-linux-gnu
+            release: local-mcp
+          - name: ubuntu-arm64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            rust_host: aarch64-unknown-linux-gnu
+            release: local-mcp
+          - name: macos-26
+            runner: macos-26
+            runner_arch: ARM64
+            rust_host: aarch64-apple-darwin
+            release: local-mcp
+          - name: windows-2022
+            runner: windows-2022
+            runner_arch: X64
+            rust_host: x86_64-pc-windows-msvc
+            release: local-mcp.exe
+          - name: windows-arm64
+            runner: windows-11-arm
+            runner_arch: ARM64
+            rust_host: aarch64-pc-windows-msvc
+            release: local-mcp.exe
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            compat-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install the pinned toolchain and components
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          # rust-toolchain.toml pins `profile = "minimal"`, which installs only
+          # rustc/cargo/rust-std. CI additionally needs rustfmt and clippy.
+          rustup component add rustfmt clippy
+
+      - name: Verify toolchain architecture
+        shell: bash
+        env:
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          EXPECTED_RUST_HOST: ${{ matrix.rust_host }}
+        run: |
+          set -euo pipefail
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+          rustc --version
+          test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH"
+          host=$(rustc -vV | awk -F': ' '/^host:/{print $2}')
+          printf 'rust_host=%s\n' "$host"
+          test "$host" = "$EXPECTED_RUST_HOST"
+
+      - name: Compile check
+        run: cargo check --locked --all-targets
+
+      - name: Build release
+        run: cargo build --release --locked
+
       - name: CLI smoke
         shell: bash
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
         run: |
-          set -euxo pipefail
-          binary=target/release/local-mcp
-          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          set -euo pipefail
+          binary="target/release/$RELEASE_BINARY"
           "$binary" --version
           "$binary" --help
+
+      - name: Verify release binary architecture
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          file "target/release/$RELEASE_BINARY"
+          file "target/release/$RELEASE_BINARY" | grep -F "$RELEASE_BINARY"
+
+      - name: Verify Windows release binary architecture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_BINARY: ${{ matrix.release }}
+          EXPECTED_PE_MACHINE: ${{ matrix.runner_arch == 'ARM64' && '0xAA64' || '0x8664' }}
+        run: |
+          $path = (Resolve-Path "target/release/$env:RELEASE_BINARY").Path
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          Write-Output "release_pe_machine=0x$($machine.ToString('X4'))"
+          if ("0x$($machine.ToString('X4'))" -ne $env:EXPECTED_PE_MACHINE) {
+            throw "Unexpected PE machine: 0x$($machine.ToString('X4')) (expected $env:EXPECTED_PE_MACHINE)"
+          }
