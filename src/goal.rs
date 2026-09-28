@@ -1862,17 +1862,18 @@ impl Goal {
             task.supersede_for_host(now)?;
         }
 
-        // 3. Rewire every surviving dependent off the superseded Task and onto
-        //    the replacement completion closure. These edges are host-derived,
-        //    so they are budgeted against the same global edge limit the
-        //    proposal validators enforce.
-        let existing_edge_count = candidate
-            .tasks
-            .values()
-            .map(|task| task.dependencies().len())
-            .sum::<usize>();
-        let mut added_edge_count = 0usize;
-        let mut rewired_dependent_ids = Vec::new();
+        // 3. Rewire every surviving dependent off the superseded Tasks and onto
+        //    the union of their replacement completion closures.
+        //
+        //    The plan is derived from the ENTIRE transaction before any
+        //    dependency list is touched. Rewiring one superseded Task at a time
+        //    makes the result order-dependent: when two superseded Tasks share
+        //    one replacement completion Task, the first rewrite inserts that
+        //    edge and the second then sees a duplicate. Deriving the removed and
+        //    added sets per dependent from the original transaction first turns
+        //    the rewrite into a single set union per dependent, so the final DAG
+        //    is identical for any ordering of the same transaction.
+        let mut closure_by_replaced = BTreeMap::<TaskId, BTreeSet<TaskId>>::new();
         for mutation in &mutations {
             let closure = mutation.completion_closure_task_ids.clone();
             if closure.is_empty()
@@ -1884,40 +1885,55 @@ impl Goal {
                     "replacement completion closure must name new, non-superseded Tasks".to_owned(),
                 ));
             }
-            let dependents = candidate
-                .tasks
-                .iter()
-                .filter(|(id, task)| {
-                    task.is_active_plan_authority()
-                        && **id != mutation.replaced_task_id
-                        && task
-                            .dependencies()
-                            .iter()
-                            .any(|edge| edge.task_id() == &mutation.replaced_task_id)
-                })
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            for dependent_id in dependents {
-                let before = candidate.tasks[&dependent_id].dependencies().len();
-                candidate
-                    .tasks
-                    .get_mut(&dependent_id)
-                    .expect("dependent exists")
-                    .rewire_dependencies_for_supersession(&mutation.replaced_task_id, &closure)?;
-                let after = candidate.tasks[&dependent_id].dependencies().len();
-                added_edge_count = added_edge_count.saturating_add(after.saturating_sub(before));
-                rewired_dependent_ids.push(dependent_id);
+            closure_by_replaced.insert(
+                mutation.replaced_task_id.clone(),
+                closure.into_iter().collect(),
+            );
+        }
+        // dependent -> (superseded Task IDs removed, union of replacement closures)
+        let mut rewiring = BTreeMap::<TaskId, (BTreeSet<TaskId>, BTreeSet<TaskId>)>::new();
+        for (replaced_id, closure) in &closure_by_replaced {
+            for (id, task) in &candidate.tasks {
+                if task.is_active_plan_authority()
+                    && task
+                        .dependencies()
+                        .iter()
+                        .any(|edge| edge.task_id() == replaced_id)
+                {
+                    let entry = rewiring
+                        .entry(id.clone())
+                        .or_insert_with(|| (BTreeSet::new(), BTreeSet::new()));
+                    entry.0.insert(replaced_id.clone());
+                    entry.1.extend(closure.iter().cloned());
+                }
             }
         }
-        if existing_edge_count.saturating_add(added_edge_count)
-            > crate::planner::MAX_PLAN_DEPENDENCY_EDGES
-        {
+        // BTreeMap keys are already unique and ordered, so the recorded
+        // rewiring list is independent of the replacement ordering.
+        for (dependent_id, (removed, added)) in &rewiring {
+            candidate
+                .tasks
+                .get_mut(dependent_id)
+                .expect("dependent exists")
+                .rewire_dependencies_for_supersessions(removed, added)?;
+        }
+        let rewired_dependent_ids = rewiring.keys().cloned().collect::<Vec<_>>();
+
+        // These edges are host-derived, so they are budgeted against the same
+        // global edge limit the proposal validators enforce. The host-derived
+        // union can remove more edges than it adds, so the graph that actually
+        // results is counted exactly rather than a running total that would
+        // double-count an overlapping closure edge.
+        let final_edge_count = candidate
+            .tasks
+            .values()
+            .map(|task| task.dependencies().len())
+            .sum::<usize>();
+        if final_edge_count > crate::planner::MAX_PLAN_DEPENDENCY_EDGES {
             return Err(OrchestratorError::InvalidDag(
                 "replacement rewiring would exceed the host dependency-edge limit".to_owned(),
             ));
         }
-        rewired_dependent_ids.sort();
-        rewired_dependent_ids.dedup();
 
         // 4. Rebind every completion criterion that required a replaced Task.
         //    A superseded Task can never satisfy TASK_VERIFIED, so leaving the

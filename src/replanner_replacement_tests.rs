@@ -7,7 +7,7 @@
 //! of unsafe graphs, budget-aware decomposition, the negative transient case,
 //! and the pre-existing safety invariants that must not regress.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -98,7 +98,7 @@ fn add_dependency(task: &mut Task, dependency: &TaskId) {
     .unwrap();
 }
 
-/// Build the composite durable fixture: an oversized read-only Task A that
+/// Build the PokéCPU-shaped durable fixture: an oversized read-only Task A that
 /// failed with a deterministic host output limit, a broad reassessment
 /// workaround W that was prepended downstream of nothing, a downstream Task B,
 /// a Writer C downstream of B, and a completion criterion requiring A.
@@ -372,7 +372,7 @@ fn new_ref(proposal_id: &str) -> Value {
 
 /// A materially decomposed replacement: three bounded read-only research Tasks
 /// plus a compact join/synthesis Task, exactly as a budget-aware Replanner must
-/// produce. The domain split is arbitrary; nothing here is project-specific.
+/// produce. The domain split is arbitrary; nothing here is PokéCPU-specific.
 fn decomposed_proposal(fixture: &Fixture, request_id: &str) -> Value {
     let goal = load(fixture);
     json!({
@@ -1065,6 +1065,860 @@ fn expect_rejected(fixture: &Fixture, proposal: &Value) {
     );
     assert_eq!(bytes(fixture), before_bytes, "rejection must not mutate");
     assert_eq!(load(fixture), before);
+}
+
+// ---------------------------------------------------------------------------
+// Atomic multi-replacement rewiring.
+//
+// A transaction may replace several Tasks whose completion closures overlap. A
+// surviving dependent that sits behind two replaced Tasks must converge on the
+// union of their closures, which is a SET: one shared closure Task is one edge,
+// not two. The fixtures below reproduce that shape directly.
+// ---------------------------------------------------------------------------
+
+const OVERSIZED_REQUEST: &str = "replace-oversized-authority-1";
+const WORKAROUND_REQUEST: &str = "replace-broad-workaround-1";
+const WORKAROUND_REJECTION: &str = "reject-broad-workaround-1";
+/// Enough filler Tasks to reach the host dependency-edge ceiling while keeping
+/// every Task's fan-in inside the per-Task bound.
+const FILLER_TASKS: usize = 46;
+
+struct ClosureFixture {
+    root: PathBuf,
+    state: PathBuf,
+    session: crate::config::Session,
+    store: TaskStore,
+    goal_id: GoalId,
+    /// The oversized post-attempt trigger.
+    oversized: TaskId,
+    /// The broad pre-execution workaround the oversized Task sits behind.
+    workaround: TaskId,
+    /// A surviving dependent of BOTH replaced Tasks.
+    downstream: TaskId,
+    /// The Writer downstream of `downstream`.
+    writer: TaskId,
+    /// Unrelated authorities `downstream` also depends on.
+    unrelated: Vec<TaskId>,
+    criterion_id: String,
+}
+
+impl Drop for ClosureFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Build the live-shaped fixture: an oversized read-only Task A that failed with
+/// a host output limit, a broad workaround W that A sits behind, a downstream
+/// Task B behind both, a Writer C behind B, and optionally `unrelated` filler
+/// authorities B also depends on plus `filler_edges` unrelated edges.
+///
+/// A depends on nothing so it is READY and can consume a real attempt; the
+/// workaround is an independent pristine pre-execution trigger, and B sits
+/// behind both of them.
+fn closure_fixture(with_unrelated: bool, filler_edges: usize) -> ClosureFixture {
+    let root = std::env::temp_dir().join(format!("local-mcp-closure-{}", Uuid::new_v4()));
+    let repo = root.join("repo");
+    let state = root.join("state");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("sentinel.txt"), b"unchanged\n").unwrap();
+    let session = crate::config::Session {
+        id: format!("closure-{}", Uuid::new_v4()),
+        cwd: repo.clone(),
+        permitted_directories: vec![repo.clone()],
+    };
+    let store = TaskStore::with_state_root(state.clone());
+    let mut goal = Goal::new(
+        session.id.clone(),
+        repo.clone(),
+        "recover the canonical authority with bounded read-only work",
+        Some("overlapping closure fixture".to_owned()),
+        vec!["stay inside repository authority".to_owned()],
+        vec![CRITERION_DESCRIPTION.to_owned()],
+        NOW,
+    )
+    .unwrap();
+
+    // Unrelated authority held only to prove the transaction never disturbs an
+    // edge it does not own. Edges point forward, so the filler stays acyclic.
+    let mut filler = (0..FILLER_TASKS)
+        .map(|index| {
+            Task::new(
+                format!("filler {index:02}"),
+                format!("hold unrelated filler authority {index:02}"),
+                true,
+                WorkerKind::CodexReadonly,
+                readonly_scope(&repo),
+                verification(&format!("filler.{index:02}")),
+                2,
+                1,
+                NOW,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let filler_ids = filler
+        .iter()
+        .map(|task| task.id().clone())
+        .collect::<Vec<_>>();
+    let mut placed = 0usize;
+    let mut exhausted = false;
+    for (index, task) in filler.iter_mut().enumerate() {
+        let mut edges = Vec::new();
+        for later in filler_ids.iter().skip(index + 1) {
+            if placed == filler_edges {
+                exhausted = true;
+                break;
+            }
+            edges.push(TaskDependency::completed(later.clone()));
+            placed += 1;
+        }
+        if !edges.is_empty() {
+            task.strengthen_dependencies(edges, &BTreeSet::new())
+                .unwrap();
+        }
+        if exhausted {
+            break;
+        }
+    }
+    assert_eq!(placed, filler_edges, "filler edge budget was not reachable");
+
+    let oversized = Task::new(
+        "recover canonical authority",
+        "recover the full authority for every entity and every evidence dimension",
+        true,
+        WorkerKind::CodexReadonly,
+        narrow_readonly_scope(&repo),
+        verification("authority.recovered"),
+        2,
+        1,
+        NOW,
+    )
+    .unwrap();
+    let oversized_id = oversized.id().clone();
+
+    let workaround = Task::new(
+        "reassess and recover authority",
+        "reassess the whole authority question broadly before retrying",
+        true,
+        WorkerKind::CodexReadonly,
+        readonly_scope(&repo),
+        verification("authority.reassessed"),
+        2,
+        1,
+        NOW,
+    )
+    .unwrap();
+    let workaround_id = workaround.id().clone();
+
+    let mut unrelated = Vec::new();
+    let mut unrelated_tasks = Vec::new();
+    if with_unrelated {
+        for name in ["hold unrelated x", "hold unrelated y"] {
+            let task = Task::new(
+                name,
+                format!("hold unrelated authority {name}"),
+                true,
+                WorkerKind::CodexReadonly,
+                readonly_scope(&repo),
+                verification("unrelated.held"),
+                2,
+                1,
+                NOW,
+            )
+            .unwrap();
+            unrelated.push(task.id().clone());
+            unrelated_tasks.push(task);
+        }
+    }
+
+    // The live-shaped survivor: it depends on BOTH replaced Tasks, so both
+    // rewires converge on it within one transaction.
+    let mut downstream = Task::new(
+        "define supported scope",
+        "record the supported scope as durable evidence",
+        true,
+        WorkerKind::CodexReadonly,
+        readonly_scope(&repo),
+        verification("scope.recorded"),
+        2,
+        1,
+        NOW,
+    )
+    .unwrap();
+    let downstream_dependencies = std::iter::once(&oversized_id)
+        .chain(std::iter::once(&workaround_id))
+        .chain(unrelated.iter())
+        .map(|id| TaskDependency::completed(id.clone()))
+        .collect::<Vec<_>>();
+    downstream
+        .strengthen_dependencies(downstream_dependencies, &BTreeSet::new())
+        .unwrap();
+    let downstream_id = downstream.id().clone();
+
+    let mut writer = Task::new(
+        "apply the bounded change",
+        "apply the scoped change downstream of the recovered authority",
+        true,
+        WorkerKind::CodexWriter,
+        writer_scope(&repo),
+        verification("change.applied"),
+        1,
+        1,
+        NOW,
+    )
+    .unwrap();
+    add_dependency(&mut writer, &downstream_id);
+    let writer_id = writer.id().clone();
+
+    let criterion_id = goal.completion_criteria()[0].id().clone();
+    let contract = GoalFinalVerificationSpec::new(
+        1,
+        vec![GoalCriterionBinding::new(
+            criterion_id.clone(),
+            vec![
+                GoalVerificationRequirement::TaskVerified {
+                    task_id: oversized_id.clone(),
+                },
+                GoalVerificationRequirement::TaskVerified {
+                    task_id: workaround_id.clone(),
+                },
+            ],
+        )],
+    );
+    let mut plan = vec![oversized, workaround];
+    plan.extend(unrelated_tasks);
+    plan.extend(filler);
+    plan.extend([downstream, writer]);
+    goal.materialize_initial_plan_with_contract(plan, contract, NOW)
+        .unwrap();
+    assert_eq!(goal.tasks()[&oversized_id].status(), TaskStatus::Ready);
+    assert_eq!(goal.tasks()[&workaround_id].status(), TaskStatus::Ready);
+
+    // One consumed attempt on the oversized Task, with no side effect, so it
+    // carries exactly one remaining retry across the transaction.
+    goal.transition_task(
+        &oversized_id,
+        TaskStatus::Running,
+        TaskTransitionContext::default(),
+        NOW,
+    )
+    .unwrap();
+    goal.task_record_latest_worker_report(
+        &oversized_id,
+        WorkerReport::new("READONLY_BACKEND_ERROR: shape failure", Vec::new()),
+    )
+    .unwrap();
+    goal.task_record_latest_attempt_failure_class(&oversized_id, FailureClass::HostOutputLimit)
+        .unwrap();
+    goal.task_bind_latest_attempt_execution(
+        &oversized_id,
+        None,
+        None,
+        None,
+        Some(SideEffectClass::None),
+        Some(SideEffectState::ConfirmedNotPerformed),
+        Some(1),
+        Some(0),
+    )
+    .unwrap();
+    goal.transition_task(
+        &oversized_id,
+        TaskStatus::Retryable,
+        TaskTransitionContext::default(),
+        NOW,
+    )
+    .unwrap();
+
+    let goal_id = goal.id().clone();
+    store.create_goal(&goal).unwrap();
+    ClosureFixture {
+        root,
+        state,
+        session,
+        store,
+        goal_id,
+        oversized: oversized_id,
+        workaround: workaround_id,
+        downstream: downstream_id,
+        writer: writer_id,
+        unrelated,
+        criterion_id: criterion_id.as_str().to_owned(),
+    }
+}
+
+fn load_closure(fixture: &ClosureFixture) -> Goal {
+    fixture
+        .store
+        .load_goal(&fixture.session.id, &fixture.goal_id)
+        .unwrap()
+}
+
+fn closure_bytes(fixture: &ClosureFixture) -> Vec<u8> {
+    fs::read(
+        fixture
+            .state
+            .join("goals")
+            .join(&fixture.session.id)
+            .join(format!("{}.json", fixture.goal_id.as_str())),
+    )
+    .unwrap()
+}
+
+fn apply_closure(fixture: &ClosureFixture, proposal: &Value) -> Result<Goal, ReplannerError> {
+    let current = load_closure(fixture);
+    materialize_replan_output(
+        &fixture.store,
+        &fixture.session,
+        &fixture.goal_id,
+        current.revision(),
+        current.plan_revision(),
+        &serde_json::to_vec(proposal).unwrap(),
+    )
+}
+
+/// Arm a durable replacement authority for both replaced Tasks.
+///
+/// The pre-execution rejection runs first because it requires a RUNNING Goal,
+/// and the post-attempt request is what moves the Goal into REPLANNING.
+fn arm_closure_requests(fixture: &ClosureFixture) {
+    let before = load_closure(fixture);
+    goal_resume(
+        &json!({
+            "session_id": fixture.session.id,
+            "goal_id": fixture.goal_id.as_str(),
+            "pre_execution_plan_rejection": {
+                "request_id": WORKAROUND_REJECTION,
+                "expected_goal_revision": before.revision(),
+                "expected_plan_revision": before.plan_revision(),
+                "trigger_task_id": fixture.workaround.as_str(),
+                "reason": "the broad reassessment must never run"
+            }
+        }),
+        &fixture.session,
+        &fixture.store,
+    )
+    .unwrap();
+    let current = load_closure(fixture);
+    goal_resume(
+        &json!({
+            "session_id": fixture.session.id,
+            "goal_id": fixture.goal_id.as_str(),
+            "failed_task_replan_requests": [{
+                "request_id": OVERSIZED_REQUEST,
+                "expected_goal_revision": current.revision(),
+                "expected_plan_revision": current.plan_revision(),
+                "trigger_task_id": fixture.oversized.as_str(),
+                "reason": "the Task shape is deterministically too large for one bounded worker",
+                "policy": "REQUIRE_DECOMPOSITION"
+            }]
+        }),
+        &fixture.session,
+        &fixture.store,
+    )
+    .unwrap();
+    let current = load_closure(fixture);
+    goal_resume(
+        &json!({
+            "session_id": fixture.session.id,
+            "goal_id": fixture.goal_id.as_str(),
+            "failed_task_replan_requests": [{
+                "request_id": WORKAROUND_REQUEST,
+                "expected_goal_revision": current.revision(),
+                "expected_plan_revision": current.plan_revision(),
+                "trigger_task_id": fixture.workaround.as_str(),
+                "reason": "the broad reassessment is permanently superseded by the decomposition",
+                "policy": "REQUIRE_DECOMPOSITION",
+                "trigger_kind": "PRE_EXECUTION_REJECTION",
+                "authority_request_id": WORKAROUND_REJECTION
+            }]
+        }),
+        &fixture.session,
+        &fixture.store,
+    )
+    .unwrap();
+    let armed = load_closure(fixture);
+    assert_eq!(armed.status(), GoalStatus::Replanning);
+    assert_eq!(
+        armed.tasks()[&fixture.oversized].status(),
+        TaskStatus::NeedsReplan
+    );
+    assert_eq!(
+        armed.tasks()[&fixture.workaround].status(),
+        TaskStatus::NeedsReplan
+    );
+}
+
+/// A replacement record for the oversized trigger.
+fn replace_oversized(
+    closure_refs: Vec<Value>,
+    criterion_refs: Vec<Value>,
+    fixture: &ClosureFixture,
+) -> Value {
+    json!({
+        "replan_request_id": OVERSIZED_REQUEST,
+        "old_task_id": fixture.oversized.as_str(),
+        "completion_closure_task_refs": closure_refs,
+        "criterion_rebindings": [{
+            "criterion_id": fixture.criterion_id,
+            "replacement_task_refs": criterion_refs
+        }]
+    })
+}
+
+/// A replacement record for the broad workaround trigger.
+fn replace_workaround(
+    closure_refs: Vec<Value>,
+    criterion_refs: Vec<Value>,
+    fixture: &ClosureFixture,
+) -> Value {
+    json!({
+        "replan_request_id": WORKAROUND_REQUEST,
+        "old_task_id": fixture.workaround.as_str(),
+        "completion_closure_task_refs": closure_refs,
+        "criterion_rebindings": [{
+            "criterion_id": fixture.criterion_id,
+            "replacement_task_refs": criterion_refs
+        }]
+    })
+}
+
+/// The live-shaped proposal: both replaced Tasks converge on ONE shared
+/// completion closure, which is what a bounded decomposition of overlapping
+/// authority legitimately produces.
+fn shared_closure_proposal(fixture: &ClosureFixture) -> Value {
+    let goal = load_closure(fixture);
+    json!({
+        "goal_id": fixture.goal_id.as_str(),
+        "base_goal_revision": goal.revision(),
+        "base_plan_revision": goal.plan_revision(),
+        "summary": "replace both invalid Tasks with one shared bounded completion closure",
+        "add_tasks": [
+            read_only_task("dim-provenance", vec![]),
+            read_only_task("dim-membership", vec![]),
+            read_only_task("join-authority", vec![
+                new_ref("dim-provenance"),
+                new_ref("dim-membership")
+            ])
+        ],
+        "replace_tasks": [
+            replace_oversized(
+                vec![new_ref("join-authority")],
+                vec![new_ref("join-authority")],
+                fixture
+            ),
+            replace_workaround(
+                vec![new_ref("join-authority")],
+                vec![new_ref("join-authority")],
+                fixture
+            )
+        ]
+    })
+}
+
+fn dependency_titles(goal: &Goal, task: &TaskId) -> Vec<String> {
+    goal.tasks()[task]
+        .dependencies()
+        .iter()
+        .map(|edge| goal.tasks()[edge.task_id()].title().to_owned())
+        .collect()
+}
+
+fn total_edge_count(goal: &Goal) -> usize {
+    goal.tasks()
+        .values()
+        .map(|task| task.dependencies().len())
+        .sum()
+}
+
+/// The whole final dependency graph, normalized by Task title so two goals
+/// built from independent fixtures are directly comparable.
+fn normalized_graph(goal: &Goal) -> BTreeMap<String, Vec<String>> {
+    goal.tasks()
+        .values()
+        .map(|task| {
+            let mut dependencies = dependency_titles(goal, task.id());
+            dependencies.sort();
+            (task.title().to_owned(), dependencies)
+        })
+        .collect()
+}
+
+fn task_by_title<'a>(goal: &'a Goal, title: &str) -> &'a Task {
+    goal.tasks()
+        .values()
+        .find(|task| task.title() == title)
+        .unwrap_or_else(|| panic!("missing task {title}"))
+}
+
+#[test]
+fn two_replaced_tasks_sharing_one_closure_converge_on_a_single_edge() {
+    let fixture = closure_fixture(false, 0);
+    let armed = load_closure(&fixture);
+    let plan_revision_before = armed.plan_revision();
+    let retry_before = armed.tasks()[&fixture.oversized].max_attempts();
+    arm_closure_requests(&fixture);
+
+    let after = apply_closure(&fixture, &shared_closure_proposal(&fixture)).unwrap();
+
+    assert_eq!(
+        after.tasks()[&fixture.oversized].status(),
+        TaskStatus::Superseded
+    );
+    assert_eq!(
+        after.tasks()[&fixture.workaround].status(),
+        TaskStatus::Superseded
+    );
+    // The minimum regression for the live failure: the dependent converges on
+    // the shared completion Task exactly once, not twice and not rejected.
+    let join = task_by_title(&after, "Task join-authority").id().clone();
+    assert_eq!(
+        dependency_titles(&after, &fixture.downstream),
+        vec!["Task join-authority"]
+    );
+    assert!(!has_dependency(
+        &after,
+        &fixture.downstream,
+        &fixture.oversized
+    ));
+    assert!(!has_dependency(
+        &after,
+        &fixture.downstream,
+        &fixture.workaround
+    ));
+    // The Writer still hangs off the surviving downstream Task.
+    assert!(has_dependency(&after, &fixture.writer, &fixture.downstream));
+    // A Task superseded by this very transaction is not a surviving dependent,
+    // so its own dependency list is left exactly as it was.
+    for superseded in [&fixture.oversized, &fixture.workaround] {
+        assert_eq!(
+            dependency_titles(&armed, superseded),
+            dependency_titles(&after, superseded),
+            "a superseded Task was rewired by its own transaction"
+        );
+    }
+    // No active authority may retain a dependency on a superseded Task.
+    for task in after.tasks().values() {
+        if !task.is_active_plan_authority() {
+            continue;
+        }
+        for edge in task.dependencies() {
+            assert_ne!(
+                after.tasks()[edge.task_id()].status(),
+                TaskStatus::Superseded,
+                "active Task {} still depends on a superseded Task",
+                task.title()
+            );
+        }
+    }
+    // The final graph holds no duplicate edge.
+    for task in after.tasks().values() {
+        let unique = task
+            .dependencies()
+            .iter()
+            .map(|edge| edge.task_id().clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), task.dependencies().len());
+    }
+    assert_eq!(after.plan_revision(), plan_revision_before + 1);
+    assert!(
+        after.tasks()[&fixture.oversized].max_attempts() >= retry_before,
+        "replacement must not consume the trigger's remaining retry"
+    );
+    assert_eq!(
+        after.tasks()[&fixture.oversized].attempts().len(),
+        armed.tasks()[&fixture.oversized].attempts().len(),
+        "old attempt history must be preserved"
+    );
+    assert_no_partial_replacement(&after, &fixture.oversized);
+    assert_no_partial_replacement(&after, &fixture.workaround);
+    // The next runnable authority is a bounded READ_ONLY replacement Task, and
+    // the Writer is not runnable behind the surviving downstream Task.
+    let provenance = task_by_title(&after, "Task dim-provenance").id().clone();
+    assert!(has_dependency(&after, &join, &provenance));
+    assert!(!has_dependency(&after, &fixture.writer, &join));
+}
+
+#[test]
+fn overlapping_closures_union_into_one_dependency_set() {
+    let fixture = closure_fixture(false, 0);
+    arm_closure_requests(&fixture);
+    let goal = load_closure(&fixture);
+    // Two closures that share one member: {left, shared} and {shared, right}.
+    // Each is the maximal node set of its own cone, and together the cones
+    // cover every new Task.
+    let proposal = json!({
+        "goal_id": fixture.goal_id.as_str(),
+        "base_goal_revision": goal.revision(),
+        "base_plan_revision": goal.plan_revision(),
+        "summary": "replace both invalid Tasks with partially overlapping closures",
+        "add_tasks": [
+            read_only_task("dim-one", vec![]),
+            read_only_task("dim-two", vec![]),
+            read_only_task("dim-three", vec![]),
+            read_only_task("left-join", vec![new_ref("dim-one"), new_ref("dim-two")]),
+            read_only_task("right-join", vec![new_ref("dim-two"), new_ref("dim-three")]),
+            read_only_task("shared-join", vec![new_ref("dim-one"), new_ref("dim-three")])
+        ],
+        "replace_tasks": [
+            replace_oversized(
+                vec![new_ref("left-join"), new_ref("shared-join")],
+                vec![new_ref("left-join"), new_ref("shared-join")],
+                &fixture
+            ),
+            replace_workaround(
+                vec![new_ref("shared-join"), new_ref("right-join")],
+                vec![new_ref("shared-join"), new_ref("right-join")],
+                &fixture
+            )
+        ]
+    });
+    let after = apply_closure(&fixture, &proposal).unwrap();
+    let mut dependencies = dependency_titles(&after, &fixture.downstream);
+    dependencies.sort();
+    assert_eq!(
+        dependencies,
+        vec![
+            "Task left-join".to_owned(),
+            "Task right-join".to_owned(),
+            "Task shared-join".to_owned(),
+        ],
+        "overlapping closures must union into one set with the shared member once"
+    );
+    for task in after.tasks().values() {
+        let unique = task
+            .dependencies()
+            .iter()
+            .map(|edge| edge.task_id().clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), task.dependencies().len());
+    }
+}
+
+#[test]
+fn replacement_rewiring_is_independent_of_the_replacement_ordering() {
+    let first = closure_fixture(false, 0);
+    arm_closure_requests(&first);
+    let mut forward = shared_closure_proposal(&first);
+    let after_forward = apply_closure(&first, &forward).unwrap();
+
+    let second = closure_fixture(false, 0);
+    arm_closure_requests(&second);
+    let mut reversed = shared_closure_proposal(&second);
+    let entries = reversed["replace_tasks"].as_array().unwrap().clone();
+    reversed["replace_tasks"] = json!([entries[1].clone(), entries[0].clone()]);
+    let after_reversed = apply_closure(&second, &reversed).unwrap();
+
+    forward["replace_tasks"] = json!([entries[0].clone(), entries[1].clone()]);
+    assert_eq!(
+        normalized_graph(&after_forward),
+        normalized_graph(&after_reversed),
+        "the final DAG must not depend on the replacement mutation order"
+    );
+    assert_eq!(
+        total_edge_count(&after_forward),
+        total_edge_count(&after_reversed)
+    );
+}
+
+#[test]
+fn replacement_rewiring_preserves_every_unrelated_dependency() {
+    let fixture = closure_fixture(true, 0);
+    arm_closure_requests(&fixture);
+    let before = load_closure(&fixture);
+    let unrelated_before = dependency_titles(&before, &fixture.downstream);
+    assert!(unrelated_before.contains(&"hold unrelated x".to_owned()));
+    assert!(unrelated_before.contains(&"hold unrelated y".to_owned()));
+
+    let after = apply_closure(&fixture, &shared_closure_proposal(&fixture)).unwrap();
+    let mut dependencies = dependency_titles(&after, &fixture.downstream);
+    dependencies.sort();
+    assert_eq!(
+        dependencies,
+        vec![
+            "Task join-authority".to_owned(),
+            "hold unrelated x".to_owned(),
+            "hold unrelated y".to_owned(),
+        ],
+        "unrelated edges must survive the transaction untouched"
+    );
+    for unrelated in &fixture.unrelated {
+        assert!(
+            has_dependency(&after, &fixture.downstream, unrelated),
+            "unrelated authority {} was dropped",
+            unrelated.as_str()
+        );
+        assert_eq!(
+            after.tasks()[unrelated].status(),
+            before.tasks()[unrelated].status()
+        );
+    }
+}
+
+#[test]
+fn a_single_replacement_still_rewires_exactly_one_dependent() {
+    let fixture = fixture(FailureClass::HostOutputLimit);
+    request_replan(&fixture, REQUEST_ID, &fixture.a, "REQUIRE_DECOMPOSITION");
+    let after = apply(&fixture, &decomposed_proposal(&fixture, REQUEST_ID)).unwrap();
+    // B depended on A alone, so the ordinary single replacement rewires it
+    // onto the closure and leaves no other edge behind.
+    let mut dependencies = dependency_titles(&after, &fixture.b);
+    dependencies.sort();
+    assert_eq!(dependencies, vec!["Task join-authority".to_owned()]);
+    assert!(has_dependency(&after, &fixture.c, &fixture.b));
+    assert!(!has_dependency(&after, &fixture.b, &fixture.a));
+    // An unrelated Task that this transaction never named is untouched.
+    assert_eq!(
+        after.tasks()[&fixture.workaround].status(),
+        TaskStatus::Ready
+    );
+}
+
+#[test]
+fn a_collapsing_replacement_at_the_edge_ceiling_is_accepted() {
+    // Existing 1022 edges plus the two internal edges of the replacement
+    // closure is exactly the 1024 ceiling before rewiring. The transaction
+    // removes two edges and adds one, so the final graph is 1023.
+    let fixture = closure_fixture(false, 1019);
+    arm_closure_requests(&fixture);
+    let before = load_closure(&fixture);
+    assert_eq!(total_edge_count(&before), 1022);
+    let after = apply_closure(&fixture, &shared_closure_proposal(&fixture)).unwrap();
+    assert_eq!(
+        total_edge_count(&after),
+        1023,
+        "the final graph must be counted exactly, not conservatively"
+    );
+}
+
+#[test]
+fn a_replacement_that_would_oversize_the_final_graph_is_rejected() {
+    // Existing 1021 edges plus three internal closure edges is exactly the
+    // ceiling before rewiring, and this closure grows the dependent by one, so
+    // the final graph would be 1025.
+    let fixture = closure_fixture(false, 1018);
+    arm_closure_requests(&fixture);
+    let before_bytes = closure_bytes(&fixture);
+    let before = load_closure(&fixture);
+    assert_eq!(total_edge_count(&before), 1021);
+    let goal = load_closure(&fixture);
+    let proposal = json!({
+        "goal_id": fixture.goal_id.as_str(),
+        "base_goal_revision": goal.revision(),
+        "base_plan_revision": goal.plan_revision(),
+        "summary": "replace the oversized Task with a growing three-node closure",
+        "add_tasks": [
+            read_only_task("dim-one", vec![]),
+            read_only_task("dim-two", vec![]),
+            read_only_task("dim-three", vec![]),
+            read_only_task("join-one", vec![new_ref("dim-one")]),
+            read_only_task("join-two", vec![new_ref("dim-two")]),
+            read_only_task("join-three", vec![new_ref("dim-three")])
+        ],
+        "replace_tasks": [replace_oversized(
+            vec![
+                new_ref("join-one"),
+                new_ref("join-two"),
+                new_ref("join-three")
+            ],
+            vec![
+                new_ref("join-one"),
+                new_ref("join-two"),
+                new_ref("join-three")
+            ],
+            &fixture
+        )]
+    });
+    assert!(
+        apply_closure(&fixture, &proposal).is_err(),
+        "an oversized final graph must be rejected"
+    );
+    assert_eq!(closure_bytes(&fixture), before_bytes);
+    assert_eq!(load_closure(&fixture), before);
+}
+
+#[test]
+fn a_late_final_dag_failure_commits_no_partial_replacement() {
+    let fixture = closure_fixture(false, 0);
+    arm_closure_requests(&fixture);
+    let before = load_closure(&fixture);
+    let before_bytes = closure_bytes(&fixture);
+    let mut proposal = shared_closure_proposal(&fixture);
+    // A replacement Task that depends on the very Task it replaces would make
+    // the final graph invalid only after rewiring and supersession are done.
+    proposal["add_tasks"][2]["dependencies"] = json!([existing_ref(&fixture.oversized)]);
+    let result = apply_closure(&fixture, &proposal);
+    assert!(result.is_err(), "an invalid final DAG must be rejected");
+    assert_eq!(
+        closure_bytes(&fixture),
+        before_bytes,
+        "no partial replacement may reach durable state"
+    );
+    let after = load_closure(&fixture);
+    assert_eq!(after, before);
+    assert_eq!(
+        after.tasks()[&fixture.oversized].status(),
+        TaskStatus::NeedsReplan
+    );
+    assert_eq!(
+        after.tasks()[&fixture.workaround].status(),
+        TaskStatus::NeedsReplan
+    );
+    assert_eq!(after.plan_revision(), before.plan_revision());
+    assert!(
+        after
+            .tasks()
+            .values()
+            .all(|task| !task.title().starts_with("Task ")),
+    );
+}
+
+#[test]
+fn the_batch_rewiring_repair_does_not_weaken_unrelated_duplicate_checks() {
+    // A new Task may not declare the same dependency twice.
+    let fixture = closure_fixture(false, 0);
+    arm_closure_requests(&fixture);
+    let before_bytes = closure_bytes(&fixture);
+    let mut proposal = shared_closure_proposal(&fixture);
+    proposal["add_tasks"][0]["dependencies"] =
+        json!([new_ref("dim-membership"), new_ref("dim-membership")]);
+    assert!(apply_closure(&fixture, &proposal).is_err());
+    assert_eq!(closure_bytes(&fixture), before_bytes);
+
+    // An ordinary monotonic add may not repeat an existing edge.
+    let fixture = closure_fixture(false, 0);
+    arm_closure_requests(&fixture);
+    let before_bytes = closure_bytes(&fixture);
+    let goal = load_closure(&fixture);
+    let duplicate_add = json!({
+        "goal_id": fixture.goal_id.as_str(),
+        "base_goal_revision": goal.revision(),
+        "base_plan_revision": goal.plan_revision(),
+        "summary": "add the same existing edge twice",
+        "add_dependencies": [
+            {"task_id": fixture.writer.as_str(), "depends_on": [fixture.downstream.as_str()]},
+            {"task_id": fixture.writer.as_str(), "depends_on": [fixture.downstream.as_str()]}
+        ]
+    });
+    assert!(apply_closure(&fixture, &duplicate_add).is_err());
+    assert_eq!(closure_bytes(&fixture), before_bytes);
+
+    // A Task may not depend on itself.
+    let fixture = closure_fixture(false, 0);
+    arm_closure_requests(&fixture);
+    let before_bytes = closure_bytes(&fixture);
+    let goal = load_closure(&fixture);
+    let self_edge = json!({
+        "goal_id": fixture.goal_id.as_str(),
+        "base_goal_revision": goal.revision(),
+        "base_plan_revision": goal.plan_revision(),
+        "summary": "add a self dependency",
+        "add_dependencies": [
+            {"task_id": fixture.writer.as_str(), "depends_on": [fixture.writer.as_str()]}
+        ]
+    });
+    assert!(apply_closure(&fixture, &self_edge).is_err());
+    assert_eq!(closure_bytes(&fixture), before_bytes);
 }
 
 #[test]

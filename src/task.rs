@@ -1815,24 +1815,32 @@ impl Task {
         Ok(())
     }
 
-    /// Rewire this Task's hard dependencies away from a Task that is about to
-    /// be permanently superseded, onto the replacement completion closure.
+    /// Rewire this Task's hard dependencies away from every Task superseded by
+    /// one atomic replacement transaction, onto the union of their replacement
+    /// completion closures.
     ///
     /// This is the one dependency *removal* the V1 model permits, and it is
-    /// only reachable from the host-owned atomic supersession path. Every other
-    /// dependency is preserved and no existing edge may be duplicated.
-    pub(crate) fn rewire_dependencies_for_supersession(
+    /// only reachable from the host-owned atomic supersession path. The final
+    /// dependency relation is a SET: several superseded dependencies may
+    /// legitimately map onto one shared replacement completion Task, so the
+    /// union collapses them to a single edge instead of producing a duplicate.
+    /// Rewiring one superseded Task at a time cannot express that, because the
+    /// second insert observes the first as a pre-existing edge.
+    ///
+    /// `removed` and `added` are ordered sets, so the committed dependency list
+    /// depends only on the transaction's content, never on its ordering. The
+    /// Task's dependency list is committed only after every check passes.
+    pub(crate) fn rewire_dependencies_for_supersessions(
         &mut self,
-        removed: &TaskId,
-        added: &[TaskId],
+        removed: &BTreeSet<TaskId>,
+        added: &BTreeSet<TaskId>,
     ) -> Result<(), OrchestratorError> {
-        if !self
-            .dependencies
+        if !removed
             .iter()
-            .any(|edge| edge.task_id() == removed)
+            .any(|id| self.dependencies.iter().any(|edge| edge.task_id() == id))
         {
             return Err(OrchestratorError::InvalidDag(
-                "supersession rewiring requires the superseded Task to be a hard dependency"
+                "supersession rewiring requires a superseded Task to be a hard dependency"
                     .to_owned(),
             ));
         }
@@ -1843,19 +1851,30 @@ impl Task {
                 ));
             }
         }
+        // One pass removes every superseded dependency this transaction owns and
+        // retains every unrelated one, so no unrelated edge can be disturbed by
+        // the number or ordering of the replacements.
         let mut dependencies = self
             .dependencies
             .iter()
-            .filter(|edge| edge.task_id() != removed)
+            .filter(|edge| !removed.contains(edge.task_id()))
             .cloned()
             .collect::<Vec<_>>();
         for dependency in added {
-            if dependencies.iter().any(|edge| edge.task_id() == dependency) {
+            if !dependencies.iter().any(|edge| edge.task_id() == dependency) {
+                dependencies.push(TaskDependency::completed(dependency.clone()));
+            }
+        }
+        // The union above is set-semantic, so this is unreachable for a Task
+        // that entered the transaction without duplicate edges. Asserting it
+        // here keeps the real invariant checked directly rather than implied.
+        let mut unique = BTreeSet::new();
+        for edge in &dependencies {
+            if !unique.insert(edge.task_id().clone()) {
                 return Err(OrchestratorError::InvalidDag(
-                    "supersession rewiring would duplicate an existing dependency edge".to_owned(),
+                    "a Task may not depend on the same Task twice".to_owned(),
                 ));
             }
-            dependencies.push(TaskDependency::completed(dependency.clone()));
         }
         if dependencies.len() > crate::planner::MAX_DEPENDENCIES_PER_TASK {
             return Err(OrchestratorError::InvalidDag(
