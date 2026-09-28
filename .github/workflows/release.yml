@@ -274,7 +274,7 @@ jobs:
               fi
               printf 'glibc_runtime=%s\n' "$(getconf GNU_LIBC_VERSION)"
               max_glibc=$(readelf --version-info "target/release/$name" \
-                | grep -oE 'GLIBC_[0-9]+(\\.[0-9]+)*' \
+                | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' \
                 | sort -Vu | tail -n1 || true)
               printf 'max_glibc_symbol_requirement=%s\n' "${max_glibc:-none}"
             else
