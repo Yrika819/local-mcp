@@ -217,6 +217,128 @@ fn goal_run_preserves_all_phase10_stop_reason_categories() {
     }
 }
 
+fn serialized_stop_result(reason: GoalRunStopReason) -> serde_json::Value {
+    let result = GoalRunResult {
+        goal_id: GoalId::parse("00000000-0000-4000-8000-000000000001").unwrap(),
+        revision_before: Some(8),
+        revision_after: Some(8),
+        steps_attempted: 1,
+        steps_applied: 0,
+        terminal_status: None,
+        stop_reason: reason,
+        trace: Vec::new(),
+    };
+    serde_json::from_str(&crate::mcp::serialize_goal_run_result(&result)).unwrap()
+}
+
+#[test]
+fn lower_authority_stop_detail_exposes_authority_and_bounded_message() {
+    let value = serialized_stop_result(GoalRunStopReason::LowerAuthorityError {
+        authority: GoalRunnerAuthority::Replanner,
+        detail: "replanner proposal violates replacement closure".to_owned(),
+    });
+    assert_eq!(value["stop_reason"], "LOWER_AUTHORITY_ERROR");
+    assert_eq!(value["stop_detail"]["kind"], "LOWER_AUTHORITY_ERROR");
+    assert_eq!(value["stop_detail"]["authority"], "REPLANNER");
+    assert_eq!(
+        value["stop_detail"]["detail"],
+        "replanner proposal violates replacement closure"
+    );
+    assert_eq!(value["stop_detail"]["detail_truncated"], false);
+}
+
+#[test]
+fn lower_authority_stop_detail_covers_every_authority_variant() {
+    let cases = [
+        (GoalRunnerAuthority::Store, "STORE"),
+        (GoalRunnerAuthority::Scheduler, "SCHEDULER"),
+        (GoalRunnerAuthority::Planner, "PLANNER"),
+        (GoalRunnerAuthority::Readonly, "READONLY"),
+        (GoalRunnerAuthority::Writer, "WRITER"),
+        (GoalRunnerAuthority::Verifier, "VERIFIER"),
+        (GoalRunnerAuthority::GoalVerifier, "GOAL_VERIFIER"),
+        (GoalRunnerAuthority::Replanner, "REPLANNER"),
+        (GoalRunnerAuthority::Finalizer, "FINALIZER"),
+    ];
+    for (authority, expected) in cases {
+        let value = serialized_stop_result(GoalRunStopReason::LowerAuthorityError {
+            authority,
+            detail: "safe internal detail".to_owned(),
+        });
+        assert_eq!(value["stop_reason"], "LOWER_AUTHORITY_ERROR");
+        assert_eq!(value["stop_detail"]["authority"], expected);
+        assert_eq!(value["stop_detail"]["detail"], "safe internal detail");
+    }
+}
+
+#[test]
+fn non_lower_authority_stop_reasons_emit_no_stop_detail() {
+    for reason in [
+        GoalRunStopReason::Completed,
+        GoalRunStopReason::Failed,
+        GoalRunStopReason::StepBudgetExhausted,
+        GoalRunStopReason::RevisionConflict {
+            expected: 1,
+            actual: 2,
+        },
+        GoalRunStopReason::ControlState(GoalStatus::Replanning),
+    ] {
+        let value = serialized_stop_result(reason);
+        assert_eq!(value["stop_detail"], serde_json::Value::Null);
+        assert!(value.get("stop_reason").unwrap().is_string());
+    }
+}
+
+#[test]
+fn oversized_lower_authority_detail_is_bounded_deterministically() {
+    // The leading ASCII byte pushes the 8 KiB cap onto the middle of a
+    // two-byte character, so truncation must walk back to a real boundary
+    // rather than splitting the character.
+    let oversized = format!("a{}", "é".repeat(8192));
+    let value = serialized_stop_result(GoalRunStopReason::LowerAuthorityError {
+        authority: GoalRunnerAuthority::Replanner,
+        detail: oversized.clone(),
+    });
+    let detail = value["stop_detail"]["detail"].as_str().unwrap();
+    assert_eq!(value["stop_detail"]["detail_truncated"], true);
+    assert_eq!(detail.len(), 8 * 1024 - 1);
+    assert!(oversized.starts_with(detail));
+    assert!(detail.ends_with('é'));
+    assert!(std::str::from_utf8(detail.as_bytes()).is_ok());
+
+    let repeated = serialized_stop_result(GoalRunStopReason::LowerAuthorityError {
+        authority: GoalRunnerAuthority::Replanner,
+        detail: oversized.clone(),
+    });
+    assert_eq!(detail, repeated["stop_detail"]["detail"].as_str().unwrap());
+}
+
+#[test]
+fn lower_authority_detail_at_exactly_the_cap_is_not_marked_truncated() {
+    let exact = "d".repeat(8 * 1024);
+    let value = serialized_stop_result(GoalRunStopReason::LowerAuthorityError {
+        authority: GoalRunnerAuthority::Replanner,
+        detail: exact.clone(),
+    });
+    assert_eq!(value["stop_detail"]["detail_truncated"], false);
+    assert_eq!(value["stop_detail"]["detail"], exact);
+}
+
+#[test]
+fn lower_authority_detail_never_exposes_prompt_or_model_output_fields() {
+    let value = serialized_stop_result(GoalRunStopReason::LowerAuthorityError {
+        authority: GoalRunnerAuthority::Replanner,
+        detail: "replanner rejected: schema violation in proposal".to_owned(),
+    });
+    let serialized = serde_json::to_string(&value).unwrap();
+    for forbidden in ["prompt", "stderr", "provider", "model", "api_key", "token"] {
+        assert!(
+            !serialized.contains(forbidden),
+            "stop detail leaked {forbidden}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct CountingModel {
     calls: AtomicUsize,

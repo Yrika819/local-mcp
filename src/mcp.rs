@@ -876,6 +876,9 @@ pub(crate) fn parse_goal_run_args(args: &Value) -> Result<GoalRunArgs> {
     Ok(request)
 }
 
+/// Upper bound for host-owned lower-authority diagnostics exposed over MCP.
+const MAX_GOAL_RUN_STOP_DETAIL_BYTES: usize = 8 * 1024;
+
 pub(crate) fn serialize_goal_run_result(result: &GoalRunResult) -> String {
     let trace = result
         .trace
@@ -899,9 +902,52 @@ pub(crate) fn serialize_goal_run_result(result: &GoalRunResult) -> String {
         "steps_applied": result.steps_applied,
         "terminal_status": result.terminal_status.map(goal_status_name),
         "stop_reason": stop_reason_name(&result.stop_reason),
+        "stop_detail": stop_detail(&result.stop_reason),
         "trace": trace,
     }))
     .expect("Goal run result view is serializable")
+}
+
+/// Bounds host-owned diagnostic text deterministically on a UTF-8 boundary.
+///
+/// The second element reports whether truncation occurred, so a consumer can
+/// never mistake a clipped diagnostic for a complete one.
+fn bounded_diagnostic(detail: &str) -> (String, bool) {
+    if detail.len() <= MAX_GOAL_RUN_STOP_DETAIL_BYTES {
+        return (detail.to_owned(), false);
+    }
+    let mut end = MAX_GOAL_RUN_STOP_DETAIL_BYTES;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    (detail[..end].to_owned(), true)
+}
+
+fn stop_detail(reason: &GoalRunStopReason) -> Value {
+    let GoalRunStopReason::LowerAuthorityError { authority, detail } = reason else {
+        return Value::Null;
+    };
+    let (detail, truncated) = bounded_diagnostic(detail);
+    json!({
+        "kind": "LOWER_AUTHORITY_ERROR",
+        "authority": runner_authority_name(*authority),
+        "detail": detail,
+        "detail_truncated": truncated,
+    })
+}
+
+fn runner_authority_name(authority: goal_runner::GoalRunnerAuthority) -> &'static str {
+    match authority {
+        goal_runner::GoalRunnerAuthority::Store => "STORE",
+        goal_runner::GoalRunnerAuthority::Scheduler => "SCHEDULER",
+        goal_runner::GoalRunnerAuthority::Planner => "PLANNER",
+        goal_runner::GoalRunnerAuthority::Readonly => "READONLY",
+        goal_runner::GoalRunnerAuthority::Writer => "WRITER",
+        goal_runner::GoalRunnerAuthority::Verifier => "VERIFIER",
+        goal_runner::GoalRunnerAuthority::GoalVerifier => "GOAL_VERIFIER",
+        goal_runner::GoalRunnerAuthority::Replanner => "REPLANNER",
+        goal_runner::GoalRunnerAuthority::Finalizer => "FINALIZER",
+    }
 }
 
 fn goal_status_name(status: GoalStatus) -> &'static str {
