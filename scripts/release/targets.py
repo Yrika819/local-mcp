@@ -155,6 +155,11 @@ def _linux(arch: str, rust_target: str, runner: str, runner_arch: str) -> Target
         # resolved as a sibling executable and the server refuses to start a
         # sandboxed command without it.
         required_helpers=("codex-linux-sandbox",),
+        # ARM64 builds are native in CI, but the current Linux sandbox
+        # capability evidence documents x86_64 only; keep the ARM asset
+        # explicitly experimental until sandbox behavior is validated on a
+        # host that can create the required namespaces.
+        experimental=(arch == "aarch64"),
     )
 
 

@@ -33,14 +33,19 @@ call.
 Ordinary command execution is sandboxed on Linux and macOS, with no network
 access:
 
-- **Linux** uses upstream **Bubblewrap 0.12.0 or newer** with user, PID, and
-  network namespaces plus seccomp, driven by a `codex-linux-sandbox` helper.
-  The released executables dynamically link to the host GNU/Linux runtime;
-  the release build records each binary's `ldd` dependencies and highest
-  required GLIBC symbol in its Actions job log. No compatibility claim is made
-  for distributions older than the ABI those checks report.
+- **Linux x86_64** uses upstream **Bubblewrap 0.12.0 or newer** with user,
+  PID, and network namespaces plus seccomp, driven by a `codex-linux-sandbox`
+  helper. **Linux aarch64 is experimental**: it builds natively in CI, but the
+  repository's Linux sandbox evidence documents x86_64 and does not establish
+  ARM64 sandbox closure. Both architectures' executables dynamically link to
+  the host GNU/Linux runtime; the release build records each binary's `ldd`
+  dependencies and highest required GLIBC symbol in its Actions job log. No
+  compatibility claim is made for distributions older than the ABI those
+  checks report.
 - **macOS** uses the system **Seatbelt** (`sandbox-exec`); the release build
-  records system library dependencies with `otool -L`.
+  records system library dependencies with `otool -L`. Native release-closure
+  evidence is Intel x86_64 only; Apple Silicon is a remote CI target and is not
+  claimed as locally release-closure validated.
 - **Windows** has **no Unix-equivalent process sandbox** in this release. See
   the experimental note below.
 
@@ -74,9 +79,9 @@ and still requires explicit local approval.
 | Platform | Status | Sandbox |
 | --- | --- | --- |
 | Linux x86_64 | Supported | Bubblewrap 0.12.0+, namespaces, seccomp |
-| Linux aarch64 | Supported | Bubblewrap 0.12.0+, namespaces, seccomp |
-| macOS x86_64 | Supported | Seatbelt (`sandbox-exec`) |
-| macOS Apple Silicon | Supported | Seatbelt (`sandbox-exec`) |
+| Linux aarch64 | **Experimental**; native build in CI, sandbox not closure-validated | Bubblewrap 0.12.0+, namespaces, seccomp |
+| macOS x86_64 | Supported; native Intel release evidence | Seatbelt (`sandbox-exec`) |
+| macOS Apple Silicon | Native build/test target in CI; not locally release-closure validated | Seatbelt (`sandbox-exec`) |
 | Windows x86_64 | **Experimental** | None; host-native with approval |
 | Windows aarch64 | **Experimental** | None; host-native with approval |
 
@@ -104,6 +109,9 @@ to run a sandboxed command without it. See
 ## Known limitations
 
 - Windows is experimental and lacks a process sandbox.
+- Linux aarch64 is an experimental native build target; sandbox behavior has
+  not been release-closure validated on a host that can create the required
+  namespaces.
 - The Bubblewrap minimum-version gate can reject a distribution package whose
   upstream-reported version is below 0.12.0 even where a fix was backported.
 - Windows remains experimental; its broader runtime dependency compatibility

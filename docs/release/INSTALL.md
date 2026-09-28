@@ -24,6 +24,11 @@ altered; do not run the binary.
 
 Pick the archive that matches your platform:
 
+> **Linux aarch64 is experimental.** Its binary is built natively and its
+> package/architecture checks run in CI, but the repository's Linux sandbox
+> evidence documents x86_64 only. Do not treat an ARM64 build as sandbox
+> closure validation.
+
 | Platform | Archive |
 | --- | --- |
 | Linux x86_64 | `local-mcp-v0.1.0-linux-x86_64.tar.gz` |

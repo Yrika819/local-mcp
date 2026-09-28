@@ -156,10 +156,13 @@ class TargetMatrixTest(unittest.TestCase):
             self.assertEqual(target.required_helpers, ())
             self.assertIn("codex-linux-sandbox", target.forbidden)
 
-    def test_windows_is_marked_experimental(self) -> None:
+    def test_documented_experimental_targets_are_marked_in_the_matrix(self) -> None:
+        # Windows has no process sandbox. Linux ARM64 has a native build but
+        # no sandbox closure evidence on a host that can create namespaces.
         self.assertTrue(targets.get("windows-x86_64").experimental)
         self.assertTrue(targets.get("windows-aarch64").experimental)
-        for key in ("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64"):
+        self.assertTrue(targets.get("linux-aarch64").experimental)
+        for key in ("linux-x86_64", "macos-x86_64", "macos-aarch64"):
             self.assertFalse(targets.get(key).experimental)
 
     def test_matrix_covers_the_required_platforms(self) -> None:
