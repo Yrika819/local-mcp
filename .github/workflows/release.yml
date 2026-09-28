@@ -1,0 +1,405 @@
+name: Release
+
+# Two entry points, with a hard separation between them:
+#
+#   * `push` on a `v*` tag is the real release path. It is the only trigger that
+#     can reach the `publish` job.
+#   * `workflow_dispatch` is the dry-run path. It builds the real, final-form
+#     archives and uploads them as Actions artifacts, and nothing else.
+#
+# The dry-run/publish split is enforced by job-level `if:` conditions rather
+# than by a boolean input, so "dry run" is not a setting a mistake can flip:
+# the publish job requires `github.event_name == 'push'` *and* a `refs/tags/v*`
+# ref, and a `workflow_dispatch` run can satisfy neither.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (must match Cargo.toml)"
+        required: true
+        default: "0.1.0"
+      reason:
+        description: "Why this dry run is being run (recorded in the run)"
+        required: false
+        default: "release preparation"
+
+# Least privilege for the whole workflow. Only the `publish` job raises this,
+# and only on the tag path, so a dry run never holds a write scope at all.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Keeps absolute build paths out of the distributed binaries.
+  RUSTFLAGS: -C debuginfo=0
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Resolve the version and prove this run is not a dry run.
+  # ---------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve version and mode
+        id: plan
+        run: |
+          set -euo pipefail
+
+          # The tag is the only source of truth on the release path; a
+          # dispatch supplies it explicitly. Either way it is checked against
+          # Cargo.toml so an asset can never be named for one version while
+          # being built from another.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+            case "$tag" in
+              v[0-9]*) ;;
+              *) echo "::error::tag $tag does not look like a version tag"; exit 1;;
+            esac
+            version="${tag#v}"
+            dry_run="false"
+          else
+            version="${{ inputs.version }}"
+            dry_run="true"
+          fi
+
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$cargo_version" ]; then
+            echo "::error::could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::requested version '$version' does not match Cargo.toml version '$cargo_version'"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "dry_run=$dry_run"
+            echo "cargo_version=$cargo_version"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run release-script self-tests
+        run: |
+          set -euo pipefail
+          python3 scripts/release/test_release_scripts.py
+          python3 scripts/release/test_workflow_policy.py
+
+  # ---------------------------------------------------------------------
+  # Build, smoke test, and package one platform per matrix cell.
+  # ---------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.key }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: linux-x86_64
+            runner: ubuntu-22.04
+            runner_arch: X64
+            rust_host: x86_64-unknown-linux-gnu
+            binaries: local-mcp,codex-linux-sandbox
+          - key: linux-aarch64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            rust_host: aarch64-unknown-linux-gnu
+            binaries: local-mcp,codex-linux-sandbox
+          - key: macos-x86_64
+            runner: macos-15-intel
+            runner_arch: X64
+            rust_host: x86_64-apple-darwin
+            binaries: local-mcp
+          - key: macos-aarch64
+            runner: macos-15
+            runner_arch: ARM64
+            rust_host: aarch64-apple-darwin
+            binaries: local-mcp
+          - key: windows-x86_64
+            runner: windows-2025
+            runner_arch: X64
+            rust_host: x86_64-pc-windows-msvc
+            binaries: local-mcp.exe
+          - key: windows-aarch64
+            runner: windows-11-arm
+            runner_arch: ARM64
+            rust_host: aarch64-pc-windows-msvc
+            binaries: local-mcp.exe
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+
+      - name: Verify runner and toolchain architecture
+        shell: bash
+        env:
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          EXPECTED_RUST_HOST: ${{ matrix.rust_host }}
+        run: |
+          set -euo pipefail
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+          test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH"
+          host=$(rustc -vV | awk -F': ' '/^host:/{print $2}')
+          printf 'rust_host=%s\n' "$host"
+          test "$host" = "$EXPECTED_RUST_HOST"
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          BINARIES: ${{ matrix.binaries }}
+        run: |
+          set -euo pipefail
+          args=()
+          IFS=',' read -ra names <<< "$BINARIES"
+          for name in "${names[@]}"; do
+            args+=(--bin "$name")
+          done
+          cargo build --release --locked "${args[@]}"
+
+      - name: CLI smoke test
+        shell: bash
+        env:
+          BINARIES: ${{ matrix.binaries }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra names <<< "$BINARIES"
+          for name in "${names[@]}"; do
+            printf '--- %s --version ---\n' "$name"
+            "target/release/$name" --version
+            printf '--- %s --help ---\n' "$name"
+            "target/release/$name" --help
+          done
+
+      - name: Package deterministic archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          KEY: ${{ matrix.key }}
+          BINARIES: ${{ matrix.binaries }}
+        run: |
+          set -euo pipefail
+          args=()
+          IFS=',' read -ra names <<< "$BINARIES"
+          for name in "${names[@]}"; do
+            args+=(--binary "$name=target/release/$name")
+          done
+          python3 scripts/release/package.py \
+            --target "$KEY" \
+            --version "$VERSION" \
+            --repo-root . \
+            --out-dir dist \
+            "${args[@]}" | tee "package-$KEY.txt"
+
+      - name: Verify packaged archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          name=$(python3 -c "import sys; sys.path.insert(0,'scripts/release'); from targets import get; print(get('$KEY').archive_name('$VERSION'))")
+          python3 scripts/release/verify_package.py \
+            --target "$KEY" \
+            --version "$VERSION" \
+            --archive "dist/$name"
+
+      - name: Verify archive extracts with the expected layout
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          name=$(python3 -c "import sys; sys.path.insert(0,'scripts/release'); from targets import get; print(get('$KEY').archive_name('$VERSION'))")
+          rm -rf extracted
+          mkdir extracted
+          case "$name" in
+            *.zip) unzip -q "dist/$name" -d extracted ;;
+            *.tar.gz) tar -xzf "dist/$name" -C extracted ;;
+            *) echo "unexpected archive name: $name"; exit 1;;
+          esac
+          # Exactly one top-level directory, and nothing beside it.
+          test "$(find extracted -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1
+          test "$(find extracted -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
+          root=$(find extracted -mindepth 1 -maxdepth 1 -type d)
+          test -f "$root/LICENSE"
+          test -f "$root/README.md"
+          test -f "$root/SECURITY.md"
+          # No build or VCS residue may travel with the release.
+          test -z "$(find extracted -name '.git*' -o -name 'target' -o -name '*.rs' | head -n1 || true)"
+          if [ "$KEY" = "linux-x86_64" ] || [ "$KEY" = "linux-aarch64" ]; then
+            test -x "$root/codex-linux-sandbox"
+          fi
+          if [ "$RUNNER_OS" != Windows ]; then
+            test -x "$root/local-mcp"
+          else
+            test -f "$root/local-mcp.exe"
+          fi
+          printf 'extracted_root=%s\n' "$root"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: archive-${{ matrix.key }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # Aggregate every platform's archive, generate checksums, and re-verify
+  # the combined set on a single runner.
+  # ---------------------------------------------------------------------
+  checksums:
+    name: checksums
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Report artifact sizes and digests
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "### Packaged release artifacts" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| artifact | bytes | sha256 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist/*; do
+            printf 'artifact=%s bytes=%s sha256=%s\n' \
+              "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')" "$(sha256sum "$f" | cut -d' ' -f1)"
+          done
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: python3 scripts/release/checksums.py generate --dist dist --version "$VERSION"
+
+      - name: Verify SHA256SUMS against the artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/checksums.py verify --dist dist --version "$VERSION"
+          # Also prove the file works with the standard tool a user would use.
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Re-verify every downloaded archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Re-running the structural checks against the downloaded copies
+          # proves the artifacts survived upload, not just the build.
+          for key in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64 windows-aarch64; do
+            name=$(python3 -c "import sys; sys.path.insert(0,'scripts/release'); from targets import get; print(get('$key').archive_name('$VERSION'))")
+            python3 scripts/release/verify_package.py --target "$key" --version "$VERSION" --archive "dist/$name"
+          done
+
+      - name: Upload checksums and archives
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: release-assets-${{ needs.plan.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------
+  # Publication. Reachable only by a real `v*` tag push.
+  #
+  # Both conditions must hold. `workflow_dispatch` sets event_name to
+  # `workflow_dispatch` and cannot produce a `refs/tags/v*` ref, so a dry run
+  # can never enter this job regardless of any input value.
+  # ---------------------------------------------------------------------
+  publish:
+    name: publish
+    needs: [plan, build, checksums]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-${{ needs.plan.outputs.version }}
+          path: dist
+
+      - name: Assert the dry-run guard held
+        run: |
+          set -euo pipefail
+          test "${{ needs.plan.outputs.dry_run }}" = "false"
+          test "${GITHUB_REF}" = "refs/tags/v${{ needs.plan.outputs.version }}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.release_tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Refuse to continue unless every expected asset is present.
+          python3 scripts/release/checksums.py verify --dist dist --version "$VERSION"
+          notes="dist/RELEASE_NOTES.md"
+          if [ -f "$notes" ]; then
+            gh release create "$TAG" dist/* --title "local-mcp $TAG" --notes-file "$notes"
+          else
+            gh release create "$TAG" dist/* --title "local-mcp $TAG" --generate-notes
+          fi
