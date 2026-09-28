@@ -27,8 +27,11 @@ package metadata:
   services, and threading APIs used by the named-pipe ACL implementation.
 
 The OpenAI Codex dependencies retain their upstream attribution and license terms.
-When distributing binaries, preserve the relevant Codex repository license and
-notice files alongside this project notice.
+The release archives include verbatim copies of the root `LICENSE` and `NOTICE`
+files from the exact Codex revision pinned in `Cargo.toml` as
+[`CODEX-LICENSE.txt`](CODEX-LICENSE.txt) and [`CODEX-NOTICE.txt`](CODEX-NOTICE.txt),
+alongside this project notice. The source copies are not rewritten; the pinned
+Codex `NOTICE` includes Ratatui attribution.
 
 ## Transitive dependencies
 

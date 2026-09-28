@@ -33,9 +33,10 @@ Pick the archive that matches your platform:
 | Windows x86_64 | `local-mcp-v0.1.0-windows-x86_64.zip` |
 | Windows ARM64 | `local-mcp-v0.1.0-windows-aarch64.zip` |
 
-Each archive contains a single versioned directory (`LICENSE`, `README.md`,
-`SECURITY.md`, and the binaries), so extracting it does not scatter files into
-your current directory.
+Each archive contains a single versioned directory with the binaries, project
+`LICENSE`, `README.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, and the
+verbatim Apache-2.0 `CODEX-LICENSE.txt` and `CODEX-NOTICE.txt` from the pinned
+Codex revision. Extracting it does not scatter files into your current directory.
 
 ## Linux
 
@@ -95,9 +96,12 @@ host property, not something you can configure around.
 
 ### Other requirements
 
-`bash` and `curl` must be available for the runtime environment, as with a
-Nix build. Your distribution's `openssl` is not needed: it is vendored and
-statically linked into the binary.
+The Linux executables dynamically link against the GNU/Linux runtime; the
+release job records the exact `ldd` output and highest required GLIBC symbol
+for each architecture. Install on a distribution whose glibc provides at least
+the reported symbol version. That ABI floor can differ between the x86_64 and
+aarch64 assets because they are built on different native Ubuntu runners. The
+vendored OpenSSL does not require a separate system OpenSSL library.
 
 ## macOS
 
@@ -113,8 +117,9 @@ tar -xzf local-mcp-v0.1.0-macos-aarch64.tar.gz
 install -m 0755 local-mcp-v0.1.0-macos-aarch64/local-mcp /usr/local/bin/local-mcp
 ```
 
-The binary is not notarized or code-signed as part of this release. Gatekeeper
-may therefore refuse to run it the first time. If it does, either use the
+The binary links to system libraries as listed by `otool -L` in the release
+build log. It is not notarized or code-signed as part of this release.
+Gatekeeper may therefore refuse to run it the first time. If it does, either use the
 source build below or remove the quarantine attribute from the file you
 extracted:
 

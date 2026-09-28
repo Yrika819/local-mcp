@@ -27,16 +27,19 @@ from typing import Dict, List, Tuple
 # that would invalidate an already-published asset.
 ARCHIVE_FORMAT_VERSION = 1
 
-# Files that ship alongside the binaries in every archive. `LICENSE` is
-# mandatory rather than decorative: the MIT license requires the copyright
-# notice to travel with all copies, and the upstream attribution in it is
-# part of the release's obligations. `README.md` and `SECURITY.md` ship so
-# that a user who downloads only a tarball still has the documented security
-# model and the known advisory status in front of them.
+# Files that ship alongside the binaries in every archive. The MIT project
+# license and Apache-2.0 Codex license require their notices to travel with
+# copies; the pinned upstream Codex NOTICE is retained verbatim too. The
+# project notice explains the broader locked dependency graph. README.md and
+# SECURITY.md travel with every download so the security model and known
+# advisory status are not separated from the binaries.
 DOCUMENT_FILES: Tuple[str, ...] = (
+    "CODEX-LICENSE.txt",
+    "CODEX-NOTICE.txt",
     "LICENSE",
     "README.md",
     "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md",
 )
 
 

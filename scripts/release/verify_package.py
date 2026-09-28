@@ -188,18 +188,23 @@ def elf_machine(data: bytes) -> Optional[str]:
     }.get(machine, f"unknown-elf-machine-0x{machine:04x}")
 
 
+def _macho_byte_order(data: bytes) -> Optional[str]:
+    """Return the header byte order for a 64-bit Mach-O magic value."""
+    if data[:4] == b"\xcf\xfa\xed\xfe":  # MH_MAGIC_64, little-endian
+        return "<"
+    if data[:4] == b"\xfe\xed\xfa\xcf":  # MH_CIGAM_64, big-endian
+        return ">"
+    return None
+
+
 def macho_arch(data: bytes) -> Optional[str]:
-    """Identify a Mach-O binary and return its architecture, or None."""
+    """Identify a 64-bit Mach-O binary and return its architecture, or None."""
     if len(data) < 32:
         return None
-    magic = struct.unpack_from(">I", data, 0)[0]
-    if magic not in (0xFEEDFACF, 0xFEEDFACE):
+    byte_order = _macho_byte_order(data)
+    if byte_order is None:
         return None
-    cpu_type = struct.unpack_from("<I", data, 4)[0]
-    # 32-bit binaries (0xFEEDFACE) are not a supported release target; the
-    # caller sees None and treats the file as unrecognized.
-    if magic == 0xFEEDFACE:
-        return None
+    cpu_type = struct.unpack_from(f"{byte_order}I", data, 4)[0]
     return {
         MACHO_CPU_X86_64: "x86_64",
         MACHO_CPU_ARM64: "aarch64",
@@ -208,9 +213,12 @@ def macho_arch(data: bytes) -> Optional[str]:
 
 def macho_filetype(data: bytes) -> Optional[int]:
     """Return the Mach-O filetype, used to confirm this is an executable."""
-    if len(data) < 16 or struct.unpack_from(">I", data, 0)[0] != 0xFEEDFACF:
+    if len(data) < 16:
         return None
-    return struct.unpack_from("<I", data, 12)[0]
+    byte_order = _macho_byte_order(data)
+    if byte_order is None:
+        return None
+    return struct.unpack_from(f"{byte_order}I", data, 12)[0]
 
 
 def pe_machine(data: bytes) -> Optional[str]:

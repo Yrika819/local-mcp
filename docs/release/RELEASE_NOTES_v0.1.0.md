@@ -35,7 +35,12 @@ access:
 
 - **Linux** uses upstream **Bubblewrap 0.12.0 or newer** with user, PID, and
   network namespaces plus seccomp, driven by a `codex-linux-sandbox` helper.
-- **macOS** uses the system **Seatbelt** (`sandbox-exec`).
+  The released executables dynamically link to the host GNU/Linux runtime;
+  the release build records each binary's `ldd` dependencies and highest
+  required GLIBC symbol in its Actions job log. No compatibility claim is made
+  for distributions older than the ABI those checks report.
+- **macOS** uses the system **Seatbelt** (`sandbox-exec`); the release build
+  records system library dependencies with `otool -L`.
 - **Windows** has **no Unix-equivalent process sandbox** in this release. See
   the experimental note below.
 
@@ -101,6 +106,8 @@ to run a sandboxed command without it. See
 - Windows is experimental and lacks a process sandbox.
 - The Bubblewrap minimum-version gate can reject a distribution package whose
   upstream-reported version is below 0.12.0 even where a fix was backported.
+- Windows remains experimental; its broader runtime dependency compatibility
+  has not been established as part of this release.
 - Hosted Linux images disagree about whether an unprivileged user can write
   `/proc/<pid>/uid_map`; where they cannot, the sandbox cannot be built at all.
   This is a kernel property, not a Bubblewrap property.

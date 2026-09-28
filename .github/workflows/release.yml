@@ -230,7 +230,10 @@ jobs:
           args=()
           IFS=',' read -ra names <<< "$BINARIES"
           for name in "${names[@]}"; do
-            args+=(--bin "$name")
+            # Cargo's binary target name does not include the Windows `.exe`
+            # output suffix; the produced file does.
+            cargo_name="${name%.exe}"
+            args+=(--bin "$cargo_name")
           done
           cargo build --release --locked "${args[@]}"
 
@@ -242,10 +245,41 @@ jobs:
           set -euo pipefail
           IFS=',' read -ra names <<< "$BINARIES"
           for name in "${names[@]}"; do
+            # The Linux helper is a launcher, not a CLI; it deliberately does
+            # not implement --version/--help and only runs under sandbox setup.
+            if [ "$name" = "codex-linux-sandbox" ]; then
+              continue
+            fi
             printf '%s\n' "--- $name --version ---"
             "target/release/$name" --version
             printf '%s\n' "--- $name --help ---"
             "target/release/$name" --help
+          done
+
+      - name: Inspect native runtime dependencies
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        env:
+          BINARIES: ${{ matrix.binaries }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra names <<< "$BINARIES"
+          for name in "${names[@]}"; do
+            printf '%s\n' "--- runtime dependencies: $name ---"
+            if [ "$RUNNER_OS" = Linux ]; then
+              ldd "target/release/$name" | tee "dependencies-$name.txt"
+              if grep -q 'not found' "dependencies-$name.txt"; then
+                echo "::error::$name has unresolved dynamic dependencies"
+                exit 1
+              fi
+              printf 'glibc_runtime=%s\n' "$(getconf GNU_LIBC_VERSION)"
+              max_glibc=$(readelf --version-info "target/release/$name" \
+                | grep -oE 'GLIBC_[0-9]+(\\.[0-9]+)*' \
+                | sort -Vu | tail -n1 || true)
+              printf 'max_glibc_symbol_requirement=%s\n' "${max_glibc:-none}"
+            else
+              otool -L "target/release/$name" | tee "dependencies-$name.txt"
+            fi
           done
 
       - name: Package deterministic archive
@@ -303,6 +337,9 @@ jobs:
           test -f "$root/LICENSE"
           test -f "$root/README.md"
           test -f "$root/SECURITY.md"
+          test -f "$root/THIRD_PARTY_NOTICES.md"
+          test -f "$root/CODEX-LICENSE.txt"
+          test -f "$root/CODEX-NOTICE.txt"
           # No build or VCS residue may travel with the release.
           test -z "$(find extracted -name '.git*' -o -name 'target' -o -name '*.rs' | head -n1 || true)"
           if [ "$KEY" = "linux-x86_64" ] || [ "$KEY" = "linux-aarch64" ]; then

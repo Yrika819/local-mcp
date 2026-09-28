@@ -50,7 +50,7 @@ def write_elf(path: Path, machine: int) -> None:
 def write_macho(path: Path, cpu_type: int) -> None:
     """Write a minimal 64-bit Mach-O header for the given cpu type."""
     header = bytearray(32)
-    struct.pack_into(">I", header, 0, 0xFEEDFACF)
+    header[0:4] = b"\xcf\xfa\xed\xfe"
     struct.pack_into("<I", header, 4, cpu_type)
     struct.pack_into("<I", header, 8, 3)  # cpusubtype
     struct.pack_into("<I", header, 12, verify_package.MACHO_FILETYPE_EXEC)
@@ -175,13 +175,21 @@ class TargetMatrixTest(unittest.TestCase):
             },
         )
 
-    def test_license_ships_in_every_archive(self) -> None:
-        # MIT requires the copyright notice to travel with copies, and the
-        # upstream attribution lives in that file.
-        self.assertIn("LICENSE", targets.DOCUMENT_FILES)
+    def test_project_and_pinned_upstream_notices_ship_in_every_archive(self) -> None:
+        # MIT and Apache-2.0 require their license notices to travel with
+        # copies. Preserve the pinned Codex NOTICE verbatim alongside the
+        # repository's dependency summary.
+        for name in (
+            "LICENSE",
+            "CODEX-LICENSE.txt",
+            "CODEX-NOTICE.txt",
+            "THIRD_PARTY_NOTICES.md",
+        ):
+            self.assertIn(name, targets.DOCUMENT_FILES)
         for target in targets.TARGETS.values():
             members = target.expected_members("0.1.0")
-            self.assertTrue(any(m.endswith("/LICENSE") for m in members), target.key)
+            for name in targets.DOCUMENT_FILES:
+                self.assertIn(f"{target.root_dir('0.1.0')}/{name}", members, target.key)
 
 
 class PackageTest(unittest.TestCase):
