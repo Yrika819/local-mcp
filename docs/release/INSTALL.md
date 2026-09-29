@@ -1,6 +1,7 @@
-# Installing Local MCP
+# Installing GoalLatch
 
-This is the per-platform install guide for the Public v1 archives. For what the
+GoalLatch Public v1 keeps the `local-mcp` executable and archive names for
+compatibility. This is the per-platform install guide for the Public v1 archives. For what the
 project is and what it does, see the [release
 notes](RELEASE_NOTES_v0.1.0.md). For the security model, read
 [`SECURITY.md`](../../SECURITY.md) — it is the authoritative description, and

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Project identity
+
+- Adopted **GoalLatch** as the public project and brand name.
+- Retained the `Yrika819/local-mcp` repository path, `local-mcp` Cargo package and
+  executable, existing release asset names, and durable compatibility identifiers.
+  This branding change does not alter runtime behavior, authority, or stored state.
+
 ## 0.1.0 — Initial release
 
 ### Goal / orchestration

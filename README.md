@@ -1,8 +1,32 @@
-# local-mcp
+# GoalLatch
 
-Local MCP is released under the MIT License. OpenAI Codex dependencies retain
-their own upstream licenses and notices. Local MCP is an independent project and is
-not affiliated with or endorsed by OpenAI.
+**Host-controlled orchestration for local coding agents.**
+
+GoalLatch is an MIT-licensed MCP server for bounded local-machine access and
+durable Goal / Task orchestration. It combines sandboxed file and command tools,
+explicit host approval for unsandboxed execution, durable recovery, and host-owned
+verification so that agent task state never becomes authority by itself.
+
+The project was previously published as **Local MCP**. For Public v1 compatibility,
+the GitHub repository, Cargo package, executable, MCP command examples, and durable
+state identifiers continue to use `local-mcp`. This is a branding change, not a
+runtime, authority, or storage migration.
+
+OpenAI Codex dependencies retain their own upstream licenses and notices. GoalLatch
+is an independent project and is not affiliated with or endorsed by OpenAI.
+
+## Why GoalLatch
+
+- **Durable goals:** `goal_*` tools persist bounded work, recovery, verification,
+  and replanning across individual agent calls.
+- **Authority stays host-owned:** Goal or model state cannot add filesystem roots,
+  network access, Git publication rights, or host-native execution authority.
+- **Sandboxed by default:** ordinary command execution is network-denied on the
+  supported Unix platforms; unsandboxed execution requires explicit approval.
+- **Fail-closed recovery:** ambiguous side effects are reconciled before retry, and
+  safety or policy refusals are terminal rather than fallback opportunities.
+- **Reviewable execution:** writer proposals are applied by the host and checked by
+  independent verification rather than accepted from model prose.
 
 ## Upstream and attribution
 
@@ -16,7 +40,7 @@ upstream copyright notice is preserved in [`LICENSE`](LICENSE), and dependency
 license evidence is recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 This project is not a tool for bypassing OpenAI safety, policy, usage, or rate-limit decisions.
-Safety and policy refusals are terminal: Local MCP does not reroute them to another
+Safety and policy refusals are terminal: GoalLatch does not reroute them to another
 model, shell, retry, or host-native execution path.
 
 `local-mcp` exposes basic local-machine capabilities as MCP tools: file reads,
@@ -32,7 +56,7 @@ host-controlled work. `goal_start` records an objective without executing it;
 or inspect durable state; and `goal_run` advances one Goal for a caller-provided
 step budget. Goal state is session-scoped and does not grant filesystem, network,
 host-native, Git, publication, or fallback authority. Effectful work continues to
-use the existing Local MCP sandbox, approval, side-effect, verification, and
+use the existing GoalLatch sandbox, approval, side-effect, verification, and
 recovery boundaries. Codex processes used by the orchestrator are read-only.
 
 ## Platform support
@@ -52,8 +76,8 @@ pinned Codex Linux helper on Linux, and Seatbelt (`sandbox-exec`) on macOS.
 Ordinary commands have network access denied. Linux requires upstream Bubblewrap
 0.12.0 or newer; the helper rejects older or unparseable versions before starting
 the requested command. See [Linux sandbox support](docs/linux_sandbox.md) for
-requirements and tested scope. The legacy Landlock path is not selected by Local
-MCP and does not replace the full Bubblewrap filesystem/network contract.
+requirements and tested scope. The legacy Landlock path is not selected by
+GoalLatch and does not replace the full Bubblewrap filesystem/network contract.
 
 ## Usage
 
@@ -154,7 +178,7 @@ the failed primary operation actually used the sandboxed path.
 - `accepted_exit_codes`: exit codes that have a defined normal/expected
   meaning for the probe. Exit `0` is always accepted.
 - `operation`: an optional structured authority/scope/budget contract.
-  Callers that do not provide it keep normal Local MCP behavior and do not
+  Callers that do not provide it keep normal GoalLatch behavior and do not
   gain executable fallback authority.
 
 Host-side results preserve `exit_code`, `stdout`, and `stderr` and add a
@@ -167,7 +191,7 @@ The host records only evidence it can know truthfully, and it keeps the
 lifecycle of the **sandbox process** separate from the lifecycle of the
 **requested command**:
 
-- `host_reached=true` means the Local MCP host received and processed the tool
+- `host_reached=true` means the GoalLatch host received and processed the tool
   request.
 - `command_start_proof` describes the requested command and is one of `PROVEN`,
   `REFUTED`, or `UNPROVEN`. `command_started` is `true` only for `PROVEN`.
@@ -213,7 +237,7 @@ Executable fallback is only an internal continuation of the host-observed
 `execute`/`start_command` path.
 
 Policy V2 deliberately does not give Codex arbitrary mutation authority. For
-executable fallback, Codex performs a read-only preflight; Local MCP then
+executable fallback, Codex performs a read-only preflight; GoalLatch then
 constructs the exact host-native command from the structured operation and
 performs independent read-only postcondition verification. This prevents the
 model from broadening `git add -- pathA pathB` into `git add -A`, changing a
@@ -275,7 +299,7 @@ consumes it; unknown state locks it. A fallback is never a free extra
 mutation.
 
 Executable fallback always requires independent post-verification. For
-`git_stage_paths`, Local MCP snapshots `git ls-files --stage -z` before the
+`git_stage_paths`, GoalLatch snapshots `git ls-files --stage -z` before the
 sandbox attempt, proves the failed attempt did not change the index before
 fallback, executes only the structured exact-path staging command, then
 compares the index again and rejects any changed path outside the allowlist.

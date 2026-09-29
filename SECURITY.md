@@ -30,7 +30,7 @@ it has no equivalent process sandbox, so host-native command and file mutation p
 are explicitly described and approval-gated. Windows named pipes reject remote clients
 and are created with an explicit current-user-only DACL (owner and sole allow ACE are
 the current Windows user SID; no Everyone, Anonymous, Authenticated Users, SYSTEM, or
-Administrators grant). On Unix, Local MCP-owned state directories are explicitly
+Administrators grant). On Unix, GoalLatch-owned state directories are explicitly
 restricted to mode 0700 and session/Goal JSON, atomic temporary files, and Goal lock
 files to mode 0600. Unix approval sockets are 0600 inside a 0700 per-user directory.
 Creation, open, load, and save paths establish or tighten owned state without relying
@@ -49,7 +49,7 @@ The locked upstream Codex dependency graph includes `quick-xml 0.38.4`
 (RUSTSEC-2024-0436). The pinned Codex protocol manifest requires
 `quick-xml 0.38.4`, and its Rama DNS dependency requires the Hickory 0.25
 series, so those fixed versions are not selectable without an upstream pin or
-manifest change. Local MCP does not call Codex's XML hook-prompt parser, does not
+manifest change. GoalLatch does not call Codex's XML hook-prompt parser, does not
 configure the Codex-managed network proxy for sandboxed execution, and does not
 enable Hickory DNSSEC validation features. These inherited findings remain in
 the lockfile and should be reassessed with any Codex/Rama/Starlark dependency
@@ -82,7 +82,7 @@ from typed host-owned evidence and are terminal blocks (`PLATFORM_SAFETY` or
 `SANDBOX_SETUP`) rather than as permission failures.
 Activity and approval messages can include caller-supplied command arguments, paths,
 and file-diff content. Do not place secrets in commands or files being edited when
-those messages are visible to the local approval UI; Local MCP does not promise
+those messages are visible to the local approval UI; GoalLatch does not promise
 redaction of user-supplied values.
 
 Maintainers should acknowledge a private report when practical, coordinate a fix or
