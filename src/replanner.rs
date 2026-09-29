@@ -1205,7 +1205,7 @@ fn parse_and_validate_proposal(
         .collect::<BTreeMap<_, _>>();
     let current_spec = goal.final_verification_spec().ok_or_else(|| {
         ReplannerError::ReplanAuthorityViolation(
-            "schema-3 replan requires an existing Goal final-verification contract".to_owned(),
+            "replan requires an existing Goal final-verification contract".to_owned(),
         )
     })?;
     let mut seen_criterion_strengthenings = BTreeSet::new();

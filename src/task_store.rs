@@ -9,6 +9,29 @@ use crate::goal::{GOAL_SCHEMA_VERSION, GOAL_STORE_FORMAT, Goal, GoalId};
 use crate::orchestrator_error::OrchestratorError;
 use crate::secure_fs;
 
+/// Schema 3 added the pristine-plan-supersession history. Reading a schema-2
+/// Goal must therefore add that field before continuing the migration chain.
+const SCHEMA_WITH_PRISTINE_PLAN_SUPERSESSIONS: u64 = 3;
+
+/// The schema immediately before Managed Worktrees V1. A stored Goal at this
+/// version has no managed-workspace state to preserve.
+const SCHEMA_BEFORE_MANAGED_WORKTREES: u64 = 3;
+
+/// Schema 4 added Managed Worktrees V1 workspace identity
+/// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` section 9). Reading a pre-managed
+/// Goal must therefore add `workspace_mode` as `PRIMARY` and must never invent
+/// managed-worktree ownership.
+const SCHEMA_WITH_MANAGED_WORKTREES: u64 = 4;
+
+/// The migration chain above is written against a specific current schema. If a
+/// future change advances `GOAL_SCHEMA_VERSION` without extending the chain,
+/// refuse to compile rather than silently routing a newer durable document
+/// through an older migration step.
+const _: () = assert!(
+    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITH_MANAGED_WORKTREES,
+    "goal schema migration chain must be extended when GOAL_SCHEMA_VERSION advances"
+);
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FaultPoint {
@@ -359,25 +382,67 @@ impl TaskStore {
             let migrated_object = migrated.as_object_mut().expect("validated object");
             migrated_object.insert(
                 "schema_version".to_owned(),
-                Value::from(GOAL_SCHEMA_VERSION),
+                Value::from(SCHEMA_WITH_PRISTINE_PLAN_SUPERSESSIONS),
             );
             migrated_object.insert(
                 "pristine_plan_supersessions".to_owned(),
                 Value::Array(Vec::new()),
             );
-            let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
-                OrchestratorError::CorruptGoal(format!(
-                    "schema-2 durable Goal shape is invalid: {error}"
-                ))
-            })?;
-            goal.validate()?;
-            return Ok(goal);
+            // The document is now schema 3. Continue through the shared
+            // pre-managed-worktree step so a stored schema-2 Goal is normalized
+            // by exactly the same code as a stored schema-3 Goal, rather than
+            // relying on a serde default to coincide with the intended value.
+            return Self::decode_pre_managed_schema(migrated);
+        }
+        if schema_version == SCHEMA_BEFORE_MANAGED_WORKTREES {
+            return Self::decode_pre_managed_schema(value);
         }
         if schema_version != GOAL_SCHEMA_VERSION as u64 {
             return Err(OrchestratorError::UnsupportedSchema(schema_version));
         }
         let goal: Goal = serde_json::from_value(value).map_err(|error| {
             OrchestratorError::CorruptGoal(format!("durable Goal shape is invalid: {error}"))
+        })?;
+        goal.validate()?;
+        Ok(goal)
+    }
+
+    /// Migrate a pre-managed-worktree durable Goal (schema 3) to schema 4.
+    ///
+    /// Schema 4 introduces explicit Managed Worktrees V1 workspace identity. A
+    /// schema-3 Goal has no such state, so migration is strictly additive: it
+    /// sets `workspace_mode` to `PRIMARY` and leaves the managed-worktree record
+    /// and creation intent absent. It never derives ownership from `Goal.cwd`,
+    /// a directory name, a branch name, or any repository observation, so no
+    /// stored Goal is silently converted into managed mode
+    /// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` sections 3 and 9).
+    fn decode_pre_managed_schema(value: Value) -> Result<Goal, OrchestratorError> {
+        let mut migrated = value;
+        let migrated_object = migrated.as_object_mut().expect("validated object");
+        migrated_object.insert("workspace_mode".to_owned(), Value::from("PRIMARY"));
+        Self::decode_migrated_goal(migrated, SCHEMA_BEFORE_MANAGED_WORKTREES)
+    }
+
+    /// Finish a migration by stamping the current schema version, decoding, and
+    /// validating. `origin` is the stored version the migration started from and
+    /// is used only for the corruption message.
+    fn decode_migrated_goal(mut migrated: Value, origin: u64) -> Result<Goal, OrchestratorError> {
+        let object = migrated.as_object_mut().expect("validated object");
+        if object.contains_key("managed_worktree")
+            || object.contains_key("managed_worktree_creation_intent")
+        {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{origin} durable Goal must not carry managed-worktree state"
+            )));
+        }
+        object.insert(
+            "schema_version".to_owned(),
+            Value::from(GOAL_SCHEMA_VERSION),
+        );
+        let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
+            OrchestratorError::CorruptGoal(format!(
+                "schema-{origin} durable Goal shape is invalid: {error}"
+            ))
         })?;
         goal.validate()?;
         Ok(goal)
@@ -916,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_loads_as_in_memory_schema_three_without_rewriting() {
+    fn schema_two_loads_as_in_memory_schema_four_without_rewriting() {
         let root = state_root();
         let store = TaskStore::with_state_root(root.clone());
         let goal = goal("schema-two-migration");
@@ -943,7 +1008,7 @@ mod tests {
                 |goal, _| {
                     goal.add_blocker(crate::goal::GoalBlocker::new(
                         "MIGRATION",
-                        "persist v3",
+                        "persist current schema",
                         false,
                     ))
                 },
@@ -955,6 +1020,132 @@ mod tests {
             persisted["schema_version"],
             Value::from(GOAL_SCHEMA_VERSION)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Managed Worktrees V1 section 9: a stored schema-3 Goal migrates
+    /// additively to the current schema as `PRIMARY` and never acquires managed
+    /// ownership from its path, branch, or directory name.
+    #[test]
+    fn schema_three_migrates_to_primary_without_inventing_ownership() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session = "schema-three-migration";
+        let goal = goal(session);
+        let path = store.goal_path(session, goal.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut value = serde_json::to_value(&goal).unwrap();
+        value["schema_version"] = Value::from(3_u64);
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = store.load_goal(session, goal.id()).unwrap();
+        assert_eq!(loaded.schema_version(), GOAL_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.workspace_mode(),
+            crate::managed_worktree::WorkspaceMode::Primary
+        );
+        assert!(loaded.managed_worktree().is_none());
+        // A migrated PRIMARY Goal keeps exactly the current execution root.
+        assert_eq!(loaded.execution_root(), Some(loaded.cwd()));
+        // Loading must not rewrite the durable file.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The schema-2 path must normalize through the same shared pre-managed step
+    /// as schema 3, so a stored schema-2 Goal is never left relying on a serde
+    /// default to coincide with the intended `PRIMARY` value.
+    #[test]
+    fn schema_two_migrates_to_primary_through_the_shared_step() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session = "schema-two-primary";
+        let goal = goal(session);
+        let path = store.goal_path(session, goal.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut value = serde_json::to_value(&goal).unwrap();
+        value["schema_version"] = Value::from(2_u64);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("pristine_plan_supersessions");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = store.load_goal(session, goal.id()).unwrap();
+        assert_eq!(loaded.schema_version(), GOAL_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.workspace_mode(),
+            crate::managed_worktree::WorkspaceMode::Primary
+        );
+        assert!(loaded.managed_worktree().is_none());
+        assert_eq!(loaded.execution_root(), Some(loaded.cwd()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A legacy stored Goal must not be able to smuggle managed state through a
+    /// migration step: schema 2/3 documents carrying managed-worktree fields are
+    /// corruption, not an upgrade path.
+    #[test]
+    fn legacy_schema_cannot_smuggle_managed_worktree_state() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        for schema in [2_u64, 3_u64] {
+            let session = format!("smuggle-{schema}");
+            let goal = goal(&session);
+            let path = store.goal_path(&session, goal.id()).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut value = serde_json::to_value(&goal).unwrap();
+            value["schema_version"] = Value::from(schema);
+            if schema == 2 {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("pristine_plan_supersessions");
+            }
+            value.as_object_mut().unwrap().insert(
+                "managed_worktree".to_owned(),
+                serde_json::json!({ "worktree_id": "smuggled" }),
+            );
+            std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+            let error = store.load_goal(&session, goal.id()).unwrap_err();
+            assert!(
+                matches!(error, OrchestratorError::CorruptGoal(_)),
+                "schema {schema} accepted smuggled managed state: {error}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A stored legacy Goal must never be silently upgraded to managed mode by
+    /// the mere presence of a managed-looking path or branch name.
+    #[test]
+    fn legacy_goal_with_managed_looking_paths_stays_primary() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session = "managed-looking-cwd";
+        let managed_looking = Goal::new(
+            session,
+            std::path::PathBuf::from("/host/managed-root/local-mcp-goal/worktrees"),
+            "objective",
+            None,
+            vec![],
+            vec![],
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let path = store.goal_path(session, managed_looking.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut value = serde_json::to_value(&managed_looking).unwrap();
+        value["schema_version"] = Value::from(3_u64);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = store.load_goal(session, managed_looking.id()).unwrap();
+        assert_eq!(
+            loaded.workspace_mode(),
+            crate::managed_worktree::WorkspaceMode::Primary
+        );
+        assert!(loaded.managed_worktree().is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

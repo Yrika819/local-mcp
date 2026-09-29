@@ -10,6 +10,9 @@ use uuid::Uuid;
 use crate::config;
 use crate::failure_class::FailureClass;
 use crate::fallback::SideEffectState;
+use crate::managed_worktree::{
+    ManagedWorktreeCreationIntent, ManagedWorktreeRecord, WorkspaceMode,
+};
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -20,7 +23,15 @@ use crate::task::{
 use crate::task::{ReplaySafety, TaskScope, WorkerKind};
 
 pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
-pub(crate) const GOAL_SCHEMA_VERSION: u32 = 3;
+
+/// Schema 4 adds explicit Managed Worktrees V1 workspace identity
+/// (`workspace_mode`, `managed_worktree`, `managed_worktree_creation_intent`).
+///
+/// Managed workspace identity changes Goal authority/evidence semantics, so
+/// `docs/MANAGED_WORKTREES_V1_DESIGN.md` section 9 forbids smuggling it in as
+/// an unversioned assumption. Schema 1/2/3 Goals stay readable and migrate to
+/// `PRIMARY` with no invented worktree ownership.
+pub(crate) const GOAL_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -40,8 +51,7 @@ impl GoalId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
-
-    fn validate(&self) -> Result<(), OrchestratorError> {
+    pub(crate) fn validate(&self) -> Result<(), OrchestratorError> {
         if Self::parse(&self.0)?.0 != self.0 {
             return Err(OrchestratorError::UnsafeIdentifier("GoalId".to_owned()));
         }
@@ -829,6 +839,12 @@ pub(crate) struct Goal {
     failed_task_replan_requests: Vec<FailedTaskReplanRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failed_task_replacements: Vec<FailedTaskReplacementRecord>,
+    #[serde(default, skip_serializing_if = "WorkspaceMode::is_primary")]
+    workspace_mode: WorkspaceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_worktree: Option<ManagedWorktreeRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_worktree_creation_intent: Option<ManagedWorktreeCreationIntent>,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -917,6 +933,9 @@ impl Goal {
             pristine_plan_supersessions: Vec::new(),
             failed_task_replan_requests: Vec::new(),
             failed_task_replacements: Vec::new(),
+            workspace_mode: WorkspaceMode::default(),
+            managed_worktree: None,
+            managed_worktree_creation_intent: None,
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -936,6 +955,61 @@ impl Goal {
 
     pub(crate) fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// Workspace selection. `PRIMARY` is the default and the exact behavior of
+    /// every Goal that does not explicitly opt in.
+    pub(crate) fn workspace_mode(&self) -> WorkspaceMode {
+        self.workspace_mode
+    }
+
+    /// Durable managed-worktree ownership, if this Goal has any.
+    ///
+    /// Presence of this value is host-owned durable state. It is never inferred
+    /// from a path name, a branch name, or a Git convention.
+    pub(crate) fn managed_worktree(&self) -> Option<&ManagedWorktreeRecord> {
+        self.managed_worktree.as_ref()
+    }
+
+    /// Outstanding creation intent, if managed-worktree creation is in flight.
+    pub(crate) fn managed_worktree_creation_intent(
+        &self,
+    ) -> Option<&ManagedWorktreeCreationIntent> {
+        self.managed_worktree_creation_intent.as_ref()
+    }
+
+    /// Host-derived effective execution root (design section 13).
+    ///
+    /// ```text
+    /// PRIMARY          -> Goal.cwd
+    /// MANAGED_ACTIVE   -> managed worktree_root
+    /// ```
+    ///
+    /// This is a pure function of durable state. It returns `None` while a
+    /// managed workspace is only requested, preparing, blocked, or already
+    /// removed, which is how design section 5's "Planner MUST NOT materialize a
+    /// managed plan while the workspace is only requested/preparing/ambiguous"
+    /// is enforced without touching Git or the filesystem.
+    ///
+    /// Phase 1 computes this only. No Planner, writer, verifier, or session
+    /// authority path is routed through it yet; that is Phase 4 execution-root
+    /// plumbing and is deliberately not authorized here.
+    ///
+    /// This is a pure accessor over durable state. It does not re-validate, so it
+    /// must only be reached from an already-validated `Goal` — every constructor
+    /// and durable load path calls `validate()` first.
+    pub(crate) fn execution_root(&self) -> Option<&std::path::Path> {
+        use crate::managed_worktree::ManagedWorktreeLifecycle;
+        match self.workspace_mode {
+            WorkspaceMode::Primary => Some(self.cwd.as_path()),
+            WorkspaceMode::ManagedWorktree => {
+                let record = self.managed_worktree.as_ref()?;
+                if record.lifecycle() != ManagedWorktreeLifecycle::Active {
+                    return None;
+                }
+                Some(record.worktree_root())
+            }
+        }
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -3196,6 +3270,77 @@ impl Goal {
         Ok(changed)
     }
 
+    /// Pure validation of the Managed Worktrees V1 durable state bound to this
+    /// Goal (design sections 3, 4, 5, 8, 11, 21).
+    ///
+    /// This validates only durable data. It performs no filesystem access, no Git
+    /// access, and derives nothing from repository observation; reconciliation
+    /// against real Git state is a separate, later phase.
+    fn validate_managed_workspace_state(&self) -> Result<(), OrchestratorError> {
+        let record = self.managed_worktree.as_ref();
+        let intent = self.managed_worktree_creation_intent.as_ref();
+
+        if self.workspace_mode.is_primary() {
+            if record.is_some() || intent.is_some() {
+                return Err(OrchestratorError::CorruptGoal(
+                    "PRIMARY workspace must not carry managed-worktree state".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let record = record.ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "MANAGED_WORKTREE workspace requires a durable managed-worktree record".to_owned(),
+            )
+        })?;
+        record.validate()?;
+
+        // One non-terminal Goal owns at most one managed linked worktree
+        // (design section 4), which is structural here: the record is singular.
+        if record.goal_id() != &self.id {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed-worktree record ownership does not match the durable Goal".to_owned(),
+            ));
+        }
+        // Design section 13 freezes `Goal.cwd` as the durable identity root, so
+        // a managed record can never relocate the primary root.
+        if record.primary_root() != self.cwd.as_path() {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed-worktree primary_root must remain the durable Goal.cwd".to_owned(),
+            ));
+        }
+        // Workspace lifecycle mutations advance Goal revision but never the plan
+        // revision (design section 21), so a creation-time binding ahead of the
+        // current Goal revision is impossible.
+        if record.created_goal_revision() > self.revision {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed-worktree created_goal_revision cannot exceed the current Goal revision"
+                    .to_owned(),
+            ));
+        }
+
+        // An outstanding intent means creation has not been reconciled yet, and a
+        // reconciled worktree must not keep a stale PREPARED intent around. A
+        // blocked creation may retain its intent so explicit host recovery can
+        // still reconcile the exact intended target.
+        match (
+            intent,
+            record.requires_creation_intent(),
+            record.permits_creation_intent(),
+        ) {
+            (None, true, _) => Err(OrchestratorError::CorruptGoal(
+                "managed-worktree creation is outstanding without a durable PREPARED intent"
+                    .to_owned(),
+            )),
+            (Some(_), _, false) => Err(OrchestratorError::CorruptGoal(
+                "reconciled managed worktree must not retain a PREPARED creation intent".to_owned(),
+            )),
+            (Some(intent), _, true) => intent.validate_against_record(record),
+            (None, false, _) => Ok(()),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), OrchestratorError> {
         if self.store_format != GOAL_STORE_FORMAT {
             return Err(OrchestratorError::CorruptGoal(
@@ -3225,15 +3370,18 @@ impl Goal {
         }
         if self.completion_criteria.is_empty() {
             return Err(OrchestratorError::CorruptGoal(
-                "schema-3 Goal must have at least one host-owned completion criterion".to_owned(),
+                "current-schema Goal must have at least one host-owned completion criterion"
+                    .to_owned(),
             ));
         }
+        self.validate_managed_workspace_state()?;
         let mut criterion_ids = BTreeSet::new();
         for criterion in &self.completion_criteria {
             criterion.id.validate()?;
             if criterion.description.trim().is_empty() || !criterion.required {
                 return Err(OrchestratorError::CorruptGoal(
-                    "schema-3 completion criteria must be non-empty and required in V1".to_owned(),
+                    "current-schema completion criteria must be non-empty and required in V1"
+                        .to_owned(),
                 ));
             }
             if !criterion_ids.insert(criterion.id.clone()) {
@@ -3667,6 +3815,9 @@ impl Goal {
             ));
         }
         self.validate_dag()?;
+        // A legacy terminal Goal has no managed-workspace history to preserve, so
+        // durable managed state on one is corruption rather than compatibility.
+        self.validate_managed_workspace_state()?;
         Ok(())
     }
 
