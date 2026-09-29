@@ -1,39 +1,38 @@
 name: Release
 
-# Three entry points, with a hard separation between them:
+# Two entry points, with a hard separation between them:
 #
 #   * `push` on a `v*` tag is the real release path. It is the only trigger
 #     that can reach the `publish` job.
-#   * `push` to this repository's dry-run branch builds the real, final-form
-#     archives and uploads them as Actions artifacts, and nothing else. This
-#     exists because `workflow_dispatch` only works for workflows that already
-#     exist on the default branch, and this workflow is deliberately not
-#     merged yet.
-#   * `workflow_dispatch` behaves identically to the dry-run branch push, for
-#     runs after the workflow reaches the default branch.
+#   * `workflow_dispatch` builds the real, final-form archives and uploads them
+#     as Actions artifacts, and nothing else. The operator types the intended
+#     version explicitly and there is no default, so a dry run can never
+#     silently re-target an already-published version.
 #
 # The dry-run/publish split is enforced by job-level `if:` conditions rather
 # than by a boolean input, so "dry run" is not a setting a mistake can flip:
 # the publish job requires `github.event_name == 'push'` *and* a
-# `refs/tags/v*` ref, and neither a branch push nor a `workflow_dispatch` run
-# can satisfy both.
+# `refs/tags/v*` ref, and a `workflow_dispatch` run can never satisfy both.
+#
+# There is no branch-push trigger. The pre-release `release/public-v1-dry-run`
+# path existed only while this workflow had not yet reached the default branch,
+# and it has served its purpose. Any trigger that is neither a `v*` tag push
+# nor an explicit `workflow_dispatch` fails closed in the `plan` job rather
+# than inferring a version from `Cargo.toml`.
 
 on:
   push:
     tags:
       - "v*"
-    branches:
-      - "release/public-v1-dry-run"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build (must match Cargo.toml)"
+        description: "Version to build (must match Cargo.toml). No default: type it explicitly."
         required: true
-        default: "0.1.0"
       reason:
         description: "Why this dry run is being run (recorded in the run)"
         required: false
-        default: "release preparation"
+        default: "release dry run"
 
 # Least privilege for the whole workflow. Only the `publish` job raises this,
 # and only on the tag path, so a dry run never holds a write scope at all.
@@ -79,10 +78,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The tag is the only source of truth on the release path; every
-          # other trigger supplies a version explicitly. Either way it is
-          # checked against Cargo.toml so an asset can never be named for one
-          # version while being built from another.
+          # The tag is the only source of truth on the release path, and
+          # workflow_dispatch supplies a version explicitly. There is no third
+          # case: any other trigger is a configuration error and stops the run
+          # rather than guessing a version. Either way it is checked against
+          # Cargo.toml so an asset can never be named for one version while
+          # being built from another.
           if [ "${{ github.event_name }}" = "push" ] && \
              [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             tag="${GITHUB_REF_NAME}"
@@ -96,11 +97,12 @@ jobs:
             version="${{ inputs.version }}"
             dry_run="true"
           else
-            # A push to a branch is always a dry run, by construction: the
-            # version comes from Cargo.toml because there is no tag to read it
-            # from.
-            version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
-            dry_run="true"
+            # Fail closed. An unsupported trigger must never be resolved into a
+            # version by inference: a version guessed wrong here would name
+            # every asset in the run.
+            echo "::error::unsupported trigger: event_name='${{ github.event_name }}' ref_type='${GITHUB_REF_TYPE}' ref='${GITHUB_REF}'"
+            echo "::error::release.yml supports only a 'v*' tag push (publication) and an explicit workflow_dispatch (dry run)"
+            exit 1
           fi
 
           cargo_version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"

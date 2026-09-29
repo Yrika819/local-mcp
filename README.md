@@ -100,12 +100,14 @@ nix build
 ```
 
 Public v1 binary downloads are distributed as versioned GitHub Release assets;
-there is no crates.io package or package-manager publication. When a GitHub
-Release is available, use the matching archive and verify it against `SHA256SUMS`;
+there is no crates.io package or package-manager publication. `v0.1.0` is
+published, so the matching archives and the `SHA256SUMS` that covers them are
+available from the
+[v0.1.0 release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.0);
 see [the installation guide](docs/release/INSTALL.md) for platform-specific
-instructions. Until the formal release is published, use the source build above
-or the optional Nix flake. On Linux, the release archive includes the required
-`codex-linux-sandbox` sibling helper.
+instructions. For a version that has no published release yet, use the source
+build above or the optional Nix flake. On Linux, the release archive includes
+the required `codex-linux-sandbox` sibling helper.
 
 The session working directory is the directory where `local-mcp start` was run;
 there is no separate persistent cwd setting. On Linux and macOS, sandboxed calls are

@@ -53,6 +53,30 @@ def job_blocks(path: Path):
         yield name, body
 
 
+def trigger_block(path: Path) -> str:
+    """Return the raw top-level `on:` block of a workflow.
+
+    The block runs until the next column-0 key (or column-0 comment), which is
+    enough separation to isolate the triggers from the rest of the header.
+    """
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r"^on:\n(.*?)(?=^\S)", text, flags=re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError(f"{path.name} has no top-level `on:` block")
+    return match.group(0)
+
+
+def dispatch_input_block(name: str) -> str:
+    """Return the raw YAML body of one `workflow_dispatch` input."""
+    triggers = trigger_block(WORKFLOW_DIR / "release.yml")
+    match = re.search(
+        rf"^      {name}:\n(.*?)(?=^      \w+:|^\S)", triggers, flags=re.MULTILINE | re.DOTALL
+    )
+    if match is None:
+        raise AssertionError(f"release.yml has no workflow_dispatch input {name!r}")
+    return match.group(1)
+
+
 class WorkflowPolicyTest(unittest.TestCase):
     def test_at_least_one_workflow_exists(self) -> None:
         self.assertTrue(workflow_files(), "no workflow files found")
@@ -121,11 +145,11 @@ class WorkflowPolicyTest(unittest.TestCase):
                     f"release.yml job {name!r} mentions write; only the publish job may"
                 )
 
-    def test_release_dry_run_branch_cannot_reach_publish(self) -> None:
-        # The dry-run branch is a push trigger, so the publish guard has to
-        # exclude branch pushes explicitly. `refs/tags/v` does not match a
-        # `refs/heads/...` ref, which is what keeps this safe; assert the guard
-        # is written in a way that depends on the ref, not on an input.
+    def test_publish_guard_keys_on_the_tag_ref_not_on_an_input(self) -> None:
+        # `refs/tags/v` cannot match a `refs/heads/...` ref or a
+        # `workflow_dispatch` ref, so keying publication on the ref is what makes
+        # it unreachable from every dry-run path. The guard must therefore be
+        # written in terms of the ref, never in terms of a caller-supplied value.
         text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
         publish = re.search(
             r"\n  publish:\n(.*?)(?=\n  [a-z_]+:\n|\Z)", text, flags=re.DOTALL
@@ -136,10 +160,104 @@ class WorkflowPolicyTest(unittest.TestCase):
         if guard is None:
             raise AssertionError("the publish job has no `if:` guard")
         self.assertIn("refs/tags/v", guard.group(1))
+        self.assertNotIn("inputs.", guard.group(1))
 
-    def test_dry_run_branch_is_the_sanctioned_dry_run_trigger(self) -> None:
+    def test_release_workflow_has_no_branch_push_dry_run_trigger(self) -> None:
+        # The pre-release dry-run branch existed only while release.yml had not
+        # yet reached the default branch. It is obsolete, and must stay gone: a
+        # branch push is a third code path with no remaining purpose, and any
+        # push to a same-named branch would silently re-enable it.
+        #
+        # This asserts on the `on:` block rather than the whole file, because the
+        # trigger is the policy; the header comment is allowed to name the
+        # retired branch when it explains why the trigger was removed.
+        triggers = trigger_block(WORKFLOW_DIR / "release.yml")
+        self.assertNotIn("release/public-v1-dry-run", triggers)
+        self.assertNotRegex(triggers, r"(?m)^\s+branches:\s*$")
+
+    def test_release_workflow_still_publishes_on_a_v_tag_push(self) -> None:
+        # Removing the branch trigger must not cost the real publication path.
+        triggers = trigger_block(WORKFLOW_DIR / "release.yml")
+        push = re.search(
+            r"^  push:\n(.*?)(?=^  \w+:|^\S)", triggers, flags=re.MULTILINE | re.DOTALL
+        )
+        if push is None:
+            raise AssertionError("release.yml has no `push` trigger")
+        self.assertIn('"v*"', push.group(1))
+        self.assertNotIn("branches:", push.group(1))
+
+    def test_release_workflow_still_supports_workflow_dispatch(self) -> None:
+        triggers = trigger_block(WORKFLOW_DIR / "release.yml")
+        self.assertIn("workflow_dispatch:", triggers)
+
+    def test_dispatch_version_is_required_and_has_no_default(self) -> None:
+        # A default would let an operator dry-run a stale version by clicking
+        # through the form, which after v0.1.0 means re-running a version that is
+        # already published. The version must be typed every time.
+        body = dispatch_input_block("version")
+        self.assertIn("required: true", body)
+        # Match the `default:` key at the start of a line, not the substring:
+        # the input's own description text mentions the word.
+        self.assertIsNone(
+            re.search(r"(?m)^\s+default:", body),
+            "the version input must not carry a default",
+        )
+
+    def test_dispatch_input_does_not_hardcode_a_published_version(self) -> None:
+        # Guards the general failure mode, not just the 0.1.0 instance: no
+        # dispatch input may carry a version-shaped default.
+        triggers = trigger_block(WORKFLOW_DIR / "release.yml")
+        for default in re.findall(r"(?m)^\s+default:\s*[\"\']?([^\"\'\n]+)", triggers):
+            self.assertIsNone(
+                re.fullmatch(r"v?\d+\.\d+\.\d+", default.strip()),
+                f"dispatch input defaults to the concrete version {default!r}",
+            )
+
+    def test_unsupported_trigger_fails_closed(self) -> None:
+        # With the branch trigger removed there is no third case to resolve.
+        # An unexpected trigger must stop the run rather than infer a version
+        # from Cargo.toml, because a wrong version names every asset in the run.
         text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
-        self.assertIn("release/public-v1-dry-run", text)
+        plan = re.search(r"\n  plan:\n(.*?)(?=\n  [a-z_]+:\n|\Z)", text, flags=re.DOTALL)
+        if plan is None:
+            raise AssertionError("release.yml has no plan job")
+        body = plan.group(1)
+        fallback = re.search(r"^\s*else\n(.*?)^\s*fi\s*$", body, flags=re.MULTILINE | re.DOTALL)
+        if fallback is None:
+            raise AssertionError("the plan job has no else branch for unexpected triggers")
+        else_block = fallback.group(1)
+        self.assertIn("exit 1", else_block)
+        self.assertIn("::error::", else_block)
+        # The removed fallback resolved a version by inference; that must not
+        # survive in any form, because it is what a stale branch push used.
+        self.assertNotIn("dry_run=", else_block)
+        self.assertNotIn("Cargo.toml", else_block)
+
+    def test_release_workflow_top_level_permission_is_contents_read(self) -> None:
+        # Not merely "no write at the top level": the whole workflow must still
+        # declare exactly `contents: read`, so the publish job is the only thing
+        # that can raise scope.
+        text = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        top_level = text.split("\njobs:", 1)[0]
+        match = re.search(r"^permissions:\n(.*?)(?=^\S)", top_level, flags=re.MULTILINE | re.DOTALL)
+        if match is None:
+            raise AssertionError("release.yml declares no top-level permissions")
+        declared = []
+        for line in match.group(1).splitlines():
+            if not line.strip():
+                break
+            if line.lstrip().startswith("#"):
+                continue
+            declared.append(line.strip())
+        self.assertEqual(declared, ["contents: read"])
+
+    def test_publish_is_the_only_job_that_grants_write(self) -> None:
+        granting = [
+            name for name, body in job_blocks(WORKFLOW_DIR / "release.yml")
+            if re.search(r"^\s{4}permissions:\s*$", body, flags=re.MULTILINE)
+            and re.search(r"^\s{6}\w+:\s*write\s*$", body, flags=re.MULTILINE)
+        ]
+        self.assertEqual(granting, ["publish"])
 
     def test_release_workflow_runs_posix_scripts_with_bash(self) -> None:
         # The matrix includes Windows, whose runner default is PowerShell.
