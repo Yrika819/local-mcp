@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Build a deterministic Local MCP release archive for one target.
 
-Determinism here means: given the same inputs, the archive bytes are
-reproducible. Every field that would otherwise record the build machine --
-timestamps, uid/gid, owner names -- is pinned to a fixed value, and members
-are written in a stable order. That is what makes the published SHA256SUMS a
-meaningful integrity record rather than a record of one machine's clock.
+Determinism here means: given identical input files (including already-built
+binaries), the archive bytes are reproducible. Every field that would otherwise
+record the packaging machine -- timestamps, uid/gid, owner names -- is pinned to
+a fixed value, and members are written in a stable order. This normalizes archive
+packaging; it does not make binaries from repeated source builds byte-identical.
 
 Usage:
     package.py --target linux-x86_64 --version 0.1.0 \\

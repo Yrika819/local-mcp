@@ -18,8 +18,10 @@ representation would obscure.
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
@@ -155,6 +157,90 @@ class WorkflowPolicyTest(unittest.TestCase):
         self.assertIn('cp "docs/release/RELEASE_NOTES_v${VERSION}.md" dist/RELEASE_NOTES.md', text)
         self.assertIn('--notes-file "$notes"', text)
         self.assertIn("dist/*.tar.gz dist/*.zip dist/SHA256SUMS", text)
+        self.assertIn('--title "Local MCP $TAG (Public v1)"', text)
+
+    def test_release_notes_links_are_release_pinned_and_tracked(self) -> None:
+        notes_path = Path("docs/release/RELEASE_NOTES_v0.1.0.md")
+        notes = (REPO_ROOT / notes_path).read_text(encoding="utf-8")
+        tracked = set(
+            subprocess.check_output(
+                ["git", "ls-files"], cwd=REPO_ROOT, text=True
+            ).splitlines()
+        )
+        links = re.findall(r"!?\[[^\]]*\]\((<[^>]+>|[^)\s]+)", notes)
+        local_targets = set()
+        for raw_destination in links:
+            destination = raw_destination.strip("<>")
+            parsed = urlsplit(destination)
+            if parsed.scheme in ("http", "https", "mailto"):
+                if parsed.hostname == "github.com" and parsed.path.startswith(
+                    "/Yrika819/local-mcp/"
+                ):
+                    prefix = "/Yrika819/local-mcp/blob/v0.1.0/"
+                    self.assertTrue(parsed.path.startswith(prefix), destination)
+                    target = unquote(parsed.path[len(prefix):])
+                    self.assertIn(target, tracked, destination)
+                    local_targets.add(target)
+                continue
+
+            self.fail(
+                f"release notes must use tag-pinned absolute links, got {destination!r}"
+            )
+
+        self.assertEqual(
+            local_targets,
+            {
+                "docs/linux_sandbox.md",
+                "SECURITY.md",
+                "docs/release/INSTALL.md",
+                "LICENSE",
+                "THIRD_PARTY_NOTICES.md",
+            },
+        )
+        self.assertEqual(
+            notes.count("Both architectures' executables dynamically link to"),
+            1,
+        )
+
+    def test_release_document_relative_links_resolve_to_tracked_files(self) -> None:
+        documents = (
+            "README.md",
+            "SECURITY.md",
+            "THIRD_PARTY_NOTICES.md",
+            "docs/linux_sandbox.md",
+            "docs/release/INSTALL.md",
+            "docs/release/RELEASE_NOTES_v0.1.0.md",
+            "docs/release/RELEASE_CHECKLIST.md",
+        )
+        tracked = set(
+            subprocess.check_output(
+                ["git", "ls-files"], cwd=REPO_ROOT, text=True
+            ).splitlines()
+        )
+        pattern = re.compile(r"!?\[[^\]]*\]\((<[^>]+>|[^)\s]+)")
+        notes_path = "docs/release/RELEASE_NOTES_v0.1.0.md"
+        for relative_document in documents:
+            document = REPO_ROOT / relative_document
+            text = document.read_text(encoding="utf-8")
+            for raw_destination in pattern.findall(text):
+                destination = raw_destination.strip("<>")
+                parsed = urlsplit(destination)
+                if parsed.scheme in ("http", "https", "mailto"):
+                    continue
+                if relative_document == notes_path:
+                    self.fail(
+                        f"release notes require absolute tag-pinned links: {destination!r}"
+                    )
+                target = (document.parent / unquote(parsed.path)).resolve()
+                try:
+                    tracked_path = target.relative_to(REPO_ROOT).as_posix()
+                except ValueError:
+                    self.fail(f"{relative_document}: link escapes repository: {destination!r}")
+                self.assertIn(
+                    tracked_path,
+                    tracked,
+                    f"{relative_document}: broken local link {destination!r}",
+                )
 
     def test_release_jobs_declare_timeouts(self) -> None:
         # An unbounded job can hang a release run until the platform's own

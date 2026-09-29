@@ -40,7 +40,8 @@ recovery boundaries. Codex processes used by the orchestrator are read-only.
 | Platform | Status | Security boundary |
 | --- | --- | --- |
 | macOS | Supported for Public v1 (native Intel x86_64 validation) | Codex Seatbelt sandbox for ordinary commands; Unix path and approval checks |
-| Linux | Supported for Public v1 when requirements below are met | Bubblewrap 0.12.0 or newer, user/PID/network namespaces, and seccomp; Unix path and approval checks |
+| Linux x86_64 | Supported for Public v1 when requirements below are met | Bubblewrap 0.12.0 or newer, user/PID/network namespaces, and seccomp; Unix path and approval checks |
+| Linux aarch64 | Experimental; sandbox closure is not validated | Bubblewrap 0.12.0 or newer, user/PID/network namespaces, and seccomp; Unix path and approval checks |
 | Windows | Experimental for Public v1; runtime/security validation deferred | Host-native command and file paths with approval; no Unix-equivalent process sandbox |
 
 Windows is not covered by the macOS release verification described below. Do not treat

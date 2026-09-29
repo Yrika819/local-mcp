@@ -38,8 +38,7 @@ access:
   helper. **Linux aarch64 is experimental**: it builds natively in CI, but the
   repository's Linux sandbox evidence documents x86_64 and does not establish
   ARM64 sandbox closure. Both architectures' executables dynamically link to
-  both architectures' executables dynamically link to the host GNU/Linux
-  runtime. The measured highest required GLIBC symbols are `GLIBC_2.34` for
+  the host GNU/Linux runtime. The measured highest required GLIBC symbols are `GLIBC_2.34` for
   x86_64 and `GLIBC_2.39` for aarch64; use a distribution providing at least
   that version. The release build also records each binary's `ldd`
   dependencies in its Actions job log.
@@ -105,7 +104,7 @@ rejects it too, by design.
 The Linux archive contains **two** binaries and they must stay in the same
 directory. `local-mcp` finds `codex-linux-sandbox` next to itself and refuses
 to run a sandboxed command without it. See
-[docs/linux_sandbox.md](../docs/linux_sandbox.md) for the full contract.
+[Linux sandbox documentation](https://github.com/Yrika819/local-mcp/blob/v0.1.0/docs/linux_sandbox.md) for the full contract.
 
 ## Known limitations
 
@@ -135,7 +134,7 @@ revision, including `quick-xml 0.38.4` and `hickory-proto 0.25.2`, plus
 not selectable away without an upstream pin change, and Local MCP does not
 exercise the affected code paths. **These remain known findings, not a
 resolved set.** The current list, with dates and rationale, is in
-[SECURITY.md](../SECURITY.md).
+[SECURITY.md](https://github.com/Yrika819/local-mcp/blob/v0.1.0/SECURITY.md).
 
 This release is not a claim of zero known vulnerabilities.
 
@@ -143,7 +142,7 @@ This release is not a claim of zero known vulnerabilities.
 
 Download the archive for your platform, verify it against `SHA256SUMS`, and
 extract it. Full per-platform instructions are in
-[docs/release/INSTALL.md](INSTALL.md).
+[installation guide](https://github.com/Yrika819/local-mcp/blob/v0.1.0/docs/release/INSTALL.md).
 
 ```sh
 sha256sum -c SHA256SUMS          # Linux
@@ -159,6 +158,6 @@ cargo build --release --locked
 
 ## License and attribution
 
-MIT. See [LICENSE](../LICENSE) for the copyright notice and
-[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) for dependency license
+MIT. See [LICENSE](https://github.com/Yrika819/local-mcp/blob/v0.1.0/LICENSE) for the copyright notice and
+[THIRD_PARTY_NOTICES.md](https://github.com/Yrika819/local-mcp/blob/v0.1.0/THIRD_PARTY_NOTICES.md) for dependency license
 evidence. The original upstream copyright notice is preserved unchanged.

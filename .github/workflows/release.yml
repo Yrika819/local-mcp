@@ -488,5 +488,5 @@ jobs:
           test -f "$notes"
           gh release create "$TAG" \
             dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
-            --title "local-mcp $TAG (Public v1)" \
+            --title "Local MCP $TAG (Public v1)" \
             --notes-file "$notes"

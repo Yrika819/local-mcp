@@ -16,8 +16,8 @@ cannot be undone (5 and 9) are the reason the ordering matters.
 - [ ] `Cargo.toml` `version` matches the tag you are about to create.
 - [ ] `CHANGELOG.md` covers the version being released.
 - [ ] `docs/release/RELEASE_NOTES_v0.1.0.md` is accurate as of the release
-      commit, including the Windows experimental status and the known
-      dependency advisories.
+      commit, including the Windows experimental status, Linux aarch64 sandbox
+      closure caveat, and known dependency advisories.
 - [ ] A final dry run on the exact release commit has passed. The one produced
       during preparation is on the branch, not on `main`.
 
@@ -143,6 +143,8 @@ network:
   release. This release ships GitHub release assets only.
 - Never remove the Windows experimental status without the separate runtime
   and sandbox closure that `SECURITY.md` describes.
+- Never present Linux aarch64 sandboxing as release-closure validated until it
+  has been validated on that architecture.
 - Never present the inherited dependency advisories as resolved.
 - Never drop the `nakasyou/local-mcp` upstream attribution in `LICENSE` or
   `README.md`.
