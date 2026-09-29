@@ -353,10 +353,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          key: compat-${{ matrix.name }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            compat-${{ runner.os }}-${{ runner.arch }}-
+            compat-${{ matrix.name }}-${{ runner.arch }}-
 
       - name: Install the pinned toolchain and components
         run: |
