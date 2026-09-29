@@ -2411,6 +2411,10 @@ Unless a later design explicitly supersedes this document, V1 does not include:
 
 ### 22.1 Managed worktrees
 
+The research and lifecycle/evidence contract for this future area is now frozen in
+`docs/MANAGED_WORKTREES_V1_DESIGN.md`. Implementation remains separate from this
+V1 design and must preserve the existing authority model.
+
 After V1 is stable, `--worktree` can support isolated implementation branches. It must first gain explicit lifecycle/evidence rules for:
 
 - worktree creation;
