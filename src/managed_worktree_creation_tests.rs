@@ -71,6 +71,10 @@ fn git_succeeds(cwd: &Path, args: &[&str]) -> bool {
 
 struct Fixture {
     root: PathBuf,
+    /// The pre-canonicalization path, used only for cleanup. `fs::canonicalize`
+    /// may resolve a symlinked temp root to a different spelling of the same
+    /// directory, and both remove the same tree.
+    cleanup_root: PathBuf,
     primary: PathBuf,
     managed_root: PathBuf,
     state_root: PathBuf,
@@ -81,19 +85,26 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.cleanup_root);
     }
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("local-mcp-mw-p3-{name}-{}", Uuid::new_v4()));
+        let raw_root =
+            std::env::temp_dir().join(format!("local-mcp-mw-p3-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(raw_root.join("primary")).unwrap();
+        std::fs::create_dir_all(raw_root.join("managed")).unwrap();
+        std::fs::create_dir_all(raw_root.join("state")).unwrap();
+        // Every path the fixture hands to production code is canonical, exactly as
+        // `create_session` makes a real session's cwd. Mixing canonical and
+        // non-canonical spellings breaks on macOS, where the temp dir is
+        // `/var/...` behind a symlink to `/private/var/...`, and on Windows,
+        // where `fs::canonicalize` adds the `\\?\` verbatim prefix.
+        let root = std::fs::canonicalize(&raw_root).expect("fixture root is canonical");
         let primary = root.join("primary");
         let managed_root = root.join("managed");
         let state_root = root.join("state");
-        std::fs::create_dir_all(&primary).unwrap();
-        std::fs::create_dir_all(&managed_root).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
 
         git(&primary, &["init", "-q", "."]);
         git(&primary, &["config", "user.email", "p3@example.invalid"]);
@@ -108,19 +119,13 @@ impl Fixture {
             // Session IDs are host-generated; a UUID keeps them valid for
             // `config::validate_session_id` regardless of the test name.
             id: format!("s{}", Uuid::new_v4().simple()),
-            // `create_session` always canonicalizes `cwd`, and managed mode
-            // requires the durable `primary_root` to equal the durable
-            // `Goal.cwd`. A temp root that is not already canonical (a
-            // `/var/...` temp dir behind a symlink, for example) would make
-            // every managed fixture fail closed for the wrong reason.
-            cwd: std::fs::canonicalize(&primary).expect("primary is canonical"),
-            permitted_directories: vec![
-                std::fs::canonicalize(&primary).expect("primary is canonical"),
-            ],
+            cwd: primary.clone(),
+            permitted_directories: vec![primary.clone()],
         };
         let store = TaskStore::with_state_root(state_root.clone());
         Self {
             root,
+            cleanup_root: raw_root,
             primary,
             managed_root,
             state_root,
@@ -437,13 +442,16 @@ impl ReadOnlyGit for CommonDirOverrideGit {
 
 #[test]
 fn a_managed_record_rejects_a_root_inside_git_administrative_internals() {
+    let fixture = Fixture::new("common-dir-overlap");
     let goal_id = GoalId::new();
     // Design invariant 8: Git administrative internals stay forbidden. Model the
     // host state the design's own research records - a session whose cwd is a
     // *linked* worktree - so the common directory is a different directory from
-    // the primary root and the primary overlap check cannot see it.
-    let primary = PathBuf::from("/srv/repo/linked-checkout");
-    let common = PathBuf::from("/srv/repo/main/.git");
+    // the primary root and the primary overlap check cannot see it. The paths
+    // come from the canonical fixture root so they are absolute and
+    // component-exact on every platform, including Windows.
+    let primary = fixture.root.join("linked-checkout");
+    let common = fixture.root.join("main").join(".git");
     let error = ManagedWorktreeRecord::requested(
         &goal_id,
         WorktreeId::new(),
