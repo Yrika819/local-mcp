@@ -220,14 +220,19 @@ pub(crate) fn planner_request_for_goal(
     session: &config::Session,
 ) -> Result<PlannerRequest, PlannerError> {
     ensure_initial_planning_state(goal)?;
-    let goal_root = validate_session_goal_binding(goal, session)?;
+    validate_session_goal_binding(goal, session)?;
+    let goal_root = execution_root_for_goal(goal, session)?;
 
     let mut permitted_roots = Vec::new();
-    for root in std::iter::once(&session.cwd).chain(session.permitted_directories.iter()) {
-        if let Ok(canonical) = fs::canonicalize(root)
-            && !permitted_roots.contains(&canonical)
-        {
-            permitted_roots.push(canonical);
+    if goal.workspace_mode().is_managed() {
+        permitted_roots.push(goal_root.clone());
+    } else {
+        for root in std::iter::once(&session.cwd).chain(session.permitted_directories.iter()) {
+            if let Ok(canonical) = fs::canonicalize(root)
+                && !permitted_roots.contains(&canonical)
+            {
+                permitted_roots.push(canonical);
+            }
         }
     }
     if !permitted_roots
@@ -362,7 +367,7 @@ pub(crate) fn materialize_initial_plan_output(
         });
     }
     ensure_initial_planning_state(&current)?;
-    let goal_root = validate_session_goal_binding(&current, session)?;
+    let goal_root = execution_root_for_goal(&current, session)?;
     let validated = parse_and_validate_proposal(output, &current, &goal_root)?;
 
     store
@@ -386,31 +391,19 @@ fn ensure_initial_planning_state(goal: &Goal) -> Result<(), PlannerError> {
             "initial planning requires plan_revision 0 and an empty Task DAG".to_owned(),
         ));
     }
-    ensure_workspace_is_plannable(goal)?;
+    // The caller immediately derives and validates the execution root before
+    // constructing a request or materializing any model-proposed paths.
     Ok(())
 }
 
-/// Fail-closed Managed Worktrees V1 Phase 3 guard.
-///
-/// Design section 5 requires the managed worktree to be established *before*
-/// Planner path materialization, so `PlannerRequest.cwd` and `permitted_roots`
-/// would otherwise still point at the primary workspace and silently materialize
-/// a managed Goal's absolute TaskScope paths into the primary checkout.
-///
-/// Managed Worktrees V1 Phase 3 authorizes creation authority only. Routing
-/// Planner at `execution_root()` is Phase 4, so **every** managed workspace is
-/// refused here regardless of lifecycle: `REQUESTED`, `PREPARED`, and `BLOCKED`
-/// have no execution root at all, and `ACTIVE` deliberately does not reach
-/// Planner until Phase 4 lands. `PRIMARY` is unaffected.
-pub(crate) fn ensure_workspace_is_plannable(goal: &Goal) -> Result<(), PlannerError> {
-    if goal.workspace_mode().is_managed() {
-        return Err(PlannerError::PlanAuthorityViolation(format!(
-            "MANAGED_WORKTREE workspace is not plannable in Managed Worktrees V1 Phase 3 (workspace lifecycle {:?}, execution_root {:?})",
-            goal.managed_worktree().map(|record| record.lifecycle()),
-            goal.execution_root()
-        )));
-    }
-    Ok(())
+/// Managed execution-root derivation is separate from primary Session identity.
+pub(crate) fn execution_root_for_goal(
+    goal: &Goal,
+    session: &config::Session,
+) -> Result<PathBuf, PlannerError> {
+    crate::managed_worktree_prepare::validated_execution_root(goal, session).map_err(|detail| {
+        PlannerError::PlanAuthorityViolation(format!("execution-root gate refused: {detail}"))
+    })
 }
 
 pub(crate) fn validate_session_goal_binding(

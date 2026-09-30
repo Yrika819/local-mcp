@@ -162,6 +162,11 @@ pub(crate) fn begin_readonly_attempt(
     let snapshot =
         store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
             validate_goal_session_binding(goal, session)?;
+            crate::planner::execution_root_for_goal(goal, session).map_err(|error| {
+                OrchestratorError::InvalidDag(format!(
+                    "readonly execution-root gate refused: {error}"
+                ))
+            })?;
             if goal.status() != GoalStatus::Running {
                 return Err(OrchestratorError::InvalidDag(
                     "readonly attempt requires a RUNNING Goal".to_owned(),
@@ -199,7 +204,7 @@ pub(crate) fn begin_readonly_attempt(
                 now,
             )
         })?;
-    build_request(&snapshot, task_id)
+    build_request(&snapshot, task_id, session)
 }
 
 pub(crate) fn run_readonly_attempt<B: ReadonlyBackend>(
@@ -271,20 +276,26 @@ pub(crate) fn run_readonly_attempt<B: ReadonlyBackend>(
     )
 }
 
-fn build_request(goal: &Goal, task_id: &TaskId) -> Result<ReadonlyRequest, ReadonlyError> {
+fn build_request(
+    goal: &Goal,
+    task_id: &TaskId,
+    session: &config::Session,
+) -> Result<ReadonlyRequest, ReadonlyError> {
     let task = goal.tasks().get(task_id).ok_or_else(|| {
         ReadonlyError::AuthorityViolation("readonly Task disappeared after checkpoint".to_owned())
     })?;
     let attempt = task.latest_attempt().ok_or_else(|| {
         ReadonlyError::AuthorityViolation("RUNNING readonly Task lacks an Attempt".to_owned())
     })?;
+    let execution_root = crate::planner::execution_root_for_goal(goal, session)
+        .map_err(|error| ReadonlyError::AuthorityViolation(error.to_string()))?;
     Ok(ReadonlyRequest {
         goal_id: goal.id().as_str().to_owned(),
         task_id: task_id.as_str().to_owned(),
         attempt_id: attempt.id().as_str().to_owned(),
         goal_revision: goal.revision(),
         plan_revision: goal.plan_revision(),
-        goal_cwd: goal.cwd().to_path_buf(),
+        goal_cwd: execution_root,
         task_title: task.title().to_owned(),
         task_objective: task.objective().to_owned(),
         allowed_paths: task.scope().allowed_paths().to_vec(),
@@ -632,6 +643,9 @@ fn validate_goal_session_binding(
             "readonly Goal cwd does not match session cwd".to_owned(),
         ));
     }
+    crate::planner::execution_root_for_goal(goal, session).map_err(|error| {
+        OrchestratorError::InvalidDag(format!("readonly execution-root gate refused: {error}"))
+    })?;
     Ok(())
 }
 

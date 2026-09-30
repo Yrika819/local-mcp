@@ -32,9 +32,8 @@
 //! eligibility gate on recovery would instead make a crashed, side-effect-free
 //! creation permanently unrecoverable, which section 11 explicitly forbids.
 //!
-//! Phase boundary: nothing here routes Planner, writer, verifier, or readonly
-//! workers to the managed root. A managed Goal reaching `ACTIVE` in this phase
-//! still cannot be planned; that is Phase 4.
+//! Phase boundary: execution routing is enabled only through the validated
+//! execution-root helper below; no Phase 5 workspace evidence is produced.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -53,7 +52,7 @@ use crate::managed_worktree_discovery::{
     Eligibility, ExpectedWorktreeTarget, Reconciliation, RepositoryObservation,
     classify_eligibility, classify_reconciliation, same_path_identity,
 };
-use crate::managed_worktree_observe::{ReadOnlyGit, observe_repository};
+use crate::managed_worktree_observe::{HostGit, ReadOnlyGit, observe_repository};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task_store::TaskStore;
 
@@ -163,6 +162,72 @@ pub(crate) fn canonical_managed_target(
             goal_id.as_str()
         ))
     })
+}
+
+/// Derive the only root from which this Goal may execute.
+///
+/// PRIMARY preserves the current root and does no managed Git observation.
+/// Managed Goals must remain bound to the primary Session identity while the
+/// exact ACTIVE worktree ownership is freshly reconciled and covered by current
+/// Session path authority. Durable Goal state alone never grants that authority.
+pub(crate) fn validated_execution_root(
+    goal: &Goal,
+    session: &config::Session,
+) -> Result<PathBuf, String> {
+    if goal.session_id() != session.id {
+        return Err("Goal does not belong to this session".to_owned());
+    }
+    let primary = std::fs::canonicalize(goal.cwd())
+        .map_err(|error| format!("Goal cwd cannot be canonicalized: {error}"))?;
+    let session_cwd = std::fs::canonicalize(&session.cwd)
+        .map_err(|error| format!("session cwd cannot be canonicalized: {error}"))?;
+    if primary != session_cwd {
+        return Err("Goal cwd no longer matches the bound session cwd".to_owned());
+    }
+    config::validate_path_authority(session, &primary, config::PathIntent::ExecutionCwd)
+        .map_err(|error| format!("Goal cwd is outside current Session authority: {error}"))?;
+    if goal.workspace_mode().is_primary() {
+        return Ok(primary);
+    }
+
+    let record = goal
+        .managed_worktree()
+        .ok_or_else(|| "managed Goal has no durable worktree ownership record".to_owned())?;
+    if record.goal_id() != goal.id() || record.primary_root() != goal.cwd() {
+        return Err("managed worktree ownership does not match Goal identity".to_owned());
+    }
+    if record.lifecycle() != ManagedWorktreeLifecycle::Active {
+        return Err(format!(
+            "managed workspace lifecycle {:?} is not executable",
+            record.lifecycle()
+        ));
+    }
+    let authorized =
+        config::resolve_path_covered_by_session_authority(session, record.worktree_root())
+            .map_err(|error| {
+                format!("managed root is not covered by current Session authority: {error}")
+            })?;
+    if !same_path_identity(&authorized, record.worktree_root()) {
+        return Err("managed root no longer resolves to its exact authorized path".to_owned());
+    }
+
+    let git = HostGit::new();
+    let observation = observe_repository(
+        &git,
+        &primary,
+        &[record.branch_ref().to_owned()],
+        &[record.worktree_root()],
+    )
+    .map_err(|error| format!("managed workspace reconciliation failed: {error}"))?;
+    let expected = ExpectedWorktreeTarget::from_record(record);
+    match classify_reconciliation(&expected, &observation) {
+        Reconciliation::ActiveExact { .. } if record.creation_attempts_consumed() > 0 => {
+            Ok(record.worktree_root().to_path_buf())
+        }
+        state => Err(format!(
+            "managed workspace is not exactly owned and active: {state:?}"
+        )),
+    }
 }
 
 /// Build the durable `REQUESTED` record for a newly managed-aware Goal.

@@ -3004,18 +3004,23 @@ fn managed_workspace_cannot_reach_planner_in_any_lifecycle() {
         Err(PlannerError::PlanAuthorityViolation(_))
     ));
 
-    // ACTIVE is still refused: Phase 3 does not route the execution root.
+    // ACTIVE exact ownership is reconciled, and Phase 4 now routes Planner to
+    // the managed candidate root.
     assert!(fixture.prepare_real(&goal_id).is_active());
     let goal = fixture.goal(&goal_id);
     assert_eq!(
         goal.managed_worktree().unwrap().lifecycle(),
         ManagedWorktreeLifecycle::Active
     );
-    assert!(goal.execution_root().is_some());
-    assert!(matches!(
-        planner::planner_request_for_goal(&goal, &session),
-        Err(PlannerError::PlanAuthorityViolation(_))
-    ));
+    assert_eq!(
+        goal.execution_root(),
+        Some(goal.managed_worktree().unwrap().worktree_root())
+    );
+    let request = planner::planner_request_for_goal(&goal, &session).unwrap();
+    assert_eq!(
+        request.cwd(),
+        goal.managed_worktree().unwrap().worktree_root()
+    );
 }
 
 #[test]
@@ -3039,6 +3044,425 @@ fn blocked_managed_workspace_cannot_reach_planner() {
 }
 
 #[test]
+fn managed_task_scope_materializes_under_candidate_and_rejects_primary_and_git_admin_paths() {
+    let mut fixture = Fixture::new("planner-scope-root");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    let goal = fixture.goal(&goal_id);
+    let worktree_root = goal.managed_worktree().unwrap().worktree_root();
+    let proposal = |path: PathBuf| planner::TaskScopeProposal {
+        allowed_paths: vec![path],
+        forbidden_paths: Vec::new(),
+        operation_kind: crate::task::TaskOperationKind::LocalMutation,
+        replay_safety: crate::task::ReplaySafety::VerifyBeforeRetry,
+    };
+
+    let normalized = planner::validate_and_normalize_scope(
+        &proposal(PathBuf::from("src/foo.rs")),
+        crate::task::WorkerKind::CodexWriter,
+        worktree_root,
+    )
+    .unwrap();
+    assert_eq!(
+        normalized.allowed_paths(),
+        &[worktree_root.join("src/foo.rs")]
+    );
+    assert!(!normalized.allowed_paths()[0].starts_with(&fixture.primary));
+
+    assert!(matches!(
+        planner::validate_and_normalize_scope(
+            &proposal(fixture.primary.join("tracked.txt")),
+            crate::task::WorkerKind::CodexWriter,
+            worktree_root,
+        ),
+        Err(PlannerError::PlanAuthorityViolation(_))
+    ));
+    assert!(matches!(
+        planner::validate_and_normalize_scope(
+            &proposal(PathBuf::from(".git")),
+            crate::task::WorkerKind::CodexWriter,
+            worktree_root,
+        ),
+        Err(PlannerError::PlanAuthorityViolation(_))
+    ));
+    assert!(matches!(
+        planner::validate_and_normalize_scope(
+            &proposal(fixture.common_dir()),
+            crate::task::WorkerKind::CodexWriter,
+            worktree_root,
+        ),
+        Err(PlannerError::PlanAuthorityViolation(_))
+    ));
+}
+
+struct CandidateWriter {
+    root: PathBuf,
+    expected: &'static [u8],
+    content: &'static str,
+}
+
+impl crate::writer::WriterBackend for CandidateWriter {
+    fn propose(
+        &self,
+        request: &crate::writer::WriterRequest,
+    ) -> Result<Vec<u8>, crate::writer::WriterError> {
+        use sha2::Digest as _;
+        assert_eq!(request.goal_cwd(), self.root);
+        let preimage = format!("{:x}", sha2::Sha256::digest(self.expected));
+        Ok(json!({
+            "goal_id": request.goal_id(),
+            "task_id": request.task_id(),
+            "attempt_id": request.attempt_id(),
+            "goal_revision": request.goal_revision(),
+            "plan_revision": request.plan_revision(),
+            "status": "candidate_complete",
+            "summary": "edit the candidate copy",
+            "evidence": [],
+            "proposed_operations": [{
+                "kind": "WRITE_UTF8",
+                "path": "src/foo.rs",
+                "expected_preimage": {"kind": "SHA256", "sha256": preimage},
+                "content": self.content
+            }]
+        })
+        .to_string()
+        .into_bytes())
+    }
+}
+
+struct CandidateReadonly {
+    primary: PathBuf,
+}
+
+impl crate::readonly_worker::ReadonlyBackend for CandidateReadonly {
+    fn investigate(
+        &self,
+        request: &crate::readonly_worker::ReadonlyRequest,
+    ) -> Result<Vec<u8>, crate::readonly_worker::ReadonlyError> {
+        let candidate_root = request.goal_cwd();
+        assert_ne!(candidate_root, self.primary.as_path());
+        assert_eq!(
+            std::fs::read(candidate_root.join("src/foo.rs")).unwrap(),
+            b"primary-and-candidate\n"
+        );
+        Ok(json!({
+            "goal_id": request.goal_id(),
+            "task_id": request.task_id(),
+            "attempt_id": request.attempt_id(),
+            "goal_revision": request.goal_revision(),
+            "plan_revision": request.plan_revision(),
+            "status": "candidate_complete",
+            "summary": "read candidate repository state",
+            "evidence": [{"kind": "candidate_file", "value": "primary-and-candidate"}]
+        })
+        .to_string()
+        .into_bytes())
+    }
+}
+
+struct CandidateReviewer;
+
+impl crate::writer::ReviewerBackend for CandidateReviewer {
+    fn review(
+        &self,
+        request: &crate::writer::ReviewerRequest,
+    ) -> Result<Vec<u8>, crate::writer::WriterError> {
+        Ok(json!({
+            "goal_id": request.goal_id(),
+            "task_id": request.task_id(),
+            "attempt_id": request.attempt_id(),
+            "goal_revision": request.goal_revision(),
+            "plan_revision": request.plan_revision(),
+            "summary": "candidate evidence observed",
+            "blocking_findings": 0,
+            "evidence": []
+        })
+        .to_string()
+        .into_bytes())
+    }
+}
+
+#[test]
+fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
+    let mut fixture = Fixture::new("phase4-e2e-isolation");
+    fixture.authorize_managed_root();
+    std::fs::create_dir_all(fixture.primary.join("src")).unwrap();
+    std::fs::write(
+        fixture.primary.join("src/foo.rs"),
+        "primary-and-candidate\n",
+    )
+    .unwrap();
+    git(&fixture.primary, &["add", "src/foo.rs"]);
+    git(&fixture.primary, &["commit", "-q", "-m", "add source file"]);
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    let goal = fixture.goal(&goal_id);
+    let candidate = goal
+        .managed_worktree()
+        .unwrap()
+        .worktree_root()
+        .to_path_buf();
+    assert_eq!(goal.cwd(), fixture.primary);
+
+    use sha2::Digest as _;
+    let candidate_digest = format!("{:x}", sha2::Sha256::digest(b"candidate-only\n"));
+    let second_candidate_digest = format!("{:x}", sha2::Sha256::digest(b"candidate-second\n"));
+    let proposal = json!({
+        "goal_id": goal.id().as_str(),
+        "goal_revision": goal.revision(),
+        "summary": "edit source in managed candidate",
+        "tasks": [
+            {
+                "proposal_id": "inspect-candidate",
+                "title": "Inspect candidate",
+                "objective": "Read repository state from the managed candidate",
+                "mandatory": false,
+                "worker": "CODEX_READONLY",
+                "dependencies": [],
+                "scope": {
+                    "allowed_paths": ["src"],
+                    "forbidden_paths": [],
+                    "operation_kind": "READ_ONLY",
+                    "replay_safety": "SAFE_READ_ONLY"
+                },
+                "verification": [{"kind": "STRUCTURED_EVIDENCE", "requirement_id": "candidate.read"}]
+            },
+            {
+                "proposal_id": "candidate-writer",
+                "title": "Edit source",
+                "objective": "Change the candidate copy only",
+                "mandatory": true,
+                "worker": "CODEX_WRITER",
+                "dependencies": [],
+                "scope": {
+                    "allowed_paths": ["src"],
+                    "forbidden_paths": [],
+                    "operation_kind": "LOCAL_MUTATION",
+                    "replay_safety": "VERIFY_BEFORE_RETRY"
+                },
+                "verification": [
+                    {"kind": "FILE_EXISTS", "path": "src/foo.rs", "must_be_file": true},
+                    {"kind": "FILE_DIGEST", "path": "src/foo.rs", "expected_sha256": candidate_digest},
+                    {"kind": "COMMAND_EXIT", "command": ["git", "rev-parse", "--show-toplevel"], "cwd": null, "accepted_exit_codes": [0]},
+                    {"kind": "GIT_SCOPE", "allowed_changed_paths": ["src/foo.rs"], "require_no_other_changes": true}
+                ]
+            },
+            {
+                "proposal_id": "candidate-writer-two",
+                "title": "Edit source again",
+                "objective": "Change the candidate copy a second time",
+                "mandatory": true,
+                "worker": "CODEX_WRITER",
+                "dependencies": ["candidate-writer"],
+                "scope": {
+                    "allowed_paths": ["src"],
+                    "forbidden_paths": [],
+                    "operation_kind": "LOCAL_MUTATION",
+                    "replay_safety": "VERIFY_BEFORE_RETRY"
+                },
+                "verification": [
+                    {"kind": "FILE_EXISTS", "path": "src/foo.rs", "must_be_file": true},
+                    {"kind": "FILE_DIGEST", "path": "src/foo.rs", "expected_sha256": second_candidate_digest},
+                    {"kind": "GIT_SCOPE", "allowed_changed_paths": ["src/foo.rs"], "require_no_other_changes": true}
+                ]
+            }
+        ],
+        "criterion_bindings": [{
+            "criterion_id": goal.completion_criteria()[0].id().as_str(),
+            "task_refs": ["candidate-writer", "candidate-writer-two"]
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let planned = planner::materialize_initial_plan_output(
+        &fixture.store,
+        &fixture.session,
+        &goal_id,
+        goal.revision(),
+        &proposal,
+    )
+    .unwrap();
+    assert_eq!(planned.plan_revision(), 1);
+    let readonly_task_id = planned
+        .tasks()
+        .iter()
+        .find(|(_, task)| task.worker() == crate::task::WorkerKind::CodexReadonly)
+        .unwrap()
+        .0
+        .clone();
+    let readonly_result = crate::readonly_worker::run_readonly_attempt(
+        &fixture.store,
+        &fixture.session,
+        &goal_id,
+        &readonly_task_id,
+        planned.revision(),
+        &CandidateReadonly {
+            primary: fixture.primary.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        readonly_result.tasks()[&readonly_task_id].status(),
+        crate::task::TaskStatus::Verifying
+    );
+    let task_id = planned
+        .tasks()
+        .iter()
+        .find(|(_, task)| task.objective() == "Change the candidate copy only")
+        .unwrap()
+        .0
+        .clone();
+    let second_task_id = planned
+        .tasks()
+        .iter()
+        .find(|(_, task)| task.objective() == "Change the candidate copy a second time")
+        .unwrap()
+        .0
+        .clone();
+    let revision_before_writer = fixture.goal(&goal_id).revision();
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(crate::writer::run_writer_attempt(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            &task_id,
+            revision_before_writer,
+            &CandidateWriter {
+                root: candidate.clone(),
+                expected: b"primary-and-candidate\n",
+                content: "candidate-only\n",
+            },
+            &CandidateReviewer,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(candidate.join("src/foo.rs")).unwrap(),
+        b"candidate-only\n"
+    );
+
+    assert_eq!(
+        std::fs::read(fixture.primary.join("src/foo.rs")).unwrap(),
+        b"primary-and-candidate\n"
+    );
+    assert_eq!(git(&fixture.primary, &["status", "--porcelain"]), "");
+    assert_eq!(result.cwd(), fixture.primary);
+
+    let verified = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(crate::verifier::verify_task(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            &task_id,
+            result.revision(),
+        ))
+        .unwrap();
+    assert_eq!(
+        verified.tasks()[&task_id].status(),
+        crate::task::TaskStatus::Completed
+    );
+    let readied_second = fixture
+        .store
+        .mutate_goal_snapshot(
+            &fixture.session.id,
+            &goal_id,
+            verified.revision(),
+            |goal, now| {
+                goal.transition_task(
+                    &second_task_id,
+                    crate::task::TaskStatus::Ready,
+                    crate::task::TaskTransitionContext::default(),
+                    now,
+                )
+            },
+        )
+        .unwrap();
+    let second_result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(crate::writer::run_writer_attempt(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            &second_task_id,
+            readied_second.revision(),
+            &CandidateWriter {
+                root: candidate.clone(),
+                expected: b"candidate-only\n",
+                content: "candidate-second\n",
+            },
+            &CandidateReviewer,
+        ))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(candidate.join("src/foo.rs")).unwrap(),
+        b"candidate-second\n"
+    );
+    let verified_second = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(crate::verifier::verify_task(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            &second_task_id,
+            second_result.revision(),
+        ))
+        .unwrap();
+    assert_eq!(
+        verified_second.tasks()[&second_task_id].status(),
+        crate::task::TaskStatus::Completed
+    );
+    assert_eq!(git(&fixture.primary, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn managed_planner_gate_refuses_revoked_authority_and_missing_or_mismatched_worktree() {
+    let mut fixture = Fixture::new("planner-reconcile-gate");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    let goal = fixture.goal(&goal_id);
+    assert!(planner::planner_request_for_goal(&goal, &fixture.session).is_ok());
+
+    let authorized = fixture.session.permitted_directories.clone();
+    fixture.session.permitted_directories.clear();
+    assert!(matches!(
+        planner::planner_request_for_goal(&goal, &fixture.session),
+        Err(PlannerError::PlanAuthorityViolation(_))
+    ));
+    fixture.session.permitted_directories = authorized;
+
+    let worktree = goal
+        .managed_worktree()
+        .unwrap()
+        .worktree_root()
+        .to_path_buf();
+    // Keep the registered worktree present, but invalidate its durable branch
+    // ownership. The execution-root gate must reconcile before planning.
+    git(&worktree, &["switch", "--detach", "HEAD"]);
+    assert!(matches!(
+        planner::planner_request_for_goal(&goal, &fixture.session),
+        Err(PlannerError::PlanAuthorityViolation(_))
+    ));
+
+    std::fs::rename(&worktree, worktree.with_extension("moved")).unwrap();
+    assert!(matches!(
+        planner::planner_request_for_goal(&goal, &fixture.session),
+        Err(PlannerError::PlanAuthorityViolation(_))
+    ));
+}
+
+#[test]
 fn primary_planner_behavior_is_unchanged() {
     let fixture = Fixture::new("planner-primary");
     let goal_id = fixture.start(WorkspaceMode::Primary);
@@ -3046,7 +3470,7 @@ fn primary_planner_behavior_is_unchanged() {
     let request = planner::planner_request_for_goal(&goal, &fixture.session).unwrap();
     assert_eq!(request.cwd(), goal.cwd());
     assert_eq!(goal.execution_root(), Some(goal.cwd()));
-    assert!(planner::ensure_workspace_is_plannable(&goal).is_ok());
+    assert!(planner::execution_root_for_goal(&goal, &fixture.session).is_ok());
 }
 
 // ---------------------------------------------------------------------------

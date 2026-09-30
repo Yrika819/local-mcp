@@ -1,14 +1,11 @@
-//! Managed Worktrees V1 — Phase 2 read-only observation seam.
+//! Managed Worktrees V1 — read-only Git/path observation seam.
 //!
-//! This module is the only part of Phase 2 that starts Git or inspects a path.
 //! Command and path observations fail closed; parsing and classification remain
 //! separately testable and perform no I/O.
 
-// Phase 2 discovery is not wired to Goal lifecycle code. Keep the frozen
-// observation model available for later phases without dead-code noise.
 #![expect(
     dead_code,
-    reason = "Managed Worktrees Phase 2 observation is not reachable from production until Phase 3 creation authority is authorized."
+    reason = "The observation seam intentionally exposes a strict allowlist broader than the current lifecycle and execution-root consumers."
 )]
 
 use std::collections::BTreeMap;

@@ -360,6 +360,11 @@ pub(crate) fn begin_writer_attempt(
     let snapshot =
         store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
             validate_goal_session_binding(goal, session)?;
+            crate::planner::execution_root_for_goal(goal, session).map_err(|error| {
+                OrchestratorError::InvalidDag(format!(
+                    "writer execution-root gate refused: {error}"
+                ))
+            })?;
             if goal.status() != GoalStatus::Running {
                 return Err(OrchestratorError::InvalidDag(
                     "writer attempt requires a RUNNING Goal".to_owned(),
@@ -402,7 +407,7 @@ pub(crate) fn begin_writer_attempt(
                 now,
             )
         })?;
-    build_writer_request(&snapshot, task_id)
+    build_writer_request(&snapshot, task_id, session)
 }
 
 pub(crate) async fn run_writer_attempt<W: WriterBackend, R: ReviewerBackend>(
@@ -505,37 +510,38 @@ pub(crate) async fn run_writer_attempt_with_boundary<
     }
     ensure_active_attempt(&current, task_id, &request)?;
 
-    let operations = match materialize_operations(&current, task_id, &result.proposed_operations) {
-        Ok(operations) => operations,
-        Err(WriterError::PreimageMismatch(_)) => {
-            return finish_valid_non_mutating_result(
-                store,
-                session,
-                goal_id,
-                task_id,
-                &request,
-                &WriterResult {
-                    status: WriterStatus::NeedsReplan,
-                    proposed_operations: Vec::new(),
-                    ..result
-                },
-                &report_digest,
-            );
-        }
-        Err(error) => {
-            let detail = error.to_string();
-            block_before_mutation(
-                store,
-                session,
-                goal_id,
-                task_id,
-                &request,
-                "WRITER_OPERATION_REJECTED",
-                &detail,
-            )?;
-            return Err(error);
-        }
-    };
+    let operations =
+        match materialize_operations(&current, session, task_id, &result.proposed_operations) {
+            Ok(operations) => operations,
+            Err(WriterError::PreimageMismatch(_)) => {
+                return finish_valid_non_mutating_result(
+                    store,
+                    session,
+                    goal_id,
+                    task_id,
+                    &request,
+                    &WriterResult {
+                        status: WriterStatus::NeedsReplan,
+                        proposed_operations: Vec::new(),
+                        ..result
+                    },
+                    &report_digest,
+                );
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                block_before_mutation(
+                    store,
+                    session,
+                    goal_id,
+                    task_id,
+                    &request,
+                    "WRITER_OPERATION_REJECTED",
+                    &detail,
+                )?;
+                return Err(error);
+            }
+        };
 
     let scope_identity = sha256_hex(
         operations
@@ -1026,6 +1032,9 @@ fn validate_goal_session_binding(
             ))
         },
     )?;
+    crate::planner::execution_root_for_goal(goal, session).map_err(|error| {
+        OrchestratorError::InvalidDag(format!("writer execution-root gate refused: {error}"))
+    })?;
     Ok(())
 }
 
@@ -1044,20 +1053,26 @@ pub(crate) fn holds_workspace_mutation_lease(task: &crate::task::Task) -> bool {
     })
 }
 
-fn build_writer_request(goal: &Goal, task_id: &TaskId) -> Result<WriterRequest, WriterError> {
+fn build_writer_request(
+    goal: &Goal,
+    task_id: &TaskId,
+    session: &config::Session,
+) -> Result<WriterRequest, WriterError> {
     let task = goal.tasks().get(task_id).ok_or_else(|| {
         WriterError::AuthorityViolation("writer Task disappeared after checkpoint".to_owned())
     })?;
     let attempt = task.latest_attempt().ok_or_else(|| {
         WriterError::AuthorityViolation("RUNNING writer Task lacks an Attempt".to_owned())
     })?;
+    let execution_root = crate::planner::execution_root_for_goal(goal, session)
+        .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
     Ok(WriterRequest {
         goal_id: goal.id().as_str().to_owned(),
         task_id: task_id.as_str().to_owned(),
         attempt_id: attempt.id().as_str().to_owned(),
         goal_revision: goal.revision(),
         plan_revision: goal.plan_revision(),
-        goal_cwd: goal.cwd().to_path_buf(),
+        goal_cwd: execution_root,
         task_title: task.title().to_owned(),
         task_objective: task.objective().to_owned(),
         allowed_paths: task.scope().allowed_paths().to_vec(),
@@ -1231,6 +1246,7 @@ fn is_canonical_sha256(value: &str) -> bool {
 
 fn materialize_operations(
     goal: &Goal,
+    session: &config::Session,
     task_id: &TaskId,
     operations: &[WriterOperation],
 ) -> Result<Vec<MaterializedWrite>, WriterError> {
@@ -1247,8 +1263,10 @@ fn materialize_operations(
             "READ_ONLY TaskScope cannot materialize writer operations".to_owned(),
         ));
     }
-    let goal_root = fs::canonicalize(goal.cwd()).map_err(|_| {
-        WriterError::AuthorityViolation("Goal cwd cannot be canonicalized".to_owned())
+    let goal_root = crate::planner::execution_root_for_goal(goal, session)
+        .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
+    let goal_root = fs::canonicalize(goal_root).map_err(|_| {
+        WriterError::AuthorityViolation("execution root cannot be canonicalized".to_owned())
     })?;
     if task.scope().allowed_paths().is_empty() {
         return Err(WriterError::AuthorityViolation(

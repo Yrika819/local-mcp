@@ -226,13 +226,16 @@ pub(crate) fn prepare(
     let attempt = task
         .latest_attempt()
         .ok_or_else(|| VerifierError::InvalidState("VERIFYING Task lacks attempt".to_owned()))?;
+    let execution_root = crate::planner::execution_root_for_goal(&goal, session)
+        .map_err(|error| VerifierError::InvalidState(error.to_string()))?;
+    let execution_root = fs::canonicalize(execution_root).map_err(|error| {
+        VerifierError::InvalidState(format!("execution root cannot be canonicalized: {error}"))
+    })?;
     Ok(Snapshot {
         goal_id: goal.id().clone(),
         revision: goal.revision(),
         plan_revision: goal.plan_revision(),
-        cwd: fs::canonicalize(goal.cwd()).map_err(|error| {
-            VerifierError::InvalidState(format!("Goal cwd cannot be canonicalized: {error}"))
-        })?,
+        cwd: execution_root,
         task_id: task_id.clone(),
         attempt_id: attempt.id().clone(),
         operation_id: attempt.operation_id().map(str::to_owned),
@@ -887,6 +890,8 @@ fn validate_session_binding(goal: &Goal, session: &config::Session) -> Result<()
     config::validate_path_authority(session, &goal_cwd, config::PathIntent::ExecutionCwd).map_err(
         |error| VerifierError::InvalidState(format!("Goal cwd is outside session roots: {error}")),
     )?;
+    crate::planner::execution_root_for_goal(goal, session)
+        .map_err(|error| VerifierError::InvalidState(error.to_string()))?;
     Ok(())
 }
 

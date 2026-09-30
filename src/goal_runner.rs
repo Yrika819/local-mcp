@@ -401,25 +401,10 @@ pub(crate) async fn prepare_managed_workspace_before_run(
                     state.status(),
                 ));
             }
-            // An ACTIVE managed workspace still cannot be planned in Phase 3.
-            let revision_after = match store.load_goal(&session.id, goal_id) {
-                Ok(goal) => goal.revision(),
-                Err(error) => {
-                    return Some(blocked(
-                        "MANAGED_WORKSPACE_EVALUATION_FAILED".to_owned(),
-                        error.to_string(),
-                        revision_before,
-                        state.status(),
-                    ));
-                }
-            };
-            Some(blocked(
-                "MANAGED_WORKSPACE_ACTIVE_NOT_PLANNABLE".to_owned(),
-                "the managed workspace is ACTIVE, but Managed Worktrees V1 Phase 3 does not route Planner to the managed execution root"
-                    .to_owned(),
-                revision_after,
-                state.status(),
-            ))
+            // ACTIVE was freshly reconciled by Phase 3 preparation. The shared
+            // execution-root gate revalidates ownership and current Session
+            // authority at each lower-authority dispatch.
+            None
         }
     }
 }
