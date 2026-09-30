@@ -109,6 +109,10 @@ impl Fixture {
         let state_root = root.join("state");
 
         git(&primary, &["init", "-q", "."]);
+        // Keep committed fixture bytes stable even when the runner has a global
+        // core.autocrlf setting; linked-worktree checkout must preserve the
+        // exact preimage used by the integration assertions.
+        git(&primary, &["config", "core.autocrlf", "false"]);
         git(&primary, &["config", "user.email", "p3@example.invalid"]);
         git(&primary, &["config", "user.name", "Managed Worktree P3"]);
         git(&primary, &["config", "commit.gpgsign", "false"]);
