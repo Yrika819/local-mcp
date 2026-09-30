@@ -499,6 +499,11 @@ pub(crate) async fn prepare_managed_workspace_with_policy(
     // and `consume_creation_attempt` refuses once the lifetime bound is spent.
     // A process restart, a resume, or a repeated `goal_run` re-enters here with
     // the same spent budget rather than a fresh one.
+    //
+    // `last_evidence` carries the most recent observed Git diagnostic across
+    // iterations, so a budget that finally runs out still reports why the
+    // previous attempts produced nothing.
+    let mut last_evidence: Option<String> = None;
     loop {
         let goal = store.load_goal(&session.id, goal_id)?;
         let Some(record) = goal.managed_worktree() else {
@@ -585,6 +590,33 @@ pub(crate) async fn prepare_managed_workspace_with_policy(
             }
         }
 
+        // Steps 4 and 5: a spent budget means there is no invocation to
+        // authorize, so this is checked before approval is requested. Asking an
+        // operator to approve a mutation that is already forbidden would be
+        // misleading, and a denial would mask the real terminal cause.
+        if !record.permits_creation_attempt() {
+            return block_lifecycle(
+                store,
+                session,
+                goal_id,
+                "MANAGED_RETRY_EXHAUSTED",
+                match last_evidence {
+                    Some(evidence) => format!(
+                        "the lifetime creation budget is spent \
+                         ({consumed}/{MAX_LIFETIME_CREATION_ATTEMPTS}) and no further host Git \
+                         creation invocation is authorized; the last observed attempt was: {evidence}",
+                        consumed = record.creation_attempts_consumed()
+                    ),
+                    None => format!(
+                        "the lifetime creation budget is spent \
+                         ({consumed}/{MAX_LIFETIME_CREATION_ATTEMPTS}) and no further host Git \
+                         creation invocation is authorized",
+                        consumed = record.creation_attempts_consumed()
+                    ),
+                },
+            );
+        }
+
         // Step 3: platform approval for the host-native mutation. On Windows the
         // frozen design keeps this approval-gated; the workspace_mode opt-in and
         // the Session path authority are separate requirements and neither one
@@ -648,19 +680,6 @@ pub(crate) async fn prepare_managed_workspace_with_policy(
         // Steps 4 and 5: consume one lifetime attempt and persist it. This is a
         // single durable mutation, and Git does not run unless it succeeds, so a
         // failed persist can never cost or grant an invocation.
-        if !record.permits_creation_attempt() {
-            return block_lifecycle(
-                store,
-                session,
-                goal_id,
-                "MANAGED_RETRY_EXHAUSTED",
-                format!(
-                    "the lifetime creation budget is spent ({consumed}/{MAX_LIFETIME_CREATION_ATTEMPTS}) \
-                     and no further host Git creation invocation is authorized",
-                    consumed = record.creation_attempts_consumed()
-                ),
-            );
-        }
         let spent = persist(store, session, goal_id, |goal| {
             goal.consume_managed_creation_attempt()
         })?;
@@ -682,6 +701,7 @@ pub(crate) async fn prepare_managed_workspace_with_policy(
         let creation = ManagedWorktreeCreation::from_intent(intent)?;
         let attempt_outcome = creator.create(&creation, record.primary_root());
         let attempt_evidence = describe_creation_attempt(&creation, &attempt_outcome);
+        last_evidence = Some(attempt_evidence.clone());
 
         // Step 7: read-only reconciliation decides the outcome.
         let post = match observe(git, record) {

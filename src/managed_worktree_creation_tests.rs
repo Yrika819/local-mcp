@@ -1353,6 +1353,53 @@ fn production_policy_on_windows_selects_approval_required() {
 }
 
 #[test]
+fn a_spent_budget_is_refused_before_the_operator_is_asked_to_approve() {
+    let mut fixture = Fixture::new("approval-after-budget");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // Spend the budget with the approval gate off, exactly as a Unix host does.
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Nothing]);
+    assert_eq!(
+        fixture
+            .prepare_with_policy(
+                &goal_id,
+                &HostGit::new(),
+                &creator,
+                &AllowAllApprovals,
+                false
+            )
+            .unwrap()
+            .block_detail()
+            .map(|block| block.code),
+        Some("MANAGED_RETRY_EXHAUSTED")
+    );
+    assert_eq!(attempts(&fixture, &goal_id), MAX_LIFETIME_CREATION_ATTEMPTS);
+
+    // With the gate on, a further run must not prompt the operator to approve a
+    // mutation that is already forbidden, and must not report a denial as the
+    // cause. The lifecycle is already `BLOCKED` from the first run, so the
+    // specific code is the explicit-recovery one; what matters is that neither
+    // an approval prompt nor a Git invocation happens.
+    let approver = RecordingApprover::allow();
+    let again = ScriptedCreator::new(&fixture, vec![Step::Nothing]);
+    let block = fixture
+        .prepare_with_policy(&goal_id, &HostGit::new(), &again, &approver, true)
+        .unwrap()
+        .block_detail()
+        .cloned()
+        .expect("a blocked workspace blocks");
+    assert_eq!(block.code, "MANAGED_RECOVERY_REQUIRED");
+    assert_eq!(
+        approver.calls(),
+        0,
+        "no approval may be requested for an unauthorized invocation"
+    );
+    assert_eq!(again.calls(), 0);
+    assert_eq!(attempts(&fixture, &goal_id), MAX_LIFETIME_CREATION_ATTEMPTS);
+}
+
+#[test]
 fn a_denied_approval_never_invokes_git_and_costs_no_attempt() {
     let mut fixture = Fixture::new("approval-denied");
     fixture.authorize_managed_root();
@@ -2643,6 +2690,12 @@ fn a_failure_to_start_git_is_reconciled_rather_than_assumed_side_effect_free() {
     assert!(
         block.detail.contains("lifetime creation budget is spent"),
         "the exhausting reason must be reported: {}",
+        block.detail
+    );
+    assert!(
+        block.detail.contains("scripted failure"),
+        "the last observed Git diagnostic must survive into the exhausted-budget \
+         report, otherwise the operator loses the real reason: {}",
         block.detail
     );
     assert!(!fixture.managed_target(&goal_id).exists());
