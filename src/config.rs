@@ -38,7 +38,7 @@ pub fn validate_path_authority(
         .permitted_directories
         .iter()
         .map(|root| {
-            std::fs::canonicalize(root)
+            canonical_path(root)
                 .with_context(|| format!("cannot resolve permitted root {}", root.display()))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -88,15 +88,14 @@ pub fn validate_path_authority(
             | PathIntent::ExecutionCwd
     );
     let resolved = if existing {
-        std::fs::canonicalize(&candidate)
-            .with_context(|| format!("cannot resolve {}", candidate.display()))?
+        canonical_path(&candidate)?
     } else {
         // CreateFile must not treat a dangling final symlink (or any other
         // reparse point) as a creatable leaf name: open/write would follow it
         // outside the permitted roots. If anything already occupies the leaf,
         // resolve it fully and reject broken links / out-of-bounds targets.
         match std::fs::symlink_metadata(&candidate) {
-            Ok(_) => std::fs::canonicalize(&candidate).with_context(|| {
+            Ok(_) => canonical_path(&candidate).with_context(|| {
                 format!(
                     "existing writer target cannot be canonicalized; broken symlinks are rejected: {}",
                     candidate.display()
@@ -104,8 +103,7 @@ pub fn validate_path_authority(
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let parent = candidate.parent().context("path has no parent directory")?;
-                let parent = std::fs::canonicalize(parent)
-                    .with_context(|| format!("cannot resolve parent {}", parent.display()))?;
+                let parent = canonical_path(parent)?;
                 parent.join(candidate.file_name().context("path has no file name")?)
             }
             Err(error) => {
@@ -134,6 +132,53 @@ pub fn validate_path_authority(
 /// a future path against Session authority. Bounded so a pathological path
 /// cannot spin.
 const MAX_UNRESOLVED_PATH_COMPONENTS: usize = 64;
+
+/// Canonicalize `path` for durable storage and for handing to a child process.
+///
+/// On Unix this is plain `fs::canonicalize`. On Windows `fs::canonicalize`
+/// returns a **verbatim** `\\?\` path, and that spelling is wrong for this
+/// product in three ways:
+///
+/// - Git for Windows is an MSYS program and rejects verbatim paths, so passing
+///   one to `git worktree add` fails with an invalid-directory error;
+/// - it differs from the spelling a session, an operator, and the permitted
+///   roots use, so a derived path would not compare equal to the authorized
+///   root for the very directory it belongs to;
+/// - reparse points are already resolved by the canonicalization itself, so the
+///   verbatim prefix adds no security value - the containment checks operate on
+///   the resolved components either way.
+///
+/// The prefix is therefore removed when the remainder is an ordinary drive path.
+/// UNC paths (`\\server\share`) are left verbatim, because they have no shorter
+/// equivalent.
+pub fn canonical_path(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    Ok(strip_verbatim_prefix(canonical))
+}
+
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return path;
+        };
+        // Only `\\?\C:` has a shorter equivalent; `\\?\UNC\server\share` does not.
+        let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+            return path;
+        };
+        let rest: PathBuf = components.collect();
+        let mut shorter = PathBuf::from(format!("{}:", drive as char));
+        shorter.push(rest);
+        shorter
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
 
 /// Resolve a host-derived path that does not exist yet to a canonical absolute
 /// path, by canonicalizing the deepest existing ancestor and re-appending the
@@ -186,8 +231,7 @@ pub fn canonical_future_path(requested: &Path) -> Result<PathBuf> {
         }
     }
 
-    let mut resolved = std::fs::canonicalize(&existing)
-        .with_context(|| format!("cannot resolve existing ancestor {}", existing.display()))?;
+    let mut resolved = canonical_path(&existing)?;
     for name in unresolved.iter().rev() {
         resolved.push(name);
     }
@@ -219,7 +263,7 @@ pub fn resolve_path_covered_by_session_authority(
         .permitted_directories
         .iter()
         .map(|root| {
-            std::fs::canonicalize(root)
+            canonical_path(root)
                 .with_context(|| format!("cannot resolve permitted root {}", root.display()))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -408,8 +452,7 @@ pub fn validate_session_id(id: &str) -> Result<()> {
 }
 
 pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    let path = std::fs::canonicalize(path)
-        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    let path = canonical_path(path)?;
     anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
     Ok(path)
 }
@@ -433,6 +476,36 @@ mod tests {
         let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
         assert_eq!(path.parent(), Some(socket_dir().as_path()));
         assert!(path.as_os_str().len() < 104);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_paths_are_never_verbatim() {
+        // `fs::canonicalize` returns `\\?\C:\...` on Windows. That spelling is
+        // rejected by Git for Windows and compares unequal to the spelling a
+        // session or a permitted root uses, so every canonical path this product
+        // persists, authorizes, or hands to a child process must be de-verbatim.
+        let base = std::env::temp_dir().join(format!("local-mcp-verb-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let canonical = canonical_path(&base).unwrap();
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "canonical paths must not be verbatim: {}",
+            canonical.display()
+        );
+        assert!(canonical.is_absolute());
+        // The non-verbatim form must still resolve to the same directory.
+        assert_eq!(
+            std::fs::canonicalize(&canonical)
+                .unwrap()
+                .components()
+                .collect::<PathBuf>(),
+            std::fs::canonicalize(&base)
+                .unwrap()
+                .components()
+                .collect::<PathBuf>(),
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -192,7 +192,9 @@ fn canonical_git_path(command: &str, output: &GitCommandOutput) -> Result<PathBu
             "{command} did not return an absolute path"
         )));
     }
-    fs::canonicalize(&path).map_err(|error| {
+    // `config::canonical_path` normalizes the Windows verbatim prefix, so the
+    // recorded identity matches the session's spelling and is a path Git accepts.
+    crate::config::canonical_path(&path).map_err(|error| {
         DiscoveryError::ObservationUnavailable(format!(
             "{command} path {} could not be canonicalized: {error}",
             path.display()
@@ -430,10 +432,12 @@ fn observe_in_progress(
 
 fn observe_path(path: &Path) -> PathObservation {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => match fs::canonicalize(path) {
-            Ok(canonical) if same_path_identity(&canonical, path) => PathObservation::Directory,
-            _ => PathObservation::Occupied,
-        },
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            match crate::config::canonical_path(path) {
+                Ok(canonical) if same_path_identity(&canonical, path) => PathObservation::Directory,
+                _ => PathObservation::Occupied,
+            }
+        }
         Ok(_) => PathObservation::Occupied,
         Err(error) if error.kind() == ErrorKind::NotFound => PathObservation::Missing,
         Err(_) => PathObservation::Unknown,

@@ -101,7 +101,7 @@ impl Fixture {
         // non-canonical spellings breaks on macOS, where the temp dir is
         // `/var/...` behind a symlink to `/private/var/...`, and on Windows,
         // where `fs::canonicalize` adds the `\\?\` verbatim prefix.
-        let root = std::fs::canonicalize(&raw_root).expect("fixture root is canonical");
+        let root = config::canonical_path(&raw_root).expect("fixture root is canonical");
         let primary = root.join("primary");
         let managed_root = root.join("managed");
         let state_root = root.join("state");
@@ -137,7 +137,7 @@ impl Fixture {
 
     /// The operator's existing explicit authorization path for a broader root.
     fn authorize_managed_root(&mut self) {
-        let canonical = std::fs::canonicalize(&self.managed_root).unwrap();
+        let canonical = config::canonical_path(&self.managed_root).unwrap();
         if !self.session.permitted_directories.contains(&canonical) {
             self.session.permitted_directories.push(canonical);
             self.session.permitted_directories.sort();
@@ -674,7 +674,7 @@ fn a_symlinked_session_cwd_cannot_host_a_managed_workspace() {
     fixture.authorize_managed_root();
     let link = fixture.root.join("primary-link");
     std::os::unix::fs::symlink(&fixture.primary, &link).unwrap();
-    assert_eq!(std::fs::canonicalize(&link).unwrap(), fixture.primary);
+    assert_eq!(config::canonical_path(&link).unwrap(), fixture.primary);
     assert_ne!(link, fixture.primary);
 
     fixture.session.cwd = link.clone();

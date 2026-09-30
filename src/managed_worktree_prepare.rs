@@ -179,7 +179,7 @@ pub(crate) fn request_managed_workspace(
     goal_id: &GoalId,
     git: &dyn ReadOnlyGit,
 ) -> Result<ManagedWorktreeRecord, ManagedWorkspaceError> {
-    let primary_root = std::fs::canonicalize(&session.cwd).map_err(|error| {
+    let primary_root = config::canonical_path(&session.cwd).map_err(|error| {
         ManagedWorkspaceError::Observation(format!("session cwd cannot be canonicalized: {error}"))
     })?;
     let target = canonical_managed_target(managed_root, session, goal_id)?;
