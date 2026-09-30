@@ -225,60 +225,55 @@ pub async fn request(
     dead_code,
     reason = "Windows-only test responder is selected by a cfg-gated integration path."
 )]
-pub(crate) fn spawn_test_approval_responder(
+pub(crate) async fn spawn_test_approval_responder(
     session_id: &str,
     expected_cwd: &Path,
-) -> Result<std::thread::JoinHandle<Result<()>>> {
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let path = config::socket_path(session_id)?;
     let expected_cwd = std::fs::canonicalize(expected_cwd)?;
-    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-    let thread = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(async move {
-                let mut listener = match bind_listener(&path) {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        let _ = ready_sender.send(Err(error.to_string()));
-                        return Err(error);
-                    }
+    let mut listener = bind_listener(&path)?;
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        let mut ready_sender = Some(ready_sender);
+        let mut stream = std::future::poll_fn(|context| {
+            let result = accept.as_mut().poll(context);
+            if let Some(sender) = ready_sender.take() {
+                let readiness = match &result {
+                    std::task::Poll::Ready(Err(error)) => Err(error.to_string()),
+                    std::task::Poll::Pending | std::task::Poll::Ready(Ok(_)) => Ok(()),
                 };
-                let accept = listener.accept();
-                tokio::pin!(accept);
-                let mut ready_sender = Some(ready_sender);
-                let mut stream = std::future::poll_fn(|context| {
-                    let result = accept.as_mut().poll(context);
-                    if let Some(sender) = ready_sender.take() {
-                        let readiness = match &result {
-                            std::task::Poll::Ready(Err(error)) => Err(error.to_string()),
-                            std::task::Poll::Pending | std::task::Poll::Ready(Ok(_)) => Ok(()),
-                        };
-                        let _ = sender.send(readiness);
-                    }
-                    result
-                })
-                .await?;
-                let mut line = String::new();
-                BufReader::new(&mut stream).read_line(&mut line).await?;
-                let message: serde_json::Value = serde_json::from_str(&line)?;
-                anyhow::ensure!(message["type"] == "approval");
-                anyhow::ensure!(message["request"]["operation"] == "start_command");
-                let requested_cwd = message["request"]["cwd"]
-                    .as_str()
-                    .context("approval request omitted cwd")?;
-                anyhow::ensure!(
-                    std::fs::canonicalize(requested_cwd)? == expected_cwd,
-                    "Verifier command approval cwd did not match the managed candidate"
-                );
-                stream.write_all(b"allow\n").await?;
-                Ok(())
-            })
+                let _ = sender.send(readiness);
+            }
+            result
+        })
+        .await?;
+        let mut line = String::new();
+        BufReader::new(&mut stream).read_line(&mut line).await?;
+        let message: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(message["type"] == "approval");
+        anyhow::ensure!(message["request"]["operation"] == "start_command");
+        let requested_cwd = message["request"]["cwd"]
+            .as_str()
+            .context("approval request omitted cwd")?;
+        anyhow::ensure!(
+            std::fs::canonicalize(requested_cwd)? == expected_cwd,
+            "Verifier command approval cwd did not match the managed candidate"
+        );
+        stream.write_all(b"allow\n").await?;
+        Ok(())
     });
-    match ready_receiver.recv() {
-        Ok(Ok(())) => Ok(thread),
-        Ok(Err(detail)) => anyhow::bail!("cannot bind test approval listener: {detail}"),
-        Err(error) => anyhow::bail!("test approval listener stopped before startup: {error}"),
+    match ready_receiver.await {
+        Ok(Ok(())) => Ok(task),
+        Ok(Err(detail)) => {
+            let _ = task.await;
+            anyhow::bail!("test approval listener failed before readiness: {detail}")
+        }
+        Err(error) => {
+            let _ = task.await;
+            anyhow::bail!("test approval listener stopped before readiness: {error}")
+        }
     }
 }
 
@@ -287,11 +282,11 @@ pub(crate) fn spawn_test_approval_responder(
     dead_code,
     reason = "Non-Windows test responder is a no-op for the shared integration fixture."
 )]
-pub(crate) fn spawn_test_approval_responder(
+pub(crate) async fn spawn_test_approval_responder(
     _session_id: &str,
     _expected_cwd: &Path,
-) -> Result<std::thread::JoinHandle<Result<()>>> {
-    Ok(std::thread::spawn(|| Ok(())))
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    Ok(tokio::spawn(async { Ok(()) }))
 }
 
 /// Sends a one-way activity update to the `start` screen. Activity reporting is

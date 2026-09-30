@@ -3356,24 +3356,27 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
     assert_eq!(git(&fixture.primary, &["status", "--porcelain"]), "");
     assert_eq!(result.cwd(), fixture.primary);
 
-    let approval_responder =
-        crate::approvals::spawn_test_approval_responder(&fixture.session.id, &candidate).unwrap();
     let verified = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(crate::verifier::verify_task(
-            &fixture.store,
-            &fixture.session,
-            &goal_id,
-            &task_id,
-            result.revision(),
-        ))
-        .unwrap();
-    approval_responder
-        .join()
-        .expect("approval responder thread completes")
-        .unwrap();
+        .block_on(async {
+            let approval_responder =
+                crate::approvals::spawn_test_approval_responder(&fixture.session.id, &candidate)
+                    .await
+                    .unwrap();
+            let verified = crate::verifier::verify_task(
+                &fixture.store,
+                &fixture.session,
+                &goal_id,
+                &task_id,
+                result.revision(),
+            )
+            .await
+            .unwrap();
+            approval_responder.await.unwrap().unwrap();
+            verified
+        });
     assert_eq!(
         verified.tasks()[&task_id].status(),
         crate::task::TaskStatus::Completed
