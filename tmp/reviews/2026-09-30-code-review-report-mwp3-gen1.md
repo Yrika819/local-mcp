@@ -84,14 +84,14 @@ Every parent disposition was re-read against the code rather than against the fi
 
 - Recommendation: `Discuss`
 - Completion: `Complete within reviewed scope`
-- Why now: every in-scope parent finding is fixed and locally verified, but the cross-platform matrix that closes this generation's Windows blind spot had not completed when the report was written, so the only remaining barrier to approval is that evidence rather than a defect.
+- Why now: every in-scope parent finding is fixed, locally verified, and confirmed by the full cross-platform matrix. The only remaining item is `F2`, an approval-affecting product question about whether the creation attempt budget must survive a process restart, which no code change can settle.
 - Must-review now:
-  1. `F1` the generation-1 re-review of the first fix found a fix-introduced Windows break, which is the precedent for re-running CI
-  2. `A1` the fixed branch CI matrix is the only authority for Windows execution
+  1. `F2` whether the per-preparation creation budget must be durable
+  2. `F1` the generation-1 re-review of the first fix found a fix-introduced Windows break, which is the precedent for re-running CI
 - Findings count: `Blocker 0 | Major 0 | Minor 1 | Question 1`
-- Standalone test gaps: `Blocker 0 | Major 0 | Minor 1`
+- Standalone test gaps: `Blocker 0 | Major 0 | Minor 0`
 - Coverage confidence: `high`
-- Biggest blind spot: the fixed Windows and macOS legs had not yet completed at the time of this report
+- Biggest blind spot: the per-preparation creation budget is not durable across process restarts, which is the open `F2`
 
 ## Complete Findings Index
 
@@ -179,15 +179,13 @@ Reviewer action: `confirm intent`
 
 ## Test Gaps
 
-| ID | Severity | Surface | Missing coverage | Risk | Origin | Evidence | Issue key | Issue fingerprint | Expected basis |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `T1` | `Minor` | fixed Windows and macOS legs | the corrected fixture and the reused host-Git identity had not yet been executed on Windows or macOS when this report was written | a residual platform defect | `Coordinator` | the push of the fix preceded this report; CI is the authority | `test-gap; entry=managed worktree cross-platform matrix after the fixture correction; contract=the corrected fixture and reused host Git identity must be executed on every supported platform; gap=a residual Windows or macOS defect is not yet excluded` | `ifp-sha256:e146170c6ecf15af7392de6719e743d519f077db3ede0dff8a07067af450ac7a` | `kind:requirement; strength:authoritative; evidence:the maintainer contract names the cross-platform matrix as the authoritative verification for platform behavior` |
+`None.` Every standalone test gap in the parent report was either resolved in the fix delta or re-raised as a product decision. The parent's `T1` (the control-state test did not drive the production seam) is resolved by a seam-level test; its `T2` is resolved by a stale-writer test; its `T3` is re-raised as `F2` rather than remaining a coverage gap.
 
 ## Review Coverage Ledger
 
 | Area ID | Area / path | Touched files or entry points | Owner | Depth | Status | Result | Evidence / next step |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `A1` | cross-platform matrix for the fixed branch | branch CI for `c36554f` | `Coordinator` | runtime verified | `Not covered` | the corrected fixture and reused identity had not yet run on Windows or macOS at report time | the Windows legs `test (windows-x64)`, `compat (windows-2022)`, `compat (windows-arm64)` and the macOS legs of the re-run matrix are the authority |
+| `A1` | cross-platform matrix for the fixed branch | branch CI `36698965907` on `287a2f1` | `Coordinator` | runtime verified | `Reviewed - no issue found` | 11/11 jobs successful, including `test (windows-x64)`, `test (macos-arm64)`, `test (macos-intel)`, and both Windows compat legs | the three earlier red runs `36687406442`, `36690619126`, `36693665396`, and `36696676278` were each diagnosed to a first causal error and fixed; `36698965907` is the authoritative green run |
 | `A2` | control-state ordering fix | [`goal_runner.rs`](/Users/yuta/local-mcp-connector-parity/src/goal_runner.rs), [`goal.rs`](/Users/yuta/local-mcp-connector-parity/src/goal.rs), [`managed_worktree_prepare.rs`](/Users/yuta/local-mcp-connector-parity/src/managed_worktree_prepare.rs) | `Coordinator` | contract trace | `Reviewed - no issue found` | `GoalStatus::blocks_foreground_run` is the single predicate; the seam and `stop_for_state` both gate on it, so they cannot drift; the result for control states is field-for-field what the runner produced before | `GoalStatus::blocks_foreground_run`; `stop_for_state`; tests `the_foreground_run_seam_refuses_a_control_state_before_any_authority_call` and `the_control_state_predicate_covers_exactly_the_states_the_runner_stops_on` |
 | `A3` | host Git identity reuse | [`managed_worktree_create.rs`](/Users/yuta/local-mcp-connector-parity/src/managed_worktree_create.rs), [`execution.rs`](/Users/yuta/local-mcp-connector-parity/src/execution.rs) | `Coordinator` | contract trace | `Reviewed - no issue found` | the seam calls the established `host_git_path()`, so platform file names, eager `PATH` validation, skip semantics, UTF-8, canonicalization, and caching all come from one authority; no second resolver remains | `resolve_host_git`; the duplicate resolver and its `is_executable` cfg pair were removed |
 | `A4` | retry predicate routing | [`managed_worktree_prepare.rs`](/Users/yuta/local-mcp-connector-parity/src/managed_worktree_prepare.rs) | `Coordinator` | contract trace | `Reviewed - no issue found` | the guard arm is ordered immediately after `ActiveExact`, so no recovery-required state is shadowed | all thirteen non-retryable classifications still route to `MANAGED_RECOVERY_REQUIRED` |
@@ -248,6 +246,8 @@ Reviewer action: `confirm intent`
 - `TMPDIR=<symlink to a real dir> cargo test --locked --all-targets managed_worktree` -> 149 passed, 0 failed, reproducing the macOS runner condition that broke CI
 - `cargo test --locked --all-targets job_running_completion_and_completed_poll_are_frozen` (x3) -> pass, confirming the macOS CI failure is load-sensitive flake in untouched code
 - `git diff --check` -> clean
+- branch CI `36698965907` on `287a2f1` -> 11/11 jobs successful, including `test (windows-x64)`, `test (macos-arm64)`, `test (macos-intel)`, `compat (windows-2022)`, and `compat (windows-arm64)`
+- the four earlier red runs, each diagnosed to a first causal error before any change: `36687406442` (fixture mixed canonical and non-canonical paths), `36690619126` (the managed target was handed to Git as a Windows verbatim path), `36693665396` (the de-verbatim normalization was too broad and broke the Session path model), `36696676278` (two test-side path spellings)
 
 ### Supporting Code Links
 
@@ -270,7 +270,7 @@ Reviewer action: `confirm intent`
 
 | Area ID | Blind spot | Decision risk | What would resolve it |
 | --- | --- | --- | --- |
-| `A1` | the fixed Windows and macOS legs had not completed at report time | a residual platform defect in the fixture correction or the resolver reuse | the re-run branch CI matrix; the Windows legs are the authority |
+| `A1` | the three earlier red runs were each fixed without a local reproduction of the Windows-only cause; the diagnosis came from CI logs and platform semantics | a Windows-only cause could be masked by a fix that happens to be correct for a different reason | a Windows developer run of the managed suite, which this review could not perform |
 | `A12` | the ordering argument for the control-state gate depends on managed Goals being unable to leave `Planning` in this phase | Phase 4 could make a managed Goal reachable in a runnable non-`Planning` state and change what the gate is protecting | Phase 4 must re-derive the gate placement rather than inherit it |
 | `A10` | the per-preparation budget is not durable | repeated restarts can drive more attempts than one invocation would | a product decision on whether a durable counter is required |
 
@@ -294,10 +294,10 @@ Reviewer action: `confirm intent`
 - Actionable finding IDs: `None`
 - Deferred finding IDs: `F1`
 - Actionable test-gap IDs: `None`
-- Deferred test-gap IDs: `T1`
+- Deferred test-gap IDs: `None`
 - Open question IDs: `F2`
-- Open coverage area IDs: `A1`
-- Highest-risk verification to repeat: the Windows `test (windows-x64)` and `compat (windows-2022)` legs of the re-run matrix, because generation 0's Windows blind spot is only closed by CI
+- Open coverage area IDs: `None`
+- Highest-risk verification to repeat: the Windows `test (windows-x64)` and `compat (windows-2022)` legs of any future matrix, because this generation recorded that a locally green suite did not predict Windows behavior
 - Suggested implementation boundaries: `None` - no further implementation is authorized without a new request
 - Re-review note: `Treat every finding as a claim to verify. Challenges require a counterclaim, argument, evidence, limits, and settlement criterion.`
 - Chain rule: `Generation 1 is terminal. Do not automatically invoke receiving-code-review; return remaining findings to the user or product owner.`
