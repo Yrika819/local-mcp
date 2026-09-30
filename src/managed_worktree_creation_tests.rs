@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -21,8 +21,9 @@ use crate::config;
 use crate::goal::{Goal, GoalId};
 use crate::goal_api::{self, ManagedRootSource};
 use crate::managed_worktree::{
-    MANAGED_BRANCH_REF_PREFIX, ManagedWorktreeCreationIntent, ManagedWorktreeLifecycle,
-    ManagedWorktreeRecord, WorkspaceMode, WorktreeId, WorktreeOperationId,
+    MANAGED_BRANCH_REF_PREFIX, MAX_LIFETIME_CREATION_ATTEMPTS, ManagedWorktreeCreationIntent,
+    ManagedWorktreeLifecycle, ManagedWorktreeRecord, WorkspaceMode, WorktreeId,
+    WorktreeOperationId,
 };
 use crate::managed_worktree_create::{
     HostWorktreeCreator, ManagedWorktreeCreation, ManagedWorktreeCreationError,
@@ -31,8 +32,9 @@ use crate::managed_worktree_create::{
 use crate::managed_worktree_discovery::DiscoveryError;
 use crate::managed_worktree_observe::{GitCommandOutput, HostGit, ReadOnlyGit, assert_read_only};
 use crate::managed_worktree_prepare::{
-    ManagedWorkspaceError, ManagedWorkspacePreparation, canonical_managed_target,
-    prepare_managed_workspace, request_managed_workspace,
+    ManagedApprovalFuture, ManagedCreationApproval, ManagedCreationApprover, ManagedWorkspaceError,
+    ManagedWorkspacePreparation, canonical_managed_target, managed_creation_requires_approval,
+    prepare_managed_workspace_with_policy, request_managed_workspace,
 };
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::{self, PlannerError};
@@ -198,8 +200,58 @@ impl Fixture {
         goal_id: &GoalId,
         git: &dyn ReadOnlyGit,
         creator: &dyn ManagedWorktreeCreator,
-    ) -> Result<ManagedWorkspacePreparation, ManagedWorkspaceError> {
-        prepare_managed_workspace(&self.store, &self.session, goal_id, git, creator)
+    ) -> Result<ManagedWorkspacePreparation, crate::managed_worktree_prepare::ManagedWorkspaceError>
+    {
+        self.prepare_with_approver(goal_id, git, creator, &AllowAllApprovals)
+    }
+
+    /// Drive preparation with an explicit approval authority.
+    ///
+    /// The preparation path is `async` only because the platform approval gate
+    /// awaits IPC. Tests drive it on a dedicated current-thread runtime, which
+    /// mirrors exactly how `goal_run` drives `run_goal_foreground` - so no test
+    /// ever needs an interactive approval UI.
+    fn prepare_with_approver(
+        &self,
+        goal_id: &GoalId,
+        git: &dyn ReadOnlyGit,
+        creator: &dyn ManagedWorktreeCreator,
+        approver: &dyn ManagedCreationApprover,
+    ) -> Result<ManagedWorkspacePreparation, crate::managed_worktree_prepare::ManagedWorkspaceError>
+    {
+        self.prepare_with_policy(
+            goal_id,
+            git,
+            creator,
+            approver,
+            managed_creation_requires_approval(),
+        )
+    }
+
+    /// Drive preparation with an explicit approval gate, so the Windows policy
+    /// is testable on a Unix host without weakening production.
+    fn prepare_with_policy(
+        &self,
+        goal_id: &GoalId,
+        git: &dyn ReadOnlyGit,
+        creator: &dyn ManagedWorktreeCreator,
+        approver: &dyn ManagedCreationApprover,
+        requires_approval: bool,
+    ) -> Result<ManagedWorkspacePreparation, crate::managed_worktree_prepare::ManagedWorkspaceError>
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(prepare_managed_workspace_with_policy(
+                &self.store,
+                &self.session,
+                goal_id,
+                git,
+                creator,
+                approver,
+                requires_approval,
+            ))
     }
 
     fn prepare_real(&self, goal_id: &GoalId) -> ManagedWorkspacePreparation {
@@ -292,6 +344,7 @@ struct Observed {
     intent_base: Option<String>,
     intent_branch: Option<String>,
     plan_revision_at_call: u32,
+    attempts_at_call: u32,
 }
 
 struct ScriptedCreator {
@@ -356,6 +409,10 @@ impl ManagedWorktreeCreator for ScriptedCreator {
             intent_base: intent.map(|intent| intent.base_commit().to_owned()),
             intent_branch: intent.map(|intent| intent.branch_ref().to_owned()),
             plan_revision_at_call: goal.plan_revision(),
+            attempts_at_call: goal
+                .managed_worktree()
+                .map(|record| record.creation_attempts_consumed())
+                .unwrap_or(0),
         });
 
         match self.steps[index] {
@@ -400,6 +457,82 @@ impl ManagedWorktreeCreator for ScriptedCreator {
                 detail: "scripted failure to start".to_owned(),
             }),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Approval test doubles
+// ---------------------------------------------------------------------------
+
+/// Approves every request and records exactly what it was asked to authorize.
+#[derive(Clone, Default)]
+struct RecordingApprover {
+    outcome: Outcome,
+    requests: Arc<Mutex<Vec<ManagedCreationApproval>>>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Outcome {
+    #[default]
+    Allow,
+    Deny,
+    Unavailable,
+}
+
+impl RecordingApprover {
+    fn with(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn allow() -> Self {
+        Self::with(Outcome::Allow)
+    }
+
+    fn deny() -> Self {
+        Self::with(Outcome::Deny)
+    }
+
+    fn unavailable() -> Self {
+        Self::with(Outcome::Unavailable)
+    }
+
+    fn requests(&self) -> Vec<ManagedCreationApproval> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn calls(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl ManagedCreationApprover for RecordingApprover {
+    fn approve(&self, request: &ManagedCreationApproval) -> ManagedApprovalFuture<'_> {
+        self.requests.lock().unwrap().push(request.clone());
+        let outcome = self.outcome;
+        Box::pin(async move {
+            match outcome {
+                Outcome::Allow => Ok(true),
+                Outcome::Deny => Ok(false),
+                // A missing approval channel and a malformed reply both surface
+                // as an error in the real `approvals::request`; neither may be
+                // read as consent.
+                Outcome::Unavailable => Err(ManagedWorkspaceError::ApprovalUnavailable(
+                    "scripted approval channel failure".to_owned(),
+                )),
+            }
+        })
+    }
+}
+
+/// Stand-in for the platform default in tests that are not about approval.
+struct AllowAllApprovals;
+
+impl ManagedCreationApprover for AllowAllApprovals {
+    fn approve(&self, _request: &ManagedCreationApproval) -> ManagedApprovalFuture<'_> {
+        Box::pin(async { Ok(true) })
     }
 }
 
@@ -553,7 +686,15 @@ fn the_foreground_run_seam_refuses_a_control_state_before_any_authority_call() {
         .unwrap();
 
     // The production seam, not the preparation layer beneath it.
-    let result = prepare_managed_workspace_before_run(&fixture.store, &fixture.session, &goal_id)
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(prepare_managed_workspace_before_run(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+        ))
         .expect("a control state stops the run at the seam");
     assert_eq!(
         result.stop_reason,
@@ -743,6 +884,828 @@ fn normalized_path(path: &Path) -> String {
 /// the canonical form while resolution is unchanged and portable.
 fn noncanonical(path: &Path) -> PathBuf {
     path.join(".")
+}
+
+// ---------------------------------------------------------------------------
+// I. Durable lifetime attempt budget
+// ---------------------------------------------------------------------------
+
+fn attempts(fixture: &Fixture, goal_id: &GoalId) -> u32 {
+    fixture
+        .goal(goal_id)
+        .managed_worktree()
+        .expect("managed record")
+        .creation_attempts_consumed()
+}
+
+#[test]
+fn a_fresh_request_starts_with_the_full_lifetime_budget() {
+    let mut fixture = Fixture::new("budget-fresh");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert_eq!(attempts(&fixture, &goal_id), 0);
+    assert!(
+        fixture
+            .goal(&goal_id)
+            .managed_worktree()
+            .unwrap()
+            .permits_creation_attempt()
+    );
+}
+
+#[test]
+fn the_first_invocation_consumes_the_attempt_durably_before_git() {
+    let mut fixture = Fixture::new("budget-first");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .is_active()
+    );
+    assert_eq!(creator.calls(), 1);
+    // The counter is durable, and it is evidence that survives ACTIVE.
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+
+    // Round-trip through the durable store rather than trusting an in-memory
+    // value: a fresh TaskStore over the same state root must read the same count.
+    let reloaded = TaskStore::with_state_root(fixture.state_root.clone())
+        .load_goal(&fixture.session.id, &goal_id)
+        .unwrap();
+    assert_eq!(
+        reloaded
+            .managed_worktree()
+            .unwrap()
+            .creation_attempts_consumed(),
+        1
+    );
+}
+
+#[test]
+fn a_proven_no_side_effect_retry_consumes_the_second_attempt_before_git() {
+    let mut fixture = Fixture::new("budget-retry");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Nothing, Step::Create]);
+    assert!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .is_active()
+    );
+    let observations = creator.observations();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(attempts(&fixture, &goal_id), 2);
+    assert_ne!(
+        observations[0].operation_id, observations[1].operation_id,
+        "each attempt keeps a distinct durable operation identity"
+    );
+    // The consumed count is already N when Git runs for attempt N, because the
+    // attempt is durably persisted before the invocation.
+    assert_eq!(observations[0].attempts_at_call, 1);
+    assert_eq!(observations[1].attempts_at_call, 2);
+}
+
+#[test]
+fn after_two_consumed_attempts_no_third_git_invocation_occurs() {
+    let mut fixture = Fixture::new("budget-exhausted");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Nothing]);
+    let block = fixture
+        .prepare(&goal_id, &HostGit::new(), &creator)
+        .unwrap()
+        .block_detail()
+        .cloned()
+        .expect("the lifetime budget is spent");
+    assert_eq!(block.code, "MANAGED_RETRY_EXHAUSTED");
+    assert_eq!(creator.calls(), 2, "exactly the lifetime bound");
+    assert_eq!(attempts(&fixture, &goal_id), 2);
+    assert!(!fixture.managed_target(&goal_id).exists());
+    assert!(!fixture.ref_exists(&Fixture::branch_ref(&goal_id)));
+}
+
+#[test]
+fn a_restart_between_attempts_does_not_restore_the_budget() {
+    let mut fixture = Fixture::new("budget-restart");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // A first process spends attempt 1 and proves no side effect, then "dies"
+    // before the retry. The retry loop in one call would continue; instead stop
+    // the call here by letting the budget be observed mid-flight.
+    let first = ScriptedCreator::new(&fixture, vec![Step::Nothing]);
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let _ = store;
+    // Run one attempt explicitly: use a creator that succeeds so a single
+    // invocation completes, then assert the durable count.
+    let ok = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &ok)
+            .unwrap()
+            .is_active()
+    );
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+    drop(first);
+
+    // A brand new TaskStore - the "restart" - sees the same spent budget and
+    // does not replenish it.
+    let restarted = TaskStore::with_state_root(fixture.state_root.clone());
+    let reloaded = restarted.load_goal(&fixture.session.id, &goal_id).unwrap();
+    let record = reloaded.managed_worktree().unwrap();
+    assert_eq!(record.creation_attempts_consumed(), 1);
+    assert!(record.permits_creation_attempt());
+
+    // A repeated prepare on an already-ACTIVE workspace consumes nothing.
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+}
+
+#[test]
+fn a_crash_after_consuming_an_attempt_does_not_refund_it() {
+    let mut fixture = Fixture::new("budget-crash-after-consume");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // Simulate the crash: a durable PREPARED intent with one attempt already
+    // consumed, and no Git side effect.
+    let goal = fixture.goal(&goal_id);
+    let record = goal.managed_worktree().unwrap();
+    let intent = ManagedWorktreeCreationIntent::prepared(
+        &goal_id,
+        record.worktree_id().clone(),
+        WorktreeOperationId::new(),
+        fixture.common_dir(),
+        fixture.managed_target(&goal_id),
+        fixture.base_commit.clone(),
+    )
+    .unwrap();
+    let revision = goal.revision();
+    fixture
+        .store
+        .mutate_goal_snapshot(&fixture.session.id, &goal_id, revision, |goal, _now| {
+            goal.set_managed_creation_intent(intent)?;
+            goal.consume_managed_creation_attempt()
+        })
+        .unwrap();
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+
+    // A later process must reconcile the proven no-side-effect and continue with
+    // the remaining single attempt - never two.
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .is_active()
+    );
+    assert_eq!(creator.calls(), 1, "only the remaining attempt was spent");
+    assert_eq!(attempts(&fixture, &goal_id), 2);
+
+    // And a third invocation is now impossible: the workspace is ACTIVE, so a
+    // further preparation only reconciles and never spawns Git again.
+    let more = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let repeated = fixture.prepare(&goal_id, &HostGit::new(), &more).unwrap();
+    assert!(
+        repeated.is_active(),
+        "an already-created workspace stays active on a further run"
+    );
+    assert_eq!(more.calls(), 0, "no further Git invocation is authorized");
+    assert_eq!(attempts(&fixture, &goal_id), 2);
+}
+
+#[test]
+fn repeated_preparation_never_replenishes_a_spent_budget() {
+    let mut fixture = Fixture::new("budget-repeat");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Nothing]);
+    assert!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .block_detail()
+            .is_some()
+    );
+    assert_eq!(attempts(&fixture, &goal_id), 2);
+
+    // Repeated prepares, and a fresh store each time, must not restore budget.
+    for _ in 0..3 {
+        let again = ScriptedCreator::new(&fixture, vec![Step::Nothing]);
+        let _ = fixture.prepare(&goal_id, &HostGit::new(), &again).unwrap();
+        assert_eq!(again.calls(), 0, "a blocked workspace must not be retried");
+        assert_eq!(attempts(&fixture, &goal_id), 2);
+    }
+}
+
+#[test]
+fn a_denied_authority_before_invocation_does_not_consume_budget() {
+    // Session path authority missing: preparation refuses before any attempt.
+    let fixture = Fixture::new("budget-no-authority");
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert_eq!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .block_detail()
+            .unwrap()
+            .code,
+        "MANAGED_SESSION_AUTHORITY"
+    );
+    assert_eq!(creator.calls(), 0);
+    assert_eq!(attempts(&fixture, &goal_id), 0);
+}
+
+#[test]
+fn an_ineligible_repository_does_not_consume_budget() {
+    let mut fixture = Fixture::new("budget-ineligible");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    std::fs::write(fixture.primary.join("tracked.txt"), "dirty\n").unwrap();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert_eq!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .block_detail()
+            .unwrap()
+            .code,
+        "MANAGED_ELIGIBILITY"
+    );
+    assert_eq!(creator.calls(), 0);
+    assert_eq!(attempts(&fixture, &goal_id), 0);
+}
+
+#[test]
+fn an_unobservable_repository_does_not_consume_budget() {
+    let mut fixture = Fixture::new("budget-unobservable");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert_eq!(
+        fixture
+            .prepare(&goal_id, &AmbiguousGit(HostGit::new()), &creator)
+            .unwrap()
+            .block_detail()
+            .unwrap()
+            .code,
+        "MANAGED_OBSERVATION_UNAVAILABLE"
+    );
+    assert_eq!(creator.calls(), 0);
+    assert_eq!(attempts(&fixture, &goal_id), 0);
+}
+
+#[test]
+fn adopting_an_exact_side_effect_does_not_consume_budget() {
+    let mut fixture = Fixture::new("budget-adopt");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // A lost response: attempt 1 ran and created the worktree, so exactly one
+    // attempt is consumed and the follow-up adoption spends nothing more.
+    let creator = ScriptedCreator::new(&fixture, vec![Step::CreateThenReportFailure]);
+    assert!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .is_active()
+    );
+    assert_eq!(creator.calls(), 1);
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+}
+
+#[test]
+fn an_exact_worktree_with_no_consumed_attempt_is_not_adopted_as_ours() {
+    let mut fixture = Fixture::new("budget-foreign-adopt");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // Build a durable PREPARED intent but consume nothing, then plant an exact
+    // worktree out of band. Nothing proves it is this lifecycle's side effect,
+    // so it must not be adopted.
+    let goal = fixture.goal(&goal_id);
+    let record = goal.managed_worktree().unwrap();
+    let intent = ManagedWorktreeCreationIntent::prepared(
+        &goal_id,
+        record.worktree_id().clone(),
+        WorktreeOperationId::new(),
+        fixture.common_dir(),
+        fixture.managed_target(&goal_id),
+        fixture.base_commit.clone(),
+    )
+    .unwrap();
+    let revision = goal.revision();
+    fixture
+        .store
+        .mutate_goal_snapshot(&fixture.session.id, &goal_id, revision, |goal, _now| {
+            goal.set_managed_creation_intent(intent)
+        })
+        .unwrap();
+    let target = fixture.managed_target(&goal_id);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    git(
+        &fixture.primary,
+        &[
+            "worktree",
+            "add",
+            "--lock",
+            "--reason",
+            &format!("local-mcp goal {}", goal_id.as_str()),
+            "-b",
+            &Fixture::branch_name(&goal_id),
+            &target.display().to_string(),
+            &fixture.base_commit,
+        ],
+    );
+
+    let block = fixture.block(&goal_id);
+    assert_eq!(block.code, "MANAGED_RECOVERY_REQUIRED");
+    assert!(
+        block
+            .detail
+            .contains("no creation attempt was ever consumed"),
+        "{}",
+        block.detail
+    );
+    assert_eq!(attempts(&fixture, &goal_id), 0);
+}
+
+#[test]
+fn a_conflicting_reconciliation_does_not_consume_a_new_attempt() {
+    let mut fixture = Fixture::new("budget-conflict");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let creator = ScriptedCreator::new(&fixture, vec![Step::BranchOnly]);
+    assert_eq!(
+        fixture
+            .prepare(&goal_id, &HostGit::new(), &creator)
+            .unwrap()
+            .block_detail()
+            .unwrap()
+            .code,
+        "MANAGED_RECOVERY_REQUIRED"
+    );
+    // The partial side effect blocked, but the one attempt it spent is recorded.
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+    assert_eq!(creator.calls(), 1, "a partial side effect is never retried");
+}
+
+#[test]
+fn an_out_of_range_attempt_count_fails_closed() {
+    let fixture = Fixture::new("budget-corrupt");
+    let goal_id = GoalId::new();
+    let primary = fixture.primary.clone();
+    let common = fixture.common_dir();
+    let target = fixture.managed_root_for_git().join("goal");
+
+    for corrupt in [
+        MAX_LIFETIME_CREATION_ATTEMPTS + 1,
+        MAX_LIFETIME_CREATION_ATTEMPTS + 50,
+        u32::MAX,
+    ] {
+        let record = ManagedWorktreeRecord::requested(
+            &goal_id,
+            WorktreeId::new(),
+            primary.clone(),
+            common.clone(),
+            target.clone(),
+            fixture.base_commit.clone(),
+            None,
+            1,
+            0,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["creation_attempts_consumed"] = json!(corrupt);
+        // Decoding must reject it rather than clamp it.
+        let decoded: Result<ManagedWorktreeRecord, _> = serde_json::from_value(value);
+        assert!(decoded.is_ok(), "shape decode is expected to succeed");
+        let decoded = decoded.unwrap();
+        assert!(
+            matches!(decoded.validate(), Err(OrchestratorError::CorruptGoal(_))),
+            "an out-of-range attempt count {corrupt} must fail closed"
+        );
+        assert!(matches!(record.consume_creation_attempt(), Ok(_) | Err(_)));
+    }
+}
+
+#[test]
+fn an_exhausted_record_refuses_to_consume_another_attempt() {
+    let fixture = Fixture::new("budget-refuse-consume");
+    let goal_id = GoalId::new();
+    let record = ManagedWorktreeRecord::requested(
+        &goal_id,
+        WorktreeId::new(),
+        fixture.primary.clone(),
+        fixture.common_dir(),
+        fixture.managed_root_for_git().join("goal"),
+        fixture.base_commit.clone(),
+        None,
+        1,
+        0,
+    )
+    .unwrap();
+    // Consumption only happens once the intent is durable, so the record is
+    // prepared first.
+    let once = record
+        .to_prepared()
+        .unwrap()
+        .consume_creation_attempt()
+        .unwrap();
+    assert_eq!(once.creation_attempts_consumed(), 1);
+    let twice = once.consume_creation_attempt().unwrap();
+    assert_eq!(twice.creation_attempts_consumed(), 2);
+    assert!(!twice.permits_creation_attempt());
+    assert!(matches!(
+        twice.consume_creation_attempt(),
+        Err(OrchestratorError::CorruptGoal(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// J. Platform approval for the host-native mutation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_platform_policy_requires_approval_only_on_windows() {
+    // Design section 23: Windows host-native mutation stays approval-gated.
+    // Unix must not gain an interactive requirement it never had.
+    assert_eq!(
+        managed_creation_requires_approval(),
+        cfg!(windows),
+        "the approval gate is platform policy, not a universal one"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn production_policy_on_windows_selects_approval_required() {
+    assert!(managed_creation_requires_approval());
+}
+
+#[test]
+fn a_denied_approval_never_invokes_git_and_costs_no_attempt() {
+    let mut fixture = Fixture::new("approval-denied");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let approver = RecordingApprover::deny();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let block = fixture
+        .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+        .unwrap()
+        .block_detail()
+        .cloned()
+        .expect("a denial blocks");
+    assert_eq!(block.code, "MANAGED_CREATION_APPROVAL_DENIED");
+    assert_eq!(creator.calls(), 0, "denial must precede any Git invocation");
+    assert_eq!(attempts(&fixture, &goal_id), 0, "denial costs no attempt");
+    assert!(!fixture.managed_target(&goal_id).exists());
+    assert!(!fixture.ref_exists(&Fixture::branch_ref(&goal_id)));
+}
+
+#[test]
+fn an_unavailable_approval_channel_never_invokes_git() {
+    let mut fixture = Fixture::new("approval-unavailable");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let approver = RecordingApprover::unavailable();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let block = fixture
+        .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+        .unwrap()
+        .block_detail()
+        .cloned()
+        .expect("an unreachable approval channel blocks");
+    assert_eq!(block.code, "MANAGED_CREATION_APPROVAL_UNAVAILABLE");
+    assert_eq!(creator.calls(), 0);
+    assert_eq!(attempts(&fixture, &goal_id), 0);
+}
+
+#[test]
+fn an_allowed_approval_binds_the_exact_host_owned_operation() {
+    let mut fixture = Fixture::new("approval-allowed");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let approver = RecordingApprover::allow();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert!(
+        fixture
+            .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+            .unwrap()
+            .is_active()
+    );
+    let requests = approver.requests();
+    assert_eq!(requests.len(), 1, "exactly one approval per invocation");
+    let request = &requests[0];
+    // The approval is bound to the exact durable target, branch, and base.
+    assert_eq!(request.goal_id, goal_id.as_str());
+    assert_eq!(request.primary_root, fixture.primary);
+    assert_eq!(request.worktree_root, fixture.managed_target(&goal_id));
+    assert_eq!(request.branch_ref, Fixture::branch_ref(&goal_id));
+    assert_eq!(request.base_commit, fixture.base_commit);
+    assert_eq!(creator.calls(), 1);
+}
+
+#[test]
+fn a_retry_requires_its_own_approval() {
+    let mut fixture = Fixture::new("approval-retry");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    let approver = RecordingApprover::allow();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Nothing, Step::Create]);
+    assert!(
+        fixture
+            .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+            .unwrap()
+            .is_active()
+    );
+    assert_eq!(
+        approver.calls(),
+        2,
+        "each invocation is approved separately"
+    );
+    assert_eq!(
+        approver.calls(),
+        2,
+        "each invocation is approved separately"
+    );
+    assert_eq!(creator.calls(), 2);
+    // Both approvals describe the same frozen operation: the retry re-requests
+    // consent for the identical target rather than reusing a stale approval.
+    let requests = approver.requests();
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
+fn approval_does_not_add_a_permitted_directory() {
+    let fixture = Fixture::new("approval-no-path");
+    // Deliberately do NOT authorize the managed root.
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let before = fixture.session.permitted_directories.clone();
+
+    let approver = RecordingApprover::allow();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let block = fixture
+        .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+        .unwrap()
+        .block_detail()
+        .cloned()
+        .expect("approval alone is insufficient");
+    assert_eq!(
+        block.code, "MANAGED_SESSION_AUTHORITY",
+        "approval must not substitute for Session path authority"
+    );
+    assert_eq!(creator.calls(), 0);
+    assert_eq!(fixture.session.permitted_directories, before);
+}
+
+#[test]
+fn session_authority_alone_does_not_replace_approval() {
+    let mut fixture = Fixture::new("approval-still-required");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // Path authority is satisfied, but the approval is refused, so on a platform
+    // that requires approval nothing may run. On a platform that does not, the
+    // Unix behavior is unchanged and creation proceeds.
+    let approver = RecordingApprover::deny();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let preparation = fixture
+        .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+        .unwrap();
+    assert_eq!(
+        preparation.block_detail().map(|block| block.code),
+        Some("MANAGED_CREATION_APPROVAL_DENIED"),
+        "Session path authority is necessary but never sufficient on Windows"
+    );
+    assert_eq!(creator.calls(), 0);
+}
+
+#[test]
+fn the_unix_gate_is_not_reached_when_the_platform_does_not_require_approval() {
+    let mut fixture = Fixture::new("approval-unix-off");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // With the gate off, the approver is never consulted at all, so a denied
+    // approver cannot affect Unix behavior.
+    let approver = RecordingApprover::deny();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert!(
+        fixture
+            .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, false)
+            .unwrap()
+            .is_active()
+    );
+    assert_eq!(
+        approver.calls(),
+        0,
+        "the gate must not be consulted on Unix"
+    );
+    assert_eq!(creator.calls(), 1);
+}
+
+#[test]
+fn the_workspace_mode_opt_in_is_not_approval() {
+    let mut fixture = Fixture::new("approval-not-optin");
+    fixture.authorize_managed_root();
+    // The Goal opted in to MANAGED_WORKTREE, yet a refused approval still stops
+    // everything: the opt-in is isolation policy, not consent to mutate.
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert_eq!(
+        fixture.goal(&goal_id).workspace_mode(),
+        WorkspaceMode::ManagedWorktree
+    );
+    let approver = RecordingApprover::deny();
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    assert_eq!(
+        fixture
+            .prepare_with_policy(&goal_id, &HostGit::new(), &creator, &approver, true)
+            .unwrap()
+            .block_detail()
+            .map(|block| block.code),
+        Some("MANAGED_CREATION_APPROVAL_DENIED")
+    );
+    assert_eq!(creator.calls(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// K. Migration
+// ---------------------------------------------------------------------------
+
+/// Build a schema-4 durable document for `goal`, optionally with a managed
+/// record, so the migration can be exercised against real stored bytes.
+fn schema_four_document(goal: &Goal) -> Value {
+    let mut value = serde_json::to_value(goal).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert("schema_version".to_owned(), json!(4));
+    if let Some(record) = goal.managed_worktree() {
+        let mut record_value = serde_json::to_value(record).unwrap();
+        // A schema-4 record has no attempt counter at all.
+        record_value
+            .as_object_mut()
+            .unwrap()
+            .remove("creation_attempts_consumed");
+        object.insert("managed_worktree".to_owned(), record_value);
+    }
+    value
+}
+
+fn write_raw_goal(fixture: &Fixture, goal_id: &GoalId, value: &Value) {
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let path = store
+        .goal_path_for_test(&fixture.session.id, goal_id)
+        .expect("goal path");
+    std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+#[test]
+fn a_schema_four_primary_goal_migrates_without_managed_authority() {
+    let fixture = Fixture::new("migrate-primary");
+    let goal_id = fixture.start(WorkspaceMode::Primary);
+    let goal = fixture.goal(&goal_id);
+    let value = schema_four_document(&goal);
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let migrated = store.load_goal(&fixture.session.id, &goal_id).unwrap();
+    assert_eq!(migrated.workspace_mode(), WorkspaceMode::Primary);
+    assert!(migrated.managed_worktree().is_none());
+    assert_eq!(migrated.execution_root(), Some(migrated.cwd()));
+}
+
+#[test]
+fn a_schema_four_requested_record_migrates_with_a_full_budget() {
+    let mut fixture = Fixture::new("migrate-requested");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let goal = fixture.goal(&goal_id);
+    let value = schema_four_document(&goal);
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    // A REQUESTED record provably never invoked Git, so it keeps a full budget.
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let migrated = store.load_goal(&fixture.session.id, &goal_id).unwrap();
+    let record = migrated.managed_worktree().unwrap();
+    assert_eq!(record.lifecycle(), ManagedWorktreeLifecycle::Requested);
+    assert_eq!(record.creation_attempts_consumed(), 0);
+    assert!(record.permits_creation_attempt());
+}
+
+#[test]
+fn a_schema_four_prepared_record_migrates_fail_closed_with_no_fresh_retry_authority() {
+    let mut fixture = Fixture::new("migrate-prepared");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let goal = fixture.goal(&goal_id);
+    let record = goal.managed_worktree().unwrap();
+    let intent = ManagedWorktreeCreationIntent::prepared(
+        &goal_id,
+        record.worktree_id().clone(),
+        WorktreeOperationId::new(),
+        fixture.common_dir(),
+        fixture.managed_target(&goal_id),
+        fixture.base_commit.clone(),
+    )
+    .unwrap();
+    let revision = goal.revision();
+    fixture
+        .store
+        .mutate_goal_snapshot(&fixture.session.id, &goal_id, revision, |goal, _now| {
+            goal.set_managed_creation_intent(intent)
+        })
+        .unwrap();
+
+    // Rewrite that durable record as a genuine schema-4 document: PREPARED,
+    // with no attempt counter, exactly what an older release would have stored.
+    let goal = fixture.goal(&goal_id);
+    let value = schema_four_document(&goal);
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let migrated = store.load_goal(&fixture.session.id, &goal_id).unwrap();
+    let record = migrated.managed_worktree().unwrap();
+    assert_eq!(
+        record.lifecycle(),
+        ManagedWorktreeLifecycle::Prepared,
+        "the migration must not invent a fresh lifecycle"
+    );
+    assert_eq!(
+        record.creation_attempts_consumed(),
+        MAX_LIFETIME_CREATION_ATTEMPTS,
+        "an ambiguous legacy PREPARED record must fail closed, not get a fresh budget"
+    );
+    assert!(
+        !record.permits_creation_attempt(),
+        "a migrated ambiguous record must not be able to invoke Git again"
+    );
+
+    // And preparation on it stops before any Git run, naming the spent budget as
+    // the reason: the migration granted no fresh retry authority.
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let code = fixture
+        .prepare(&goal_id, &HostGit::new(), &creator)
+        .unwrap()
+        .block_detail()
+        .map(|block| block.code)
+        .expect("a migrated ambiguous record blocks");
+    assert_eq!(code, "MANAGED_RETRY_EXHAUSTED");
+    assert_eq!(creator.calls(), 0);
+}
+
+#[test]
+fn the_migration_never_infers_attempts_from_names_or_state() {
+    let mut fixture = Fixture::new("migrate-no-inference");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let goal = fixture.goal(&goal_id);
+    let value = schema_four_document(&goal);
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    // Whatever exists on disk - branch name, worktree path, revision - must not
+    // change the migrated count. It is derived only from the lifecycle.
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let migrated = store.load_goal(&fixture.session.id, &goal_id).unwrap();
+    let record = migrated.managed_worktree().unwrap();
+    assert_eq!(record.creation_attempts_consumed(), 0);
+    assert!(record.branch_ref().contains(goal_id.as_str()));
+    assert!(record.worktree_root().ends_with(goal_id.as_str()));
+}
+
+#[test]
+fn a_schema_four_document_with_a_corrupt_lifecycle_fails_closed() {
+    let mut fixture = Fixture::new("migrate-corrupt-lifecycle");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let mut value = schema_four_document(&fixture.goal(&goal_id));
+    value
+        .as_object_mut()
+        .unwrap()
+        .get_mut("managed_worktree")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("lifecycle".to_owned(), json!("NOT_A_LIFECYCLE"));
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let error = store
+        .load_goal(&fixture.session.id, &goal_id)
+        .expect_err("an unrecognised lifecycle must not be silently accepted");
+    assert!(matches!(error, OrchestratorError::CorruptGoal(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,7 +2285,9 @@ fn creation_produces_the_exact_locked_worktree_branch_and_head() {
 
     let after = fixture.goal(&goal_id);
     assert_eq!(after.plan_revision(), 0);
-    assert_eq!(after.revision(), revision_before + 2);
+    // PREPARED, the consumed attempt, then ACTIVE.
+    assert_eq!(after.revision(), revision_before + 3);
+    assert_eq!(attempts(&fixture, &goal_id), 1);
 }
 
 #[cfg(unix)]
@@ -1406,7 +2371,9 @@ fn prepared_intent_is_durable_before_git_and_plan_revision_stays_zero() {
 
     let after = fixture.goal(&goal_id);
     assert_eq!(after.plan_revision(), 0, "plan_revision must remain 0");
-    assert_eq!(after.revision(), revision_before + 2);
+    // PREPARED, the consumed attempt, then ACTIVE: three lifecycle mutations.
+    assert_eq!(after.revision(), revision_before + 3);
+    assert_eq!(attempts(&fixture, &goal_id), 1);
     assert_eq!(
         after.managed_worktree().unwrap().lifecycle(),
         ManagedWorktreeLifecycle::Active
@@ -1561,12 +2528,12 @@ fn a_failure_to_start_git_is_reconciled_rather_than_assumed_side_effect_free() {
     assert_eq!(block.code, "MANAGED_RETRY_EXHAUSTED");
     assert_eq!(
         creator.calls() as u32,
-        crate::managed_worktree_prepare::MAX_CREATION_ATTEMPTS,
+        MAX_LIFETIME_CREATION_ATTEMPTS,
         "a start failure is reconciled, not retried without proof"
     );
     assert!(
-        block.detail.contains("could not run"),
-        "Git's own failure must reach the evidence: {}",
+        block.detail.contains("lifetime creation budget is spent"),
+        "the exhausting reason must be reported: {}",
         block.detail
     );
     assert!(!fixture.managed_target(&goal_id).exists());
