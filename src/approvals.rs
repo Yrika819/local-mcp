@@ -224,13 +224,23 @@ pub(crate) fn spawn_test_approval_responder(
     expected_cwd: &Path,
 ) -> Result<std::thread::JoinHandle<Result<()>>> {
     let path = config::socket_path(session_id)?;
-    let mut listener = bind_listener(&path)?;
     let expected_cwd = std::fs::canonicalize(expected_cwd)?;
-    Ok(std::thread::spawn(move || {
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(async move {
+                let mut listener = match bind_listener(&path) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error.to_string()));
+                        return Err(error);
+                    }
+                };
+                ready_sender
+                    .send(Ok(()))
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 let mut stream = listener.accept().await?;
                 let mut line = String::new();
                 BufReader::new(&mut stream).read_line(&mut line).await?;
@@ -247,7 +257,12 @@ pub(crate) fn spawn_test_approval_responder(
                 stream.write_all(b"allow\n").await?;
                 Ok(())
             })
-    }))
+    });
+    match ready_receiver.recv() {
+        Ok(Ok(())) => Ok(thread),
+        Ok(Err(detail)) => anyhow::bail!("cannot bind test approval listener: {detail}"),
+        Err(error) => anyhow::bail!("test approval listener stopped before startup: {error}"),
+    }
 }
 
 /// Sends a one-way activity update to the `start` screen. Activity reporting is
