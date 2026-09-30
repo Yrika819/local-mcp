@@ -230,6 +230,10 @@ pub(crate) async fn spawn_test_approval_responder(
     expected_cwd: &Path,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let path = config::socket_path(session_id)?;
+    eprintln!(
+        "Windows test responder session={session_id} pipe={}",
+        path.display()
+    );
     let expected_cwd = std::fs::canonicalize(expected_cwd)?;
     let mut listener = bind_listener(&path)?;
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
@@ -244,6 +248,7 @@ pub(crate) async fn spawn_test_approval_responder(
                     std::task::Poll::Ready(Err(error)) => Err(error.to_string()),
                     std::task::Poll::Pending | std::task::Poll::Ready(Ok(_)) => Ok(()),
                 };
+                eprintln!("Windows test responder readiness={readiness:?}");
                 let _ = sender.send(readiness);
             }
             result
