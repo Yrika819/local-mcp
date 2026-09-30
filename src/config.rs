@@ -38,7 +38,7 @@ pub fn validate_path_authority(
         .permitted_directories
         .iter()
         .map(|root| {
-            canonical_path(root)
+            std::fs::canonicalize(root)
                 .with_context(|| format!("cannot resolve permitted root {}", root.display()))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -88,14 +88,15 @@ pub fn validate_path_authority(
             | PathIntent::ExecutionCwd
     );
     let resolved = if existing {
-        canonical_path(&candidate)?
+        std::fs::canonicalize(&candidate)
+            .with_context(|| format!("cannot resolve {}", candidate.display()))?
     } else {
         // CreateFile must not treat a dangling final symlink (or any other
         // reparse point) as a creatable leaf name: open/write would follow it
         // outside the permitted roots. If anything already occupies the leaf,
         // resolve it fully and reject broken links / out-of-bounds targets.
         match std::fs::symlink_metadata(&candidate) {
-            Ok(_) => canonical_path(&candidate).with_context(|| {
+            Ok(_) => std::fs::canonicalize(&candidate).with_context(|| {
                 format!(
                     "existing writer target cannot be canonicalized; broken symlinks are rejected: {}",
                     candidate.display()
@@ -103,7 +104,8 @@ pub fn validate_path_authority(
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let parent = candidate.parent().context("path has no parent directory")?;
-                let parent = canonical_path(parent)?;
+                let parent = std::fs::canonicalize(parent)
+                    .with_context(|| format!("cannot resolve parent {}", parent.display()))?;
                 parent.join(candidate.file_name().context("path has no file name")?)
             }
             Err(error) => {
@@ -133,22 +135,23 @@ pub fn validate_path_authority(
 /// cannot spin.
 const MAX_UNRESOLVED_PATH_COMPONENTS: usize = 64;
 
-/// Canonicalize `path` for durable storage and for handing to a child process.
+/// Canonicalize `path` for durable storage **and for handing to a child process**.
 ///
 /// On Unix this is plain `fs::canonicalize`. On Windows `fs::canonicalize`
-/// returns a **verbatim** `\\?\` path, and that spelling is wrong for this
-/// product in three ways:
+/// returns a **verbatim** `\\?\C:\...` path, and Git for Windows is an MSYS
+/// program that rejects that spelling - a recorded managed target could not be
+/// handed to `git worktree add` at all. Removing the prefix when the remainder
+/// is an ordinary drive path therefore only changes the *spelling*, not the
+/// directory: the reparse points and junctions that matter are already resolved
+/// by the canonicalization, and the containment checks operate on the resolved
+/// components either way.
 ///
-/// - Git for Windows is an MSYS program and rejects verbatim paths, so passing
-///   one to `git worktree add` fails with an invalid-directory error;
-/// - it differs from the spelling a session, an operator, and the permitted
-///   roots use, so a derived path would not compare equal to the authorized
-///   root for the very directory it belongs to;
-/// - reparse points are already resolved by the canonicalization itself, so the
-///   verbatim prefix adds no security value - the containment checks operate on
-///   the resolved components either way.
+/// Scope is deliberately narrow. The Session path model, `create_session`, and
+/// `validate_path_authority` keep `fs::canonicalize`'s exact spelling, because
+/// the durable `primary_root` must stay byte-equal to the session's `cwd`. This
+/// helper is used only for the paths that must be given to a child process and
+/// for comparisons that involve them.
 ///
-/// The prefix is therefore removed when the remainder is an ordinary drive path.
 /// UNC paths (`\\server\share`) are left verbatim, because they have no shorter
 /// equivalent.
 pub fn canonical_path(path: &Path) -> Result<PathBuf> {
@@ -452,7 +455,8 @@ pub fn validate_session_id(id: &str) -> Result<()> {
 }
 
 pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    let path = canonical_path(path)?;
+    let path = std::fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve {}", path.display()))?;
     anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
     Ok(path)
 }

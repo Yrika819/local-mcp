@@ -192,9 +192,11 @@ fn canonical_git_path(command: &str, output: &GitCommandOutput) -> Result<PathBu
             "{command} did not return an absolute path"
         )));
     }
-    // `config::canonical_path` normalizes the Windows verbatim prefix, so the
-    // recorded identity matches the session's spelling and is a path Git accepts.
-    crate::config::canonical_path(&path).map_err(|error| {
+    // `fs::canonicalize` is kept verbatim here on purpose: the durable
+    // `primary_root` must stay byte-equal to the session's `cwd`, which
+    // `create_session` also produced with `fs::canonicalize`. Only paths handed
+    // to a child process are de-verbatim.
+    fs::canonicalize(&path).map_err(|error| {
         DiscoveryError::ObservationUnavailable(format!(
             "{command} path {} could not be canonicalized: {error}",
             path.display()

@@ -96,12 +96,12 @@ impl Fixture {
         std::fs::create_dir_all(raw_root.join("primary")).unwrap();
         std::fs::create_dir_all(raw_root.join("managed")).unwrap();
         std::fs::create_dir_all(raw_root.join("state")).unwrap();
-        // Every path the fixture hands to production code is canonical, exactly as
-        // `create_session` makes a real session's cwd. Mixing canonical and
-        // non-canonical spellings breaks on macOS, where the temp dir is
-        // `/var/...` behind a symlink to `/private/var/...`, and on Windows,
-        // where `fs::canonicalize` adds the `\\?\` verbatim prefix.
-        let root = config::canonical_path(&raw_root).expect("fixture root is canonical");
+        // `create_session` and `canonical_directory` use plain
+        // `fs::canonicalize`, and the durable `primary_root` must stay
+        // byte-equal to `session.cwd`, so the fixture uses the same spelling. On
+        // macOS this also resolves the `/var` -> `/private/var` symlink, which is
+        // what kept the earlier fixture self-inconsistent.
+        let root = std::fs::canonicalize(&raw_root).expect("fixture root is canonical");
         let primary = root.join("primary");
         let managed_root = root.join("managed");
         let state_root = root.join("state");
@@ -137,7 +137,7 @@ impl Fixture {
 
     /// The operator's existing explicit authorization path for a broader root.
     fn authorize_managed_root(&mut self) {
-        let canonical = config::canonical_path(&self.managed_root).unwrap();
+        let canonical = std::fs::canonicalize(&self.managed_root).unwrap();
         if !self.session.permitted_directories.contains(&canonical) {
             self.session.permitted_directories.push(canonical);
             self.session.permitted_directories.sort();
@@ -235,10 +235,19 @@ impl Fixture {
     }
 
     fn common_dir(&self) -> PathBuf {
-        PathBuf::from(git(
+        // `git rev-parse` reports the common dir; production canonicalizes it
+        // with `fs::canonicalize` before it is recorded, so the fixture does too.
+        let reported = git(
             &self.primary,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ))
+        );
+        std::fs::canonicalize(Path::new(&reported)).expect("common dir is canonical")
+    }
+
+    /// The managed root as the host records it for a child process, i.e.
+    /// de-verbatim on Windows.
+    fn managed_root_for_git(&self) -> PathBuf {
+        config::canonical_path(&self.managed_root).expect("managed root is canonical")
     }
 }
 
@@ -674,7 +683,7 @@ fn a_symlinked_session_cwd_cannot_host_a_managed_workspace() {
     fixture.authorize_managed_root();
     let link = fixture.root.join("primary-link");
     std::os::unix::fs::symlink(&fixture.primary, &link).unwrap();
-    assert_eq!(config::canonical_path(&link).unwrap(), fixture.primary);
+    assert_eq!(std::fs::canonicalize(&link).unwrap(), fixture.primary);
     assert_ne!(link, fixture.primary);
 
     fixture.session.cwd = link.clone();
@@ -1006,7 +1015,7 @@ fn an_explicitly_authorized_broader_root_covers_the_exact_derived_child() {
     assert!(
         fixture
             .managed_target(&goal_id)
-            .starts_with(&fixture.managed_root)
+            .starts_with(fixture.managed_root_for_git())
     );
     assert!(fixture.prepare_real(&goal_id).is_active());
 }
@@ -1655,6 +1664,7 @@ fn a_common_dir_mismatch_blocks_before_any_creation() {
 
     let other = fixture.root.join("other-common-dir");
     std::fs::create_dir_all(&other).unwrap();
+    let other = std::fs::canonicalize(&other).unwrap();
     let other = std::fs::canonicalize(&other).unwrap();
     let observer = CommonDirOverrideGit {
         inner: HostGit::new(),
