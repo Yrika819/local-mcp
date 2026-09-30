@@ -803,7 +803,7 @@ fn normalize_planner_path(
         ));
     }
 
-    let canonical_goal_root = config::canonical_path(goal_root).map_err(|_| {
+    let canonical_goal_root = canonical_path_for_root(goal_root, goal_root).map_err(|_| {
         PlannerError::PlanAuthorityViolation(
             "Goal execution root cannot be canonicalized".to_owned(),
         )
@@ -813,7 +813,7 @@ fn normalize_planner_path(
     } else {
         canonical_goal_root.join(path)
     };
-    let resolved = canonicalize_existing_prefix(&absolute)?;
+    let resolved = canonicalize_existing_prefix(&absolute, &canonical_goal_root)?;
     if !resolved.starts_with(&canonical_goal_root) {
         return Err(PlannerError::PlanAuthorityViolation(
             "Task path escapes the Goal cwd".to_owned(),
@@ -827,7 +827,10 @@ fn normalize_planner_path(
     Ok(resolved)
 }
 
-fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, PlannerError> {
+fn canonicalize_existing_prefix(
+    path: &Path,
+    spelling_root: &Path,
+) -> Result<PathBuf, PlannerError> {
     let mut existing = path.to_path_buf();
     let mut suffix = Vec::new();
     while !existing.exists() {
@@ -841,13 +844,22 @@ fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, PlannerError> {
             ));
         }
     }
-    let mut resolved = config::canonical_path(&existing).map_err(|_| {
+    let mut resolved = canonical_path_for_root(&existing, spelling_root).map_err(|_| {
         PlannerError::PlanAuthorityViolation("path ancestor cannot be canonicalized".to_owned())
     })?;
     for component in suffix.iter().rev() {
         resolved.push(component);
     }
     Ok(resolved)
+}
+
+fn canonical_path_for_root(path: &Path, _spelling_root: &Path) -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    if _spelling_root.to_string_lossy().starts_with(r"\\?\") {
+        return std::fs::canonicalize(path).map_err(Into::into);
+    }
+
+    config::canonical_path(path)
 }
 
 fn contains_git_internal(path: &Path) -> bool {
