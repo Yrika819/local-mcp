@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+#[cfg(windows)]
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -242,11 +244,21 @@ pub(crate) fn spawn_test_approval_responder(
                         return Err(error);
                     }
                 };
-                eprintln!("Windows test approval listener bound");
-                ready_sender
-                    .send(Ok(()))
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let mut stream = listener.accept().await?;
+                let accept = listener.accept();
+                tokio::pin!(accept);
+                let mut ready_sender = Some(ready_sender);
+                let mut stream = std::future::poll_fn(|context| {
+                    let result = accept.as_mut().poll(context);
+                    if let Some(sender) = ready_sender.take() {
+                        let readiness = match &result {
+                            std::task::Poll::Ready(Err(error)) => Err(error.to_string()),
+                            std::task::Poll::Pending | std::task::Poll::Ready(Ok(_)) => Ok(()),
+                        };
+                        let _ = sender.send(readiness);
+                    }
+                    result
+                })
+                .await?;
                 let mut line = String::new();
                 BufReader::new(&mut stream).read_line(&mut line).await?;
                 let message: serde_json::Value = serde_json::from_str(&line)?;
@@ -279,7 +291,6 @@ pub(crate) fn spawn_test_approval_responder(
     _session_id: &str,
     _expected_cwd: &Path,
 ) -> Result<std::thread::JoinHandle<Result<()>>> {
-    eprintln!("Non-Windows test approval responder stub selected");
     Ok(std::thread::spawn(|| Ok(())))
 }
 
