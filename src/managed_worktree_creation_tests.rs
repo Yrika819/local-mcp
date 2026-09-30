@@ -733,6 +733,12 @@ fn a_dot_suffixed_session_cwd_still_resolves_to_the_same_identity() {
     );
 }
 
+/// Spell a path the way Git's porcelain output does, so a test can compare a
+/// recorded target against what Git reports.
+fn normalized_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 /// The same directory, spelled with a trailing `.` so the raw bytes differ from
 /// the canonical form while resolution is unchanged and portable.
 fn noncanonical(path: &Path) -> PathBuf {
@@ -1735,9 +1741,16 @@ fn stale_or_missing_metadata_blocks_without_destructive_repair() {
         "{}",
         block.detail
     );
-    // No destructive repair happened: the registration is still there.
+    // No destructive repair happened: the registration is still there. Git
+    // spells worktree paths with forward slashes, so compare on a normalized
+    // form rather than on the platform separator.
     let porcelain = git(&fixture.primary, &["worktree", "list", "--porcelain"]);
-    assert!(porcelain.contains(&target.display().to_string()));
+    assert!(
+        porcelain
+            .replace('\\', "/")
+            .contains(&normalized_path(&target)),
+        "the worktree registration must survive: {porcelain}"
+    );
 }
 
 #[test]
@@ -1805,8 +1818,11 @@ fn the_managed_branch_checked_out_elsewhere_blocks_reconciliation() {
         })
         .unwrap();
 
-    // The managed branch is already checked out in a different worktree.
-    let elsewhere = fixture.managed_root.join("someone-elses-worktree");
+    // The managed branch is already checked out in a different worktree. The
+    // path is spelled the way the host hands it to Git, i.e. de-verbatim.
+    let elsewhere = fixture
+        .managed_root_for_git()
+        .join("someone-elses-worktree");
     std::fs::create_dir_all(fixture.managed_root.join("s")).unwrap();
     git(
         &fixture.primary,
