@@ -147,6 +147,12 @@ impl Fixture {
         ExpectedWorktreeTarget::from_record(&self.record_with_lifecycle("ACTIVE"))
     }
 
+    /// A `PREPARED` record, which is the only non-blocked lifecycle that may
+    /// carry a durable creation intent.
+    fn prepared_record(&self) -> ManagedWorktreeRecord {
+        self.record.to_prepared().unwrap()
+    }
+
     fn record_with_lifecycle(&self, lifecycle: &str) -> ManagedWorktreeRecord {
         let mut serialized = serde_json::to_value(&self.record).unwrap();
         serialized["lifecycle"] = serde_json::json!(lifecycle);
@@ -1098,7 +1104,8 @@ fn no_side_effect_permits_bounded_retry_and_nothing_else_does() {
     )
     .unwrap();
     let expected =
-        ExpectedWorktreeTarget::from_record_and_intent(&fixture.record, &intent).unwrap();
+        ExpectedWorktreeTarget::from_record_and_intent(&fixture.prepared_record(), &intent)
+            .unwrap();
     let state = classify_reconciliation(&expected, &observation, false);
     assert_eq!(
         state,
@@ -1449,7 +1456,8 @@ fn unknown_attributes_on_any_registered_worktree_are_ambiguous() {
     )
     .unwrap();
     let expected =
-        ExpectedWorktreeTarget::from_record_and_intent(&fixture.record, &intent).unwrap();
+        ExpectedWorktreeTarget::from_record_and_intent(&fixture.prepared_record(), &intent)
+            .unwrap();
 
     let unknown_primary = record(
         PRIMARY_ROOT,

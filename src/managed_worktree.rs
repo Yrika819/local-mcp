@@ -17,10 +17,12 @@
 //! cannot prove an observation was genuine; proving that is the job of the
 //! read-only reconciliation phase, not this module.
 //!
-//! Phase boundary: nothing in this file performs or authorizes
-//! `git worktree add`, branch creation, lock/unlock, remove, prune, or any ref
-//! mutation, and nothing here widens Session path authority. See
-//! `docs/MANAGED_WORKTREES_V1_DESIGN.md` section 26 for the frozen phase order.
+//! Phase 3 adds the creation-authority transition helpers
+//! ([`ManagedWorktreeRecord::to_prepared`], [`ManagedWorktreeRecord::to_active`],
+//! and [`ManagedWorktreeRecord::to_blocked`]). They remain pure state
+//! transitions with no filesystem or Git access; the Git mutation itself lives
+//! behind the narrow host-owned creation seam in `managed_worktree_create`, and
+//! the orchestration in `managed_worktree_prepare`.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -34,6 +36,14 @@ use crate::orchestrator_error::OrchestratorError;
 ///
 /// The full Goal UUID is authoritative; a shortened UUID is never acceptable.
 pub(crate) const MANAGED_BRANCH_REF_PREFIX: &str = "refs/heads/local-mcp/goal/";
+
+/// Git's fully-qualified ref namespace. `git worktree add -b` takes a branch
+/// *name*, i.e. the durable ref with exactly this prefix removed.
+const REFS_HEADS_PREFIX: &str = "refs/heads/";
+
+/// The same namespace as a branch name: [`MANAGED_BRANCH_REF_PREFIX`] without
+/// Git's ref namespace.
+const MANAGED_BRANCH_NAME_PREFIX: &str = "local-mcp/goal/";
 
 /// Deterministic host-owned lock reason from design section 10/12.
 pub(crate) const MANAGED_LOCK_REASON_PREFIX: &str = "local-mcp goal ";
@@ -55,6 +65,27 @@ pub(crate) fn managed_lock_reason(goal_id: &GoalId) -> String {
     format!("{MANAGED_LOCK_REASON_PREFIX}{}", goal_id.as_str())
 }
 
+/// The exact `-b` argument for `git worktree add`, derived from the durable ref.
+///
+/// The durable branch ref is `refs/heads/local-mcp/goal/<full-goal-uuid>`, but
+/// Git's `-b` takes the *branch name*, which is that ref without its
+/// `refs/heads/` prefix: `local-mcp/goal/<full-goal-uuid>`. The conversion is
+/// total and exact: it only accepts a ref under
+/// [`MANAGED_BRANCH_REF_PREFIX`], so a caller cannot express any other branch
+/// argument (design sections 8 and 10).
+pub(crate) fn managed_branch_name(branch_ref: &str) -> Result<String, OrchestratorError> {
+    let suffix = branch_ref
+        .strip_prefix(REFS_HEADS_PREFIX)
+        .and_then(|name| name.strip_prefix(MANAGED_BRANCH_NAME_PREFIX))
+        .ok_or_else(|| OrchestratorError::UnsafeIdentifier("managed branch ref".to_owned()))?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(OrchestratorError::UnsafeIdentifier(
+            "managed branch ref".to_owned(),
+        ));
+    }
+    Ok(format!("{MANAGED_BRANCH_NAME_PREFIX}{suffix}"))
+}
+
 /// Host-owned identity of one managed linked worktree (design section 8).
 ///
 /// A worktree may outlive its Goal for review/cleanup, but durable ownership
@@ -65,7 +96,7 @@ pub(crate) struct WorktreeId(String);
 
 #[expect(
     dead_code,
-    reason = "Managed Worktrees identity accessors are frozen contract state; Phase 3 creation authority is not authorized yet."
+    reason = "WorktreeId::parse is only reachable from durable decode and validation; the creation seam consumes a host-generated id."
 )]
 impl WorktreeId {
     pub(crate) fn new() -> Self {
@@ -99,7 +130,7 @@ pub(crate) struct WorktreeOperationId(String);
 
 #[expect(
     dead_code,
-    reason = "Managed Worktrees operation identity is frozen contract state; Phase 3 creation authority is not authorized yet."
+    reason = "WorktreeOperationId::parse is only reachable from durable decode and validation; creation mints a host-generated id."
 )]
 impl WorktreeOperationId {
     pub(crate) fn new() -> Self {
@@ -139,10 +170,6 @@ pub(crate) enum WorkspaceMode {
     ManagedWorktree,
 }
 
-#[expect(
-    dead_code,
-    reason = "workspace_mode is frozen contract state; the public opt-in arrives with Phase 3 creation authority."
-)]
 impl WorkspaceMode {
     pub(crate) fn is_primary(&self) -> bool {
         matches!(self, Self::Primary)
@@ -173,7 +200,7 @@ pub(crate) enum ManagedWorktreeLifecycle {
 
 #[expect(
     dead_code,
-    reason = "Managed Worktrees lifecycle edges are frozen contract state; no lifecycle transition is authorized in Phase 1 or 2."
+    reason = "ManagedWorktreeLifecycle::is_terminal is frozen contract state consumed by later cleanup phases, not by Phase 3."
 )]
 impl ManagedWorktreeLifecycle {
     pub(crate) fn is_terminal(&self) -> bool {
@@ -239,10 +266,6 @@ pub(crate) enum ManagedWorktreeIntentState {
     Prepared,
 }
 
-#[expect(
-    dead_code,
-    reason = "PREPARED intent construction is frozen contract state; Phase 3 creation authority is not authorized yet."
-)]
 impl ManagedWorktreeCreationIntent {
     /// Build the host-derived `PREPARED` intent for `goal_id`.
     ///
@@ -304,7 +327,7 @@ impl ManagedWorktreeCreationIntent {
 
     /// Pure validation. Performs no filesystem or Git access.
     pub(crate) fn validate(&self) -> Result<(), OrchestratorError> {
-        if self.state != ManagedWorktreeIntentState::Prepared {
+        if self.state() != ManagedWorktreeIntentState::Prepared {
             return Err(OrchestratorError::CorruptGoal(
                 "managed-worktree creation intent must be PREPARED".to_owned(),
             ));
@@ -312,8 +335,8 @@ impl ManagedWorktreeCreationIntent {
         self.goal_id.validate()?;
         self.worktree_id.validate()?;
         self.operation_id.validate()?;
-        validate_canonical_absolute(&self.repository_common_dir, "repository_common_dir")?;
-        validate_canonical_absolute(&self.worktree_root, "worktree_root")?;
+        validate_canonical_absolute(self.repository_common_dir(), "repository_common_dir")?;
+        validate_canonical_absolute(self.worktree_root(), "worktree_root")?;
         validate_expected_branch_ref(&self.goal_id, &self.branch_ref)?;
         validate_object_id(&self.base_commit, "base_commit")?;
         Ok(())
@@ -329,12 +352,12 @@ impl ManagedWorktreeCreationIntent {
     ) -> Result<(), OrchestratorError> {
         self.validate()?;
         record.validate()?;
-        let consistent = self.goal_id == record.goal_id
-            && self.worktree_id == record.worktree_id
-            && self.repository_common_dir == record.repository_common_dir
-            && self.worktree_root == record.worktree_root
-            && self.branch_ref == record.branch_ref
-            && self.base_commit == record.base_commit;
+        let consistent = self.goal_id() == record.goal_id()
+            && self.worktree_id() == record.worktree_id()
+            && self.repository_common_dir() == record.repository_common_dir()
+            && self.worktree_root() == record.worktree_root()
+            && self.branch_ref() == record.branch_ref()
+            && self.base_commit() == record.base_commit();
         if !consistent {
             return Err(OrchestratorError::CorruptGoal(
                 "managed-worktree creation intent and record describe different targets".to_owned(),
@@ -372,7 +395,7 @@ pub(crate) struct ManagedWorktreeRecord {
 
 #[expect(
     dead_code,
-    reason = "Managed Worktrees record accessors are frozen contract state; Phase 3 creation and Phase 5 evidence are not authorized yet."
+    reason = "Some record accessors are consumed by later evidence/finalization phases rather than by Phase 3 creation."
 )]
 #[expect(
     clippy::too_many_arguments,
@@ -475,11 +498,15 @@ impl ManagedWorktreeRecord {
     /// Design section 11 persists the intent before Git and reconciles before
     /// committing `ACTIVE`, so an outstanding intent implies a lifecycle that
     /// has not been reconciled yet.
+    ///
+    /// `Requested` is deliberately excluded. Design section 5 orders the flow
+    /// `requested -> host PrepareWorkspace -> durable creation intent -> Git`,
+    /// so a requested workspace has not reached the intent yet. Phase 3 requires
+    /// this because the Session path-authority and eligibility gates run *before*
+    /// the intent is persisted: a denial must not leave a `PREPARED` side effect
+    /// behind.
     pub(crate) fn requires_creation_intent(&self) -> bool {
-        matches!(
-            self.lifecycle,
-            ManagedWorktreeLifecycle::Requested | ManagedWorktreeLifecycle::Prepared
-        )
+        matches!(self.lifecycle, ManagedWorktreeLifecycle::Prepared)
     }
 
     /// Whether this lifecycle may still carry a `PREPARED` creation intent.
@@ -561,6 +588,65 @@ impl ManagedWorktreeRecord {
             validate_bounded_text(at, "last_reconciled_at")?;
         }
         Ok(())
+    }
+
+    /// Pure `REQUESTED -> PREPARED` transition.
+    ///
+    /// This is the durable state the host persists **before** invoking
+    /// `git worktree add` (design section 11). It carries no reconciliation
+    /// observation, because nothing has been invoked yet.
+    pub(crate) fn to_prepared(&self) -> Result<Self, OrchestratorError> {
+        self.transition_to(ManagedWorktreeLifecycle::Prepared, None, None)
+    }
+
+    /// Pure `PREPARED -> ACTIVE` transition carrying a mechanical observation.
+    ///
+    /// The caller must have already reconciled the exact expected target with
+    /// read-only Git observation. The frozen identity bindings
+    /// (`worktree_root`, `branch_ref`, `base_commit`, `created_goal_revision`,
+    /// `created_plan_revision`) are carried over unchanged: creation fixes them.
+    pub(crate) fn to_active(&self, head: &str, at: &str) -> Result<Self, OrchestratorError> {
+        self.transition_to(
+            ManagedWorktreeLifecycle::Active,
+            Some(head.to_owned()),
+            Some(at.to_owned()),
+        )
+    }
+
+    /// Pure transition to `BLOCKED` for a conflict, ambiguity, or an
+    /// unauthorized target.
+    ///
+    /// Any previously recorded reconciliation observation is preserved: it is
+    /// durable evidence for explicit host recovery. `BLOCKED` is never a retry
+    /// permission.
+    pub(crate) fn to_blocked(&self) -> Result<Self, OrchestratorError> {
+        self.transition_to(
+            ManagedWorktreeLifecycle::Blocked,
+            self.last_reconciled_head.clone(),
+            self.last_reconciled_at.clone(),
+        )
+    }
+
+    fn transition_to(
+        &self,
+        next: ManagedWorktreeLifecycle,
+        head: Option<String>,
+        at: Option<String>,
+    ) -> Result<Self, OrchestratorError> {
+        if !self.lifecycle.can_transition_to(next) {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "managed-worktree lifecycle {:?} cannot transition to {next:?}",
+                self.lifecycle
+            )));
+        }
+        let moved = Self {
+            lifecycle: next,
+            last_reconciled_head: head,
+            last_reconciled_at: at,
+            ..self.clone()
+        };
+        moved.validate()?;
+        Ok(moved)
     }
 }
 

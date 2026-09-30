@@ -76,6 +76,12 @@ fn prepared_intent(goal: &Goal, record: &ManagedWorktreeRecord) -> ManagedWorktr
     .unwrap()
 }
 
+/// A `PREPARED` record. Only `PREPARED` and `BLOCKED` may carry a durable
+/// creation intent, so any fixture that attaches an intent starts here.
+fn prepared_record(goal: &Goal) -> ManagedWorktreeRecord {
+    requested_record(goal).to_prepared().unwrap()
+}
+
 // --- Section 3: public opt-in and PRIMARY default ---------------------------
 
 #[test]
@@ -568,13 +574,36 @@ fn intent_for_a_different_worktree_identity_is_rejected() {
 #[test]
 fn outstanding_creation_requires_a_prepared_intent() {
     let goal = managed_goal();
-    let record = requested_record(&goal);
-    let mut value = serde_json::to_value(&goal).unwrap();
-    value["workspace_mode"] = Value::from("MANAGED_WORKTREE");
-    value["managed_worktree"] = serde_json::to_value(&record).unwrap();
-    let decoded: Goal = serde_json::from_value(value).unwrap();
+
+    // A `REQUESTED` workspace has not reached the intent yet, so carrying no
+    // intent is the correct durable state, not corruption.
+    let mut requested = serde_json::to_value(&goal).unwrap();
+    requested["workspace_mode"] = Value::from("MANAGED_WORKTREE");
+    requested["managed_worktree"] = serde_json::to_value(requested_record(&goal)).unwrap();
+    let requested: Goal = serde_json::from_value(requested).unwrap();
+    requested.validate().unwrap();
+
+    // Once creation is `PREPARED`, the durable intent is mandatory: a crash
+    // between persistence and Git must be recoverable, which requires it.
+    let mut prepared = serde_json::to_value(&goal).unwrap();
+    prepared["workspace_mode"] = Value::from("MANAGED_WORKTREE");
+    prepared["managed_worktree"] = serde_json::to_value(prepared_record(&goal)).unwrap();
+    let prepared: Goal = serde_json::from_value(prepared).unwrap();
     assert!(matches!(
-        decoded.validate(),
+        prepared.validate(),
+        Err(OrchestratorError::CorruptGoal(_))
+    ));
+
+    // And a `REQUESTED` workspace must not carry a stale intent.
+    let mut stale = serde_json::to_value(&goal).unwrap();
+    stale["workspace_mode"] = Value::from("MANAGED_WORKTREE");
+    let record = requested_record(&goal);
+    stale["managed_worktree"] = serde_json::to_value(&record).unwrap();
+    stale["managed_worktree_creation_intent"] =
+        serde_json::to_value(prepared_intent(&goal, &record)).unwrap();
+    let stale: Goal = serde_json::from_value(stale).unwrap();
+    assert!(matches!(
+        stale.validate(),
         Err(OrchestratorError::CorruptGoal(_))
     ));
 }
@@ -716,22 +745,32 @@ fn reconciled_lifecycle_rejects_a_malformed_reconciled_head() {
 #[test]
 fn execution_root_is_primary_until_a_managed_worktree_is_active() {
     let goal = managed_goal();
-    let record = requested_record(&goal);
-    let intent = prepared_intent(&goal, &record);
+    let prepared = prepared_record(&goal);
+    let intent = prepared_intent(&goal, &prepared);
 
-    // Requested: managed execution root is not yet usable.
+    // Requested: managed execution root is not yet usable, and no intent exists
+    // because the creation step has not persisted one yet.
     let mut value = serde_json::to_value(&goal).unwrap();
     value["workspace_mode"] = Value::from("MANAGED_WORKTREE");
-    value["managed_worktree"] = serde_json::to_value(&record).unwrap();
-    value["managed_worktree_creation_intent"] = serde_json::to_value(&intent).unwrap();
+    value["managed_worktree"] = serde_json::to_value(requested_record(&goal)).unwrap();
     let requested: Goal = serde_json::from_value(value.clone()).unwrap();
     requested.validate().unwrap();
     assert_eq!(requested.execution_root(), None);
 
+    // Prepared: still not usable, and the durable intent is present.
+    let mut preparing = value.clone();
+    preparing["managed_worktree"] = serde_json::to_value(&prepared).unwrap();
+    preparing["managed_worktree_creation_intent"] = serde_json::to_value(&intent).unwrap();
+    let preparing: Goal = serde_json::from_value(preparing).unwrap();
+    preparing.validate().unwrap();
+    assert_eq!(preparing.execution_root(), None);
+
     // Blocked stays unusable, and a blocked creation keeps its intent so an
     // explicit host recovery can still reconcile the exact intended target.
     let mut blocked = value.clone();
+    blocked["managed_worktree"] = serde_json::to_value(&prepared).unwrap();
     blocked["managed_worktree"]["lifecycle"] = Value::from("BLOCKED");
+    blocked["managed_worktree_creation_intent"] = serde_json::to_value(&intent).unwrap();
     let blocked: Goal = serde_json::from_value(blocked).unwrap();
     blocked.validate().unwrap();
     assert_eq!(blocked.execution_root(), None);
@@ -779,7 +818,7 @@ fn a_reconciled_worktree_must_not_retain_a_prepared_intent() {
 #[test]
 fn managed_goal_round_trips_through_durable_json() {
     let goal = managed_goal();
-    let record = requested_record(&goal);
+    let record = prepared_record(&goal);
     let intent = prepared_intent(&goal, &record);
     let mut value = serde_json::to_value(&goal).unwrap();
     value["workspace_mode"] = Value::from("MANAGED_WORKTREE");
@@ -823,7 +862,7 @@ fn validation_is_pure_and_does_not_require_paths_to_exist() {
     // None of these paths exist on the test host; validation must still pass
     // because it is a pure function of durable data only.
     let goal = managed_goal();
-    let record = requested_record(&goal);
+    let record = prepared_record(&goal);
     let intent = prepared_intent(&goal, &record);
     assert!(!PathBuf::from(PRIMARY_ROOT).exists());
     assert!(!PathBuf::from(WORKTREE_ROOT).exists());
