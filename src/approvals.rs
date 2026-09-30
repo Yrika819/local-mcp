@@ -242,6 +242,7 @@ pub(crate) fn spawn_test_approval_responder(
                         return Err(error);
                     }
                 };
+                eprintln!("Windows test approval listener bound");
                 ready_sender
                     .send(Ok(()))
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -278,6 +279,7 @@ pub(crate) fn spawn_test_approval_responder(
     _session_id: &str,
     _expected_cwd: &Path,
 ) -> Result<std::thread::JoinHandle<Result<()>>> {
+    eprintln!("Non-Windows test approval responder stub selected");
     Ok(std::thread::spawn(|| Ok(())))
 }
 
