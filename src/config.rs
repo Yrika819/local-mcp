@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -127,6 +128,140 @@ pub fn validate_path_authority(
         );
     }
     Ok(resolved)
+}
+
+/// Maximum number of not-yet-existing leading components resolved when checking
+/// a future path against Session authority. Bounded so a pathological path
+/// cannot spin.
+const MAX_UNRESOLVED_PATH_COMPONENTS: usize = 64;
+
+/// Resolve a host-derived path that does not exist yet to a canonical absolute
+/// path, by canonicalizing the deepest existing ancestor and re-appending the
+/// missing components.
+///
+/// This grants no authority and touches no session state. It exists so a
+/// host-derived managed target is canonical before it is persisted, and so the
+/// Session authority check below can compare the live resolution against the
+/// durable record.
+pub fn canonical_future_path(requested: &Path) -> Result<PathBuf> {
+    let candidate = requested.to_owned();
+    anyhow::ensure!(
+        candidate.is_absolute(),
+        "path is not absolute: {}",
+        requested.display()
+    );
+
+    let mut unresolved: Vec<OsString> = Vec::new();
+    let mut existing = candidate.clone();
+    loop {
+        anyhow::ensure!(
+            unresolved.len() < MAX_UNRESOLVED_PATH_COMPONENTS,
+            "path has too many unresolved components: {}",
+            requested.display()
+        );
+        match std::fs::symlink_metadata(&existing) {
+            // The leaf may be a symlink or reparse point; `canonicalize` below
+            // resolves it. A dangling link fails to canonicalize and is rejected.
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .with_context(|| format!("path has no file name: {}", existing.display()))?
+                    .to_os_string();
+                anyhow::ensure!(
+                    name != "..",
+                    "path may not contain '..' components: {}",
+                    requested.display()
+                );
+                unresolved.push(name);
+                let parent = existing.parent().map(Path::to_path_buf).with_context(|| {
+                    format!("path has no existing ancestor: {}", requested.display())
+                })?;
+                existing = parent;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("cannot inspect {}", existing.display())));
+            }
+        }
+    }
+
+    let mut resolved = std::fs::canonicalize(&existing)
+        .with_context(|| format!("cannot resolve existing ancestor {}", existing.display()))?;
+    for name in unresolved.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// Resolve a host-derived path that does not exist yet, and require that the
+/// result is **already** covered by current Session filesystem authority.
+///
+/// This is the Managed Worktrees V1 Session path-authority gate
+/// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` section 7). It deliberately:
+///
+/// - never mutates `session.permitted_directories`;
+/// - never treats durable Goal state as authorization;
+/// - never invents a second permission system. If the exact derived target is
+///   not covered, the caller must stop and the operator must use the existing
+///   explicit `/permission allow <directory>` path.
+///
+/// Containment is decided by [`canonical_future_path`], which resolves every
+/// symlink and, on Windows, every reparse point or junction that already exists
+/// on the path before the containment check, exactly as `validate_path_authority`
+/// does for a single missing component. Components that do not exist yet cannot
+/// be reparse points, so nothing escapes the check.
+pub fn resolve_path_covered_by_session_authority(
+    session: &Session,
+    requested: &Path,
+) -> Result<PathBuf> {
+    let roots = session
+        .permitted_directories
+        .iter()
+        .map(|root| {
+            std::fs::canonicalize(root)
+                .with_context(|| format!("cannot resolve permitted root {}", root.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(!roots.is_empty(), "session has no permitted directories");
+
+    let candidate = if requested.is_absolute() {
+        requested.to_owned()
+    } else {
+        session.cwd.join(requested)
+    };
+    let resolved = canonical_future_path(&candidate)?;
+    anyhow::ensure!(
+        roots.iter().any(|root| resolved.starts_with(root)),
+        "path is outside the session's permitted directories: {}",
+        requested.display()
+    );
+    Ok(resolved)
+}
+
+/// Host-owned environment override for the Managed Worktrees root.
+///
+/// This is host/operator configuration, never MCP input, model prose, or a
+/// value derived from an existing arbitrary worktree.
+pub const MANAGED_WORKTREE_ROOT_ENV: &str = "LOCAL_MCP_MANAGED_WORKTREE_ROOT";
+
+/// The host-owned root under which managed linked worktrees are created
+/// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` section 7).
+///
+/// The exact root is host configuration/state. It is not Goal authority, and it
+/// is never supplied through `goal_start`. The default keeps managed worktrees
+/// beside the other host-owned `local-mcp` state, outside any user repository.
+pub fn managed_worktree_root() -> Result<PathBuf> {
+    if let Some(raw) = std::env::var_os(MANAGED_WORKTREE_ROOT_ENV) {
+        let path = PathBuf::from(raw);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "{MANAGED_WORKTREE_ROOT_ENV} must be an absolute path: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+    Ok(state_dir()?.join("managed-worktrees"))
 }
 
 pub fn state_dir() -> Result<PathBuf> {

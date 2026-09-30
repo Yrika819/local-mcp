@@ -824,6 +824,15 @@ fn canonicalize_json_with_key(value: &serde_json::Value, key: Option<&str>) -> s
 }
 
 fn ensure_replan_eligible(goal: &Goal) -> Result<(), ReplannerError> {
+    // Defense in depth for the Managed Worktrees V1 Phase 3 Planner boundary.
+    // A managed Goal cannot acquire tasks, so this is unreachable in practice;
+    // the guard is kept so no model-driven path materializes a managed plan.
+    planner::ensure_workspace_is_plannable(goal).map_err(|error| match error {
+        crate::planner::PlannerError::PlanAuthorityViolation(detail) => {
+            ReplannerError::ReplanNotApplicable(detail)
+        }
+        other => ReplannerError::ReplanNotApplicable(other.to_string()),
+    })?;
     if goal.is_terminal() {
         return Err(ReplannerError::ReplanNotApplicable(
             "terminal Goal history is immutable".to_owned(),

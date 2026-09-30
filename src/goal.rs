@@ -891,6 +891,69 @@ impl Goal {
         completion_criteria: Vec<String>,
         now: &str,
     ) -> Result<Self, OrchestratorError> {
+        Self::build_with_id(
+            id,
+            session_id,
+            cwd,
+            objective,
+            title,
+            constraints,
+            completion_criteria,
+            now,
+            None,
+        )
+    }
+
+    /// Host-owned constructor for an explicitly requested managed worktree.
+    ///
+    /// The only difference from [`Goal::new_with_id`] is the durable
+    /// `MANAGED_WORKTREE` identity: the workspace mode plus the `REQUESTED`
+    /// record whose path, branch, base commit, and common directory were all
+    /// derived by the host. `PRIMARY` Goals never pass a record, so their
+    /// construction and behavior are unchanged.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors new_with_id so managed construction differs only by the record."
+    )]
+    pub(crate) fn new_managed_with_id(
+        id: GoalId,
+        session_id: impl Into<String>,
+        cwd: PathBuf,
+        objective: impl Into<String>,
+        title: Option<String>,
+        constraints: Vec<String>,
+        completion_criteria: Vec<String>,
+        now: &str,
+        record: ManagedWorktreeRecord,
+    ) -> Result<Self, OrchestratorError> {
+        Self::build_with_id(
+            id,
+            session_id,
+            cwd,
+            objective,
+            title,
+            constraints,
+            completion_criteria,
+            now,
+            Some(record),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Goal identity and managed workspace identity are independent authority bindings."
+    )]
+    fn build_with_id(
+        id: GoalId,
+        session_id: impl Into<String>,
+        cwd: PathBuf,
+        objective: impl Into<String>,
+        title: Option<String>,
+        constraints: Vec<String>,
+        completion_criteria: Vec<String>,
+        now: &str,
+        managed_worktree: Option<ManagedWorktreeRecord>,
+    ) -> Result<Self, OrchestratorError> {
         id.validate()?;
         let session_id = session_id.into();
         config::validate_session_id(&session_id)
@@ -933,8 +996,12 @@ impl Goal {
             pristine_plan_supersessions: Vec::new(),
             failed_task_replan_requests: Vec::new(),
             failed_task_replacements: Vec::new(),
-            workspace_mode: WorkspaceMode::default(),
-            managed_worktree: None,
+            workspace_mode: if managed_worktree.is_some() {
+                WorkspaceMode::ManagedWorktree
+            } else {
+                WorkspaceMode::default()
+            },
+            managed_worktree,
             managed_worktree_creation_intent: None,
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
@@ -1014,6 +1081,100 @@ impl Goal {
 
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Persist the durable `PREPARED` creation intent.
+    ///
+    /// Design section 11 requires this to be durable **before** `git worktree
+    /// add` is invoked, so a crash after this point is mechanically recoverable.
+    /// The caller must use `TaskStore::mutate_goal_snapshot`, which advances
+    /// `Goal.revision` and leaves `plan_revision` untouched (design section 21).
+    pub(crate) fn set_managed_creation_intent(
+        &mut self,
+        intent: ManagedWorktreeCreationIntent,
+    ) -> Result<(), OrchestratorError> {
+        if self.managed_worktree_creation_intent.is_some() {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed-worktree creation intent is already outstanding".to_owned(),
+            ));
+        }
+        let record = self.managed_worktree.as_ref().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "MANAGED_WORKTREE workspace requires a durable managed-worktree record".to_owned(),
+            )
+        })?;
+        let prepared = record.to_prepared()?;
+        intent.validate_against_record(&prepared)?;
+        self.managed_worktree = Some(prepared);
+        self.managed_worktree_creation_intent = Some(intent);
+        Ok(())
+    }
+
+    /// Replace the outstanding intent with a fresh operation identity.
+    ///
+    /// Design section 11's bounded retry is permitted only after a mechanically
+    /// proven no-side-effect result. The record stays `PREPARED`; only the
+    /// operation identity changes, so the two attempts stay distinguishable in
+    /// durable evidence.
+    pub(crate) fn renew_managed_creation_intent(
+        &mut self,
+        intent: ManagedWorktreeCreationIntent,
+    ) -> Result<(), OrchestratorError> {
+        if self.managed_worktree_creation_intent.is_none() {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed-worktree creation retry requires an outstanding PREPARED intent"
+                    .to_owned(),
+            ));
+        }
+        let record = self.managed_worktree.as_ref().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "MANAGED_WORKTREE workspace requires a durable managed-worktree record".to_owned(),
+            )
+        })?;
+        if !record.permits_creation_intent() {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed-worktree lifecycle cannot carry a prepared creation intent".to_owned(),
+            ));
+        }
+        intent.validate_against_record(record)?;
+        self.managed_worktree_creation_intent = Some(intent);
+        Ok(())
+    }
+
+    /// Commit the reconciled `ACTIVE` binding and clear the outstanding intent.
+    ///
+    /// The caller must already hold a mechanical read-only observation proving
+    /// exact durable ownership. `plan_revision` is deliberately not touched.
+    pub(crate) fn activate_managed_worktree(
+        &mut self,
+        head: &str,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        let record = self.managed_worktree.as_ref().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "MANAGED_WORKTREE workspace requires a durable managed-worktree record".to_owned(),
+            )
+        })?;
+        let active = record.to_active(head, now)?;
+        self.managed_worktree = Some(active);
+        self.managed_worktree_creation_intent = None;
+        Ok(())
+    }
+
+    /// Record a `BLOCKED` managed workspace with the evidence that stopped it.
+    ///
+    /// The outstanding intent is retained so explicit host recovery can still
+    /// reconcile the exact intended target. `BLOCKED` is never a retry
+    /// permission: only `Reconciliation::NoSideEffect` is.
+    pub(crate) fn block_managed_worktree(&mut self) -> Result<(), OrchestratorError> {
+        let record = self.managed_worktree.as_ref().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "MANAGED_WORKTREE workspace requires a durable managed-worktree record".to_owned(),
+            )
+        })?;
+        let blocked = record.to_blocked()?;
+        self.managed_worktree = Some(blocked);
+        Ok(())
     }
 
     pub(crate) fn schema_version(&self) -> u32 {

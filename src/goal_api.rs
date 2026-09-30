@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,9 @@ use crate::goal::{
     CheckpointReason, FailedTaskReplanPolicy, FailedTaskReplanTriggerKind, Goal, GoalId,
     GoalStatus, PreExecutionPlanReplanPolicy,
 };
+use crate::managed_worktree::WorkspaceMode;
+use crate::managed_worktree_observe::HostGit;
+use crate::managed_worktree_prepare::ManagedWorkspaceError;
 use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -199,6 +203,15 @@ struct GoalStartRequest {
     completion_criteria: Vec<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Additive Managed Worktrees V1 opt-in. Omitted is exactly `PRIMARY`.
+    ///
+    /// This is isolation policy only. It is deliberately not a way to name a
+    /// worktree path, branch, ref, base commit, common directory, Git argv, or
+    /// permission root: `deny_unknown_fields` refuses all of those, and every
+    /// managed identity value is re-derived by the host from the Goal ID and
+    /// host configuration.
+    #[serde(default)]
+    workspace_mode: WorkspaceMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,10 +388,53 @@ pub(crate) struct GoalResultView {
     completed_at: Option<String>,
 }
 
+/// Where the host-owned managed-worktree root comes from.
+///
+/// `PRIMARY` never resolves any variant, so existing callers keep exactly their
+/// current behavior and never touch host managed-root configuration.
+#[derive(Clone, Debug)]
+pub(crate) enum ManagedRootSource {
+    /// Host configuration/state.
+    Host,
+    /// An explicit host-owned root. Tests use this so they never read or write
+    /// the real host state directory.
+    #[cfg(test)]
+    Fixed(PathBuf),
+}
+
+impl ManagedRootSource {
+    #[cfg(test)]
+    pub(crate) fn fixed(root: PathBuf) -> Self {
+        Self::Fixed(root)
+    }
+
+    fn resolve(&self) -> Result<PathBuf, GoalApiError> {
+        match self {
+            Self::Host => config::managed_worktree_root().map_err(|error| {
+                managed_workspace_start_error(ManagedWorkspaceError::HostConfiguration(
+                    error.to_string(),
+                ))
+            }),
+            #[cfg(test)]
+            Self::Fixed(root) => Ok(root.clone()),
+        }
+    }
+}
+
 pub(crate) fn goal_start(
     args: &Value,
     session: &config::Session,
     store: &TaskStore,
+) -> Result<GoalStartView, GoalApiError> {
+    goal_start_with_managed_root(args, session, store, &ManagedRootSource::Host)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn goal_start_with_managed_root(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    managed_root_source: &ManagedRootSource,
 ) -> Result<GoalStartView, GoalApiError> {
     let request: GoalStartRequest = parse_request(args)?;
     validate_session_binding(&request.session_id, session)?;
@@ -403,8 +459,43 @@ pub(crate) fn goal_start(
     }
 
     let now = utc_now_rfc3339();
-    let goal = match deterministic_id.clone() {
-        Some(goal_id) => Goal::new_with_id(
+    // PRIMARY keeps the exact pre-managed construction path. Managed mode
+    // derives its Goal identity first, because the host-derived managed target
+    // is a function of it.
+    let goal = if request.workspace_mode.is_primary() {
+        match deterministic_id.clone() {
+            Some(goal_id) => Goal::new_with_id(
+                goal_id,
+                session.id.clone(),
+                session.cwd.clone(),
+                request.objective.clone(),
+                request.title.clone(),
+                request.constraints.clone(),
+                request.completion_criteria.clone(),
+                &now,
+            ),
+            None => Goal::new(
+                session.id.clone(),
+                session.cwd.clone(),
+                request.objective.clone(),
+                request.title.clone(),
+                request.constraints.clone(),
+                request.completion_criteria.clone(),
+                &now,
+            ),
+        }
+        .map_err(GoalApiError::from_orchestrator)?
+    } else {
+        let goal_id = deterministic_id.clone().unwrap_or_else(GoalId::new);
+        let managed_root = managed_root_source.resolve()?;
+        let record = crate::managed_worktree_prepare::request_managed_workspace(
+            &managed_root,
+            session,
+            &goal_id,
+            &HostGit::new(),
+        )
+        .map_err(managed_workspace_start_error)?;
+        Goal::new_managed_with_id(
             goal_id,
             session.id.clone(),
             session.cwd.clone(),
@@ -413,18 +504,10 @@ pub(crate) fn goal_start(
             request.constraints.clone(),
             request.completion_criteria.clone(),
             &now,
-        ),
-        None => Goal::new(
-            session.id.clone(),
-            session.cwd.clone(),
-            request.objective.clone(),
-            request.title.clone(),
-            request.constraints.clone(),
-            request.completion_criteria.clone(),
-            &now,
-        ),
-    }
-    .map_err(GoalApiError::from_orchestrator)?;
+            record,
+        )
+        .map_err(GoalApiError::from_orchestrator)?
+    };
 
     if let Err(error) = store.create_goal(&goal) {
         if matches!(error, OrchestratorError::ActiveGoalAlreadyExists)
@@ -1544,6 +1627,21 @@ fn same_start_payload(goal: &Goal, request: &GoalStartRequest) -> bool {
         && goal.title() == request.title.as_deref()
         && goal.constraints() == request.constraints
         && goal.completion_criterion_descriptions() == expected_criteria
+        // Workspace mode is isolation policy and part of the request identity:
+        // reusing one idempotency key across modes must not silently replay the
+        // other mode's Goal.
+        && goal.workspace_mode() == request.workspace_mode
+}
+
+/// A managed `goal_start` that cannot derive host state fails closed and creates
+/// no Goal, rather than recording a managed request that could never be
+/// prepared.
+fn managed_workspace_start_error(error: ManagedWorkspaceError) -> GoalApiError {
+    GoalApiError {
+        code: "MANAGED_WORKSPACE_UNAVAILABLE",
+        message: error.to_string(),
+        active_goal: None,
+    }
 }
 
 fn idempotent_goal_id(session_id: &str, key: &str) -> GoalId {

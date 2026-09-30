@@ -1,6 +1,9 @@
 use crate::config;
 use crate::goal::{GoalId, GoalStatus};
 use crate::goal_finalizer::{self, GoalFinalizationOutcome, GoalFinalizerError};
+use crate::managed_worktree_create::HostWorktreeCreator;
+use crate::managed_worktree_observe::HostGit;
+use crate::managed_worktree_prepare::{ManagedWorkspacePreparation, prepare_managed_workspace};
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::PlannerBackend;
 use crate::readonly_worker::ReadonlyBackend;
@@ -95,6 +98,12 @@ pub(crate) enum GoalRunStopReason {
         action: GoalRunTraceAction,
     },
     FinalizationNotReady(GoalFinalizationOutcome),
+    /// Managed Worktrees V1 Phase 3: the host PrepareWorkspace step stopped.
+    /// A managed Goal is never dispatched to Planner in this phase.
+    ManagedWorkspaceBlocked {
+        code: String,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,7 +287,108 @@ where
         reviewer_backend,
         replanner_backend,
     };
+
+    // Managed Worktrees V1 Phase 3 host PrepareWorkspace step.
+    //
+    // Design section 5 freezes the order
+    // `goal_start -> requested -> PrepareWorkspace -> PREPARED intent -> Git ->
+    // ACTIVE -> Planner`. Running it here, before any scheduler step, is the
+    // narrowest seam that preserves that order: the scheduler cannot dispatch
+    // `PlanInitial` until preparation has either produced an `ACTIVE` binding or
+    // stopped. `PRIMARY` Goals return `NotManaged` and reach the unchanged
+    // runner path with no filesystem or Git access.
+    if let Some(outcome) = prepare_managed_workspace_before_run(store, session, goal_id) {
+        return outcome;
+    }
+
     run_goal_with_authorities(&mut authorities, goal_id.clone(), limits).await
+}
+
+/// Run managed workspace preparation and, if it stops, produce the terminal run
+/// result. Returns `None` when the caller should continue into the runner.
+fn prepare_managed_workspace_before_run(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+) -> Option<GoalRunResult> {
+    let state = match store.load_goal(&session.id, goal_id) {
+        Ok(goal) => goal,
+        Err(error) => {
+            return Some(result_for_initial_error(
+                goal_id.clone(),
+                RunnerDriverError::LowerAuthority {
+                    authority: GoalRunnerAuthority::Store,
+                    detail: error.to_string(),
+                },
+            ));
+        }
+    };
+    let revision_before = state.revision();
+
+    let preparation = prepare_managed_workspace(
+        store,
+        session,
+        goal_id,
+        &HostGit::new(),
+        &HostWorktreeCreator::new(),
+    );
+
+    let blocked = |code: String, detail: String, revision_after: u64, status: GoalStatus| {
+        build_result(
+            goal_id.clone(),
+            Some(revision_before),
+            Some(revision_after),
+            0,
+            GoalRunStopReason::ManagedWorkspaceBlocked { code, detail },
+            status,
+            Vec::new(),
+        )
+    };
+
+    match preparation {
+        // PRIMARY: the existing runner path continues completely unchanged.
+        Ok(ManagedWorkspacePreparation::NotManaged) => None,
+        Err(error) => Some(blocked(
+            "MANAGED_WORKSPACE_EVALUATION_FAILED".to_owned(),
+            error.to_string(),
+            revision_before,
+            state.status(),
+        )),
+        Ok(preparation) => {
+            if let Some(block) = preparation.block_detail() {
+                let after = store
+                    .load_goal(&session.id, goal_id)
+                    .map(|goal| goal.revision())
+                    .unwrap_or(revision_before);
+                return Some(blocked(
+                    block.code.to_owned(),
+                    block.detail.clone(),
+                    after,
+                    state.status(),
+                ));
+            }
+            // An ACTIVE managed workspace still cannot be planned in Phase 3.
+            let (status_after, revision_after) = match store.load_goal(&session.id, goal_id) {
+                Ok(goal) => (goal.status(), goal.revision()),
+                Err(error) => {
+                    return Some(blocked(
+                        "MANAGED_WORKSPACE_EVALUATION_FAILED".to_owned(),
+                        error.to_string(),
+                        revision_before,
+                        state.status(),
+                    ));
+                }
+            };
+            let _ = status_after;
+            Some(blocked(
+                "MANAGED_WORKSPACE_ACTIVE_NOT_PLANNABLE".to_owned(),
+                "the managed workspace is ACTIVE, but Managed Worktrees V1 Phase 3 does not route Planner to the managed execution root"
+                    .to_owned(),
+                revision_after,
+                state.status(),
+            ))
+        }
+    }
 }
 
 pub(crate) async fn run_goal_with_authorities<A>(

@@ -386,6 +386,30 @@ fn ensure_initial_planning_state(goal: &Goal) -> Result<(), PlannerError> {
             "initial planning requires plan_revision 0 and an empty Task DAG".to_owned(),
         ));
     }
+    ensure_workspace_is_plannable(goal)?;
+    Ok(())
+}
+
+/// Fail-closed Managed Worktrees V1 Phase 3 guard.
+///
+/// Design section 5 requires the managed worktree to be established *before*
+/// Planner path materialization, so `PlannerRequest.cwd` and `permitted_roots`
+/// would otherwise still point at the primary workspace and silently materialize
+/// a managed Goal's absolute TaskScope paths into the primary checkout.
+///
+/// Managed Worktrees V1 Phase 3 authorizes creation authority only. Routing
+/// Planner at `execution_root()` is Phase 4, so **every** managed workspace is
+/// refused here regardless of lifecycle: `REQUESTED`, `PREPARED`, and `BLOCKED`
+/// have no execution root at all, and `ACTIVE` deliberately does not reach
+/// Planner until Phase 4 lands. `PRIMARY` is unaffected.
+pub(crate) fn ensure_workspace_is_plannable(goal: &Goal) -> Result<(), PlannerError> {
+    if goal.workspace_mode().is_managed() {
+        return Err(PlannerError::PlanAuthorityViolation(format!(
+            "MANAGED_WORKTREE workspace is not plannable in Managed Worktrees V1 Phase 3 (workspace lifecycle {:?}, execution_root {:?})",
+            goal.managed_worktree().map(|record| record.lifecycle()),
+            goal.execution_root()
+        )));
+    }
     Ok(())
 }
 
