@@ -17,6 +17,7 @@
 
 - Report type: `receiving-code-review`
 - Resolution ID: `rr-20260930-mwp3b41d08`
+- Source report ID: `cr-20260930-mwp3a7c2e1`
 - Source review report ID: `cr-20260930-mwp3a7c2e1`
 - Source review report path: `tmp/reviews/2026-09-30-code-review-report-mwp3-gen0.md`
 - Review chain ID: `rc-20260930-mwp3d94f18`
