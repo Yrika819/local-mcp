@@ -18,9 +18,22 @@ use crate::managed_worktree::{
 use crate::orchestrator_error::OrchestratorError;
 
 const NOW: &str = "2026-01-01T00:00:00Z";
+#[cfg(not(windows))]
 const PRIMARY_ROOT: &str = "/repo/primary";
+#[cfg(windows)]
+const PRIMARY_ROOT: &str = r"C:\repo\primary";
+#[cfg(not(windows))]
 const COMMON_DIR: &str = "/repo/primary/.git";
+#[cfg(windows)]
+const COMMON_DIR: &str = r"C:\repo\primary\.git";
+#[cfg(not(windows))]
 const WORKTREE_ROOT: &str = "/managed/session-1/goal-1";
+#[cfg(windows)]
+const WORKTREE_ROOT: &str = r"C:\managed\session-1\goal-1";
+#[cfg(not(windows))]
+const FILESYSTEM_ROOT: &str = "/";
+#[cfg(windows)]
+const FILESYSTEM_ROOT: &str = r"C:\";
 const BASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn managed_goal() -> Goal {
@@ -205,8 +218,6 @@ fn record_rejects_non_absolute_or_non_canonical_paths() {
         ("primary_root", "relative/primary"),
         ("repository_common_dir", "relative/.git"),
         ("worktree_root", "relative/managed"),
-        ("worktree_root", "/managed/../managed/escape"),
-        ("worktree_root", "/managed/./canonical-but-not-normalized"),
     ] {
         let mut value = serde_json::to_value(requested_record(&goal)).unwrap();
         value[field] = Value::from(hostile);
@@ -214,6 +225,25 @@ fn record_rejects_non_absolute_or_non_canonical_paths() {
         assert!(
             matches!(decoded.validate(), Err(OrchestratorError::CorruptGoal(_))),
             "field {field} accepted hostile path {hostile}"
+        );
+    }
+
+    let root = PathBuf::from(WORKTREE_ROOT);
+    let parent = root.parent().unwrap();
+    for hostile in [
+        parent
+            .join("..")
+            .join(parent.file_name().unwrap())
+            .join("escape"),
+        parent.join(".").join("canonical-but-not-normalized"),
+    ] {
+        let mut value = serde_json::to_value(requested_record(&goal)).unwrap();
+        value["worktree_root"] = serde_json::to_value(&hostile).unwrap();
+        let decoded: ManagedWorktreeRecord = serde_json::from_value(value).unwrap();
+        assert!(
+            matches!(decoded.validate(), Err(OrchestratorError::CorruptGoal(_))),
+            "accepted non-canonical path {}",
+            hostile.display()
         );
     }
 }
@@ -225,27 +255,31 @@ fn record_rejects_worktree_root_overlapping_the_primary_workspace() {
     // workspace, would relocate managed execution into the primary. Reject it
     // purely from durable data (design sections 2.7, 2.8, 13).
     let goal = managed_goal();
-    for hostile in [
-        "/repo/primary/.git",
-        "/repo/primary/.git/worktrees",
-        "/repo/primary/src",
-        "/repo/primary/nested/deep",
-        "/repo",
-        "/",
-    ] {
+    let primary_root = PathBuf::from(PRIMARY_ROOT);
+    let hostile_roots = [
+        primary_root.join(".git"),
+        primary_root.join(".git/worktrees"),
+        primary_root.join("src"),
+        primary_root.join("nested/deep"),
+        primary_root.parent().unwrap().to_path_buf(),
+        PathBuf::from(FILESYSTEM_ROOT),
+    ];
+    for hostile in hostile_roots {
         let mut value = serde_json::to_value(requested_record(&goal)).unwrap();
-        value["worktree_root"] = Value::from(hostile);
+        value["worktree_root"] = serde_json::to_value(&hostile).unwrap();
         let decoded: ManagedWorktreeRecord = serde_json::from_value(value).unwrap();
         let error = decoded.validate().unwrap_err();
         assert!(
             matches!(error, OrchestratorError::CorruptGoal(_)),
-            "worktree_root {hostile} was accepted"
+            "worktree_root {} was accepted",
+            hostile.display()
         );
         assert!(
             error
                 .to_string()
                 .contains("must not overlap the primary workspace"),
-            "worktree_root {hostile} was rejected for the wrong reason: {error}"
+            "worktree_root {} was rejected for the wrong reason: {error}",
+            hostile.display()
         );
     }
 }
@@ -432,7 +466,7 @@ fn goal_rejects_record_whose_primary_root_moves_goal_cwd() {
     let record = ManagedWorktreeRecord::requested(
         goal.id(),
         WorktreeId::new(),
-        PathBuf::from("/repo/somewhere-else"),
+        PathBuf::from(PRIMARY_ROOT).with_file_name("somewhere-else"),
         PathBuf::from(COMMON_DIR),
         PathBuf::from(WORKTREE_ROOT),
         BASE_COMMIT.to_owned(),
@@ -488,14 +522,25 @@ fn intent_must_describe_the_same_target_as_the_record() {
     let intent = prepared_intent(&goal, &record);
     intent.validate_against_record(&record).unwrap();
 
+    let other_worktree_root = PathBuf::from(WORKTREE_ROOT).with_file_name("goal-2");
+    let other_common_dir = PathBuf::from(COMMON_DIR).with_file_name(".git-other");
     for (field, hostile) in [
-        ("worktree_root", "/managed/session-1/goal-2"),
-        ("branch_ref", "refs/heads/local-mcp/goal/other"),
-        ("base_commit", "fedcba9876543210fedcba9876543210fedcba98"),
-        ("repository_common_dir", "/repo/primary/.git-other"),
+        (
+            "worktree_root",
+            serde_json::to_value(other_worktree_root).unwrap(),
+        ),
+        ("branch_ref", Value::from("refs/heads/local-mcp/goal/other")),
+        (
+            "base_commit",
+            Value::from("fedcba9876543210fedcba9876543210fedcba98"),
+        ),
+        (
+            "repository_common_dir",
+            serde_json::to_value(other_common_dir).unwrap(),
+        ),
     ] {
         let mut value = serde_json::to_value(&intent).unwrap();
-        value[field] = Value::from(hostile);
+        value[field] = hostile;
         let decoded: ManagedWorktreeCreationIntent = serde_json::from_value(value).unwrap();
         assert!(
             matches!(
