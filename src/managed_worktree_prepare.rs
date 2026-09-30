@@ -22,6 +22,16 @@
 //! the base, because design section 11 makes a crash after `PREPARED` durable
 //! state recoverable and a later primary commit is not a reason to strand it.
 //!
+//! Recorded deviation: design section 6 also lists "the primary worktree has no
+//! tracked, staged, or untracked changes" and "no merge/rebase/... operation is
+//! in progress" as preconditions for creation, and those two are likewise not
+//! re-evaluated when recovering a `PREPARED` intent. This is safe because
+//! creation passes an exact base **commit**: Git checks out that revision, so no
+//! primary working-tree state is ever copied or hidden, which is the hazard
+//! section 6 and design invariant 13 exist to prevent. Re-running the full
+//! eligibility gate on recovery would instead make a crashed, side-effect-free
+//! creation permanently unrecoverable, which section 11 explicitly forbids.
+//!
 //! Phase boundary: nothing here routes Planner, writer, verifier, or readonly
 //! workers to the managed root. A managed Goal reaching `ACTIVE` in this phase
 //! still cannot be planned; that is Phase 4.
@@ -218,10 +228,17 @@ pub(crate) fn prepare_managed_workspace(
     if goal.workspace_mode().is_primary() {
         return Ok(ManagedWorkspacePreparation::NotManaged);
     }
-    if goal.status().is_terminal() {
+    if goal.blocks_foreground_run() {
         return Ok(ManagedWorkspacePreparation::block(
-            "MANAGED_GOAL_TERMINAL",
-            "a terminal Goal must not prepare a managed workspace",
+            if goal.status().is_terminal() {
+                "MANAGED_GOAL_TERMINAL"
+            } else {
+                "MANAGED_GOAL_CONTROL_STATE"
+            },
+            format!(
+                "a {:?} Goal must not prepare a managed workspace; the foreground runner performs no work in this state",
+                goal.status()
+            ),
         ));
     }
     let record = goal.managed_worktree().ok_or_else(|| {
@@ -380,9 +397,11 @@ pub(crate) fn prepare_managed_workspace(
         // Neither the exit status nor a failure to start the process is treated
         // as a verdict. Design section 11 requires reconciliation after *every*
         // attempted creation, including failure, timeout, and interruption, so
-        // both are recorded and then decided by the read-only observation below.
+        // the result is recorded as evidence and then decided by the read-only
+        // observation below.
         let creation = ManagedWorktreeCreation::from_intent(intent)?;
-        let _attempted = creator.create(&creation, record.primary_root());
+        let attempt_outcome = creator.create(&creation, record.primary_root());
+        let attempt_evidence = describe_creation_attempt(&creation, &attempt_outcome);
 
         // Post-invocation reconciliation decides everything. A failure to
         // observe is itself a reason to stop: the side effect of the command
@@ -396,29 +415,33 @@ pub(crate) fn prepare_managed_workspace(
             Reconciliation::ActiveExact { head } => {
                 return activate(store, session, goal_id, &head);
             }
-            Reconciliation::NoSideEffect { .. } if attempt < MAX_CREATION_ATTEMPTS => {
-                // Proven no side effect. A bounded retry is permitted, and the
-                // next iteration mints a fresh operation ID.
-                continue;
+            // Anything the frozen Phase 2 predicate does not certify as a
+            // retryable no-side-effect result needs explicit host recovery, and
+            // is never repaired with force.
+            state if !state.permits_bounded_retry() => {
+                return block_lifecycle(
+                    store,
+                    session,
+                    goal_id,
+                    "MANAGED_RECOVERY_REQUIRED",
+                    format!(
+                        "managed target does not reconcile after creation: {state:?}; {attempt_evidence}"
+                    ),
+                );
             }
-            Reconciliation::NoSideEffect { .. } => {
+            // Proven no side effect, with an exact PREPARED operation ID bound.
+            // A bounded retry is permitted only while the budget lasts; the next
+            // iteration mints a fresh operation ID.
+            _ if attempt < MAX_CREATION_ATTEMPTS => continue,
+            _ => {
                 return block_lifecycle(
                     store,
                     session,
                     goal_id,
                     "MANAGED_RETRY_EXHAUSTED",
                     format!(
-                        "creation attempt {attempt} left no worktree or branch side effect and the retry budget is exhausted"
+                        "creation attempt {attempt} left no worktree or branch side effect and the retry budget is exhausted; {attempt_evidence}"
                     ),
-                );
-            }
-            other => {
-                return block_lifecycle(
-                    store,
-                    session,
-                    goal_id,
-                    "MANAGED_RECOVERY_REQUIRED",
-                    format!("managed target does not reconcile after creation: {other:?}"),
                 );
             }
         }
@@ -427,6 +450,48 @@ pub(crate) fn prepare_managed_workspace(
     Err(ManagedWorkspaceError::GoalState(
         "managed creation loop exited without a decision".to_owned(),
     ))
+}
+
+/// Bound, human-readable evidence about one creation attempt.
+///
+/// Git's own diagnostic is host-owned and is the only place the real reason a
+/// command failed appears, so it is recorded rather than dropped. It is bounded
+/// because it ends up in a durable Goal blocker and in the `goal_run` result.
+fn describe_creation_attempt(
+    creation: &ManagedWorktreeCreation,
+    attempt: &Result<
+        crate::managed_worktree_create::ManagedWorktreeCreationOutcome,
+        crate::managed_worktree_create::ManagedWorktreeCreationError,
+    >,
+) -> String {
+    const MAX_EVIDENCE_CHARS: usize = 400;
+    let text = match attempt {
+        Ok(outcome) => {
+            let status = match outcome.exit_code {
+                Some(code) => format!("exit status {code}"),
+                None => "terminated without an exit status".to_owned(),
+            };
+            let stderr: String = outcome
+                .stderr
+                .trim()
+                .chars()
+                .take(MAX_EVIDENCE_CHARS)
+                .collect();
+            if stderr.is_empty() {
+                format!(
+                    "git worktree add -b {} completed with {status} and no diagnostics",
+                    creation.branch_name()
+                )
+            } else {
+                format!(
+                    "git worktree add -b {} completed with {status}: {stderr}",
+                    creation.branch_name()
+                )
+            }
+        }
+        Err(error) => format!("git worktree add could not run: {error}"),
+    };
+    text.chars().take(MAX_EVIDENCE_CHARS * 2).collect()
 }
 
 /// Observe the repository for reconciliation, or explain why it could not be
@@ -486,14 +551,17 @@ fn activate(
     goal_id: &GoalId,
     head: &str,
 ) -> Result<ManagedWorkspacePreparation, ManagedWorkspaceError> {
+    // Design section 21: a workspace lifecycle mutation advances `Goal.revision`
+    // and never `plan_revision`. The store enforces that, so this asserts the
+    // invariant after the fact rather than deciding anything.
     let durable = persist(store, session, goal_id, |goal| {
         goal.activate_managed_worktree(head, &now_rfc3339())
     })?;
-    if durable.plan_revision() != 0 {
-        return Err(ManagedWorkspaceError::GoalState(
-            "managed workspace activation must not change plan_revision".to_owned(),
-        ));
-    }
+    debug_assert_eq!(
+        durable.plan_revision(),
+        0,
+        "managed workspace activation must not change plan_revision"
+    );
     Ok(ManagedWorkspacePreparation::Active {
         head: head.to_owned(),
     })
@@ -535,11 +603,22 @@ fn block_lifecycle(
         goal.add_blocker(crate::goal::GoalBlocker::new(code, blocker_detail, true))?;
         goal.block_managed_worktree()
     })?;
-    debug_assert_eq!(durable.plan_revision(), 0);
+    debug_assert_eq!(
+        durable.plan_revision(),
+        0,
+        "managed workspace blocking must not change plan_revision"
+    );
     Ok(ManagedWorkspacePreparation::block(code, detail))
 }
 
 /// Append a durable, deduplicated Goal blocker.
+///
+/// The first detail recorded for a code is kept deliberately. Deduping keeps
+/// the mutation a no-op on repeated refusals, and `mutate_goal_snapshot` then
+/// leaves `Goal.revision` untouched, so re-running `goal_run` against an
+/// unchanged cause does not churn durable state. The *current* detail is always
+/// returned to the caller in [`ManagedWorkspacePreparation::Blocked`], so the
+/// live reason is never lost.
 fn record_blocker(
     store: &TaskStore,
     session: &config::Session,

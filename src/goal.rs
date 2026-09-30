@@ -1083,6 +1083,25 @@ impl Goal {
         self.revision
     }
 
+    /// Whether the foreground runner performs no work at all for this state.
+    ///
+    /// A Goal in a terminal, control, or blocked state is returned from without
+    /// any scheduler or finalizer step, and without any authority call. Managed
+    /// workspace preparation is an authority call, so it must honour the same
+    /// predicate: creating a linked worktree and a local branch for a Goal the
+    /// operator cancelled or paused would be a host Git mutation the existing
+    /// runner contract forbids.
+    pub(crate) fn blocks_foreground_run(&self) -> bool {
+        self.status.is_terminal()
+            || matches!(
+                self.status,
+                GoalStatus::Paused
+                    | GoalStatus::Pausing
+                    | GoalStatus::Cancelling
+                    | GoalStatus::Blocked
+            )
+    }
+
     /// Persist the durable `PREPARED` creation intent.
     ///
     /// Design section 11 requires this to be durable **before** `git worktree

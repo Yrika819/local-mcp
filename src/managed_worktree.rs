@@ -543,6 +543,19 @@ impl ManagedWorktreeRecord {
                 "managed worktree root must not overlap the primary workspace".to_owned(),
             ));
         }
+        // Design invariant 8 keeps Git administrative internals forbidden, and
+        // the common directory is exactly where they live. For a session whose
+        // `cwd` is itself a linked worktree, the primary root and the common
+        // directory are different directories, so the check above does not cover
+        // the admin tree. A host-managed root placed inside it (reachable only
+        // through operator configuration) would otherwise be accepted.
+        if self.worktree_root.starts_with(&self.repository_common_dir)
+            || self.repository_common_dir.starts_with(&self.worktree_root)
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "managed worktree root must not overlap the repository common directory".to_owned(),
+            ));
+        }
         validate_expected_branch_ref(&self.goal_id, &self.branch_ref)?;
         validate_expected_lock_reason(&self.goal_id, &self.lock_reason)?;
         validate_object_id(&self.base_commit, "base_commit")?;

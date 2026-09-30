@@ -325,6 +325,26 @@ fn prepare_managed_workspace_before_run(
     };
     let revision_before = state.revision();
 
+    // The existing control-state gate, applied before any managed side effect.
+    //
+    // `run_goal_with_authorities` performs exactly this check as its first
+    // action. Managed preparation must not precede it: creating a linked
+    // worktree and a local branch is a host Git mutation, and a Goal the runner
+    // would have returned from without doing any work must stay that way. This
+    // reuses the same predicate and produces the same result, so control-state
+    // and terminal Goals are unchanged.
+    if let Some(stop_reason) = stop_for_state(state.status()) {
+        return Some(build_result(
+            goal_id.clone(),
+            Some(revision_before),
+            Some(revision_before),
+            0,
+            stop_reason,
+            state.status(),
+            Vec::new(),
+        ));
+    }
+
     let preparation = prepare_managed_workspace(
         store,
         session,
@@ -368,8 +388,8 @@ fn prepare_managed_workspace_before_run(
                 ));
             }
             // An ACTIVE managed workspace still cannot be planned in Phase 3.
-            let (status_after, revision_after) = match store.load_goal(&session.id, goal_id) {
-                Ok(goal) => (goal.status(), goal.revision()),
+            let revision_after = match store.load_goal(&session.id, goal_id) {
+                Ok(goal) => goal.revision(),
                 Err(error) => {
                     return Some(blocked(
                         "MANAGED_WORKSPACE_EVALUATION_FAILED".to_owned(),
@@ -379,7 +399,6 @@ fn prepare_managed_workspace_before_run(
                     ));
                 }
             };
-            let _ = status_after;
             Some(blocked(
                 "MANAGED_WORKSPACE_ACTIVE_NOT_PLANNABLE".to_owned(),
                 "the managed workspace is ACTIVE, but Managed Worktrees V1 Phase 3 does not route Planner to the managed execution root"

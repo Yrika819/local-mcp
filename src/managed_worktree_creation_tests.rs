@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -108,8 +108,15 @@ impl Fixture {
             // Session IDs are host-generated; a UUID keeps them valid for
             // `config::validate_session_id` regardless of the test name.
             id: format!("s{}", Uuid::new_v4().simple()),
-            cwd: primary.clone(),
-            permitted_directories: vec![primary.clone()],
+            // `create_session` always canonicalizes `cwd`, and managed mode
+            // requires the durable `primary_root` to equal the durable
+            // `Goal.cwd`. A temp root that is not already canonical (a
+            // `/var/...` temp dir behind a symlink, for example) would make
+            // every managed fixture fail closed for the wrong reason.
+            cwd: std::fs::canonicalize(&primary).expect("primary is canonical"),
+            permitted_directories: vec![
+                std::fs::canonicalize(&primary).expect("primary is canonical"),
+            ],
         };
         let store = TaskStore::with_state_root(state_root.clone());
         Self {
@@ -426,6 +433,95 @@ impl ReadOnlyGit for CommonDirOverrideGit {
     fn ref_exists(&self, ref_name: &str, cwd: &Path) -> Result<bool, DiscoveryError> {
         self.inner.ref_exists(ref_name, cwd)
     }
+}
+
+#[test]
+fn a_managed_goal_in_a_control_state_does_not_reach_git() {
+    use crate::goal::GoalStatus;
+
+    let mut fixture = Fixture::new("control-state");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+
+    // The operator cancels the Goal before it is ever run.
+    let cancel = json!({
+        "session_id": fixture.session.id,
+        "goal_id": goal_id.as_str(),
+        "reason": "operator changed their mind"
+    });
+    let _ = cancel;
+    let status = fixture
+        .store
+        .load_goal(&fixture.session.id, &goal_id)
+        .unwrap();
+    assert_eq!(status.status(), GoalStatus::Planning);
+    fixture
+        .store
+        .mutate_goal_snapshot(
+            &fixture.session.id,
+            &goal_id,
+            status.revision(),
+            |goal, now| goal.transition_to(GoalStatus::Cancelling, now),
+        )
+        .unwrap();
+
+    let before_worktrees = git(&fixture.primary, &["worktree", "list", "--porcelain"]);
+    let creator = ScriptedCreator::new(&fixture, vec![Step::Create]);
+    let preparation = fixture
+        .prepare(&goal_id, &HostGit::new(), &creator)
+        .unwrap();
+    let block = preparation.block_detail().expect("control state blocks");
+    assert_eq!(block.code, "MANAGED_GOAL_CONTROL_STATE");
+
+    assert_eq!(
+        creator.calls(),
+        0,
+        "a Goal in a control state must not create a worktree: {preparation:?}"
+    );
+    assert_eq!(
+        git(&fixture.primary, &["worktree", "list", "--porcelain"]),
+        before_worktrees
+    );
+    assert!(!fixture.managed_target(&goal_id).exists());
+    assert!(!fixture.ref_exists(&Fixture::branch_ref(&goal_id)));
+    assert_eq!(
+        fixture
+            .goal(&goal_id)
+            .managed_worktree()
+            .unwrap()
+            .lifecycle(),
+        ManagedWorktreeLifecycle::Requested,
+        "a control state must not advance the managed lifecycle"
+    );
+}
+
+#[test]
+fn a_non_canonical_session_cwd_cannot_host_a_managed_workspace() {
+    // Production sessions always canonicalize their cwd. A non-canonical cwd
+    // would make the host-derived `primary_root` differ from the durable
+    // `Goal.cwd`, which managed mode must reject rather than silently repair.
+    let mut fixture = Fixture::new("noncanonical-cwd");
+    fixture.authorize_managed_root();
+    fixture.session.cwd = noncanonical(&fixture.primary);
+    let error = fixture
+        .start_value(&json!({
+            "session_id": fixture.session.id,
+            "objective": "managed worktree objective",
+            "workspace_mode": "MANAGED_WORKTREE"
+        }))
+        .expect_err("a non-canonical session cwd is refused");
+    assert_eq!(error.code(), "MANAGED_WORKSPACE_UNAVAILABLE");
+}
+
+fn noncanonical(path: &Path) -> PathBuf {
+    let mut result = PathBuf::from("/tmp");
+    let canonical = std::fs::canonicalize(path).unwrap();
+    for component in canonical.components().skip(1) {
+        result.push(component);
+    }
+    // A `.` component is dropped by Path::components(), so the raw bytes differ
+    // from the canonical form while resolving to the same location.
+    result.join(".")
 }
 
 // ---------------------------------------------------------------------------
@@ -989,12 +1085,19 @@ fn creation_produces_the_exact_locked_worktree_branch_and_head() {
     assert!(porcelain.contains(&format!("locked local-mcp goal {}", goal_id.as_str())));
     assert!(porcelain.contains(&fixture.base_commit));
 
-    // Creation grants zero remote authority.
-    let remotes = git(&fixture.primary, &["remote"]);
+    // Creation grants zero remote authority: the command shape has no fetch,
+    // push, or publish form, and the repository keeps no remote.
     assert!(
-        remotes.is_empty() || !porcelain.contains("push"),
-        "creation must not configure any remote"
+        git(&fixture.primary, &["remote"]).is_empty(),
+        "the fixture repository must have no remote to exercise"
     );
+    let config = git(&fixture.primary, &["config", "--local", "--list"]);
+    for forbidden in ["remote.", "branch.", "push", "url."] {
+        assert!(
+            !config.contains(forbidden),
+            "creation must not write {forbidden} configuration: {config}"
+        );
+    }
 
     let after = fixture.goal(&goal_id);
     assert_eq!(after.plan_revision(), 0);
@@ -1232,14 +1335,19 @@ fn a_failure_to_start_git_is_reconciled_rather_than_assumed_side_effect_free() {
         .block_detail()
         .cloned()
         .expect("a start failure is reconciled and bounded");
-    // Either the observation proved no side effect (retry, then exhausted) or
-    // it could not be made; both stop without assuming success.
+    // The observation still proved no side effect, so the frozen predicate
+    // permits the bounded retry and the budget is then exhausted.
+    assert_eq!(block.code, "MANAGED_RETRY_EXHAUSTED");
+    assert_eq!(
+        creator.calls() as u32,
+        crate::managed_worktree_prepare::MAX_CREATION_ATTEMPTS,
+        "a start failure is reconciled, not retried without proof"
+    );
     assert!(
-        block.code == "MANAGED_RETRY_EXHAUSTED" || block.code == "MANAGED_OBSERVATION_UNAVAILABLE",
-        "unexpected block {}",
+        block.detail.contains("could not run"),
+        "Git's own failure must reach the evidence: {}",
         block.detail
     );
-    assert!(creator.calls() >= 1);
     assert!(!fixture.managed_target(&goal_id).exists());
 }
 
@@ -1642,8 +1750,8 @@ fn a_managed_record_cannot_be_forged_from_a_foreign_goal_id() {
 }
 
 #[test]
-fn concurrent_preparation_is_serialized_by_the_goal_revision() {
-    let mut fixture = Fixture::new("serialized");
+fn an_already_active_managed_workspace_is_reconciled_not_recreated() {
+    let mut fixture = Fixture::new("not-recreated");
     fixture.authorize_managed_root();
     let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
 
@@ -1652,12 +1760,12 @@ fn concurrent_preparation_is_serialized_by_the_goal_revision() {
         .prepare(&goal_id, &HostGit::new(), &creator)
         .unwrap();
     assert!(first.is_active());
+    assert_eq!(creator.calls(), 1);
 
     // A second explicit run reconciles the now-ACTIVE workspace exactly and
     // must not create anything again.
     let before = git(&fixture.primary, &["worktree", "list", "--porcelain"]);
-    let again = fixture.prepare_real(&goal_id);
-    assert!(again.is_active());
+    assert!(fixture.prepare_real(&goal_id).is_active());
     assert_eq!(
         git(&fixture.primary, &["worktree", "list", "--porcelain"]),
         before,
@@ -1666,15 +1774,23 @@ fn concurrent_preparation_is_serialized_by_the_goal_revision() {
 }
 
 #[test]
-fn the_shared_observations_are_cheap_enough_to_be_safe_under_repeat_runs() {
-    // Sanity check that repeated preparation of a healthy ACTIVE workspace does
-    // not advance the Goal revision (nothing changed).
+fn repeated_preparation_of_a_healthy_workspace_changes_nothing() {
     let mut fixture = Fixture::new("idempotent-prepare");
     fixture.authorize_managed_root();
     let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
     assert!(fixture.prepare_real(&goal_id).is_active());
     let revision = fixture.goal(&goal_id).revision();
+    let worktrees = git(&fixture.primary, &["worktree", "list", "--porcelain"]);
+
     assert!(fixture.prepare_real(&goal_id).is_active());
-    assert_eq!(fixture.goal(&goal_id).revision(), revision);
-    let _ = Arc::strong_count(&Arc::new(0));
+
+    assert_eq!(
+        fixture.goal(&goal_id).revision(),
+        revision,
+        "re-reconciling an exact ACTIVE workspace must not churn Goal.revision"
+    );
+    assert_eq!(
+        git(&fixture.primary, &["worktree", "list", "--porcelain"]),
+        worktrees
+    );
 }

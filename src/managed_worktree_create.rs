@@ -32,22 +32,12 @@ use crate::managed_worktree::{
 };
 use crate::managed_worktree_observe::is_git_environment_variable;
 
-/// Git global options applied to every managed creation command.
+/// The exact frozen global-option head.
 ///
-/// - `core.fsmonitor=false` mirrors the Phase 2 observer so a configured
-///   filesystem monitor cannot influence creation;
-/// - `core.hooksPath=` **disables hooks**. `git worktree add` performs a
-///   checkout and therefore runs `post-checkout`; a repository-local hook is
-///   untrusted executable content that must not be reachable from a
-///   host-internal lifecycle mutation, so the hook path is neutralized rather
-///   than inherited;
-/// - `--no-optional-locks` matches the observer, so creation does not take the
-///   optional index lock and cannot be confused with writer activity.
-///
-/// Inherited `GIT_*` environment variables are removed exactly as the Phase 2
-/// observer removes them, so a traced, aliased, or otherwise redirected Git
-/// process cannot widen this into different authority.
-const CREATION_GIT_OPTIONS: [&str; 5] = [
+/// Kept as a literal so the runtime self-check below can compare against it
+/// position by position. A future edit that widens this list is a visible diff
+/// *and* a self-check failure.
+const FROZEN_GIT_OPTION_HEAD: [&str; 5] = [
     "-c",
     "core.fsmonitor=false",
     "-c",
@@ -79,12 +69,21 @@ pub(crate) enum ManagedWorktreeCreationError {
     /// still reconciled before any retry: no start is not proof of no side
     /// effect.
     Spawn { detail: String },
+    /// The host Git executable identity could not be established, so no command
+    /// was run at all.
+    ExecutableIdentity(String),
 }
 
 impl std::fmt::Display for ManagedWorktreeCreationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn { detail } => write!(f, "git worktree add could not start: {detail}"),
+            Self::ExecutableIdentity(detail) => {
+                write!(
+                    f,
+                    "git executable identity could not be established: {detail}"
+                )
+            }
         }
     }
 }
@@ -150,7 +149,7 @@ impl ManagedWorktreeCreation {
     /// There is deliberately no `-B`, no `--force`, and no branch or commit
     /// guessing: Git must create the branch or fail.
     pub(crate) fn argv(&self) -> Vec<OsString> {
-        let mut argv: Vec<OsString> = CREATION_GIT_OPTIONS
+        let mut argv: Vec<OsString> = FROZEN_GIT_OPTION_HEAD
             .iter()
             .map(OsString::from)
             .collect::<Vec<_>>();
@@ -172,25 +171,31 @@ impl ManagedWorktreeCreation {
     ///
     /// This is a self-check on the builder above, not an authority check: it
     /// exists so that widening the argv in this module fails loudly here instead
-    /// of silently granting Git more capability. Because the tail is compared
-    /// position by position against the frozen shape, `-B`, `--force`, and any
-    /// other extra flag are structurally impossible.
+    /// of silently granting Git more capability. The **whole** argv is compared,
+    /// global-option head included, against a literal expectation. The head is
+    /// where a widening lands (`--exec-path=<dir>`, another `-c`, a dropped
+    /// `core.hooksPath=`), and a tail-only comparison would move its slice
+    /// boundary with the constant and miss exactly that edit. Because every
+    /// position is compared, `-B`, `--force`, and any other extra flag are
+    /// structurally impossible.
     fn assert_exact_shape(&self) -> Result<(), crate::orchestrator_error::OrchestratorError> {
         use crate::orchestrator_error::OrchestratorError;
 
-        let argv = self.argv();
-        let expected_tail: Vec<OsString> = vec![
+        let head: Vec<OsString> = FROZEN_GIT_OPTION_HEAD.iter().map(OsString::from).collect();
+        let tail: Vec<OsString> = vec![
             OsString::from("worktree"),
             OsString::from("add"),
             OsString::from("--lock"),
             OsString::from("--reason"),
-            OsString::from(&self.lock_reason),
+            OsString::from(self.lock_reason()),
             OsString::from("-b"),
-            OsString::from(&self.branch_name),
-            self.worktree_root.clone().into_os_string(),
-            OsString::from(&self.base_commit),
+            OsString::from(self.branch_name()),
+            self.worktree_root().to_path_buf().into_os_string(),
+            OsString::from(self.base_commit()),
         ];
-        if argv[CREATION_GIT_OPTIONS.len()..] != expected_tail[..] {
+        let mut expected = head;
+        expected.extend(tail);
+        if self.argv() != expected {
             return Err(OrchestratorError::CorruptGoal(
                 "managed worktree creation argv does not match the frozen command shape".to_owned(),
             ));
@@ -211,6 +216,102 @@ pub(crate) trait ManagedWorktreeCreator {
         creation: &ManagedWorktreeCreation,
         primary_root: &Path,
     ) -> Result<ManagedWorktreeCreationOutcome, ManagedWorktreeCreationError>;
+}
+
+/// Resolve the host Git executable to a concrete, canonical, executable file.
+///
+/// `Command::new("git")` alone is executable-path substitution: the name is
+/// resolved by the OS through `PATH`, so an attacker-writable earlier entry
+/// decides which binary runs a **mutating** command. This mirrors the
+/// host-Git-identity checks the staging mutation already applies: every `PATH`
+/// entry must be a non-empty absolute path, the selected candidate must be a
+/// regular file with an execute bit, and the result is canonicalized so the
+/// identity can be re-checked.
+fn resolve_host_git() -> Result<PathBuf, ManagedWorktreeCreationError> {
+    let path = std::env::var_os("PATH").ok_or_else(|| {
+        ManagedWorktreeCreationError::ExecutableIdentity("PATH is not set".to_owned())
+    })?;
+    let mut candidate: Option<PathBuf> = None;
+    for entry in std::env::split_paths(&path) {
+        if entry.as_os_str().is_empty() {
+            return Err(ManagedWorktreeCreationError::ExecutableIdentity(
+                "PATH contains an empty entry".to_owned(),
+            ));
+        }
+        if !entry.is_absolute() {
+            return Err(ManagedWorktreeCreationError::ExecutableIdentity(format!(
+                "PATH entry {} is not absolute",
+                entry.display()
+            )));
+        }
+        let executable = entry.join("git");
+        let Ok(metadata) = std::fs::metadata(&executable) else {
+            continue;
+        };
+        if !metadata.is_file() || !is_executable(&metadata) {
+            return Err(ManagedWorktreeCreationError::ExecutableIdentity(format!(
+                "{} is not a regular executable file",
+                executable.display()
+            )));
+        }
+        candidate = Some(executable);
+        break;
+    }
+    let candidate = candidate.ok_or_else(|| {
+        ManagedWorktreeCreationError::ExecutableIdentity("no usable git in PATH".to_owned())
+    })?;
+    std::fs::canonicalize(&candidate).map_err(|error| {
+        ManagedWorktreeCreationError::ExecutableIdentity(format!(
+            "git executable {} could not be canonicalized: {error}",
+            candidate.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    // Windows has no execute bit; a regular file in a directory on `PATH` is
+    // the platform's executable-identity rule.
+    let _ = metadata;
+    true
+}
+
+/// Environment variables removed before the mutating command runs.
+///
+/// `GIT_*` is the Git configuration surface. The rest are the ambient
+/// interpreter and Git-configuration-discovery channels that could otherwise
+/// redirect the process: `LD_PRELOAD`/`DYLD_*` substitute loaded code,
+/// `GIT_CONFIG*`/`XDG_CONFIG_HOME`/`HOME`/`APPDATA` relocate Git's
+/// configuration, and `PAGER`/`SSH_*` are not used by this command but are
+/// removed so no inherited value participates.
+const SANITIZED_ENVIRONMENT: [&str; 12] = [
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "XDG_CONFIG_HOME",
+    "HOME",
+    "APPDATA",
+];
+
+fn is_sanitized_environment_variable(key: &std::ffi::OsStr) -> bool {
+    // `is_git_environment_variable` covers every `GIT_*` variable, which also
+    // covers the explicit `GIT_CONFIG*` entries above.
+    is_git_environment_variable(key)
+        || SANITIZED_ENVIRONMENT
+            .iter()
+            .any(|name| std::ffi::OsStr::new(name) == key)
 }
 
 /// A creator backed by the host Git executable.
@@ -238,9 +339,24 @@ impl ManagedWorktreeCreator for HostWorktreeCreator {
         creation: &ManagedWorktreeCreation,
         primary_root: &Path,
     ) -> Result<ManagedWorktreeCreationOutcome, ManagedWorktreeCreationError> {
-        let mut command = Command::new(&self.executable);
+        // An explicitly configured executable is honored only when it is itself
+        // a canonical, executable file; otherwise fall back to the validated
+        // host identity so this seam never runs an unverified binary.
+        let executable = match std::fs::canonicalize(&self.executable) {
+            Ok(resolved)
+                if self.executable.is_absolute()
+                    && is_executable(&std::fs::metadata(&resolved).map_err(|error| {
+                        ManagedWorktreeCreationError::ExecutableIdentity(error.to_string())
+                    })?) =>
+            {
+                resolved
+            }
+            _ => resolve_host_git()?,
+        };
+
+        let mut command = Command::new(&executable);
         for (key, _) in std::env::vars_os() {
-            if is_git_environment_variable(&key) {
+            if is_sanitized_environment_variable(&key) {
                 command.env_remove(key);
             }
         }

@@ -238,7 +238,7 @@ pub(crate) fn tools() -> Value {
         {"name":"goal_resume","description":"Recover stale durable Goal task state and make resumable state ready for future orchestration. This does not execute work in Phase 3. An optional explicit pre-execution plan rejection may durably enter the existing Replanner path without executing a Worker. An optional failed_task_replan_requests array durably requests replacement of structurally invalid Tasks with bounded replacement closures; it never executes a Worker and never consumes the trigger's remaining retry.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"pre_execution_plan_rejection":{"type":"object","additionalProperties":false,"properties":{"request_id":{"type":"string","minLength":1,"maxLength":128},"expected_goal_revision":{"type":"integer","minimum":1},"expected_plan_revision":{"type":"integer","minimum":1},"trigger_task_id":{"type":"string","format":"uuid","maxLength":36},"reason":{"type":"string","minLength":1,"maxLength":8192},"replan_policy":{"type":"string","enum":["NORMAL","REQUIRE_READONLY_REASSESSMENT"],"default":"NORMAL"}},"required":["request_id","expected_goal_revision","expected_plan_revision","trigger_task_id","reason"]}},"required":["session_id"]}},
         {"name":"goal_cancel","description":"Request cancellation of durable Goal authority only. This does not stop unrelated legacy Local MCP Jobs or revert repository state.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"reason":{"type":"string","maxLength":8192}},"required":["session_id"]}},
         {"name":"goal_result","description":"Return the best durable result state for one explicit Goal ID. Non-terminal Goals return NOT_TERMINAL rather than fabricated success.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"}},"required":["session_id","goal_id"]}}
-        ,{"name":"goal_run","description":"Run one existing Goal in the foreground for a bounded number of host-controlled Scheduler/Finalizer steps. Model calls, if needed, use the host-configured read-only Codex model.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"max_steps":{"type":"integer","minimum":1,"maximum":256}},"required":["session_id","goal_id","max_steps"]}}
+        ,{"name":"goal_run","description":"Run one existing Goal in the foreground for a bounded number of host-controlled Scheduler/Finalizer steps. Model calls, if needed, use the host-configured read-only Codex model. A Goal started with workspace_mode MANAGED_WORKTREE causes the host to create one host-managed Git linked worktree and a local branch under the host managed root before planning; that root must already be covered by the session's permitted directories, and a Goal that has not yet been authorized is refused without creating anything.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"max_steps":{"type":"integer","minimum":1,"maximum":256}},"required":["session_id","goal_id","max_steps"]}}
     ]);
     let operation_schema = json!({
         "type": "object",
@@ -924,6 +924,18 @@ fn bounded_diagnostic(detail: &str) -> (String, bool) {
 }
 
 fn stop_detail(reason: &GoalRunStopReason) -> Value {
+    // A managed workspace stop carries host-owned evidence about why preparation
+    // stopped. It is surfaced under the same bound as every other diagnostic so
+    // the operator sees the real reason rather than only a code.
+    if let GoalRunStopReason::ManagedWorkspaceBlocked { code, detail } = reason {
+        let (detail, truncated) = bounded_diagnostic(detail);
+        return json!({
+            "kind": "MANAGED_WORKSPACE_BLOCKED",
+            "code": code,
+            "detail": detail,
+            "detail_truncated": truncated,
+        });
+    }
     let GoalRunStopReason::LowerAuthorityError { authority, detail } = reason else {
         return Value::Null;
     };
@@ -984,7 +996,10 @@ fn stop_reason_name(reason: &GoalRunStopReason) -> String {
         GoalRunStopReason::NoProgress { .. } => "NO_PROGRESS".into(),
         GoalRunStopReason::FinalizationNotReady(_) => "FINALIZATION_NOT_READY".into(),
         GoalRunStopReason::ManagedWorkspaceBlocked { code, .. } => {
-            format!("MANAGED_WORKSPACE_{code}")
+            // Every managed block code already begins with `MANAGED_`, so the
+            // name is the code itself; the historical `MANAGED_WORKSPACE_`
+            // prefix is not applied again.
+            code.clone()
         }
     }
 }
