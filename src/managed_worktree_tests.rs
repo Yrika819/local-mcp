@@ -258,9 +258,9 @@ fn record_rejects_worktree_root_overlapping_the_primary_workspace() {
     let primary_root = PathBuf::from(PRIMARY_ROOT);
     let hostile_roots = [
         primary_root.join(".git"),
-        primary_root.join(".git/worktrees"),
+        primary_root.join(".git").join("worktrees"),
         primary_root.join("src"),
-        primary_root.join("nested/deep"),
+        primary_root.join("nested").join("deep"),
         primary_root.parent().unwrap().to_path_buf(),
         PathBuf::from(FILESYSTEM_ROOT),
     ];

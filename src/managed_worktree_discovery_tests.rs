@@ -1810,10 +1810,16 @@ impl Drop for TempRepo {
 }
 
 #[cfg(not(windows))]
+fn canonical_temp_path(name: &str) -> PathBuf {
+    std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(name)
+}
+
+#[cfg(not(windows))]
 impl TempRepo {
     fn new(label: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("local-mcp-mw-{label}-{}", uuid::Uuid::new_v4()));
+        let root = canonical_temp_path(&format!("local-mcp-mw-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let repo = Self { root };
         repo.git(&["init", "-q", "-b", "main", "."]);
@@ -1939,8 +1945,7 @@ fn real_repository_is_observed_read_only() {
 fn real_linked_worktree_is_observed_and_classified() {
     let repo = TempRepo::new("linked");
     let head = repo.head();
-    let worktree =
-        std::env::temp_dir().join(format!("local-mcp-mw-linked-wt-{}", uuid::Uuid::new_v4()));
+    let worktree = canonical_temp_path(&format!("local-mcp-mw-linked-wt-{}", uuid::Uuid::new_v4()));
     // The branch is host-derived from the durable record, not chosen here.
     let (record, branch) = record_for(&repo.root, &worktree, &head, &repo.common_dir());
     repo.git(&[
@@ -2010,8 +2015,7 @@ fn real_linked_worktree_is_observed_and_classified() {
 fn real_dirty_primary_and_merge_in_progress_block_eligibility() {
     let repo = TempRepo::new("dirty");
     let head = repo.head();
-    let worktree =
-        std::env::temp_dir().join(format!("local-mcp-mw-dirty-wt-{}", uuid::Uuid::new_v4()));
+    let worktree = canonical_temp_path(&format!("local-mcp-mw-dirty-wt-{}", uuid::Uuid::new_v4()));
     let (record, branch) = record_for(&repo.root, &worktree, &head, &repo.common_dir());
     let expected = ExpectedWorktreeTarget::from_record(&record);
     let git = HostGit::new();
@@ -2109,7 +2113,7 @@ fn real_rebase_in_progress_is_detected_from_operation_metadata() {
 #[cfg(not(windows))]
 #[test]
 fn real_unborn_head_repository_is_trustworthy_but_ineligible() {
-    let empty = std::env::temp_dir().join(format!("local-mcp-mw-unborn-{}", uuid::Uuid::new_v4()));
+    let empty = canonical_temp_path(&format!("local-mcp-mw-unborn-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&empty).unwrap();
     let init = std::process::Command::new("git")
         .args(["init", "-q", "-b", "main"])
