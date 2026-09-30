@@ -442,6 +442,17 @@ pub(crate) async fn prepare_managed_workspace_with_policy(
             };
             return match classify_reconciliation(&expected, &observation) {
                 Reconciliation::ActiveExact { head } => {
+                    if record.creation_attempts_consumed() == 0 {
+                        return block_lifecycle(
+                            store,
+                            session,
+                            goal_id,
+                            "MANAGED_RECOVERY_REQUIRED",
+                            "an exact managed worktree exists but no creation attempt was ever \
+                             consumed, so it cannot be proven to be this Goal's side effect"
+                                .to_owned(),
+                        );
+                    }
                     Ok(ManagedWorkspacePreparation::Active { head })
                 }
                 other => block_lifecycle(

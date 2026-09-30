@@ -1686,6 +1686,115 @@ fn the_migration_never_infers_attempts_from_names_or_state() {
 }
 
 #[test]
+fn a_schema_four_document_that_carries_the_attempt_field_is_rejected() {
+    let mut fixture = Fixture::new("migrate-carries-field");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let goal = fixture.goal(&goal_id);
+
+    // A schema-4 record cannot legitimately carry this field. Honouring one would
+    // let the document hand itself a fresh lifetime budget, defeating the
+    // fail-closed derivation.
+    for (lifecycle, supplied) in [
+        ("REQUESTED", 0),
+        ("PREPARED", 0),
+        ("PREPARED", MAX_LIFETIME_CREATION_ATTEMPTS),
+        ("ACTIVE", 0),
+    ] {
+        let mut value = schema_four_document(&goal);
+        let record = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("managed_worktree")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        record.insert("lifecycle".to_owned(), json!(lifecycle));
+        record.insert("creation_attempts_consumed".to_owned(), json!(supplied));
+        if lifecycle == "ACTIVE" {
+            record.insert(
+                "last_reconciled_head".to_owned(),
+                json!(fixture.base_commit),
+            );
+            record.insert(
+                "last_reconciled_at".to_owned(),
+                json!("2026-01-01T00:00:00Z"),
+            );
+        }
+        write_raw_goal(&fixture, &goal_id, &value);
+
+        let store = TaskStore::with_state_root(fixture.state_root.clone());
+        let error = store
+            .load_goal(&fixture.session.id, &goal_id)
+            .expect_err("a schema-4 document must not supply its own attempt budget");
+        assert!(
+            matches!(error, OrchestratorError::CorruptGoal(_)),
+            "unexpected error for {lifecycle}/{supplied}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_current_schema_document_missing_the_attempt_field_is_rejected() {
+    let mut fixture = Fixture::new("stripped-field");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let mut value = serde_json::to_value(fixture.goal(&goal_id)).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .get_mut("managed_worktree")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("creation_attempts_consumed");
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    // The field is authority-bearing and zero is the maximum-authority value, so
+    // a current-schema document that omits it must fail closed rather than decode
+    // as a full budget.
+    let store = TaskStore::with_state_root(fixture.state_root.clone());
+    let error = store
+        .load_goal(&fixture.session.id, &goal_id)
+        .expect_err("a stripped attempt counter must not reopen the budget");
+    assert!(matches!(error, OrchestratorError::CorruptGoal(_)));
+}
+
+#[test]
+fn an_active_record_with_no_consumed_attempt_is_not_treated_as_ours() {
+    let mut fixture = Fixture::new("active-zero-attempts");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    // Create it for real, so the worktree genuinely exists and reconciles
+    // exactly. Then rewrite only the durable counter.
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    assert_eq!(attempts(&fixture, &goal_id), 1);
+
+    let mut value = serde_json::to_value(fixture.goal(&goal_id)).unwrap();
+    {
+        let record_value = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("managed_worktree")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        record_value.insert("creation_attempts_consumed".to_owned(), json!(0));
+    }
+    write_raw_goal(&fixture, &goal_id, &value);
+
+    let block = fixture.block(&goal_id);
+    assert_eq!(block.code, "MANAGED_RECOVERY_REQUIRED");
+    assert!(
+        block
+            .detail
+            .contains("no creation attempt was ever consumed"),
+        "{}",
+        block.detail
+    );
+}
+
+#[test]
 fn a_schema_four_document_with_a_corrupt_lifecycle_fails_closed() {
     let mut fixture = Fixture::new("migrate-corrupt-lifecycle");
     fixture.authorize_managed_root();

@@ -408,10 +408,12 @@ pub(crate) struct ManagedWorktreeRecord {
     /// reconciliation, not reaching `ACTIVE` or `BLOCKED`. That is what makes the
     /// bound survive a crash between consuming an attempt and spawning Git.
     ///
-    /// `#[serde(default)]` so a record written before this field existed decodes
-    /// as zero, which is then corrected by the schema migration rather than by
-    /// this default. See `task_store::decode_pre_durable_attempt_budget`.
-    #[serde(default)]
+    /// Deliberately **not** `#[serde(default)]`. This field is authority-bearing:
+    /// a missing value must fail closed rather than decode as zero, because zero
+    /// is the maximum-authority value - it reopens the whole lifetime budget. The
+    /// only legitimate way to read a record without this field is a document
+    /// written before schema 5, and the schema-4 migration inserts the value
+    /// before decoding. A current-schema document that omits it is rejected.
     creation_attempts_consumed: u32,
     last_reconciled_head: Option<String>,
     last_reconciled_at: Option<String>,
@@ -668,8 +670,9 @@ impl ManagedWorktreeRecord {
         // the transition, not a shape property of the record, and inferring it
         // would force every synthetic `ACTIVE` fixture to invent a count. The
         // "never adopt a worktree this lifecycle did not create" rule is enforced
-        // where it belongs instead, in the preparation step, which refuses to
-        // adopt an exact side effect when zero attempts were ever consumed.
+        // where it belongs instead, in `managed_worktree_prepare`, which refuses
+        // to treat an exact side effect as owned when zero attempts were ever
+        // consumed - on the pre-invocation path and on the `ACTIVE` path alike.
         let (head, at) = (&self.last_reconciled_head, &self.last_reconciled_at);
         if head.is_some() != at.is_some() {
             return Err(OrchestratorError::CorruptGoal(

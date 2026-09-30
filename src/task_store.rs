@@ -444,7 +444,18 @@ impl TaskStore {
                         "schema-4 managed_worktree must be an object".to_owned(),
                     )
                 })?;
-                let already_present = record_object.contains_key("creation_attempts_consumed");
+                // A schema-4 record cannot carry this field: it did not exist
+                // at that version, and the record denies unknown fields. Honouring
+                // one would let a document hand itself fresh retry authority and
+                // defeat the derivation below, which is exactly what this
+                // migration exists to refuse. Reject it, matching the sibling
+                // migration that refuses carried managed state.
+                if record_object.contains_key("creation_attempts_consumed") {
+                    return Err(OrchestratorError::CorruptGoal(format!(
+                        "schema-{SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET} durable Goal must not carry \
+                         creation_attempts_consumed"
+                    )));
+                }
                 let lifecycle = record_object
                     .get("lifecycle")
                     .and_then(Value::as_str)
@@ -454,17 +465,15 @@ impl TaskStore {
                         )
                     })?
                     .to_owned();
-                if !already_present {
-                    let starting = if lifecycle == "REQUESTED" {
-                        0
-                    } else {
-                        MAX_LIFETIME_CREATION_ATTEMPTS
-                    };
-                    record_object.insert(
-                        "creation_attempts_consumed".to_owned(),
-                        Value::from(starting),
-                    );
-                }
+                let starting = if lifecycle == "REQUESTED" {
+                    0
+                } else {
+                    MAX_LIFETIME_CREATION_ATTEMPTS
+                };
+                record_object.insert(
+                    "creation_attempts_consumed".to_owned(),
+                    Value::from(starting),
+                );
             }
         }
         object.insert(
