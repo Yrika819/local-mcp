@@ -19,6 +19,8 @@ mod goal_finalizer;
 mod goal_runner;
 mod goal_verifier;
 mod managed_worktree;
+mod managed_worktree_discovery;
+mod managed_worktree_observe;
 mod mcp;
 mod mutation;
 mod mutation_recovery;
@@ -50,6 +52,8 @@ mod goal_hardening_tests;
 mod goal_runner_tests;
 #[cfg(test)]
 mod goal_verifier_tests;
+#[cfg(test)]
+mod managed_worktree_discovery_tests;
 #[cfg(test)]
 mod managed_worktree_tests;
 #[cfg(test)]
