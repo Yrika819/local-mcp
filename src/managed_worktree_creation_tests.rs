@@ -436,6 +436,30 @@ impl ReadOnlyGit for CommonDirOverrideGit {
 }
 
 #[test]
+fn a_managed_record_rejects_a_root_inside_git_administrative_internals() {
+    let goal_id = GoalId::new();
+    // Design invariant 8: Git administrative internals stay forbidden. Model the
+    // host state the design's own research records - a session whose cwd is a
+    // *linked* worktree - so the common directory is a different directory from
+    // the primary root and the primary overlap check cannot see it.
+    let primary = PathBuf::from("/srv/repo/linked-checkout");
+    let common = PathBuf::from("/srv/repo/main/.git");
+    let error = ManagedWorktreeRecord::requested(
+        &goal_id,
+        WorktreeId::new(),
+        primary,
+        common.clone(),
+        common.join("worktrees").join("goal"),
+        "0".repeat(40),
+        None,
+        1,
+        0,
+    )
+    .expect_err("a root inside the common directory is rejected");
+    assert!(error.to_string().contains("common directory"), "{}", error);
+}
+
+#[test]
 fn a_managed_goal_in_a_control_state_does_not_reach_git() {
     use crate::goal::GoalStatus;
 
@@ -496,32 +520,206 @@ fn a_managed_goal_in_a_control_state_does_not_reach_git() {
 }
 
 #[test]
-fn a_non_canonical_session_cwd_cannot_host_a_managed_workspace() {
-    // Production sessions always canonicalize their cwd. A non-canonical cwd
-    // would make the host-derived `primary_root` differ from the durable
-    // `Goal.cwd`, which managed mode must reject rather than silently repair.
-    let mut fixture = Fixture::new("noncanonical-cwd");
+fn the_foreground_run_seam_refuses_a_control_state_before_any_authority_call() {
+    use crate::goal::GoalStatus;
+    use crate::goal_runner::{GoalRunStopReason, prepare_managed_workspace_before_run};
+
+    let mut fixture = Fixture::new("seam-control-state");
     fixture.authorize_managed_root();
-    fixture.session.cwd = noncanonical(&fixture.primary);
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let revision = fixture.goal(&goal_id).revision();
+    fixture
+        .store
+        .mutate_goal_snapshot(&fixture.session.id, &goal_id, revision, |goal, now| {
+            goal.transition_to(GoalStatus::Cancelling, now)
+        })
+        .unwrap();
+
+    // The production seam, not the preparation layer beneath it.
+    let result = prepare_managed_workspace_before_run(&fixture.store, &fixture.session, &goal_id)
+        .expect("a control state stops the run at the seam");
+    assert_eq!(
+        result.stop_reason,
+        GoalRunStopReason::ControlState(GoalStatus::Cancelling),
+        "the seam must return the runner's own control-state stop reason"
+    );
+    assert_eq!(result.steps_attempted, 0);
+    assert_eq!(result.steps_applied, 0);
+    assert_eq!(result.revision_before, Some(revision + 1));
+    assert_eq!(result.revision_after, Some(revision + 1));
+
+    assert!(!fixture.managed_target(&goal_id).exists());
+    assert!(!fixture.ref_exists(&Fixture::branch_ref(&goal_id)));
+}
+
+#[test]
+fn the_control_state_predicate_covers_exactly_the_states_the_runner_stops_on() {
+    use crate::goal::GoalStatus;
+
+    // Every Goal status, and the set the runner refuses to advance. The seam,
+    // `Goal::blocks_foreground_run`, and `stop_for_state` all read this one
+    // predicate, so this table is the exhaustive pin.
+    let all = [
+        GoalStatus::Planning,
+        GoalStatus::Running,
+        GoalStatus::Replanning,
+        GoalStatus::Verifying,
+        GoalStatus::Pausing,
+        GoalStatus::Paused,
+        GoalStatus::Blocked,
+        GoalStatus::Cancelling,
+        GoalStatus::Completed,
+        GoalStatus::Failed,
+        GoalStatus::Cancelled,
+    ];
+    for status in all {
+        let expected = matches!(
+            status,
+            GoalStatus::Pausing
+                | GoalStatus::Paused
+                | GoalStatus::Blocked
+                | GoalStatus::Cancelling
+                | GoalStatus::Completed
+                | GoalStatus::Failed
+                | GoalStatus::Cancelled
+        );
+        assert_eq!(
+            status.blocks_foreground_run(),
+            expected,
+            "unexpected control-state verdict for {status:?}"
+        );
+        assert_eq!(
+            status.is_terminal() || status.blocks_foreground_run(),
+            status.blocks_foreground_run(),
+            "terminal states must always block for {status:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stale_writer_cannot_advance_the_managed_lifecycle() {
+    // Optimistic concurrency on `mutate_goal_snapshot` is what serializes two
+    // preparations of the same managed Goal at the durable layer.
+    let mut fixture = Fixture::new("stale-writer");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let goal = fixture.goal(&goal_id);
+    let record = goal.managed_worktree().unwrap();
+    let stale_revision = goal.revision();
+
+    let intent = ManagedWorktreeCreationIntent::prepared(
+        &goal_id,
+        record.worktree_id().clone(),
+        WorktreeOperationId::new(),
+        fixture.common_dir(),
+        fixture.managed_target(&goal_id),
+        fixture.base_commit.clone(),
+    )
+    .unwrap();
+    fixture
+        .store
+        .mutate_goal_snapshot(
+            &fixture.session.id,
+            &goal_id,
+            stale_revision,
+            |goal, _now| goal.set_managed_creation_intent(intent),
+        )
+        .unwrap();
+
+    // A second writer holding the same, now-stale revision is refused.
+    let second = ManagedWorktreeCreationIntent::prepared(
+        &goal_id,
+        record.worktree_id().clone(),
+        WorktreeOperationId::new(),
+        fixture.common_dir(),
+        fixture.managed_target(&goal_id),
+        fixture.base_commit.clone(),
+    )
+    .unwrap();
+    let error = fixture
+        .store
+        .mutate_goal_snapshot(
+            &fixture.session.id,
+            &goal_id,
+            stale_revision,
+            |goal, _now| goal.set_managed_creation_intent(second),
+        )
+        .expect_err("a stale writer must not advance the managed lifecycle");
+    assert!(matches!(error, OrchestratorError::RevisionConflict { .. }));
+
+    let after = fixture.goal(&goal_id);
+    assert_eq!(
+        after.managed_worktree().unwrap().lifecycle(),
+        ManagedWorktreeLifecycle::Prepared
+    );
+    assert_eq!(after.plan_revision(), 0);
+}
+
+/// A session cwd that resolves to the primary directory through a symlink makes
+/// the host-derived `primary_root` a *different* path from the durable
+/// `Goal.cwd`. Managed mode must refuse that rather than silently repair it,
+/// because `Goal.cwd` is the durable identity root.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_session_cwd_cannot_host_a_managed_workspace() {
+    let mut fixture = Fixture::new("symlinked-cwd");
+    fixture.authorize_managed_root();
+    let link = fixture.root.join("primary-link");
+    std::os::unix::fs::symlink(&fixture.primary, &link).unwrap();
+    assert_eq!(std::fs::canonicalize(&link).unwrap(), fixture.primary);
+    assert_ne!(link, fixture.primary);
+
+    fixture.session.cwd = link.clone();
     let error = fixture
         .start_value(&json!({
             "session_id": fixture.session.id,
             "objective": "managed worktree objective",
             "workspace_mode": "MANAGED_WORKTREE"
         }))
-        .expect_err("a non-canonical session cwd is refused");
-    assert_eq!(error.code(), "MANAGED_WORKSPACE_UNAVAILABLE");
+        .expect_err("a symlinked session cwd is refused");
+    // Whichever guard fires first, the request must not create a Goal whose
+    // durable identity root disagrees with its host-derived `primary_root`.
+    assert!(
+        matches!(
+            error.code(),
+            "MANAGED_WORKSPACE_UNAVAILABLE" | "GOAL_STATE_CORRUPT"
+        ),
+        "unexpected refusal {}",
+        error.code()
+    );
+    assert!(link.exists());
+    assert!(
+        fixture
+            .store
+            .list_goals_for_session(&fixture.session.id)
+            .unwrap()
+            .is_empty(),
+        "a refused managed request must not leave a Goal behind"
+    );
 }
 
+/// A trailing `.` is component-equal to the canonical path, so `Path` validation
+/// accepts it and the durable identity root is unaffected. This pins that the
+/// canonicalization in `request_managed_workspace` is not stricter than the
+/// durable `primary_root == cwd` invariant for this spelling.
+#[test]
+fn a_dot_suffixed_session_cwd_still_resolves_to_the_same_identity() {
+    let mut fixture = Fixture::new("dot-suffixed-cwd");
+    fixture.authorize_managed_root();
+    fixture.session.cwd = noncanonical(&fixture.primary);
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let goal = fixture.goal(&goal_id);
+    assert_eq!(
+        goal.managed_worktree().unwrap().primary_root(),
+        goal.cwd(),
+        "a component-equal spelling is the same durable identity root"
+    );
+}
+
+/// The same directory, spelled with a trailing `.` so the raw bytes differ from
+/// the canonical form while resolution is unchanged and portable.
 fn noncanonical(path: &Path) -> PathBuf {
-    let mut result = PathBuf::from("/tmp");
-    let canonical = std::fs::canonicalize(path).unwrap();
-    for component in canonical.components().skip(1) {
-        result.push(component);
-    }
-    // A `.` component is dropped by Path::components(), so the raw bytes differ
-    // from the canonical form while resolving to the same location.
-    result.join(".")
+    path.join(".")
 }
 
 // ---------------------------------------------------------------------------

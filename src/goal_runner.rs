@@ -306,7 +306,11 @@ where
 
 /// Run managed workspace preparation and, if it stops, produce the terminal run
 /// result. Returns `None` when the caller should continue into the runner.
-fn prepare_managed_workspace_before_run(
+///
+/// Exposed to tests so the control-state gate this function applies is covered
+/// at the same seam production uses, rather than only at the preparation layer
+/// beneath it.
+pub(crate) fn prepare_managed_workspace_before_run(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
@@ -868,6 +872,11 @@ fn build_result(
 }
 
 fn stop_for_state(status: GoalStatus) -> Option<GoalRunStopReason> {
+    // The set of states that do no work is owned by `GoalStatus`, so the
+    // managed preparation seam and this gate cannot drift apart.
+    if !status.blocks_foreground_run() {
+        return None;
+    }
     match status {
         GoalStatus::Completed => Some(GoalRunStopReason::Completed),
         GoalStatus::Failed => Some(GoalRunStopReason::Failed),
@@ -877,6 +886,9 @@ fn stop_for_state(status: GoalStatus) -> Option<GoalRunStopReason> {
             Some(GoalRunStopReason::ControlState(status))
         }
         GoalStatus::Blocked => Some(GoalRunStopReason::Blocked),
+        // Unreachable: `blocks_foreground_run` already returned `None` for
+        // every runnable state. Listed so a new `GoalStatus` cannot silently
+        // fall into a stop here.
         GoalStatus::Planning
         | GoalStatus::Running
         | GoalStatus::Replanning

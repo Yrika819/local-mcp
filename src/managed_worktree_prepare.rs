@@ -228,15 +228,11 @@ pub(crate) fn prepare_managed_workspace(
     if goal.workspace_mode().is_primary() {
         return Ok(ManagedWorkspacePreparation::NotManaged);
     }
-    if goal.blocks_foreground_run() {
+    if goal.status().is_terminal() {
         return Ok(ManagedWorkspacePreparation::block(
-            if goal.status().is_terminal() {
-                "MANAGED_GOAL_TERMINAL"
-            } else {
-                "MANAGED_GOAL_CONTROL_STATE"
-            },
+            "MANAGED_GOAL_TERMINAL",
             format!(
-                "a {:?} Goal must not prepare a managed workspace; the foreground runner performs no work in this state",
+                "a terminal {:?} Goal must not prepare a managed workspace",
                 goal.status()
             ),
         ));
@@ -320,6 +316,22 @@ pub(crate) fn prepare_managed_workspace(
             ));
         }
         ManagedWorktreeLifecycle::Requested | ManagedWorktreeLifecycle::Prepared => {}
+    }
+
+    // The remaining control states (paused, pausing, cancelling, blocked) run
+    // the foreground loop with zero steps, so preparing would be a host Git
+    // mutation the runner contract forbids. This is checked after the lifecycle
+    // classification so a non-creatable workspace still reports the more
+    // specific explicit-recovery code, and before the authority gate so no
+    // durable evidence is written for a Goal that will not proceed.
+    if goal.blocks_foreground_run() {
+        return Ok(ManagedWorkspacePreparation::block(
+            "MANAGED_GOAL_CONTROL_STATE",
+            format!(
+                "a {:?} Goal must not prepare a managed workspace; the foreground runner performs no work in this state",
+                goal.status()
+            ),
+        ));
     }
 
     for attempt in 1..=MAX_CREATION_ATTEMPTS {

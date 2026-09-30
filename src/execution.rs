@@ -493,7 +493,11 @@ fn trusted_git_failure(error: anyhow::Error, output: Option<sandbox::Output>) ->
 
 static HOST_GIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-fn host_git_path() -> Result<PathBuf> {
+/// The host Git executable, resolved and validated once and cached.
+///
+/// Exposed so the Managed Worktrees creation seam runs the same host Git
+/// identity as the staging mutation instead of re-deriving a weaker one.
+pub(crate) fn host_git_path() -> Result<PathBuf> {
     HOST_GIT
         .get_or_init(|| resolve_host_git_path().map_err(|error| format!("{error:#}")))
         .clone()

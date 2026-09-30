@@ -382,6 +382,22 @@ impl GoalStatus {
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    /// Whether the foreground runner performs no step at all for this state.
+    ///
+    /// This is the single source of truth for that decision. `goal_runner`
+    /// maps it to a stop reason, and managed workspace preparation consults it,
+    /// so a new state can never be "runnable" to one and "stopped" to the other.
+    /// Managed preparation is an authority call: a Goal the runner would return
+    /// from without doing any work must not have a linked worktree and a local
+    /// branch created for it.
+    pub(crate) fn blocks_foreground_run(self) -> bool {
+        self.is_terminal()
+            || matches!(
+                self,
+                Self::Paused | Self::Pausing | Self::Cancelling | Self::Blocked
+            )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,21 +1101,11 @@ impl Goal {
 
     /// Whether the foreground runner performs no work at all for this state.
     ///
-    /// A Goal in a terminal, control, or blocked state is returned from without
-    /// any scheduler or finalizer step, and without any authority call. Managed
-    /// workspace preparation is an authority call, so it must honour the same
-    /// predicate: creating a linked worktree and a local branch for a Goal the
-    /// operator cancelled or paused would be a host Git mutation the existing
-    /// runner contract forbids.
+    /// Delegates to [`GoalStatus::blocks_foreground_run`], which is also what
+    /// `goal_runner`'s stop gate uses, so the runner and managed workspace
+    /// preparation cannot disagree about which states do no work.
     pub(crate) fn blocks_foreground_run(&self) -> bool {
-        self.status.is_terminal()
-            || matches!(
-                self.status,
-                GoalStatus::Paused
-                    | GoalStatus::Pausing
-                    | GoalStatus::Cancelling
-                    | GoalStatus::Blocked
-            )
+        self.status.blocks_foreground_run()
     }
 
     /// Persist the durable `PREPARED` creation intent.

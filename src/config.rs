@@ -242,7 +242,10 @@ pub fn resolve_path_covered_by_session_authority(
 /// Host-owned environment override for the Managed Worktrees root.
 ///
 /// This is host/operator configuration, never MCP input, model prose, or a
-/// value derived from an existing arbitrary worktree.
+/// value derived from an existing arbitrary worktree. A root that overlaps a
+/// repository's primary workspace or common directory is rejected when the
+/// managed record is built, so a misconfigured root fails closed rather than
+/// placing a linked worktree in Git administrative internals.
 pub const MANAGED_WORKTREE_ROOT_ENV: &str = "LOCAL_MCP_MANAGED_WORKTREE_ROOT";
 
 /// The host-owned root under which managed linked worktrees are created
