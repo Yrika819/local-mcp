@@ -219,6 +219,10 @@ pub async fn request(
 }
 
 #[cfg(all(test, windows))]
+#[allow(
+    dead_code,
+    reason = "Windows-only test responder is selected by a cfg-gated integration path."
+)]
 pub(crate) fn spawn_test_approval_responder(
     session_id: &str,
     expected_cwd: &Path,
@@ -263,6 +267,18 @@ pub(crate) fn spawn_test_approval_responder(
         Ok(Err(detail)) => anyhow::bail!("cannot bind test approval listener: {detail}"),
         Err(error) => anyhow::bail!("test approval listener stopped before startup: {error}"),
     }
+}
+
+#[cfg(all(test, not(windows)))]
+#[allow(
+    dead_code,
+    reason = "Non-Windows test responder is a no-op for the shared integration fixture."
+)]
+pub(crate) fn spawn_test_approval_responder(
+    _session_id: &str,
+    _expected_cwd: &Path,
+) -> Result<std::thread::JoinHandle<Result<()>>> {
+    Ok(std::thread::spawn(|| Ok(())))
 }
 
 /// Sends a one-way activity update to the `start` screen. Activity reporting is
