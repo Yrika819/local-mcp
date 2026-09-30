@@ -31,7 +31,12 @@ pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
 /// `docs/MANAGED_WORKTREES_V1_DESIGN.md` section 9 forbids smuggling it in as
 /// an unversioned assumption. Schema 1/2/3 Goals stay readable and migrate to
 /// `PRIMARY` with no invented worktree ownership.
-pub(crate) const GOAL_SCHEMA_VERSION: u32 = 4;
+///
+/// Schema 5 adds the durable lifetime creation-attempt budget. It is an explicit
+/// advance because the new field changes durable retry authority: a schema-4
+/// managed record has no attempt count, and the migration must decide one
+/// without inventing permission to mutate Git again.
+pub(crate) const GOAL_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1183,6 +1188,23 @@ impl Goal {
         let active = record.to_active(head, now)?;
         self.managed_worktree = Some(active);
         self.managed_worktree_creation_intent = None;
+        Ok(())
+    }
+
+    /// Durably consume one authorized host Git creation attempt.
+    ///
+    /// The caller must persist the result **before** invoking Git, so a crash
+    /// after this point costs the attempt instead of refunding it. It is
+    /// monotonic and is never reset by a restart, a resume, a proven
+    /// no-side-effect reconciliation, or reaching `ACTIVE`/`BLOCKED`.
+    pub(crate) fn consume_managed_creation_attempt(&mut self) -> Result<(), OrchestratorError> {
+        let record = self.managed_worktree.as_ref().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "MANAGED_WORKTREE workspace requires a durable managed-worktree record".to_owned(),
+            )
+        })?;
+        let consumed = record.consume_creation_attempt()?;
+        self.managed_worktree = Some(consumed);
         Ok(())
     }
 

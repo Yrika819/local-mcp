@@ -36,14 +36,15 @@
 //! workers to the managed root. A managed Goal reaching `ACTIVE` in this phase
 //! still cannot be planned; that is Phase 4.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use crate::config;
 use crate::goal::{Goal, GoalId};
-use crate::managed_worktree::ManagedWorktreeLifecycle;
 use crate::managed_worktree::{
-    ManagedWorktreeCreationIntent, ManagedWorktreeRecord, WorktreeId, WorktreeOperationId,
-    managed_branch_ref,
+    MAX_LIFETIME_CREATION_ATTEMPTS, ManagedWorktreeCreationIntent, ManagedWorktreeLifecycle,
+    ManagedWorktreeRecord, WorktreeId, WorktreeOperationId, managed_branch_ref,
 };
 use crate::managed_worktree_create::{
     ManagedWorktreeCreation, ManagedWorktreeCreationError, ManagedWorktreeCreator,
@@ -55,15 +56,6 @@ use crate::managed_worktree_discovery::{
 use crate::managed_worktree_observe::{ReadOnlyGit, observe_repository};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task_store::TaskStore;
-
-/// Maximum creation attempts within one preparation, i.e. the initial attempt
-/// plus exactly one bounded retry.
-///
-/// The retry is permitted only after reconciliation mechanically proves that
-/// neither the path nor the branch side effect exists. Ambiguity never retries.
-/// This bound is per preparation; durable evidence keeps each attempt's
-/// operation identity distinct, and no low-level side-effect budget is reset.
-pub(crate) const MAX_CREATION_ATTEMPTS: u32 = 2;
 
 /// Why managed workspace preparation could not be evaluated at all.
 ///
@@ -77,6 +69,9 @@ pub(crate) enum ManagedWorkspaceError {
     Observation(String),
     /// Durable Goal state does not permit managed preparation.
     GoalState(String),
+    /// The host approval authority could not be reached. Treated exactly like a
+    /// refusal: no Git invocation, and no attempt consumed.
+    ApprovalUnavailable(String),
 }
 
 impl std::fmt::Display for ManagedWorkspaceError {
@@ -87,6 +82,9 @@ impl std::fmt::Display for ManagedWorkspaceError {
             }
             Self::Observation(detail) => write!(f, "managed workspace observation: {detail}"),
             Self::GoalState(detail) => write!(f, "managed workspace goal state: {detail}"),
+            Self::ApprovalUnavailable(detail) => {
+                write!(f, "managed workspace approval unavailable: {detail}")
+            }
         }
     }
 }
@@ -215,16 +213,165 @@ pub(crate) fn request_managed_workspace(
     .map_err(ManagedWorkspaceError::from)
 }
 
+/// The approval operation name shown to the operator.
+const MANAGED_CREATION_APPROVAL_OPERATION: &str = "managed_worktree_create";
+
+/// Whether the host-native managed-creation Git mutation is approval-gated.
+///
+/// Design section 23 is explicit: on Windows "host-native mutation remains
+/// approval-gated under current Windows policy". Linux and macOS already place
+/// managed creation inside the existing Session-authority and frozen Unix model,
+/// and this phase must not add an interactive requirement there, so the gate is
+/// platform policy rather than a universal one.
+pub(crate) const fn managed_creation_requires_approval() -> bool {
+    cfg!(windows)
+}
+
+/// The exact host-owned operation an approval may authorize.
+///
+/// Every field is derived from the durable `PREPARED` intent, so a caller or a
+/// model cannot alter what is being approved. The request is a description, not
+/// an authority source: after approval the caller re-reads the durable intent and
+/// refuses to proceed if it no longer matches this description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedCreationApproval {
+    pub(crate) goal_id: String,
+    pub(crate) primary_root: PathBuf,
+    pub(crate) worktree_root: PathBuf,
+    pub(crate) branch_ref: String,
+    pub(crate) base_commit: String,
+}
+
+impl ManagedCreationApproval {
+    fn from_intent(intent: &ManagedWorktreeCreationIntent, record: &ManagedWorktreeRecord) -> Self {
+        Self {
+            goal_id: intent.goal_id().as_str().to_owned(),
+            primary_root: record.primary_root().to_path_buf(),
+            worktree_root: record.worktree_root().to_path_buf(),
+            branch_ref: record.branch_ref().to_owned(),
+            base_commit: record.base_commit().to_owned(),
+        }
+    }
+
+    /// Whether this description still describes `intent` exactly.
+    ///
+    /// A mismatch means durable state changed across the approval window, so the
+    /// approval no longer authorizes the operation that is about to run.
+    pub(crate) fn matches(&self, intent: &ManagedWorktreeCreationIntent) -> bool {
+        self.goal_id == intent.goal_id().as_str()
+            && self.worktree_root == intent.worktree_root()
+            && self.branch_ref == intent.branch_ref()
+            && self.base_commit == intent.base_commit()
+    }
+
+    fn operation(&self) -> &'static str {
+        MANAGED_CREATION_APPROVAL_OPERATION
+    }
+
+    fn detail(&self) -> String {
+        format!(
+            "operation=managed_worktree_create goal={} primary_root={} worktree_root={} \
+             branch={} base_commit={}",
+            self.goal_id,
+            self.primary_root.display(),
+            self.worktree_root.display(),
+            self.branch_ref,
+            self.base_commit,
+        )
+    }
+}
+
+/// The one question the managed creation path may ask the host approval
+/// authority.
+///
+/// This is a narrow seam so the preparation logic stays free of UI and IPC
+/// details, and so tests can inject a deterministic double instead of requiring
+/// an interactive approval UI.
+pub(crate) type ManagedApprovalFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<bool, ManagedWorkspaceError>> + Send + 'a>>;
+
+pub(crate) trait ManagedCreationApprover {
+    /// Approve exactly this operation, or refuse it.
+    ///
+    /// Returning `Err` is a failure to obtain approval and is treated exactly
+    /// like a refusal: no Git invocation.
+    fn approve(&self, request: &ManagedCreationApproval) -> ManagedApprovalFuture<'_>;
+}
+
+/// The production approver, reusing the existing local approval system.
+///
+/// It is the same `approvals::request` path the `without_sandbox` and staging
+/// mutations use, so the existing yolo semantics are preserved unchanged: yolo
+/// auto-allows each request, and a missing session socket or a malformed reply
+/// already fails closed.
+pub(crate) struct SessionManagedCreationApprover {
+    session_id: String,
+}
+
+impl SessionManagedCreationApprover {
+    pub(crate) fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+}
+
+impl ManagedCreationApprover for SessionManagedCreationApprover {
+    fn approve(&self, request: &ManagedCreationApproval) -> ManagedApprovalFuture<'_> {
+        let session_id = self.session_id.clone();
+        let operation = request.operation();
+        let detail = request.detail();
+        let primary_root = request.primary_root.clone();
+        Box::pin(async move {
+            crate::approvals::request(&session_id, operation, detail, primary_root)
+                .await
+                .map_err(|error| ManagedWorkspaceError::ApprovalUnavailable(format!("{error:#}")))
+        })
+    }
+}
+
 /// Run the host PrepareWorkspace step, or reconcile an in-flight one.
 ///
 /// `PRIMARY` Goals return [`ManagedWorkspacePreparation::NotManaged`] and cause
 /// no filesystem or Git access at all.
-pub(crate) fn prepare_managed_workspace(
+///
+/// The platform approval gate comes from [`managed_creation_requires_approval`].
+/// Tests that must exercise the gate on a non-Windows host call
+/// [`prepare_managed_workspace_with_policy`] directly.
+pub(crate) async fn prepare_managed_workspace(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
     git: &dyn ReadOnlyGit,
     creator: &dyn ManagedWorktreeCreator,
+    approver: &dyn ManagedCreationApprover,
+) -> Result<ManagedWorkspacePreparation, ManagedWorkspaceError> {
+    prepare_managed_workspace_with_policy(
+        store,
+        session,
+        goal_id,
+        git,
+        creator,
+        approver,
+        managed_creation_requires_approval(),
+    )
+    .await
+}
+
+/// The same preparation, with the approval gate decided by the caller.
+///
+/// Splitting the policy out is what makes the Windows gate testable on Unix CI
+/// without weakening the real platform policy: production always passes
+/// [`managed_creation_requires_approval`], and the `#[cfg(windows)]` test proves
+/// that value is what production selects.
+pub(crate) async fn prepare_managed_workspace_with_policy(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    git: &dyn ReadOnlyGit,
+    creator: &dyn ManagedWorktreeCreator,
+    approver: &dyn ManagedCreationApprover,
+    requires_approval: bool,
 ) -> Result<ManagedWorkspacePreparation, ManagedWorkspaceError> {
     let goal = store.load_goal(&session.id, goal_id)?;
     if goal.workspace_mode().is_primary() {
@@ -336,7 +483,12 @@ pub(crate) fn prepare_managed_workspace(
         ));
     }
 
-    for attempt in 1..=MAX_CREATION_ATTEMPTS {
+    // The lifetime attempt budget is durable state, so this loop is bounded by
+    // the record itself: every iteration either returns or consumes one attempt,
+    // and `consume_creation_attempt` refuses once the lifetime bound is spent.
+    // A process restart, a resume, or a repeated `goal_run` re-enters here with
+    // the same spent budget rather than a fresh one.
+    loop {
         let goal = store.load_goal(&session.id, goal_id)?;
         let Some(record) = goal.managed_worktree() else {
             return Err(ManagedWorkspaceError::GoalState(
@@ -365,7 +517,8 @@ pub(crate) fn prepare_managed_workspace(
             }
         }
 
-        // Durable PREPARED intent, persisted before Git is invoked.
+        // Step 1: a durable PREPARED intent exists before anything else. It
+        // records the exact target, not an attempt.
         let intent = build_intent(record)?;
         let prepared = if record.lifecycle() == ManagedWorktreeLifecycle::Requested {
             persist(store, session, goal_id, |goal| {
@@ -384,14 +537,29 @@ pub(crate) fn prepare_managed_workspace(
         })?;
         let expected = ExpectedWorktreeTarget::from_record_and_intent(record, intent)?;
 
-        // Pre-invocation reconciliation: adopt an exact side effect left by a
-        // lost response, or mechanically prove that nothing happened.
+        // Step 2: reconcile before invoking anything. Adopting an exact side
+        // effect costs no attempt, because no invocation happens.
         let pre = match observe(git, record) {
             Ok(observation) => observation,
             Err(block) => return refuse_managed_workspace(store, session, goal_id, block),
         };
         match classify_reconciliation(&expected, &pre) {
             Reconciliation::ActiveExact { head } => {
+                // An attempt is consumed before every spawn, so a zero count
+                // proves this host never invoked Git here. An exact-looking
+                // worktree in that state was not created by this lifecycle and
+                // must not be adopted as owned.
+                if record.creation_attempts_consumed() == 0 {
+                    return block_lifecycle(
+                        store,
+                        session,
+                        goal_id,
+                        "MANAGED_RECOVERY_REQUIRED",
+                        "an exact managed worktree exists but no creation attempt was ever \
+                         consumed, so it cannot be proven to be this Goal's side effect"
+                            .to_owned(),
+                    );
+                }
                 return activate(store, session, goal_id, &head);
             }
             Reconciliation::NoSideEffect { .. } => {}
@@ -406,7 +574,94 @@ pub(crate) fn prepare_managed_workspace(
             }
         }
 
-        // The single authorized mutation.
+        // Step 3: platform approval for the host-native mutation. On Windows the
+        // frozen design keeps this approval-gated; the workspace_mode opt-in and
+        // the Session path authority are separate requirements and neither one
+        // satisfies this gate.
+        if requires_approval {
+            let approval = ManagedCreationApproval::from_intent(intent, record);
+            let approved = approver.approve(&approval).await;
+            let approved = match approved {
+                Ok(approved) => approved,
+                Err(error) => {
+                    return refuse_managed_workspace(
+                        store,
+                        session,
+                        goal_id,
+                        ManagedWorkspaceBlock {
+                            code: "MANAGED_CREATION_APPROVAL_UNAVAILABLE",
+                            detail: format!(
+                                "host approval for managed worktree creation could not be \
+                                 obtained: {error}"
+                            ),
+                        },
+                    );
+                }
+            };
+            if !approved {
+                return refuse_managed_workspace(
+                    store,
+                    session,
+                    goal_id,
+                    ManagedWorkspaceBlock {
+                        code: "MANAGED_CREATION_APPROVAL_DENIED",
+                        detail: format!(
+                            "the operator denied managed worktree creation for goal {}",
+                            intent.goal_id().as_str()
+                        ),
+                    },
+                );
+            }
+            // A stale approval must not authorize a different operation: re-read
+            // the durable intent and require it still describes exactly what was
+            // approved.
+            let current = store.load_goal(&session.id, goal_id)?;
+            let current_intent = current.managed_worktree_creation_intent().ok_or_else(|| {
+                ManagedWorkspaceError::GoalState(
+                    "the approved creation intent is no longer durable".to_owned(),
+                )
+            })?;
+            if !approval.matches(current_intent) {
+                return block_lifecycle(
+                    store,
+                    session,
+                    goal_id,
+                    "MANAGED_RECOVERY_REQUIRED",
+                    "durable managed creation state changed while approval was pending, so the \
+                     approval no longer authorizes this operation"
+                        .to_owned(),
+                );
+            }
+        }
+
+        // Steps 4 and 5: consume one lifetime attempt and persist it. This is a
+        // single durable mutation, and Git does not run unless it succeeds, so a
+        // failed persist can never cost or grant an invocation.
+        if !record.permits_creation_attempt() {
+            return block_lifecycle(
+                store,
+                session,
+                goal_id,
+                "MANAGED_RETRY_EXHAUSTED",
+                format!(
+                    "the lifetime creation budget is spent ({consumed}/{MAX_LIFETIME_CREATION_ATTEMPTS}) \
+                     and no further host Git creation invocation is authorized",
+                    consumed = record.creation_attempts_consumed()
+                ),
+            );
+        }
+        let spent = persist(store, session, goal_id, |goal| {
+            goal.consume_managed_creation_attempt()
+        })?;
+        let record = spent.managed_worktree().ok_or_else(|| {
+            ManagedWorkspaceError::GoalState("managed record vanished".to_owned())
+        })?;
+        let intent = spent.managed_worktree_creation_intent().ok_or_else(|| {
+            ManagedWorkspaceError::GoalState("managed intent vanished".to_owned())
+        })?;
+        let expected = ExpectedWorktreeTarget::from_record_and_intent(record, intent)?;
+
+        // Step 6: the single authorized mutation.
         //
         // Neither the exit status nor a failure to start the process is treated
         // as a verdict. Design section 11 requires reconciliation after *every*
@@ -417,10 +672,7 @@ pub(crate) fn prepare_managed_workspace(
         let attempt_outcome = creator.create(&creation, record.primary_root());
         let attempt_evidence = describe_creation_attempt(&creation, &attempt_outcome);
 
-        // Post-invocation reconciliation decides everything. A failure to
-        // observe is itself a reason to stop: the side effect of the command
-        // that just ran is unknown, and unknown side effects are reconciled
-        // before any retry.
+        // Step 7: read-only reconciliation decides the outcome.
         let post = match observe(git, record) {
             Ok(observation) => observation,
             Err(block) => return refuse_managed_workspace(store, session, goal_id, block),
@@ -443,27 +695,12 @@ pub(crate) fn prepare_managed_workspace(
                     ),
                 );
             }
-            // Proven no side effect, with an exact PREPARED operation ID bound.
-            // A bounded retry is permitted only while the budget lasts; the next
-            // iteration mints a fresh operation ID.
-            _ if attempt < MAX_CREATION_ATTEMPTS => continue,
-            _ => {
-                return block_lifecycle(
-                    store,
-                    session,
-                    goal_id,
-                    "MANAGED_RETRY_EXHAUSTED",
-                    format!(
-                        "creation attempt {attempt} left no worktree or branch side effect and the retry budget is exhausted; {attempt_evidence}"
-                    ),
-                );
-            }
+            // Proven no side effect. Whether another attempt is authorized is
+            // decided by the durable budget at the top of the next iteration,
+            // never by a per-call loop counter.
+            _ => continue,
         }
     }
-
-    Err(ManagedWorkspaceError::GoalState(
-        "managed creation loop exited without a decision".to_owned(),
-    ))
 }
 
 /// Bound, human-readable evidence about one creation attempt.

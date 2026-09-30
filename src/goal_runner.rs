@@ -3,7 +3,9 @@ use crate::goal::{GoalId, GoalStatus};
 use crate::goal_finalizer::{self, GoalFinalizationOutcome, GoalFinalizerError};
 use crate::managed_worktree_create::HostWorktreeCreator;
 use crate::managed_worktree_observe::HostGit;
-use crate::managed_worktree_prepare::{ManagedWorkspacePreparation, prepare_managed_workspace};
+use crate::managed_worktree_prepare::{
+    ManagedWorkspacePreparation, SessionManagedCreationApprover, prepare_managed_workspace,
+};
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::PlannerBackend;
 use crate::readonly_worker::ReadonlyBackend;
@@ -297,7 +299,7 @@ where
     // `PlanInitial` until preparation has either produced an `ACTIVE` binding or
     // stopped. `PRIMARY` Goals return `NotManaged` and reach the unchanged
     // runner path with no filesystem or Git access.
-    if let Some(outcome) = prepare_managed_workspace_before_run(store, session, goal_id) {
+    if let Some(outcome) = prepare_managed_workspace_before_run(store, session, goal_id).await {
         return outcome;
     }
 
@@ -310,7 +312,7 @@ where
 /// Exposed to tests so the control-state gate this function applies is covered
 /// at the same seam production uses, rather than only at the preparation layer
 /// beneath it.
-pub(crate) fn prepare_managed_workspace_before_run(
+pub(crate) async fn prepare_managed_workspace_before_run(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
@@ -349,13 +351,21 @@ pub(crate) fn prepare_managed_workspace_before_run(
         ));
     }
 
+    // The approver reuses the existing local approval system, so the Windows
+    // host-native mutation gate and the established yolo semantics are the same
+    // ones every other approval-gated host mutation already uses. This runs on
+    // the runner's current-thread runtime, so awaiting the approval IPC here
+    // creates no nested runtime.
+    let approver = SessionManagedCreationApprover::new(session.id.clone());
     let preparation = prepare_managed_workspace(
         store,
         session,
         goal_id,
         &HostGit::new(),
         &HostWorktreeCreator::new(),
-    );
+        &approver,
+    )
+    .await;
 
     let blocked = |code: String, detail: String, revision_after: u64, status: GoalStatus| {
         build_result(

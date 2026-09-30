@@ -17,18 +17,18 @@ const SCHEMA_WITH_PRISTINE_PLAN_SUPERSESSIONS: u64 = 3;
 /// version has no managed-workspace state to preserve.
 const SCHEMA_BEFORE_MANAGED_WORKTREES: u64 = 3;
 
-/// Schema 4 added Managed Worktrees V1 workspace identity
-/// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` section 9). Reading a pre-managed
-/// Goal must therefore add `workspace_mode` as `PRIMARY` and must never invent
-/// managed-worktree ownership.
-const SCHEMA_WITH_MANAGED_WORKTREES: u64 = 4;
+/// Schema 5 added the durable lifetime creation-attempt budget to the
+/// Managed Worktrees record. A stored schema-4 record has no such counter, so
+/// the migration must decide it without inventing retry authority. Schema 4 is
+/// the last version without that budget, so it is the origin of this step.
+const SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET: u64 = 4;
 
 /// The migration chain above is written against a specific current schema. If a
 /// future change advances `GOAL_SCHEMA_VERSION` without extending the chain,
 /// refuse to compile rather than silently routing a newer durable document
 /// through an older migration step.
 const _: () = assert!(
-    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITH_MANAGED_WORKTREES,
+    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET + 1,
     "goal schema migration chain must be extended when GOAL_SCHEMA_VERSION advances"
 );
 
@@ -397,6 +397,9 @@ impl TaskStore {
         if schema_version == SCHEMA_BEFORE_MANAGED_WORKTREES {
             return Self::decode_pre_managed_schema(value);
         }
+        if schema_version == SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET {
+            return Self::decode_pre_durable_attempt_budget(value);
+        }
         if schema_version != GOAL_SCHEMA_VERSION as u64 {
             return Err(OrchestratorError::UnsupportedSchema(schema_version));
         }
@@ -407,7 +410,77 @@ impl TaskStore {
         Ok(goal)
     }
 
-    /// Migrate a pre-managed-worktree durable Goal (schema 3) to schema 4.
+    /// Migrate a schema-4 durable Goal to schema 5 by deciding its durable
+    /// creation-attempt budget.
+    ///
+    /// Schema 4 has no attempt counter, so the migration must establish one
+    /// without inventing retry authority. It may never infer a count from a
+    /// branch name, a path, an existing worktree, a revision number, or any Git
+    /// observation. The only safe derivation is from the lifecycle itself, which
+    /// the frozen design fixes:
+    ///
+    /// - `REQUESTED` provably never invoked Git, because the durable `PREPARED`
+    ///   intent is persisted before any invocation (design section 11). It
+    ///   therefore starts with a full budget.
+    /// - every other lifecycle - `PREPARED`, `BLOCKED`, `ACTIVE`,
+    ///   `CLEANUP_ELIGIBLE`, `REMOVED` - may already have invoked Git an unknown
+    ///   number of times. It is migrated to a spent budget, which fails closed
+    ///   into explicit host recovery rather than granting extra mutation
+    ///   authority. In particular a legacy `PREPARED` record, whose attempt state
+    ///   is genuinely ambiguous, is never defaulted to a fresh budget.
+    ///
+    /// A schema-4 `PRIMARY` Goal has no managed record and is untouched.
+    fn decode_pre_durable_attempt_budget(value: Value) -> Result<Goal, OrchestratorError> {
+        use crate::managed_worktree::MAX_LIFETIME_CREATION_ATTEMPTS;
+
+        let mut migrated = value;
+        let object = migrated.as_object_mut().expect("validated object");
+        let record = object.get_mut("managed_worktree");
+        match record {
+            None => {}
+            Some(record) => {
+                let record_object = record.as_object_mut().ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "schema-4 managed_worktree must be an object".to_owned(),
+                    )
+                })?;
+                let already_present = record_object.contains_key("creation_attempts_consumed");
+                let lifecycle = record_object
+                    .get("lifecycle")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        OrchestratorError::CorruptGoal(
+                            "schema-4 managed_worktree must carry a lifecycle".to_owned(),
+                        )
+                    })?
+                    .to_owned();
+                if !already_present {
+                    let starting = if lifecycle == "REQUESTED" {
+                        0
+                    } else {
+                        MAX_LIFETIME_CREATION_ATTEMPTS
+                    };
+                    record_object.insert(
+                        "creation_attempts_consumed".to_owned(),
+                        Value::from(starting),
+                    );
+                }
+            }
+        }
+        object.insert(
+            "schema_version".to_owned(),
+            Value::from(GOAL_SCHEMA_VERSION),
+        );
+        let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
+            OrchestratorError::CorruptGoal(format!(
+                "schema-{SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET} durable Goal shape is invalid: {error}"
+            ))
+        })?;
+        goal.validate()?;
+        Ok(goal)
+    }
+
+    /// Migrate a pre-managed-worktree durable Goal (schema 3) to the current schema.
     ///
     /// Schema 4 introduces explicit Managed Worktrees V1 workspace identity. A
     /// schema-3 Goal has no such state, so migration is strictly additive: it

@@ -367,6 +367,16 @@ impl ManagedWorktreeCreationIntent {
     }
 }
 
+/// The lifetime number of authorized host Git creation invocations for one
+/// managed worktree, for the whole life of that creation sequence.
+///
+/// This is a **lifetime** bound, not a per-call one. A process restart, a Goal
+/// resume, a repeated `goal_run`, a transport failure, or a host restart must not
+/// replenish it. Design section 11 permits exactly one bounded retry after a
+/// mechanically proven no-side-effect reconciliation, and that allowance is spent
+/// from this budget like the initial attempt.
+pub(crate) const MAX_LIFETIME_CREATION_ATTEMPTS: u32 = 2;
+
 /// Durable managed-worktree record from design section 8.
 ///
 /// All paths are canonical absolute host paths. `source_ref` is informational
@@ -389,6 +399,20 @@ pub(crate) struct ManagedWorktreeRecord {
     created_goal_revision: u64,
     created_plan_revision: u32,
     lock_reason: String,
+    /// How many of [`MAX_LIFETIME_CREATION_ATTEMPTS`] authorized host Git
+    /// invocations this worktree has already consumed.
+    ///
+    /// Monotonic for the life of the record. It is incremented and durably
+    /// persisted **before** each Git invocation, and never decremented or reset
+    /// by anything - not a restart, not a resume, not a proven no-side-effect
+    /// reconciliation, not reaching `ACTIVE` or `BLOCKED`. That is what makes the
+    /// bound survive a crash between consuming an attempt and spawning Git.
+    ///
+    /// `#[serde(default)]` so a record written before this field existed decodes
+    /// as zero, which is then corrected by the schema migration rather than by
+    /// this default. See `task_store::decode_pre_durable_attempt_budget`.
+    #[serde(default)]
+    creation_attempts_consumed: u32,
     last_reconciled_head: Option<String>,
     last_reconciled_at: Option<String>,
 }
@@ -430,6 +454,7 @@ impl ManagedWorktreeRecord {
             created_goal_revision,
             created_plan_revision,
             lock_reason: managed_lock_reason(goal_id),
+            creation_attempts_consumed: 0,
             last_reconciled_head: None,
             last_reconciled_at: None,
         };
@@ -491,6 +516,49 @@ impl ManagedWorktreeRecord {
 
     pub(crate) fn last_reconciled_at(&self) -> Option<&str> {
         self.last_reconciled_at.as_deref()
+    }
+
+    /// How many authorized host Git creation invocations have been consumed.
+    pub(crate) fn creation_attempts_consumed(&self) -> u32 {
+        self.creation_attempts_consumed
+    }
+
+    /// Whether another authorized Git creation invocation may be spent.
+    ///
+    /// This reads only durable state, so it answers the same way before and after
+    /// a process restart, a resume, or any number of repeated runs.
+    pub(crate) fn permits_creation_attempt(&self) -> bool {
+        self.creation_attempts_consumed < MAX_LIFETIME_CREATION_ATTEMPTS
+    }
+
+    /// Consume exactly one authorized creation attempt.
+    ///
+    /// Pure. The caller must persist the result **before** invoking Git, so a
+    /// crash after this point still costs the attempt rather than refunding it.
+    /// Refuses once the lifetime bound is spent, and refuses a value that is
+    /// already out of range rather than wrapping.
+    pub(crate) fn consume_creation_attempt(&self) -> Result<Self, OrchestratorError> {
+        if self.creation_attempts_consumed >= MAX_LIFETIME_CREATION_ATTEMPTS {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "managed-worktree creation attempt budget is exhausted ({}/{})",
+                self.creation_attempts_consumed, MAX_LIFETIME_CREATION_ATTEMPTS
+            )));
+        }
+        let consumed = self
+            .creation_attempts_consumed
+            .checked_add(1)
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "managed-worktree creation attempt count overflow".to_owned(),
+                )
+            })?;
+        debug_assert!(consumed <= MAX_LIFETIME_CREATION_ATTEMPTS);
+        let spent = Self {
+            creation_attempts_consumed: consumed,
+            ..self.clone()
+        };
+        spent.validate()?;
+        Ok(spent)
     }
 
     /// Whether a creation intent is still outstanding for this record.
@@ -575,6 +643,33 @@ impl ManagedWorktreeRecord {
                 "managed worktree must be created before initial plan materialization".to_owned(),
             ));
         }
+        // The lifetime attempt budget is a durable authority bound. An
+        // out-of-range value is corruption and fails closed: it must never be
+        // clamped, wrapped, or treated as "still available".
+        if self.creation_attempts_consumed > MAX_LIFETIME_CREATION_ATTEMPTS {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "managed-worktree creation_attempts_consumed {} exceeds the lifetime bound {}",
+                self.creation_attempts_consumed, MAX_LIFETIME_CREATION_ATTEMPTS
+            )));
+        }
+        // A `REQUESTED` workspace provably never invoked Git, because the intent
+        // is persisted before any invocation (design section 11). This is a
+        // derivable shape fact, and rejecting a record that claims otherwise
+        // fails closed.
+        if self.lifecycle == ManagedWorktreeLifecycle::Requested
+            && self.creation_attempts_consumed != 0
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "a requested managed worktree cannot have consumed a creation attempt".to_owned(),
+            ));
+        }
+        // Note: `ACTIVE` deliberately does *not* imply a non-zero count here.
+        // Whether the host actually spent an attempt is a historical fact about
+        // the transition, not a shape property of the record, and inferring it
+        // would force every synthetic `ACTIVE` fixture to invent a count. The
+        // "never adopt a worktree this lifecycle did not create" rule is enforced
+        // where it belongs instead, in the preparation step, which refuses to
+        // adopt an exact side effect when zero attempts were ever consumed.
         let (head, at) = (&self.last_reconciled_head, &self.last_reconciled_at);
         if head.is_some() != at.is_some() {
             return Err(OrchestratorError::CorruptGoal(
@@ -654,6 +749,10 @@ impl ManagedWorktreeRecord {
         }
         let moved = Self {
             lifecycle: next,
+            // The consumed attempt count is durable evidence and is carried
+            // across every lifecycle transition unchanged. Nothing that reaches
+            // `ACTIVE` or `BLOCKED` refunds an attempt.
+            creation_attempts_consumed: self.creation_attempts_consumed,
             last_reconciled_head: head,
             last_reconciled_at: at,
             ..self.clone()
