@@ -803,13 +803,18 @@ fn normalize_planner_path(
         ));
     }
 
+    let canonical_goal_root = config::canonical_path(goal_root).map_err(|_| {
+        PlannerError::PlanAuthorityViolation(
+            "Goal execution root cannot be canonicalized".to_owned(),
+        )
+    })?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        goal_root.join(path)
+        canonical_goal_root.join(path)
     };
     let resolved = canonicalize_existing_prefix(&absolute)?;
-    if !resolved.starts_with(goal_root) {
+    if !resolved.starts_with(&canonical_goal_root) {
         return Err(PlannerError::PlanAuthorityViolation(
             "Task path escapes the Goal cwd".to_owned(),
         ));
@@ -836,7 +841,7 @@ fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, PlannerError> {
             ));
         }
     }
-    let mut resolved = fs::canonicalize(&existing).map_err(|_| {
+    let mut resolved = config::canonical_path(&existing).map_err(|_| {
         PlannerError::PlanAuthorityViolation("path ancestor cannot be canonicalized".to_owned())
     })?;
     for component in suffix.iter().rev() {
