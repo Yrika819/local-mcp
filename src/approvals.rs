@@ -218,6 +218,38 @@ pub async fn request(
     }
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn spawn_test_approval_responder(
+    session_id: &str,
+    expected_cwd: &Path,
+) -> Result<std::thread::JoinHandle<Result<()>>> {
+    let path = config::socket_path(session_id)?;
+    let mut listener = bind_listener(&path)?;
+    let expected_cwd = std::fs::canonicalize(expected_cwd)?;
+    Ok(std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let mut stream = listener.accept().await?;
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).await?;
+                let message: serde_json::Value = serde_json::from_str(&line)?;
+                anyhow::ensure!(message["type"] == "approval");
+                anyhow::ensure!(message["request"]["operation"] == "start_command");
+                let requested_cwd = message["request"]["cwd"]
+                    .as_str()
+                    .context("approval request omitted cwd")?;
+                anyhow::ensure!(
+                    std::fs::canonicalize(requested_cwd)? == expected_cwd,
+                    "Verifier command approval cwd did not match the managed candidate"
+                );
+                stream.write_all(b"allow\n").await?;
+                Ok(())
+            })
+    }))
+}
+
 /// Sends a one-way activity update to the `start` screen. Activity reporting is
 /// deliberately best-effort: an MCP operation must not fail just because its UI
 /// was closed between loading the session and completing the operation.
