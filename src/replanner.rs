@@ -3068,7 +3068,7 @@ mod tests {
         proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
         proposal["add_tasks"][0]["verification"] = json!([{
             "kind": "COMMAND_EXIT",
-            "command": ["printf", "a"],
+            "command": ["git", "rev-parse", "--show-toplevel"],
             "cwd": null,
             "accepted_exit_codes": [0]
         }]);

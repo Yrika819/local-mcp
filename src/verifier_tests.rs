@@ -24,11 +24,20 @@ struct Fixture {
     store: TaskStore,
     goal_id: GoalId,
     task_id: TaskId,
+    /// Whether this fixture created `root` and may therefore delete it.
+    ///
+    /// A caller that supplies its own workspace (a write probe that needs several
+    /// surviving directories) owns the cleanup. Without this, dropping the first
+    /// fixture would delete the shared workspace and every later assertion would
+    /// pass for the wrong reason.
+    owns_root: bool,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if self.owns_root {
+            let _ = fs::remove_dir_all(&self.root);
+        }
         let _ = fs::remove_dir_all(&self.state);
     }
 }
@@ -45,12 +54,38 @@ fn read_fixture(
     evidence: Vec<TaskEvidence>,
 ) -> Fixture {
     let root = temp_dir("workspace");
-    let state = temp_dir("state");
     let session = config::Session {
         id: Uuid::new_v4().to_string(),
         cwd: root.clone(),
         permitted_directories: vec![root.clone()],
     };
+    let scope = TaskScope::new(
+        vec![root.clone()],
+        vec![],
+        TaskOperationKind::ReadOnly,
+        ReplaySafety::SafeReadOnly,
+    );
+    let mut fixture = read_fixture_in(specs, max_attempts, evidence, root, scope, session);
+    // This fixture created the workspace, so it may clean it up.
+    fixture.owns_root = true;
+    fixture
+}
+
+/// The same fixture, but with a caller-chosen workspace, TaskScope, and Session
+/// authority.
+///
+/// Used to build a Session that genuinely permits a directory the TaskScope
+/// never granted, so a write probe can distinguish "not permitted" from "not
+/// authorized for this Task". The caller keeps ownership of `root`.
+fn read_fixture_in(
+    specs: Vec<VerificationSpec>,
+    max_attempts: u32,
+    evidence: Vec<TaskEvidence>,
+    root: PathBuf,
+    scope: TaskScope,
+    session: config::Session,
+) -> Fixture {
+    let state = temp_dir("state");
     let mut goal = Goal::new(
         session.id.clone(),
         root.clone(),
@@ -66,12 +101,7 @@ fn read_fixture(
         "mechanically verify fixture",
         true,
         WorkerKind::CodexReadonly,
-        TaskScope::new(
-            vec![root.clone()],
-            Vec::new(),
-            TaskOperationKind::ReadOnly,
-            ReplaySafety::SafeReadOnly,
-        ),
+        scope,
         specs,
         max_attempts,
         1,
@@ -107,11 +137,225 @@ fn read_fixture(
         store,
         goal_id,
         task_id,
+        owns_root: false,
     }
 }
 
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A pure-observation `COMMAND_EXIT` has no write authority anywhere.
+///
+/// The generic command path is handed the Session's whole `permitted_directories`
+/// set as the sandbox writable roots, so an empty writable-root list is not what
+/// makes a verification command safe here. This proves the safety mechanically,
+/// with test-owned temporary directories, across all three destinations the
+/// requirement names: a TaskScope-allowed path, a TaskScope-forbidden path, and
+/// another Session-permitted path the TaskScope never granted.
+///
+/// Every destination is pre-created with known content, so the probe proves both
+/// halves: nothing is created and nothing is altered.
+#[tokio::test]
+async fn a_pure_verifier_command_cannot_write_anywhere_it_is_permitted_to_see() {
+    let base = temp_dir("write-probe");
+    let session_root = base.join("session");
+    let allowed = session_root.join("allowed");
+    let forbidden = session_root.join("forbidden");
+    // A second root the Session genuinely permits but the TaskScope never grants.
+    let elsewhere = base.join("elsewhere");
+    for directory in [&allowed, &forbidden, &elsewhere] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let session = config::Session {
+        id: Uuid::new_v4().to_string(),
+        cwd: session_root.clone(),
+        // The Session permits all three. The claim is not about Session
+        // authority; it is that a pure observation has no write authority at all.
+        permitted_directories: vec![session_root.clone(), elsewhere.clone()],
+    };
+    let scope = TaskScope::new(
+        vec![allowed.clone()],
+        vec![forbidden.clone()],
+        TaskOperationKind::ReadOnly,
+        ReplaySafety::SafeReadOnly,
+    );
+
+    // Two pre-existing files, one to try to create and one to try to alter, in
+    // each of the three destinations.
+    let mut targets: Vec<(PathBuf, PathBuf, &'static str)> = Vec::new();
+    for directory in [&allowed, &forbidden, &elsewhere] {
+        let sentinel = directory.join("sentinel.txt");
+        fs::write(&sentinel, b"do-not-modify\n").unwrap();
+        targets.push((
+            directory.join("created.txt"),
+            sentinel,
+            match directory.as_path() {
+                p if p == allowed.as_path() => "task-scope-allowed",
+                p if p == forbidden.as_path() => "task-scope-forbidden",
+                _ => "other-session-permitted",
+            },
+        ));
+    }
+
+    let read_fixture_for = |command: Vec<String>| {
+        read_fixture_in(
+            vec![VerificationSpec::CommandExit {
+                command,
+                cwd: None,
+                accepted_exit_codes: vec![0],
+            }],
+            2,
+            Vec::new(),
+            session_root.clone(),
+            TaskScope::new(
+                vec![allowed.clone()],
+                vec![forbidden.clone()],
+                TaskOperationKind::ReadOnly,
+                ReplaySafety::SafeReadOnly,
+            ),
+            config::Session {
+                id: session.id.clone(),
+                cwd: session.cwd.clone(),
+                permitted_directories: session.permitted_directories.clone(),
+            },
+        )
+    };
+
+    for (create_target, sentinel, label) in &targets {
+        for command in [
+            // A shell write.
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("printf 'x' > {}", create_target.display()),
+            ],
+            vec![
+                "bash".to_owned(),
+                "-c".to_owned(),
+                format!("printf 'x' > {}", create_target.display()),
+            ],
+            // A direct create and a direct alter.
+            vec!["touch".to_owned(), create_target.display().to_string()],
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("printf 'x' > {}", sentinel.display()),
+            ],
+            // A script.
+            vec![
+                "python3".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "open({:?}, 'w').write('x')",
+                    create_target.display().to_string()
+                ),
+            ],
+            // An argv that starts from a host-approved shape and then smuggles a
+            // write through Git's own configuration.
+            vec![
+                "git".to_owned(),
+                "-c".to_owned(),
+                format!("core.fsmonitor=touch {}", create_target.display()),
+                "rev-parse".to_owned(),
+                "--show-toplevel".to_owned(),
+            ],
+            // An approved shape with the destination appended as an extra argument.
+            vec![
+                "git".to_owned(),
+                "rev-parse".to_owned(),
+                "--show-toplevel".to_owned(),
+                create_target.display().to_string(),
+            ],
+            // A mutating Git shape aimed at the same destination.
+            vec![
+                "git".to_owned(),
+                "worktree".to_owned(),
+                "add".to_owned(),
+                create_target.display().to_string(),
+            ],
+        ] {
+            let fixture = read_fixture_for(command.clone());
+            let before = fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap();
+            let result = verify_task(
+                &fixture.store,
+                &fixture.session,
+                &fixture.goal_id,
+                &fixture.task_id,
+                before.revision(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(VerifierError::InvalidState(_))),
+                "{label}: {command:?} must be refused before spawn"
+            );
+            let after = fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap();
+            assert_eq!(after, before, "{label}: {command:?} changed durable state");
+            assert!(
+                !create_target.exists(),
+                "{label}: {command:?} created {}",
+                create_target.display()
+            );
+            assert_eq!(
+                fs::read(sentinel).unwrap(),
+                b"do-not-modify\n",
+                "{label}: {command:?} altered {}",
+                sentinel.display()
+            );
+        }
+    }
+
+    // The host-approved pure observation still runs, and still writes nothing
+    // anywhere in the Session's permitted roots.
+    let approved = read_fixture_for(vec![
+        "git".to_owned(),
+        "rev-parse".to_owned(),
+        "--show-toplevel".to_owned(),
+    ]);
+    let before = approved
+        .store
+        .load_goal(&approved.session.id, &approved.goal_id)
+        .unwrap();
+    let approved_result = verify_task(
+        &approved.store,
+        &approved.session,
+        &approved.goal_id,
+        &approved.task_id,
+        before.revision(),
+    )
+    .await;
+    // On a host where the sandbox is a wrapper the requested-command start is
+    // unproven and the check blocks; on a host-native platform it is proven. Both
+    // are correct, and neither may have written anything.
+    assert!(
+        matches!(
+            approved_result,
+            Ok(_) | Err(VerifierError::Observation(_)) | Err(VerifierError::InvalidState(_))
+        ),
+        "the approved observation produced an unexpected error"
+    );
+    let _ = scope;
+    for (create_target, sentinel, label) in &targets {
+        assert!(
+            !create_target.exists(),
+            "{label}: the approved pure observation created {}",
+            create_target.display()
+        );
+        assert_eq!(
+            fs::read(sentinel).unwrap(),
+            b"do-not-modify\n",
+            "{label}: the approved pure observation altered {}",
+            sentinel.display()
+        );
+    }
+
+    let _ = fs::remove_dir_all(base);
 }
 
 fn structured_ok(id: &str) -> TaskEvidence {
@@ -610,58 +854,242 @@ async fn review_gate_is_advisory_evidence_rechecked_by_host_verifier() {
     );
 }
 
+/// A host-approved pure-observation `COMMAND_EXIT` is judged on the
+/// requested command's own lifecycle.
+///
+/// `/usr/bin/true` is no longer a usable fixture: the authority admits exact
+/// read-only Git observation shapes only, and a generic executable is refused
+/// before it is spawned.
+///
+/// This is `#[cfg(not(windows))]` because the command path is approval-gated on
+/// Windows — `primary_execution_mode()` is `HostNative` there, so
+/// `start_command` asks the local approval channel before it spawns, and this
+/// fixture deliberately runs no approval responder. On Linux and macOS the
+/// sandbox is a separate wrapper, and the wrapper's exit says nothing about
+/// whether the requested command ran, so the check fails closed. That is the
+/// frozen lifecycle contract, not a platform regression. The Windows approval
+/// path itself is covered by the managed-worktree integration test, which spawns
+/// a real approval responder.
 #[cfg(not(windows))]
 #[tokio::test]
-async fn command_exit_pass_and_failure_use_existing_execution_authority() {
-    let pass = read_fixture(
+async fn command_exit_runs_only_a_host_approved_observation_and_needs_a_proven_start() {
+    let fixture = read_fixture(
         vec![VerificationSpec::CommandExit {
-            command: vec!["/usr/bin/true".into()],
+            command: vec![
+                "git".to_owned(),
+                "rev-parse".to_owned(),
+                "--show-toplevel".to_owned(),
+            ],
             cwd: None,
             accepted_exit_codes: vec![0],
         }],
         2,
         vec![],
     );
-    let goal = pass
+    init_git(&fixture.root);
+    let goal = fixture
         .store
-        .load_goal(&pass.session.id, &pass.goal_id)
-        .unwrap();
-    let done = verify_task(
-        &pass.store,
-        &pass.session,
-        &pass.goal_id,
-        &pass.task_id,
-        goal.revision(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(done.tasks()[&pass.task_id].status(), TaskStatus::Completed);
-
-    let fail = read_fixture(
-        vec![VerificationSpec::CommandExit {
-            command: vec!["/usr/bin/false".into()],
-            cwd: None,
-            accepted_exit_codes: vec![0],
-        }],
-        2,
-        vec![],
-    );
-    let goal = fail
-        .store
-        .load_goal(&fail.session.id, &fail.goal_id)
+        .load_goal(&fixture.session.id, &fixture.goal_id)
         .unwrap();
     let result = verify_task(
-        &fail.store,
-        &fail.session,
-        &fail.goal_id,
-        &fail.task_id,
+        &fixture.store,
+        &fixture.session,
+        &fixture.goal_id,
+        &fixture.task_id,
         goal.revision(),
     )
     .await
     .unwrap();
+    let status = result.tasks()[&fixture.task_id].status();
+    // A sandbox wrapper carried the request and its completion is not proof that
+    // `git rev-parse --show-toplevel` ran, so the check never passes.
+    assert_eq!(status, TaskStatus::Blocked);
+}
+
+/// A command the host cannot place in the verifier-safe observation class is
+/// refused before anything is spawned, and the refusal changes no durable state.
+#[tokio::test]
+async fn unapproved_verification_commands_are_refused_before_spawn() {
+    for command in [
+        // A generic executable is never host-approved authority.
+        vec!["/usr/bin/true".to_owned()],
+        vec!["/usr/bin/false".to_owned()],
+        // Shells and interpreters.
+        vec!["sh".to_owned(), "-c".to_owned(), "git status".to_owned()],
+        vec!["bash".to_owned(), "-lc".to_owned(), "git status".to_owned()],
+        vec!["zsh".to_owned(), "-c".to_owned(), "git status".to_owned()],
+        vec!["cmd".to_owned(), "/c".to_owned(), "git status".to_owned()],
+        vec![
+            "powershell".to_owned(),
+            "-Command".to_owned(),
+            "git status".to_owned(),
+        ],
+        // Scripts and interpreters.
+        vec!["python".to_owned(), "scripts/check.py".to_owned()],
+        vec!["python3".to_owned(), "-c".to_owned(), "print(1)".to_owned()],
+        // Mutating and ambiguous Git.
+        vec!["git".to_owned(), "commit".to_owned()],
+        vec!["git".to_owned(), "add".to_owned(), "--".to_owned()],
+        vec!["touch".to_owned(), "file".to_owned()],
+        vec!["rm".to_owned(), "-rf".to_owned(), "dir".to_owned()],
+        vec![
+            "git".to_owned(),
+            "symbolic-ref".to_owned(),
+            "HEAD".to_owned(),
+            "refs/heads/x".to_owned(),
+        ],
+        vec![
+            "git".to_owned(),
+            "symbolic-ref".to_owned(),
+            "--delete".to_owned(),
+            "HEAD".to_owned(),
+        ],
+        vec!["git".to_owned(), "branch".to_owned(), "new-name".to_owned()],
+        // A build or test driver is not pure observation.
+        vec!["cargo".to_owned(), "test".to_owned()],
+        vec!["gradle".to_owned(), "test".to_owned()],
+        vec!["./gradlew".to_owned(), "test".to_owned()],
+        vec!["npm".to_owned(), "test".to_owned()],
+        // An authority-shaping global must not redirect a verification command
+        // away from the validated execution root.
+        vec![
+            "git".to_owned(),
+            "-C".to_owned(),
+            "/elsewhere".to_owned(),
+            "rev-parse".to_owned(),
+            "--show-toplevel".to_owned(),
+        ],
+        vec!["some-unknown-tool".to_owned(), "--read-only".to_owned()],
+    ] {
+        let fixture = read_fixture(
+            vec![VerificationSpec::CommandExit {
+                command: command.clone(),
+                cwd: None,
+                accepted_exit_codes: vec![0],
+            }],
+            2,
+            vec![],
+        );
+        let before = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let result = verify_task(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.task_id,
+            before.revision(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(VerifierError::InvalidState(_))),
+            "{command:?} must be refused before spawn"
+        );
+        let after = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        assert_eq!(after, before, "{command:?} changed durable state");
+    }
+}
+
+/// `sandbox_process_finished` is an observation of the process the host waited
+/// on. It is never evidence that the requested command ran, so the Verifier can
+/// never read it as command completion.
+#[test]
+fn wrapper_completion_is_not_requested_command_completion() {
+    // The confirmed black-box result: the wrapper finished, the requested
+    // command never started, and the reported exit code is still zero.
+    let unproven = r#"{
+        "request_id": "r1",
+        "host_reached": true,
+        "command_started": false,
+        "command_start_proof": "UNPROVEN",
+        "command_finished": false,
+        "sandbox_process_finished": true,
+        "exit_code": 0
+    }"#;
+    let lifecycle = crate::verifier::parse_command_lifecycle_for_test(unproven).unwrap();
+    assert!(!lifecycle.command_finished);
+    assert_eq!(lifecycle.command_start_proof, "UNPROVEN");
+
+    // A proven start is the only thing that makes the requested command's own
+    // completion usable.
+    let proven = r#"{
+        "request_id": "r2",
+        "host_reached": true,
+        "command_started": true,
+        "command_start_proof": "PROVEN",
+        "command_finished": true,
+        "sandbox_process_finished": true,
+        "exit_code": 0
+    }"#;
+    let lifecycle = crate::verifier::parse_command_lifecycle_for_test(proven).unwrap();
+    assert!(lifecycle.command_finished);
+    assert_eq!(lifecycle.command_start_proof, "PROVEN");
+
+    // A refuted start is never completion either.
+    let refuted = r#"{
+        "request_id": "r3",
+        "host_reached": true,
+        "command_started": false,
+        "command_start_proof": "REFUTED",
+        "command_finished": false,
+        "sandbox_process_finished": true,
+        "exit_code": 0
+    }"#;
+    let lifecycle = crate::verifier::parse_command_lifecycle_for_test(refuted).unwrap();
+    assert!(!lifecycle.command_finished);
+}
+
+/// A mutating argv labelled `read_only_command` is still a mutation, and the
+/// independent host classification is what reaches the Verifier.
+#[test]
+fn read_only_command_metadata_cannot_override_a_mutating_argv() {
+    use crate::fallback::OperationIntent;
+    use crate::fallback::OperationType;
+
+    let labelled = OperationIntent {
+        kind: OperationType::ReadOnlyCommand,
+        operation_id: None,
+        paths: vec![],
+        argv: vec!["git".into(), "branch".into(), "new-name".into()],
+        source: None,
+        destination: None,
+        target: None,
+        create_only: false,
+        force: false,
+        attempt_budget_remaining: 1,
+        side_effect_budget_remaining: 1,
+    };
     assert_eq!(
-        result.tasks()[&fail.task_id].status(),
-        TaskStatus::Retryable
+        crate::fallback::infer_side_effect_class(
+            &["git".to_owned(), "branch".to_owned(), "new-name".to_owned()],
+            Some(&labelled)
+        ),
+        SideEffectClass::LocalMutation
+    );
+    assert_eq!(
+        crate::fallback::infer_side_effect_class(
+            &[
+                "git".to_owned(),
+                "symbolic-ref".to_owned(),
+                "--delete".to_owned(),
+                "HEAD".to_owned()
+            ],
+            Some(&labelled)
+        ),
+        SideEffectClass::LocalMutation
+    );
+    // And the Verifier's own authority refuses it independently of any label.
+    assert!(
+        crate::verifier_command_authority::classify(&[
+            "git".to_owned(),
+            "branch".to_owned(),
+            "new-name".to_owned()
+        ])
+        .is_err()
     );
 }
 
@@ -1003,7 +1431,6 @@ async fn verifier_targets_only_explicit_task_and_runs_no_scheduler() {
     let _ = fs::remove_dir_all(state);
 }
 
-#[cfg(not(windows))]
 fn init_git(root: &PathBuf) {
     let status = std::process::Command::new("git")
         .arg("init")

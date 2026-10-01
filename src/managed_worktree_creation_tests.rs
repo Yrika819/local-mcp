@@ -3189,6 +3189,18 @@ impl crate::writer::ReviewerBackend for CandidateReviewer {
 
 #[test]
 fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
+    // This plan deliberately carries no `COMMAND_EXIT` check. `COMMAND_EXIT` is
+    // pure observation, and a pure observation carried by a sandbox wrapper has
+    // no host-proven requested-command completion on Linux or macOS, so such a
+    // check can never pass there and the Task would block. On Windows the command
+    // path is also approval-gated. There is therefore no platform on which a
+    // managed `COMMAND_EXIT` completes today.
+    //
+    // The replacement coverage below is for the Verifier's own host-owned Git
+    // observation, which is what actually reports the managed execution root. The
+    // narrower property that a `COMMAND_EXIT` with `cwd: null` resolves to the
+    // execution root is no longer covered in managed mode, and the security
+    // closure handoff records that as a known coverage gap.
     let mut fixture = Fixture::new("phase4-e2e-isolation");
     fixture.authorize_managed_root();
     std::fs::create_dir_all(fixture.primary.join("src")).unwrap();
@@ -3248,7 +3260,6 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
                 "verification": [
                     {"kind": "FILE_EXISTS", "path": "src/foo.rs", "must_be_file": true},
                     {"kind": "FILE_DIGEST", "path": "src/foo.rs", "expected_sha256": candidate_digest},
-                    {"kind": "COMMAND_EXIT", "command": ["git", "rev-parse", "--show-toplevel"], "cwd": null, "accepted_exit_codes": [0]},
                     {"kind": "GIT_SCOPE", "allowed_changed_paths": ["src/foo.rs"], "require_no_other_changes": true}
                 ]
             },
@@ -3555,6 +3566,71 @@ fn verifier_git_path_spelling_matches_managed_scope_and_primary_root_mode() {
 // ---------------------------------------------------------------------------
 // H. Durable identity and forgery resistance
 // ---------------------------------------------------------------------------
+
+/// The Verifier's own Git observation is host-owned, runs against the managed
+/// linked worktree rather than the primary checkout, and needs no sandbox
+/// wrapper to prove the requested command ran.
+///
+/// This keeps the Phase 4 execution-root coverage that the integration test's
+/// plan no longer supplies, and it is the reason internal observation no longer
+/// travels the generic `start_command` path.
+#[test]
+fn managed_verifier_observation_uses_the_managed_execution_root() {
+    let mut fixture = Fixture::new("verifier-exec-root");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    let goal = fixture.goal(&goal_id);
+    let candidate = goal.managed_worktree().unwrap().worktree_root();
+    assert!(!candidate.starts_with(goal.cwd()));
+
+    // A change made only in the managed candidate must be what the host
+    // observes, which is only true if the observation ran in the worktree.
+    std::fs::write(candidate.join("tracked.txt"), "candidate-change\n").unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // An explicit approval policy keeps this test about the execution root; the
+    // platform approval gate has its own tests.
+    let observed = runtime
+        .block_on(crate::verifier::test_observe_git_with_policy(
+            candidate,
+            &fixture.session,
+            false,
+        ))
+        .expect("host-owned Git observation succeeds in the managed worktree");
+    assert!(
+        observed.root.starts_with(candidate),
+        "observation root {} is not the managed execution root",
+        observed.root.display()
+    );
+    assert!(
+        observed
+            .changed
+            .iter()
+            .any(|path| path == &candidate.join("tracked.txt"))
+    );
+
+    // The same observation against the primary checkout is a different worktree
+    // and reports no change there: the primary stays unchanged.
+    let primary_observed = runtime
+        .block_on(crate::verifier::test_observe_git_with_policy(
+            goal.cwd(),
+            &fixture.session,
+            false,
+        ))
+        .expect("host-owned Git observation succeeds in the primary checkout");
+    assert!(primary_observed.root.starts_with(goal.cwd()));
+    assert!(
+        !primary_observed
+            .changed
+            .iter()
+            .any(|path| path == &candidate.join("tracked.txt")),
+        "the primary checkout must not carry the candidate's change"
+    );
+}
 
 #[test]
 fn managed_goal_start_persists_host_derived_identity_only() {
