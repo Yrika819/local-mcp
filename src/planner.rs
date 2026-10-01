@@ -33,6 +33,25 @@ pub(crate) const MAX_VERIFICATION_PER_TASK: usize = 32;
 pub(crate) const MAX_VERIFICATION_TOTAL: usize = 1024;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
 
+// Replanner Hardening V1 durable-history budgets.
+//
+// The active-plan ceilings above are charged to the *active execution graph*
+// only: Tasks whose status is `SUPERSEDED` are permanently non-runnable,
+// permanently unsatisfiable as `TASK_VERIFIED` proof, and unreferenced by any
+// active dependency or criterion binding, so charging them against a live plan
+// budget permanently consumed the headroom a repaired plan still needed.
+//
+// Excluding history must not make durable growth unbounded, so each dimension
+// keeps an explicit, separate history ceiling. Every one of these values is
+// strictly greater than the corresponding pre-split total that *any* durable
+// Goal can hold, because before the split the active ceilings were computed
+// over all durable Tasks. That is why the split needs no schema bump, no
+// migration, and cannot invalidate an existing Goal.
+pub(crate) const MAX_DURABLE_SUPERSEDED_TASKS: usize = 1024;
+pub(crate) const MAX_DURABLE_SUPERSEDED_DEPENDENCY_EDGES: usize = 4096;
+pub(crate) const MAX_DURABLE_SUPERSEDED_SCOPE_PATHS: usize = 4096;
+pub(crate) const MAX_DURABLE_SUPERSEDED_VERIFICATION_ENTRIES: usize = 4096;
+
 pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize = 128;
 
 /// Host-visible compact read-only output contract. Reused verbatim by the
@@ -300,6 +319,13 @@ pub(crate) fn planner_request_for_goal(
 /// requirements. Nothing here predicts tokens, so the result is reproducible
 /// and auditable. A Goal that has not been planned yet falls back to its
 /// criteria, which is the only sizing signal available at planning time.
+///
+/// Evidence dimensions are counted over the active execution graph only. A
+/// superseded Task's requirements describe work that is no longer in the plan,
+/// and letting them accumulate would make every subsequent repair look broader
+/// than the plan actually is — the same feedback loop the sizing profile exists
+/// to interrupt. At initial planning time the Task map is empty
+/// (`ensure_initial_planning_state`), so this filter is a no-op for the Planner.
 pub(crate) fn task_sizing_profile_for_goal(goal: &Goal) -> crate::replanner::TaskSizingProfile {
     let entity_count = goal
         .completion_criteria()
@@ -312,6 +338,7 @@ pub(crate) fn task_sizing_profile_for_goal(goal: &Goal) -> crate::replanner::Tas
     let dimension_count = goal
         .tasks()
         .values()
+        .filter(|task| task.is_active_plan_authority())
         .flat_map(|task| task.verification_specs().iter())
         .filter_map(|spec| match spec {
             VerificationSpec::StructuredEvidence { requirement_id } => {

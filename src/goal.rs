@@ -2206,9 +2206,17 @@ impl Goal {
         // union can remove more edges than it adds, so the graph that actually
         // results is counted exactly rather than a running total that would
         // double-count an overlapping closure edge.
+        //
+        // Counted over the active execution graph only, on the same
+        // `is_active_plan_authority()` predicate the validator uses. Counting
+        // superseded Tasks here as well would make this backstop disagree with
+        // `replanner::enforce_plan_budgets`, and a Goal with a long replacement
+        // history would have every legal replacement refused for edges that no
+        // longer belong to the plan.
         let final_edge_count = candidate
             .tasks
             .values()
+            .filter(|task| task.is_active_plan_authority())
             .map(|task| task.dependencies().len())
             .sum::<usize>();
         if final_edge_count > crate::planner::MAX_PLAN_DEPENDENCY_EDGES {

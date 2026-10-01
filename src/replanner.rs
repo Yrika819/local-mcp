@@ -779,6 +779,213 @@ fn canonical_proposal_digest(value: &serde_json::Value) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Plan-level resource totals, split into the active execution graph and the
+/// durable history.
+///
+/// The split is exactly the crate's existing `Task::is_active_plan_authority()`
+/// predicate, i.e. `status != SUPERSEDED`. This is not "non-terminal": a
+/// `COMPLETED`, `FAILED` or `CANCELLED` Task stays in the active graph because it
+/// is still a legal dependency node and, for `COMPLETED`, still a valid
+/// `TASK_VERIFIED` proof. Excluding those would let a plan grow without bound
+/// and would let a mandatory Task skip its proof requirement.
+///
+/// Every sum is `saturating_add`. These are untrusted-input-driven aggregates, so
+/// an overflow must saturate into a rejection rather than wrap into a smaller
+/// number that would admit an oversized plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlanTotals {
+    active_tasks: usize,
+    active_dependency_edges: usize,
+    active_scope_paths: usize,
+    active_verification_entries: usize,
+    history_tasks: usize,
+    history_dependency_edges: usize,
+    history_scope_paths: usize,
+    history_verification_entries: usize,
+}
+
+impl PlanTotals {
+    fn of(goal: &Goal) -> Self {
+        let mut totals = Self::default();
+        for task in goal.tasks().values() {
+            let scope_paths = task
+                .scope()
+                .allowed_paths()
+                .len()
+                .saturating_add(task.scope().forbidden_paths().len());
+            if task.is_active_plan_authority() {
+                totals.active_tasks = totals.active_tasks.saturating_add(1);
+                totals.active_dependency_edges = totals
+                    .active_dependency_edges
+                    .saturating_add(task.dependencies().len());
+                totals.active_scope_paths = totals.active_scope_paths.saturating_add(scope_paths);
+                totals.active_verification_entries = totals
+                    .active_verification_entries
+                    .saturating_add(task.verification_specs().len());
+            } else {
+                totals.history_tasks = totals.history_tasks.saturating_add(1);
+                totals.history_dependency_edges = totals
+                    .history_dependency_edges
+                    .saturating_add(task.dependencies().len());
+                totals.history_scope_paths = totals.history_scope_paths.saturating_add(scope_paths);
+                totals.history_verification_entries = totals
+                    .history_verification_entries
+                    .saturating_add(task.verification_specs().len());
+            }
+        }
+        totals
+    }
+
+    /// The durable history this proposal would leave behind: the current history
+    /// plus every active Task it supersedes. Nothing is deleted, so the totals
+    /// only ever grow, and the history ceilings are what keeps that bounded.
+    fn history_after_superseding(&self, goal: &Goal, superseded: &BTreeSet<TaskId>) -> Self {
+        let mut totals = *self;
+        for id in superseded {
+            let Some(task) = goal.tasks().get(id) else {
+                continue;
+            };
+            if !task.is_active_plan_authority() {
+                // Already history: replacing an already-superseded Task is
+                // refused elsewhere, so never double-charge it here.
+                continue;
+            }
+            totals.active_tasks = totals.active_tasks.saturating_sub(1);
+            totals.active_dependency_edges = totals
+                .active_dependency_edges
+                .saturating_sub(task.dependencies().len());
+            totals.active_scope_paths = totals.active_scope_paths.saturating_sub(
+                task.scope()
+                    .allowed_paths()
+                    .len()
+                    .saturating_add(task.scope().forbidden_paths().len()),
+            );
+            totals.active_verification_entries = totals
+                .active_verification_entries
+                .saturating_sub(task.verification_specs().len());
+            totals.history_tasks = totals.history_tasks.saturating_add(1);
+            totals.history_dependency_edges = totals
+                .history_dependency_edges
+                .saturating_add(task.dependencies().len());
+            totals.history_scope_paths = totals.history_scope_paths.saturating_add(
+                task.scope()
+                    .allowed_paths()
+                    .len()
+                    .saturating_add(task.scope().forbidden_paths().len()),
+            );
+            totals.history_verification_entries = totals
+                .history_verification_entries
+                .saturating_add(task.verification_specs().len());
+        }
+        totals
+    }
+}
+
+/// Enforce the active-plan ceilings against the active execution graph only, and
+/// the separate durable-history ceilings against the history this proposal would
+/// leave behind.
+fn enforce_plan_budgets(
+    goal: &Goal,
+    proposal: &ReplanProposal,
+    proposed_tasks: usize,
+    proposed_dependency_edges: usize,
+    proposed_scope_paths: usize,
+    proposed_verification_entries: usize,
+) -> Result<(), ReplannerError> {
+    let totals = PlanTotals::of(goal);
+    if totals
+        .active_tasks
+        .saturating_add(proposed_tasks)
+        .saturating_sub(superseded_task_count(goal, proposal))
+        > planner::MAX_PLAN_TASKS
+    {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 128 Task host limit".to_owned(),
+        ));
+    }
+    if totals
+        .active_dependency_edges
+        .saturating_add(proposed_dependency_edges)
+        > planner::MAX_PLAN_DEPENDENCY_EDGES
+    {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 1024 dependency-edge limit".to_owned(),
+        ));
+    }
+    if totals
+        .active_scope_paths
+        .saturating_add(proposed_scope_paths)
+        > planner::MAX_SCOPE_PATHS_TOTAL
+    {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 1024 scope-path limit".to_owned(),
+        ));
+    }
+    if totals
+        .active_verification_entries
+        .saturating_add(proposed_verification_entries)
+        > planner::MAX_VERIFICATION_TOTAL
+    {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "candidate plan exceeds the 1024 verification-entry limit".to_owned(),
+        ));
+    }
+
+    // Superseded history must not become literally unbounded. These ceilings are
+    // separate from, and never traded against, the active-plan ceilings: a Goal
+    // may legitimately hold a full active plan *and* a long replacement history.
+    let resulting = totals.history_after_superseding(goal, &superseded_task_ids(goal, proposal));
+    if resulting.history_tasks > planner::MAX_DURABLE_SUPERSEDED_TASKS
+        || resulting.history_dependency_edges > planner::MAX_DURABLE_SUPERSEDED_DEPENDENCY_EDGES
+        || resulting.history_scope_paths > planner::MAX_DURABLE_SUPERSEDED_SCOPE_PATHS
+        || resulting.history_verification_entries
+            > planner::MAX_DURABLE_SUPERSEDED_VERIFICATION_ENTRIES
+    {
+        return Err(ReplannerError::ReplannerSchemaViolation(
+            "durable replacement history exceeds its separate host storage budget".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// How many active Tasks this proposal supersedes, so the active Task ceiling
+/// counts a replacement as size-neutral.
+fn superseded_task_count(goal: &Goal, proposal: &ReplanProposal) -> usize {
+    superseded_task_ids(goal, proposal)
+        .iter()
+        .filter(|id| {
+            goal.tasks()
+                .get(*id)
+                .is_some_and(|task| task.is_active_plan_authority())
+        })
+        .count()
+}
+
+/// Every durable Task this proposal would move into history, host-derived.
+///
+/// For failed-task replacement the set is the `old_task_id` of each entry. For
+/// pristine-plan supersession it is exactly the Tasks created at the rejected
+/// plan revision, which is the same host-derived set
+/// `validate_pristine_plan_supersession` requires — a supersession that claimed
+/// a different set is rejected there, so budgeting the derived set here can only
+/// be conservative, never permissive.
+fn superseded_task_ids(goal: &Goal, proposal: &ReplanProposal) -> BTreeSet<TaskId> {
+    let mut ids = proposal
+        .replace_tasks
+        .iter()
+        .filter_map(|replacement| TaskId::parse(&replacement.old_task_id).ok())
+        .collect::<BTreeSet<_>>();
+    if proposal.pristine_plan_supersession.is_some() {
+        ids.extend(
+            goal.tasks()
+                .iter()
+                .filter(|(_, task)| task.created_plan_revision() == goal.plan_revision())
+                .map(|(id, _)| id.clone()),
+        );
+    }
+    ids
+}
+
 fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
     canonicalize_json_with_key(value, None)
 }
@@ -916,53 +1123,21 @@ fn parse_and_validate_proposal(
             "replan must contain at least one monotonic change".to_owned(),
         ));
     }
-    if goal.tasks().len().saturating_add(proposal.add_tasks.len()) > planner::MAX_PLAN_TASKS {
-        return Err(ReplannerError::ReplannerSchemaViolation(
-            "candidate plan exceeds the 128 Task host limit".to_owned(),
-        ));
-    }
-
-    let existing_dependency_edges = goal
-        .tasks()
-        .values()
-        .map(|task| task.dependencies().len())
-        .sum::<usize>();
+    // Active-plan budgets are charged to the active execution graph only, and the
+    // durable history this proposal would grow is charged to its own separate
+    // ceilings. See `PlanTotals` and `enforce_plan_budgets`.
     let proposed_dependency_edges = proposal
         .add_tasks
         .iter()
         .map(|task| task.dependencies.len())
         .sum::<usize>()
         .saturating_add(proposal.add_dependencies.len());
-    if existing_dependency_edges.saturating_add(proposed_dependency_edges)
-        > planner::MAX_PLAN_DEPENDENCY_EDGES
-    {
-        return Err(ReplannerError::ReplannerSchemaViolation(
-            "candidate plan exceeds the 1024 dependency-edge limit".to_owned(),
-        ));
-    }
-
-    let existing_scope_paths = goal
-        .tasks()
-        .values()
-        .map(|task| task.scope().allowed_paths().len() + task.scope().forbidden_paths().len())
-        .sum::<usize>();
-    let new_scope_paths = proposal
+    let proposed_scope_paths = proposal
         .add_tasks
         .iter()
         .map(|task| task.scope.allowed_paths.len() + task.scope.forbidden_paths.len())
         .sum::<usize>();
-    if existing_scope_paths.saturating_add(new_scope_paths) > planner::MAX_SCOPE_PATHS_TOTAL {
-        return Err(ReplannerError::ReplannerSchemaViolation(
-            "candidate plan exceeds the 1024 scope-path limit".to_owned(),
-        ));
-    }
-
-    let existing_verification = goal
-        .tasks()
-        .values()
-        .map(|task| task.verification_specs().len())
-        .sum::<usize>();
-    let new_verification = proposal
+    let proposed_verification_entries = proposal
         .add_tasks
         .iter()
         .map(|task| task.verification.len())
@@ -974,11 +1149,14 @@ fn parse_and_validate_proposal(
                 .map(|entry| entry.add.len())
                 .sum::<usize>(),
         );
-    if existing_verification.saturating_add(new_verification) > planner::MAX_VERIFICATION_TOTAL {
-        return Err(ReplannerError::ReplannerSchemaViolation(
-            "candidate plan exceeds the 1024 verification-entry limit".to_owned(),
-        ));
-    }
+    enforce_plan_budgets(
+        goal,
+        &proposal,
+        proposal.add_tasks.len(),
+        proposed_dependency_edges,
+        proposed_scope_paths,
+        proposed_verification_entries,
+    )?;
 
     let mut local_ids = BTreeSet::new();
     for task in &proposal.add_tasks {
