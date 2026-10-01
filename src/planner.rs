@@ -892,6 +892,19 @@ pub(crate) fn validate_and_normalize_verification(
                     "COMMAND_EXIT contains duplicate accepted exit codes".to_owned(),
                 ));
             }
+            // A plan the host can never verify must not be materialized. The
+            // Verifier refuses anything outside the host-owned observation
+            // authority before it spawns, and refusing there would abort the
+            // verification run with the Task left in VERIFYING — which the
+            // scheduler keeps re-selecting. Refusing the plan here instead makes
+            // the problem a bounded, recoverable plan rejection.
+            crate::verifier_command_authority::classify(&command).map_err(|rejection| {
+                PlannerError::PlannerSchemaViolation(format!(
+                    "COMMAND_EXIT is not an approved pure-observation command: {}. {}",
+                    rejection.detail(),
+                    crate::verifier_command_authority::APPROVED_TAILS_HINT
+                ))
+            })?;
             let cwd = cwd
                 .map(|path| normalize_planner_path(&path, goal_root, false))
                 .transpose()?;
@@ -1151,6 +1164,83 @@ mod tests {
     use crate::task_store::FaultPoint;
 
     const NOW: &str = "2026-09-13T00:00:00Z";
+
+    /// A plan the host can never verify must be rejected at materialization.
+    ///
+    /// Refusing later, inside the Verifier, would abort the verification run with
+    /// the Task left in VERIFYING, which the scheduler keeps re-selecting, so the
+    /// Goal would wedge instead of producing a recoverable plan rejection.
+    #[test]
+    fn an_unverifiable_command_exit_is_refused_when_the_plan_is_materialized() {
+        let root = PathBuf::from("/tmp/goal-root");
+        for command in [
+            vec!["cargo".to_owned(), "test".to_owned()],
+            vec!["/usr/bin/true".to_owned()],
+            vec!["sh".to_owned(), "-c".to_owned(), "git status".to_owned()],
+            vec!["git".to_owned(), "commit".to_owned()],
+            vec!["git".to_owned(), "status".to_owned()],
+            vec![
+                "git".to_owned(),
+                "symbolic-ref".to_owned(),
+                "HEAD".to_owned(),
+                "refs/heads/x".to_owned(),
+            ],
+            vec!["python3".to_owned(), "check.py".to_owned()],
+            vec![
+                "git".to_owned(),
+                "-C".to_owned(),
+                "/elsewhere".to_owned(),
+                "rev-parse".to_owned(),
+                "--show-toplevel".to_owned(),
+            ],
+        ] {
+            let result = validate_and_normalize_verification(
+                VerificationSpec::CommandExit {
+                    command: command.clone(),
+                    cwd: None,
+                    accepted_exit_codes: vec![0],
+                },
+                &root,
+            );
+            assert!(
+                matches!(result, Err(PlannerError::PlannerSchemaViolation(_))),
+                "{command:?} must be refused when the plan is materialized"
+            );
+        }
+        for command in [
+            vec![
+                "git".to_owned(),
+                "rev-parse".to_owned(),
+                "--show-toplevel".to_owned(),
+            ],
+            vec![
+                "git".to_owned(),
+                "branch".to_owned(),
+                "--show-current".to_owned(),
+            ],
+            vec![
+                "git".to_owned(),
+                "--no-optional-locks".to_owned(),
+                "worktree".to_owned(),
+                "list".to_owned(),
+                "--porcelain".to_owned(),
+                "-z".to_owned(),
+            ],
+        ] {
+            assert!(
+                validate_and_normalize_verification(
+                    VerificationSpec::CommandExit {
+                        command: command.clone(),
+                        cwd: None,
+                        accepted_exit_codes: vec![0],
+                    },
+                    &root,
+                )
+                .is_ok(),
+                "{command:?} is an approved pure observation"
+            );
+        }
+    }
 
     struct Fixture {
         root: PathBuf,

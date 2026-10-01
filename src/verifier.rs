@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
@@ -10,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::execution;
-use crate::fallback::{self, SideEffectClass, SideEffectState};
+use crate::fallback::SideEffectState;
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -19,6 +18,8 @@ use crate::task::{
     VerificationSpec,
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
+use crate::verifier_command_authority::{self, VerifierCommandClass};
+use crate::verifier_git_observation::{self, GitObservation};
 
 const VERIFIER_SOURCE: &str = "HOST_DETERMINISTIC_VERIFIER";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
@@ -168,16 +169,13 @@ struct CommandObservation {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    /// Whether the **requested command** provably ran to completion.
+    ///
+    /// This is the requested-command lifecycle, never the sandbox wrapper's.
     command_finished: bool,
+    /// Host-owned requested-command start proof, retained for the failure fact.
+    command_start_proof: String,
     execution_error: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct GitObservation {
-    head: Option<String>,
-    root: PathBuf,
-    changed: Vec<PathBuf>,
-    staged: Vec<PathBuf>,
 }
 
 pub(crate) async fn verify_task(
@@ -517,7 +515,12 @@ async fn evaluate_spec(
             cwd,
             accepted_exit_codes,
         } => {
-            validate_command(command)?;
+            // Refused before anything is spawned unless the host can positively
+            // place this exact argv in the verifier-safe observation class.
+            let VerifierCommandClass::PureObservation =
+                verifier_command_authority::classify(command).map_err(|rejection| {
+                    VerifierError::InvalidState(rejection.detail().to_owned())
+                })?;
             let cwd = cwd
                 .as_ref()
                 .map(|value| resolve_path(value, &snapshot.cwd))
@@ -531,8 +534,17 @@ async fn evaluate_spec(
                     evidence: Vec::new(),
                 });
             }
+            // The model proposes the argv; the host decides the binary. Without
+            // this substitution a repository could plant an executable named
+            // `git` and the approved argv shape would run it instead, with the
+            // Session's own writable roots.
+            let argv = host_git_argv(command)?;
             let observed =
-                run_command(command, &cwd, accepted_exit_codes, session, COMMAND_TIMEOUT).await?;
+                run_command(&argv, &cwd, accepted_exit_codes, session, COMMAND_TIMEOUT).await?;
+            // Success requires the requested command's own completion. Where the
+            // sandbox is carried by a wrapper, the wrapper's exit says nothing
+            // about whether the requested command ran, so an unproven run fails
+            // closed instead of being read as a passing observation.
             let passed = observed.command_finished
                 && observed.execution_error.is_none()
                 && observed
@@ -541,8 +553,8 @@ async fn evaluate_spec(
             Ok(Check {
                 passed,
                 detail: format!(
-                    "verification command exit {:?}; accepted {:?}",
-                    observed.exit_code, accepted_exit_codes
+                    "verification command exit {:?} with requested-command start proof {}; accepted {:?}",
+                    observed.exit_code, observed.command_start_proof, accepted_exit_codes
                 ),
                 disposition: if passed {
                     Disposition::Pass
@@ -926,28 +938,11 @@ fn canonicalize_existing_prefix(
     path: &Path,
     spelling_root: &Path,
 ) -> Result<PathBuf, VerifierError> {
-    let mut existing = path.to_path_buf();
-    let mut suffix = Vec::new();
-    while !existing.exists() {
-        let name = existing.file_name().ok_or_else(|| {
-            VerifierError::InvalidState(
-                "verification path has no canonicalizable ancestor".to_owned(),
-            )
-        })?;
-        suffix.push(name.to_os_string());
-        if !existing.pop() {
-            return Err(VerifierError::InvalidState(
-                "verification path has no canonicalizable ancestor".to_owned(),
-            ));
-        }
-    }
-    let mut resolved = config::canonical_path_like(&existing, spelling_root).map_err(|error| {
+    // One implementation, shared with the Git observation seam, so the two
+    // cannot drift into resolving a path differently.
+    verifier_git_observation::canonicalize_existing_prefix(path, spelling_root).map_err(|error| {
         VerifierError::InvalidState(format!("cannot canonicalize verification path: {error}"))
-    })?;
-    for part in suffix.iter().rev() {
-        resolved.push(part);
-    }
-    Ok(resolved)
+    })
 }
 
 pub(crate) fn task_scope_allows_git_changes(scope: &TaskScope, changed: &[PathBuf]) -> bool {
@@ -974,30 +969,24 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_command(command: &[String]) -> Result<(), VerifierError> {
-    if command.is_empty() {
-        return Err(VerifierError::InvalidState(
-            "verification command is empty".to_owned(),
-        ));
-    }
-    let executable = Path::new(&command[0])
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&command[0])
-        .to_ascii_lowercase();
-    if executable.ends_with("sh") || executable == "cmd" || executable.contains("powershell") {
-        return Err(VerifierError::InvalidState(
-            "shell-based verification command is not permitted".to_owned(),
-        ));
-    }
-    match fallback::infer_side_effect_class(command, None) {
-        SideEffectClass::LocalMutation | SideEffectClass::RemoteMutation => {
-            Err(VerifierError::InvalidState(
-                "verification command is classified as mutating".to_owned(),
-            ))
-        }
-        SideEffectClass::None | SideEffectClass::Unknown => Ok(()),
-    }
+/// Replace the proposal's `argv[0]` with the host-resolved Git identity.
+///
+/// The model chooses the observation, never the executable. The authority layer
+/// has already refused anything whose file name is not Git, but a name is not an
+/// identity: `./git` inside the repository, or any absolute path, would
+/// otherwise select a program the host never resolved. This substitution is the
+/// point where the executable becomes host-owned.
+fn host_git_argv(command: &[String]) -> Result<Vec<String>, VerifierError> {
+    let host_git = execution::host_git_path().map_err(|error| {
+        VerifierError::InvalidState(format!("host Git is unavailable: {error:#}"))
+    })?;
+    let host_git = host_git.to_str().ok_or_else(|| {
+        VerifierError::InvalidState("host Git path is not valid UTF-8".to_owned())
+    })?;
+    let mut argv = Vec::with_capacity(command.len());
+    argv.push(host_git.to_owned());
+    argv.extend_from_slice(&command[1..]);
+    Ok(argv)
 }
 
 async fn run_command(
@@ -1069,14 +1058,21 @@ fn parse_execution_payload(text: &str) -> Result<CommandObservation, VerifierErr
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        // The verifier judges the exit status the host observed. Where a sandbox
-        // wrapper carries the request, that is the executed process outcome, not
-        // the requested command's own lifecycle; the command lifecycle is
-        // reported separately and deliberately fails closed.
+        // The execution layer keeps the requested command's lifecycle separate
+        // from the sandbox wrapper's, and only the requested command's own
+        // completion can satisfy a verification check. `sandbox_process_finished`
+        // is deliberately not read here: where the sandbox is a separate wrapper
+        // it describes the wrapper, and a wrapper that exited says nothing about
+        // whether the requested command ever exec'd.
         command_finished: value
-            .get("sandbox_process_finished")
+            .get("command_finished")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        command_start_proof: value
+            .get("command_start_proof")
+            .and_then(Value::as_str)
+            .unwrap_or("UNAVAILABLE")
+            .to_owned(),
         execution_error: value
             .get("execution_error")
             .and_then(Value::as_str)
@@ -1088,108 +1084,12 @@ async fn observe_git(
     root: &Path,
     session: &config::Session,
 ) -> Result<GitObservation, VerifierError> {
-    let accepted = [0];
-    let top = run_command(
-        &[
-            "git".to_owned(),
-            "rev-parse".to_owned(),
-            "--show-toplevel".to_owned(),
-        ],
-        root,
-        &accepted,
-        session,
-        COMMAND_TIMEOUT,
-    )
-    .await?;
-    if top.exit_code != Some(0) || !top.command_finished {
-        return Err(VerifierError::Observation(
-            "Goal cwd is not an observable Git worktree".to_owned(),
-        ));
-    }
-    let git_root =
-        config::canonical_path_like(Path::new(top.stdout.trim()), root).map_err(|error| {
-            VerifierError::Observation(format!("cannot canonicalize Git root: {error}"))
-        })?;
-    if !root.starts_with(&git_root) {
-        return Err(VerifierError::Observation(
-            "Git root does not contain Goal cwd".to_owned(),
-        ));
-    }
-    let status = run_command(
-        &[
-            "git".to_owned(),
-            "status".to_owned(),
-            "--porcelain=v1".to_owned(),
-            "-z".to_owned(),
-            "--untracked-files=all".to_owned(),
-        ],
-        &git_root,
-        &accepted,
-        session,
-        COMMAND_TIMEOUT,
-    )
-    .await?;
-    if status.exit_code != Some(0) || !status.command_finished {
-        return Err(VerifierError::Observation(
-            "Git status observation failed".to_owned(),
-        ));
-    }
-    let changed = parse_status_paths(&status.stdout, &git_root)?;
-    let staged = run_command(
-        &[
-            "git".to_owned(),
-            "diff".to_owned(),
-            "--cached".to_owned(),
-            "--name-only".to_owned(),
-            "-z".to_owned(),
-        ],
-        &git_root,
-        &accepted,
-        session,
-        COMMAND_TIMEOUT,
-    )
-    .await?;
-    let staged = parse_nul_paths(&staged.stdout, &git_root)?;
-    let head = run_command(
-        &["git".to_owned(), "rev-parse".to_owned(), "HEAD".to_owned()],
-        &git_root,
-        &accepted,
-        session,
-        COMMAND_TIMEOUT,
-    )
-    .await
-    .ok()
-    .filter(|value| value.exit_code == Some(0) && value.command_finished)
-    .map(|value| value.stdout.trim().to_owned())
-    .filter(|value| !value.is_empty());
-    Ok(GitObservation {
-        head,
-        root: git_root,
-        changed,
-        staged,
-    })
-}
-
-fn parse_status_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, VerifierError> {
-    let mut paths = BTreeSet::new();
-    for token in stdout.split('\0').filter(|token| !token.is_empty()) {
-        let bytes = token.as_bytes();
-        let raw = if bytes.len() >= 3 && bytes[2] == b' ' {
-            &token[3..]
-        } else {
-            token
-        };
-        paths.insert(resolve_git_path(raw, root)?);
-    }
-    Ok(paths.into_iter().collect())
-}
-
-fn parse_nul_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, VerifierError> {
-    let mut paths = BTreeSet::new();
-    for token in stdout.split('\0').filter(|token| !token.is_empty()) {
-        paths.insert(resolve_git_path(token, root)?);
-    }
-    Ok(paths.into_iter().collect())
+    // Host-owned observation, not a model proposal and not the generic command
+    // path: the Verifier's own Git state is gathered by a narrow seam that owns
+    // the executable, the argv, and the lifecycle proof.
+    verifier_git_observation::observe(root, session)
+        .await
+        .map_err(VerifierError::Observation)
 }
 
 #[cfg(test)]
@@ -1198,17 +1098,7 @@ fn parse_nul_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, VerifierEr
     reason = "Windows-only path spelling regression fixture calls this helper on that target."
 )]
 pub(crate) fn resolve_git_path_for_test(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
-    resolve_git_path(raw, root)
-}
-
-fn resolve_git_path(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
-    let path = Path::new(raw);
-    if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
-        return Err(VerifierError::Observation(
-            "Git emitted an unsafe path".to_owned(),
-        ));
-    }
-    canonicalize_existing_prefix(&root.join(path), root)
+    verifier_git_observation::resolve_git_path(raw, root).map_err(VerifierError::Observation)
 }
 
 #[cfg(all(test, not(windows)))]
@@ -1221,4 +1111,41 @@ pub(crate) async fn test_command_timeout(
     run_command(command, cwd, &[0], session, timeout)
         .await
         .map(|_| ())
+}
+
+/// The requested-command lifecycle facts the Verifier derives from an execution
+/// payload, exposed so the wrapper/requested-command split can be tested
+/// directly against synthetic host evidence.
+#[cfg(test)]
+pub(crate) struct CommandLifecycleForTest {
+    pub(crate) command_finished: bool,
+    pub(crate) command_start_proof: String,
+}
+
+#[cfg(test)]
+pub(crate) fn parse_command_lifecycle_for_test(
+    text: &str,
+) -> Result<CommandLifecycleForTest, VerifierError> {
+    let observation = parse_execution_payload(text)?;
+    Ok(CommandLifecycleForTest {
+        command_finished: observation.command_finished,
+        command_start_proof: observation.command_start_proof,
+    })
+}
+
+/// The same observation with an explicit approval policy.
+///
+/// A test that is not about the approval gate uses this, so it does not need a
+/// live approval responder on the platform that has one. The production policy
+/// is exercised end to end by the managed-worktree integration test, which spawns
+/// a real approval responder on Windows.
+#[cfg(test)]
+pub(crate) async fn test_observe_git_with_policy(
+    root: &Path,
+    session: &config::Session,
+    requires_approval: bool,
+) -> Result<verifier_git_observation::GitObservation, VerifierError> {
+    verifier_git_observation::observe_with_policy(root, session, requires_approval)
+        .await
+        .map_err(VerifierError::Observation)
 }
