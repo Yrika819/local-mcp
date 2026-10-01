@@ -145,19 +145,13 @@ fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// A pure-observation `COMMAND_EXIT` has no write authority anywhere.
+/// Legacy COMMAND_EXIT never spawns, even for a formerly approved observation.
 ///
-/// The generic command path is handed the Session's whole `permitted_directories`
-/// set as the sandbox writable roots, so an empty writable-root list is not what
-/// makes a verification command safe here. This proves the safety mechanically,
-/// with test-owned temporary directories, across all three destinations the
-/// requirement names: a TaskScope-allowed path, a TaskScope-forbidden path, and
-/// another Session-permitted path the TaskScope never granted.
-///
-/// Every destination is pre-created with known content, so the probe proves both
-/// halves: nothing is created and nothing is altered.
+/// This proves the unsupported durable-state path is a one-time terminal block,
+/// and that commands targeting TaskScope-allowed/forbidden and other Session roots
+/// cannot create or alter files.
 #[tokio::test]
-async fn a_pure_verifier_command_cannot_write_anywhere_it_is_permitted_to_see() {
+async fn legacy_command_exit_blocks_without_spawning_or_writing_anywhere() {
     let base = temp_dir("write-probe");
     let session_root = base.join("session");
     let allowed = session_root.join("allowed");
@@ -288,15 +282,16 @@ async fn a_pure_verifier_command_cannot_write_anywhere_it_is_permitted_to_see() 
                 before.revision(),
             )
             .await;
-            assert!(
-                matches!(result, Err(VerifierError::InvalidState(_))),
-                "{label}: {command:?} must be refused before spawn"
+            let after = result.expect("legacy COMMAND_EXIT is durably blocked");
+            assert_eq!(
+                after.tasks()[&fixture.task_id].status(),
+                TaskStatus::Blocked,
+                "{label}: {command:?} must block once without spawn"
             );
-            let after = fixture
-                .store
-                .load_goal(&fixture.session.id, &fixture.goal_id)
-                .unwrap();
-            assert_eq!(after, before, "{label}: {command:?} changed durable state");
+            assert!(
+                after.revision() > before.revision(),
+                "the block must be durable"
+            );
             assert!(
                 !create_target.exists(),
                 "{label}: {command:?} created {}",
@@ -311,8 +306,7 @@ async fn a_pure_verifier_command_cannot_write_anywhere_it_is_permitted_to_see() 
         }
     }
 
-    // The host-approved pure observation still runs, and still writes nothing
-    // anywhere in the Session's permitted roots.
+    // A formerly host-approved pure observation is equally unsupported and never runs.
     let approved = read_fixture_for(vec![
         "git".to_owned(),
         "rev-parse".to_owned(),
@@ -329,16 +323,11 @@ async fn a_pure_verifier_command_cannot_write_anywhere_it_is_permitted_to_see() 
         &approved.task_id,
         before.revision(),
     )
-    .await;
-    // On a host where the sandbox is a wrapper the requested-command start is
-    // unproven and the check blocks; on a host-native platform it is proven. Both
-    // are correct, and neither may have written anything.
-    assert!(
-        matches!(
-            approved_result,
-            Ok(_) | Err(VerifierError::Observation(_)) | Err(VerifierError::InvalidState(_))
-        ),
-        "the approved observation produced an unexpected error"
+    .await
+    .expect("legacy command must be blocked");
+    assert_eq!(
+        approved_result.tasks()[&approved.task_id].status(),
+        TaskStatus::Blocked
     );
     let _ = scope;
     for (create_target, sentinel, label) in &targets {
@@ -854,25 +843,10 @@ async fn review_gate_is_advisory_evidence_rechecked_by_host_verifier() {
     );
 }
 
-/// A host-approved pure-observation `COMMAND_EXIT` is judged on the
-/// requested command's own lifecycle.
-///
-/// `/usr/bin/true` is no longer a usable fixture: the authority admits exact
-/// read-only Git observation shapes only, and a generic executable is refused
-/// before it is spawned.
-///
-/// This is `#[cfg(not(windows))]` because the command path is approval-gated on
-/// Windows — `primary_execution_mode()` is `HostNative` there, so
-/// `start_command` asks the local approval channel before it spawns, and this
-/// fixture deliberately runs no approval responder. On Linux and macOS the
-/// sandbox is a separate wrapper, and the wrapper's exit says nothing about
-/// whether the requested command ran, so the check fails closed. That is the
-/// frozen lifecycle contract, not a platform regression. The Windows approval
-/// path itself is covered by the managed-worktree integration test, which spawns
-/// a real approval responder.
-#[cfg(not(windows))]
+/// A legacy COMMAND_EXIT that was once host-approved cannot execute after the
+/// product decision to require mechanically evaluated verification.
 #[tokio::test]
-async fn command_exit_runs_only_a_host_approved_observation_and_needs_a_proven_start() {
+async fn legacy_command_exit_is_blocked_even_for_host_git_observation_shape() {
     let fixture = read_fixture(
         vec![VerificationSpec::CommandExit {
             command: vec![
@@ -900,14 +874,23 @@ async fn command_exit_runs_only_a_host_approved_observation_and_needs_a_proven_s
     )
     .await
     .unwrap();
-    let status = result.tasks()[&fixture.task_id].status();
-    // A sandbox wrapper carried the request and its completion is not proof that
-    // `git rev-parse --show-toplevel` ran, so the check never passes.
-    assert_eq!(status, TaskStatus::Blocked);
+    assert_eq!(
+        result.tasks()[&fixture.task_id].status(),
+        TaskStatus::Blocked
+    );
+    assert_eq!(
+        result.tasks()[&fixture.task_id].status(),
+        TaskStatus::Blocked
+    );
+    for _ in 0..3 {
+        assert!(!matches!(
+            crate::scheduler::select_next_action(&result).unwrap(),
+            crate::scheduler::SchedulerDecision::VerifyTask { .. }
+        ));
+    }
 }
 
-/// A command the host cannot place in the verifier-safe observation class is
-/// refused before anything is spawned, and the refusal changes no durable state.
+/// Unsupported legacy commands are all durably blocked without spawning.
 #[tokio::test]
 async fn unapproved_verification_commands_are_refused_before_spawn() {
     for command in [
@@ -982,15 +965,12 @@ async fn unapproved_verification_commands_are_refused_before_spawn() {
             before.revision(),
         )
         .await;
-        assert!(
-            matches!(result, Err(VerifierError::InvalidState(_))),
-            "{command:?} must be refused before spawn"
+        let after = result.expect("legacy COMMAND_EXIT must be blocked without spawn");
+        assert_eq!(
+            after.tasks()[&fixture.task_id].status(),
+            TaskStatus::Blocked
         );
-        let after = fixture
-            .store
-            .load_goal(&fixture.session.id, &fixture.goal_id)
-            .unwrap();
-        assert_eq!(after, before, "{command:?} changed durable state");
+        assert!(after.revision() > before.revision());
     }
 }
 
@@ -1082,19 +1062,10 @@ fn read_only_command_metadata_cannot_override_a_mutating_argv() {
         ),
         SideEffectClass::LocalMutation
     );
-    // And the Verifier's own authority refuses it independently of any label.
-    assert!(
-        crate::verifier_command_authority::classify(&[
-            "git".to_owned(),
-            "branch".to_owned(),
-            "new-name".to_owned()
-        ])
-        .is_err()
-    );
 }
 
 #[tokio::test]
-async fn mutating_verification_command_is_rejected_without_state_change() {
+async fn mutating_legacy_verification_command_is_blocked_without_spawn() {
     let fixture = read_fixture(
         vec![VerificationSpec::CommandExit {
             command: vec!["git".into(), "commit".into()],
@@ -1116,12 +1087,12 @@ async fn mutating_verification_command_is_rejected_without_state_change() {
         before.revision(),
     )
     .await;
-    assert!(matches!(result, Err(VerifierError::InvalidState(_))));
-    let after = fixture
-        .store
-        .load_goal(&fixture.session.id, &fixture.goal_id)
-        .unwrap();
-    assert_eq!(after, before);
+    let after = result.expect("legacy mutation proposal is durably blocked");
+    assert_eq!(
+        after.tasks()[&fixture.task_id].status(),
+        TaskStatus::Blocked
+    );
+    assert!(after.revision() > before.revision());
 }
 
 #[tokio::test]
@@ -1578,21 +1549,193 @@ async fn git_scope_and_forbidden_changes_are_host_observed() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn verification_command_timeout_is_bounded_and_never_passes() {
-    let fixture = read_fixture(
-        vec![VerificationSpec::StructuredEvidence {
-            requirement_id: "ok".into(),
+async fn forbidden_rename_destination_is_refused_by_production_scope_gate() {
+    let root = temp_dir("forbidden-destination-rename");
+    let session = config::Session {
+        id: Uuid::new_v4().to_string(),
+        cwd: root.clone(),
+        permitted_directories: vec![root.clone()],
+    };
+    let forbidden = root.join("ab forbidden destination.txt");
+    let scope = TaskScope::new(
+        vec![root.join("allowed source.txt")],
+        vec![forbidden.clone()],
+        TaskOperationKind::ReadOnly,
+        ReplaySafety::SafeReadOnly,
+    );
+    let fixture = read_fixture_in(
+        vec![VerificationSpec::NoForbiddenChanges {
+            forbidden_paths: vec![forbidden.clone()],
         }],
         2,
-        vec![structured_ok("ok")],
+        vec![],
+        root.clone(),
+        scope,
+        session,
     );
-    let command = vec!["/bin/sleep".to_owned(), "1".to_owned()];
-    let result = crate::verifier::test_command_timeout(
-        &command,
-        &fixture.root,
+    init_git(&fixture.root);
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&fixture.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    git(&["config", "user.email", "verifier@example.invalid"]);
+    git(&["config", "user.name", "Verifier Test"]);
+    fs::write(fixture.root.join("allowed source.txt"), b"content\n").unwrap();
+    git(&["add", "--", "allowed source.txt"]);
+    git(&["commit", "-q", "-m", "add allowed source"]);
+    fs::rename(fixture.root.join("allowed source.txt"), &forbidden).unwrap();
+    let observed = crate::verifier_git_observation::observe(&fixture.root, &fixture.session)
+        .await
+        .expect("trusted Git observation parses real rename");
+    assert!(
+        observed
+            .changed
+            .contains(&fixture.root.join("allowed source.txt"))
+    );
+    assert!(observed.changed.contains(&forbidden));
+    assert!(
+        !crate::verifier::task_scope_allows_git_changes(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap()
+                .tasks()[&fixture.task_id]
+                .scope(),
+            &observed.changed,
+        ),
+        "the production TaskScope predicate must reject the forbidden rename destination"
+    );
+    let goal = fixture
+        .store
+        .load_goal(&fixture.session.id, &fixture.goal_id)
+        .unwrap();
+    let result = verify_task(
+        &fixture.store,
         &fixture.session,
-        std::time::Duration::from_millis(20),
+        &fixture.goal_id,
+        &fixture.task_id,
+        goal.revision(),
     )
-    .await;
-    assert!(matches!(result, Err(VerifierError::Observation(_))));
+    .await
+    .unwrap();
+    assert_eq!(
+        result.tasks()[&fixture.task_id].status(),
+        TaskStatus::Blocked
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn forbidden_rename_source_is_refused_by_production_scope_gate() {
+    let root = temp_dir("forbidden-rename");
+    init_git(&root);
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["config", "user.email", "verifier@example.invalid"]);
+    git(&["config", "user.name", "Verifier Test"]);
+    fs::write(root.join("ab forbidden.txt"), b"forbidden\n").unwrap();
+    git(&["add", "--", "ab forbidden.txt"]);
+    git(&["commit", "-q", "-m", "add forbidden source"]);
+    fs::rename(root.join("ab forbidden.txt"), root.join("allowed.txt")).unwrap();
+    let observed = crate::verifier_git_observation::observe(
+        &root,
+        &config::Session {
+            id: "rename-observation".to_owned(),
+            cwd: root.clone(),
+            permitted_directories: vec![root.clone()],
+        },
+    )
+    .await
+    .expect("trusted Git observation parses real rename");
+    assert!(observed.changed.contains(&root.join("ab forbidden.txt")));
+    assert!(observed.changed.contains(&root.join("allowed.txt")));
+    let scope = TaskScope::new(
+        vec![root.join("allowed.txt")],
+        vec![root.join("ab forbidden.txt")],
+        TaskOperationKind::ReadOnly,
+        ReplaySafety::SafeReadOnly,
+    );
+    assert!(
+        !crate::verifier::task_scope_allows_git_changes(&scope, &observed.changed),
+        "the production TaskScope predicate must reject the forbidden rename source"
+    );
+
+    let state = temp_dir("forbidden-rename-state");
+    let session = config::Session {
+        id: Uuid::new_v4().to_string(),
+        cwd: root.clone(),
+        permitted_directories: vec![root.clone()],
+    };
+    let mut goal = Goal::new(
+        session.id.clone(),
+        root.clone(),
+        "forbidden rename source",
+        None,
+        vec![],
+        vec!["forbidden paths remain unchanged".into()],
+        NOW,
+    )
+    .unwrap();
+    let task = Task::new(
+        "rename",
+        "rename forbidden file",
+        true,
+        WorkerKind::CodexReadonly,
+        scope,
+        vec![VerificationSpec::NoForbiddenChanges {
+            forbidden_paths: vec![root.join("ab forbidden.txt")],
+        }],
+        2,
+        1,
+        NOW,
+    )
+    .unwrap();
+    let task_id = task.id().clone();
+    goal.materialize_initial_plan(vec![task], NOW).unwrap();
+    goal.transition_task(
+        &task_id,
+        TaskStatus::Running,
+        TaskTransitionContext::default(),
+        NOW,
+    )
+    .unwrap();
+    goal.transition_task(
+        &task_id,
+        TaskStatus::Verifying,
+        TaskTransitionContext::default(),
+        NOW,
+    )
+    .unwrap();
+    let goal_id = goal.id().clone();
+    let store = TaskStore::with_state_root(state.clone());
+    store.create_goal(&goal).unwrap();
+    let result = verify_task(&store, &session, &goal_id, &task_id, 1)
+        .await
+        .expect("verifier commits the forbidden-path refusal");
+    assert_eq!(result.tasks()[&task_id].status(), TaskStatus::Blocked);
+    assert_eq!(
+        result.tasks()[&task_id]
+            .verification_results()
+            .last()
+            .unwrap()
+            .outcome(),
+        crate::task::VerificationOutcome::Indeterminate
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(state).unwrap();
 }

@@ -3057,13 +3057,8 @@ mod tests {
     }
 
     #[test]
-    fn replay_with_same_rejection_id_but_different_effective_digest_is_rejected() {
+    fn replanner_rejects_command_exit_without_mutating_durable_goal() {
         let fixture = pre_execution_rejection_fixture();
-        let goal = fixture
-            .store
-            .load_goal(&fixture.session.id, &fixture.goal_id)
-            .unwrap();
-        let criterion_id = goal.completion_criteria()[0].id().as_str().to_owned();
         let mut proposal = proposal_value(&fixture);
         proposal["add_tasks"] = json!([read_only_task("replacement", vec![])]);
         proposal["add_tasks"][0]["verification"] = json!([{
@@ -3074,24 +3069,12 @@ mod tests {
         }]);
         proposal["add_dependencies"] = json!([]);
         proposal["resolve_needs_replan"] = json!([]);
-        proposal["pristine_plan_supersession"] = json!({
-            "rejection_request_id": "rejection-feedback-1",
-            "criterion_rebindings": [{"criterion_id": criterion_id, "replacement_task_refs": [new_ref("replacement")]}]
-        });
-        apply(&fixture, &serde_json::to_vec(&proposal).unwrap()).unwrap();
-        proposal["add_tasks"][0]["verification"][0]["command"] = json!(["a", "printf"]);
         let before = bytes(&fixture);
-        let replay = materialize_replan_output(
-            &fixture.store,
-            &fixture.session,
-            &fixture.goal_id,
-            goal.revision(),
-            goal.plan_revision(),
-            &serde_json::to_vec(&proposal).unwrap(),
-        );
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap());
         assert!(matches!(
-            replay,
-            Err(ReplannerError::ReplanAuthorityViolation(_))
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(reason))
+                if reason.contains("COMMAND_EXIT verification is currently unsupported")
         ));
         assert_eq!(bytes(&fixture), before);
     }

@@ -143,11 +143,13 @@ fn all_production_adapters_use_fixed_roles_and_return_exact_raw_model_bytes() {
     assert!(calls[0].prompt().contains("SAFE_READ_ONLY"));
     assert!(calls[0].prompt().contains("VERIFY_BEFORE_RETRY"));
     assert!(calls[0].prompt().contains("NEVER_AUTOMATIC"));
-    assert!(calls[0].prompt().contains("command:[\"argv0\",\"arg1\"]"));
+    assert!(calls[0].prompt().contains(
+        "COMMAND_EXIT remains decodable for legacy durable state but is unsupported for new plans"
+    ));
     assert!(
         calls[0]
             .prompt()
-            .contains("requires 1..=64 non-empty paths")
+            .contains("use mechanically evaluated verification specifications instead")
     );
     assert!(
         calls[0]

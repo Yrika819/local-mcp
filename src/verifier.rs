@@ -2,13 +2,13 @@ use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config;
-use crate::execution;
+
 use crate::fallback::SideEffectState;
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::orchestrator_error::OrchestratorError;
@@ -18,11 +18,10 @@ use crate::task::{
     VerificationSpec,
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
-use crate::verifier_command_authority::{self, VerifierCommandClass};
+
 use crate::verifier_git_observation::{self, GitObservation};
 
 const VERIFIER_SOURCE: &str = "HOST_DETERMINISTIC_VERIFIER";
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) struct VerifierCompletionAuthority {
     _private: (),
@@ -163,19 +162,10 @@ struct Check {
     evidence: Vec<TaskEvidence>,
 }
 
-#[derive(Clone, Debug)]
+#[cfg(test)]
 struct CommandObservation {
-    request_id: String,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    /// Whether the **requested command** provably ran to completion.
-    ///
-    /// This is the requested-command lifecycle, never the sandbox wrapper's.
     command_finished: bool,
-    /// Host-owned requested-command start proof, retained for the failure fact.
     command_start_proof: String,
-    execution_error: Option<String>,
 }
 
 pub(crate) async fn verify_task(
@@ -388,7 +378,7 @@ pub(crate) async fn evaluate(
 async fn evaluate_spec(
     spec: &VerificationSpec,
     snapshot: &Snapshot,
-    session: &config::Session,
+    _session: &config::Session,
     git: Option<&GitObservation>,
 ) -> Result<Check, VerifierError> {
     match spec {
@@ -510,67 +500,12 @@ async fn evaluate_spec(
                 }),
             }
         }
-        VerificationSpec::CommandExit {
-            command,
-            cwd,
-            accepted_exit_codes,
-        } => {
-            // Refused before anything is spawned unless the host can positively
-            // place this exact argv in the verifier-safe observation class.
-            let VerifierCommandClass::PureObservation =
-                verifier_command_authority::classify(command).map_err(|rejection| {
-                    VerifierError::InvalidState(rejection.detail().to_owned())
-                })?;
-            let cwd = cwd
-                .as_ref()
-                .map(|value| resolve_path(value, &snapshot.cwd))
-                .transpose()?
-                .unwrap_or_else(|| snapshot.cwd.clone());
-            if !cwd.is_dir() {
-                return Ok(Check {
-                    passed: false,
-                    detail: format!("verification cwd {} is not a directory", cwd.display()),
-                    disposition: Disposition::Blocked,
-                    evidence: Vec::new(),
-                });
-            }
-            // The model proposes the argv; the host decides the binary. Without
-            // this substitution a repository could plant an executable named
-            // `git` and the approved argv shape would run it instead, with the
-            // Session's own writable roots.
-            let argv = host_git_argv(command)?;
-            let observed =
-                run_command(&argv, &cwd, accepted_exit_codes, session, COMMAND_TIMEOUT).await?;
-            // Success requires the requested command's own completion. Where the
-            // sandbox is carried by a wrapper, the wrapper's exit says nothing
-            // about whether the requested command ran, so an unproven run fails
-            // closed instead of being read as a passing observation.
-            let passed = observed.command_finished
-                && observed.execution_error.is_none()
-                && observed
-                    .exit_code
-                    .is_some_and(|code| accepted_exit_codes.contains(&code));
-            Ok(Check {
-                passed,
-                detail: format!(
-                    "verification command exit {:?} with requested-command start proof {}; accepted {:?}",
-                    observed.exit_code, observed.command_start_proof, accepted_exit_codes
-                ),
-                disposition: if passed {
-                    Disposition::Pass
-                } else if observed.command_finished {
-                    Disposition::Retryable
-                } else {
-                    Disposition::Blocked
-                },
-                evidence: vec![TaskEvidence::CommandResult {
-                    request_id: observed.request_id,
-                    exit_code: observed.exit_code,
-                    stdout_digest: Some(hash_bytes(observed.stdout.as_bytes())),
-                    stderr_digest: Some(hash_bytes(observed.stderr.as_bytes())),
-                }],
-            })
-        }
+        VerificationSpec::CommandExit { .. } => Ok(Check {
+            passed: false,
+            detail: "legacy COMMAND_EXIT verification is unsupported; no command was spawned; replace it with mechanically evaluated verification specifications".to_owned(),
+            disposition: Disposition::Blocked,
+            evidence: Vec::new(),
+        }),
         VerificationSpec::GitScope {
             allowed_changed_paths,
             require_no_other_changes,
@@ -969,95 +904,12 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Replace the proposal's `argv[0]` with the host-resolved Git identity.
-///
-/// The model chooses the observation, never the executable. The authority layer
-/// has already refused anything whose file name is not Git, but a name is not an
-/// identity: `./git` inside the repository, or any absolute path, would
-/// otherwise select a program the host never resolved. This substitution is the
-/// point where the executable becomes host-owned.
-fn host_git_argv(command: &[String]) -> Result<Vec<String>, VerifierError> {
-    let host_git = execution::host_git_path().map_err(|error| {
-        VerifierError::InvalidState(format!("host Git is unavailable: {error:#}"))
-    })?;
-    let host_git = host_git.to_str().ok_or_else(|| {
-        VerifierError::InvalidState("host Git path is not valid UTF-8".to_owned())
-    })?;
-    let mut argv = Vec::with_capacity(command.len());
-    argv.push(host_git.to_owned());
-    argv.extend_from_slice(&command[1..]);
-    Ok(argv)
-}
-
-async fn run_command(
-    command: &[String],
-    cwd: &Path,
-    accepted: &[i32],
-    session: &config::Session,
-    timeout: Duration,
-) -> Result<CommandObservation, VerifierError> {
-    let args = json!({
-        "command": command,
-        "cwd": cwd.to_string_lossy(),
-        "accepted_exit_codes": accepted,
-        "fallback_depth": 0,
-    });
-    let execution = execution::start_command(&args, session)
-        .await
-        .map_err(|error| VerifierError::Observation(format!("command launch failed: {error:#}")))?;
-    await_execution(execution, timeout).await
-}
-
-async fn await_execution(
-    mut execution: execution::BackgroundExecution,
-    timeout: Duration,
-) -> Result<CommandObservation, VerifierError> {
-    match tokio::time::timeout(timeout, &mut execution.handle).await {
-        Ok(Ok(Ok(payload))) => parse_execution_payload(&payload),
-        Ok(Ok(Err(error))) => parse_execution_payload(&error.to_string()).map_err(|_| {
-            VerifierError::Observation(format!(
-                "command failed without structured evidence: {error:#}"
-            ))
-        }),
-        Ok(Err(error)) => Err(VerifierError::Observation(format!(
-            "command join failed: {error}"
-        ))),
-        Err(_) => {
-            execution.handle.abort();
-            Err(VerifierError::Observation(
-                "verification command exceeded bounded timeout".to_owned(),
-            ))
-        }
-    }
-}
-
+#[cfg(test)]
 fn parse_execution_payload(text: &str) -> Result<CommandObservation, VerifierError> {
     let value: Value = serde_json::from_str(text).map_err(|_| {
         VerifierError::Observation("execution authority returned malformed evidence".to_owned())
     })?;
-    let request_id = value
-        .get("request_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            VerifierError::Observation("execution evidence lacks request_id".to_owned())
-        })?
-        .to_owned();
     Ok(CommandObservation {
-        request_id,
-        exit_code: value
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .and_then(|code| i32::try_from(code).ok()),
-        stdout: value
-            .get("stdout")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        stderr: value
-            .get("stderr")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
         // The execution layer keeps the requested command's lifecycle separate
         // from the sandbox wrapper's, and only the requested command's own
         // completion can satisfy a verification check. `sandbox_process_finished`
@@ -1073,10 +925,6 @@ fn parse_execution_payload(text: &str) -> Result<CommandObservation, VerifierErr
             .and_then(Value::as_str)
             .unwrap_or("UNAVAILABLE")
             .to_owned(),
-        execution_error: value
-            .get("execution_error")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
     })
 }
 
@@ -1099,18 +947,6 @@ async fn observe_git(
 )]
 pub(crate) fn resolve_git_path_for_test(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
     verifier_git_observation::resolve_git_path(raw, root).map_err(VerifierError::Observation)
-}
-
-#[cfg(all(test, not(windows)))]
-pub(crate) async fn test_command_timeout(
-    command: &[String],
-    cwd: &Path,
-    session: &config::Session,
-    timeout: Duration,
-) -> Result<(), VerifierError> {
-    run_command(command, cwd, &[0], session, timeout)
-        .await
-        .map(|_| ())
 }
 
 /// The requested-command lifecycle facts the Verifier derives from an execution

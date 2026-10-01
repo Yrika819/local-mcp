@@ -634,6 +634,41 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> std::result::Result<Output, RunError> {
+    let output = run_unrestricted_clean_raw_with_limits(
+        command,
+        cwd,
+        stdin,
+        timeout,
+        stdout_limit,
+        stderr_limit,
+    )
+    .await?;
+    Ok(Output {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        command_start: output.command_start,
+    })
+}
+
+/// The bounded trusted-process result before any text decoding.
+#[derive(Debug)]
+pub(crate) struct RawOutput {
+    pub(crate) status: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) command_start: CommandStart,
+}
+
+/// Run a bounded trusted command while preserving stdout bytes for path authority.
+pub(crate) async fn run_unrestricted_clean_raw_with_limits(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> std::result::Result<RawOutput, RunError> {
     if command.is_empty() {
         return Err(RunError::new(
             anyhow::anyhow!("command must not be empty"),
@@ -820,10 +855,10 @@ pub(crate) async fn run_unrestricted_clean_with_limits(
             return Err(RunError::new(anyhow::anyhow!("{error}"), true, finished));
         }
     };
-    Ok(Output {
+    Ok(RawOutput {
         status: status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout,
+        stderr,
         command_start: CommandStart::Proven,
     })
 }

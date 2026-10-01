@@ -32,8 +32,7 @@ pub(crate) const MAX_SCOPE_PATHS_TOTAL: usize = 1024;
 pub(crate) const MAX_VERIFICATION_PER_TASK: usize = 32;
 pub(crate) const MAX_VERIFICATION_TOTAL: usize = 1024;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
-pub(crate) const MAX_COMMAND_ARGS: usize = 64;
-pub(crate) const MAX_COMMAND_ARG_BYTES: usize = 8192;
+
 pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize = 128;
 
 /// Host-visible compact read-only output contract. Reused verbatim by the
@@ -863,57 +862,10 @@ pub(crate) fn validate_and_normalize_verification(
     goal_root: &Path,
 ) -> Result<VerificationSpec, PlannerError> {
     match spec {
-        VerificationSpec::CommandExit {
-            command,
-            cwd,
-            accepted_exit_codes,
-        } => {
-            if command.is_empty() || command.len() > MAX_COMMAND_ARGS {
-                return Err(PlannerError::PlannerSchemaViolation(
-                    "COMMAND_EXIT requires 1..=64 argv entries".to_owned(),
-                ));
-            }
-            if command
-                .iter()
-                .any(|arg| arg.is_empty() || arg.len() > MAX_COMMAND_ARG_BYTES)
-            {
-                return Err(PlannerError::PlannerSchemaViolation(
-                    "COMMAND_EXIT argv entries must be non-empty and at most 8192 bytes".to_owned(),
-                ));
-            }
-            if accepted_exit_codes.is_empty() || accepted_exit_codes.len() > 32 {
-                return Err(PlannerError::PlannerSchemaViolation(
-                    "COMMAND_EXIT requires 1..=32 accepted exit codes".to_owned(),
-                ));
-            }
-            let unique = accepted_exit_codes.iter().copied().collect::<BTreeSet<_>>();
-            if unique.len() != accepted_exit_codes.len() {
-                return Err(PlannerError::PlannerSchemaViolation(
-                    "COMMAND_EXIT contains duplicate accepted exit codes".to_owned(),
-                ));
-            }
-            // A plan the host can never verify must not be materialized. The
-            // Verifier refuses anything outside the host-owned observation
-            // authority before it spawns, and refusing there would abort the
-            // verification run with the Task left in VERIFYING — which the
-            // scheduler keeps re-selecting. Refusing the plan here instead makes
-            // the problem a bounded, recoverable plan rejection.
-            crate::verifier_command_authority::classify(&command).map_err(|rejection| {
-                PlannerError::PlannerSchemaViolation(format!(
-                    "COMMAND_EXIT is not an approved pure-observation command: {}. {}",
-                    rejection.detail(),
-                    crate::verifier_command_authority::APPROVED_TAILS_HINT
-                ))
-            })?;
-            let cwd = cwd
-                .map(|path| normalize_planner_path(&path, goal_root, false))
-                .transpose()?;
-            Ok(VerificationSpec::CommandExit {
-                command,
-                cwd,
-                accepted_exit_codes,
-            })
-        }
+        VerificationSpec::CommandExit { .. } => Err(PlannerError::PlannerSchemaViolation(
+            "COMMAND_EXIT verification is currently unsupported; use mechanically evaluated verification specifications instead".to_owned(),
+        )),
+
         VerificationSpec::FileExists { path, must_be_file } => Ok(VerificationSpec::FileExists {
             path: normalize_planner_path(&path, goal_root, false)?,
             must_be_file,
@@ -1205,39 +1157,6 @@ mod tests {
             assert!(
                 matches!(result, Err(PlannerError::PlannerSchemaViolation(_))),
                 "{command:?} must be refused when the plan is materialized"
-            );
-        }
-        for command in [
-            vec![
-                "git".to_owned(),
-                "rev-parse".to_owned(),
-                "--show-toplevel".to_owned(),
-            ],
-            vec![
-                "git".to_owned(),
-                "branch".to_owned(),
-                "--show-current".to_owned(),
-            ],
-            vec![
-                "git".to_owned(),
-                "--no-optional-locks".to_owned(),
-                "worktree".to_owned(),
-                "list".to_owned(),
-                "--porcelain".to_owned(),
-                "-z".to_owned(),
-            ],
-        ] {
-            assert!(
-                validate_and_normalize_verification(
-                    VerificationSpec::CommandExit {
-                        command: command.clone(),
-                        cwd: None,
-                        accepted_exit_codes: vec![0],
-                    },
-                    &root,
-                )
-                .is_ok(),
-                "{command:?} is an approved pure observation"
             );
         }
     }

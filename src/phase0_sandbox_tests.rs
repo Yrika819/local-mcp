@@ -289,6 +289,28 @@ async fn bounded_clean_runner_rejects_stderr_overflow() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn bounded_clean_raw_runner_preserves_non_utf8_stdout_bytes() {
+    let root = std::env::temp_dir().join(format!("local-mcp-bounded-raw-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = executable_script(&root, "raw.sh", "#!/bin/sh\nprintf '\\377'\n");
+    let output = sandbox::run_unrestricted_clean_raw_with_limits(
+        &script_command(&script),
+        &root,
+        None,
+        Duration::from_secs(2),
+        1024,
+        1024,
+    )
+    .await
+    .expect("bounded raw child should complete");
+    assert_eq!(output.status, 0);
+    assert_eq!(output.stdout, vec![0xff]);
+    assert!(output.command_start.is_proven());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn bounded_clean_runner_preserves_normal_output() {
     let root = std::env::temp_dir().join(format!("local-mcp-bounded-clean-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();

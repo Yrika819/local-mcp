@@ -40,7 +40,6 @@ mod secure_fs;
 mod task;
 mod task_store;
 mod verifier;
-mod verifier_command_authority;
 mod verifier_git_observation;
 mod worker_capability;
 mod writer;

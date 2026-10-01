@@ -28,6 +28,7 @@
 //! arbitrary argv here.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -151,7 +152,11 @@ pub(crate) async fn observe_with_policy(
     if !top.succeeded() {
         return Err("Goal cwd is not an observable Git worktree".to_owned());
     }
-    let git_root = config::canonical_path_like(Path::new(top.stdout.trim()), root)
+    let top_path = parse_single_path_line(&top.stdout)?;
+    if !top_path.is_absolute() {
+        return Err("Git root output is not an absolute filesystem path".to_owned());
+    }
+    let git_root = config::canonical_path_like(&top_path, root)
         .map_err(|error| format!("cannot canonicalize Git root: {error}"))?;
     if !root.starts_with(&git_root) {
         return Err("Git root does not contain Goal cwd".to_owned());
@@ -176,8 +181,7 @@ pub(crate) async fn observe_with_policy(
         .await
         .ok()
         .filter(GitOutput::succeeded)
-        .map(|output| output.stdout.trim().to_owned())
-        .filter(|value| !value.is_empty());
+        .and_then(|output| parse_head_oid(&output.stdout).ok());
 
     Ok(GitObservation {
         head,
@@ -188,7 +192,7 @@ pub(crate) async fn observe_with_policy(
 }
 
 struct GitOutput {
-    stdout: String,
+    stdout: Vec<u8>,
     exit_code: i32,
 }
 
@@ -243,7 +247,7 @@ async fn run(
         )),
     )
     .await;
-    let output = sandbox::run_unrestricted_clean_with_limits(
+    let output = sandbox::run_unrestricted_clean_raw_with_limits(
         &argv,
         cwd,
         None,
@@ -267,40 +271,137 @@ async fn run(
     })
 }
 
-fn parse_status_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
+fn nul_records(stdout: &[u8]) -> Result<Vec<&[u8]>, String> {
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(payload) = stdout.strip_suffix(&[0]) else {
+        return Err("Git returned an unterminated NUL record".to_owned());
+    };
+    let records = payload.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if records.iter().any(|record| record.is_empty()) {
+        return Err("Git returned an empty NUL record".to_owned());
+    }
+    Ok(records)
+}
+
+fn valid_xy(index: u8, worktree: u8) -> bool {
+    let ordinary = |status| {
+        matches!(
+            status,
+            b' ' | b'M' | b'T' | b'A' | b'D' | b'R' | b'C' | b'U'
+        )
+    };
+    (ordinary(index) && ordinary(worktree) && (index != b' ' || worktree != b' '))
+        || (index == b'?' && worktree == b'?')
+        || (index == b'!' && worktree == b'!')
+}
+
+fn parse_status_paths(stdout: &[u8], root: &Path) -> Result<Vec<PathBuf>, String> {
+    let records = nul_records(stdout)?;
     let mut paths = BTreeSet::new();
-    for token in stdout.split('\0').filter(|token| !token.is_empty()) {
-        let bytes = token.as_bytes();
-        let raw = if bytes.len() >= 3 && bytes[2] == b' ' {
-            &token[3..]
-        } else {
-            token
-        };
-        paths.insert(resolve_git_path(raw, root)?);
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.len() < 4 || record[2] != b' ' || !valid_xy(record[0], record[1]) {
+            return Err("Git returned malformed porcelain status".to_owned());
+        }
+        let first_path = &record[3..];
+        if first_path.is_empty() {
+            return Err("Git returned an empty porcelain path".to_owned());
+        }
+        paths.insert(resolve_git_path_bytes(first_path, root)?);
+        if matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C') {
+            index += 1;
+            let second_path = records
+                .get(index)
+                .copied()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| "Git rename/copy record omitted its source path".to_owned())?;
+            paths.insert(resolve_git_path_bytes(second_path, root)?);
+        }
+        index += 1;
     }
     Ok(paths.into_iter().collect())
 }
 
-fn parse_nul_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
+fn parse_nul_paths(stdout: &[u8], root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = BTreeSet::new();
-    for token in stdout.split('\0').filter(|token| !token.is_empty()) {
-        paths.insert(resolve_git_path(token, root)?);
+    for record in nul_records(stdout)? {
+        paths.insert(resolve_git_path_bytes(record, root)?);
     }
     Ok(paths.into_iter().collect())
+}
+
+fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(OsString::from_vec(raw.to_vec())))
+    }
+    #[cfg(windows)]
+    {
+        let value = std::str::from_utf8(raw)
+            .map_err(|_| "Git path bytes are not representable losslessly on Windows".to_owned())?;
+        Ok(PathBuf::from(OsString::from(value)))
+    }
+}
+
+fn resolve_git_path_bytes(raw: &[u8], root: &Path) -> Result<PathBuf, String> {
+    let path = path_from_git_bytes(raw)?;
+    if path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
+    {
+        return Err("Git emitted an unsafe path".to_owned());
+    }
+    canonicalize_existing_prefix(&root.join(path), root)
+}
+
+fn parse_single_path_line(stdout: &[u8]) -> Result<PathBuf, String> {
+    let Some(line) = stdout.strip_suffix(b"\n") else {
+        return Err("Git root output is not a single newline-terminated path".to_owned());
+    };
+    if line.is_empty() || line.contains(&0) || line.contains(&b'\n') || line.contains(&b'\r') {
+        return Err("Git root output contains ambiguous path framing".to_owned());
+    }
+    path_from_git_bytes(line)
+}
+
+fn parse_head_oid(stdout: &[u8]) -> Result<String, String> {
+    let Some(oid) = stdout.strip_suffix(b"\n") else {
+        return Err("Git HEAD output is not newline terminated".to_owned());
+    };
+    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
+        return Err("Git HEAD output is not an ASCII object ID".to_owned());
+    }
+    String::from_utf8(oid.to_vec()).map_err(|_| "Git HEAD output is not ASCII".to_owned())
 }
 
 /// Resolve a Git-emitted path against the observed root.
 ///
-/// A literal absolute path or a `..` component is refused outright. A symlink is
+/// Absolute, rooted, drive-prefixed, or `..` paths are refused before joining. A symlink is
 /// different: canonicalization follows it, so a tracked link pointing out of the
 /// worktree resolves to its target rather than to the link. That is
 /// fail-closed rather than permissive, because such a path matches none of the
 /// durable allowed boundaries and is therefore reported as out of scope — but
 /// it is not "rejected", and callers must not read the refusal above as the
 /// whole containment story.
+#[cfg(test)]
 pub(crate) fn resolve_git_path(raw: &str, root: &Path) -> Result<PathBuf, String> {
     let path = Path::new(raw);
-    if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+    if path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
+    {
         return Err("Git emitted an unsafe path".to_owned());
     }
     canonicalize_existing_prefix(&root.join(path), root)
@@ -641,6 +742,148 @@ mod tests {
             cfg!(windows),
             "the approval gate is platform policy, not a universal one"
         );
+    }
+
+    #[test]
+    fn porcelain_v1_z_parser_consumes_rename_and_copy_source_records_statefully() {
+        let root = temp_dir("porcelain-parser");
+        let cases: &[(&str, &[u8], &[&str])] = &[
+            ("modified", b" M ordinary.txt\0", &["ordinary.txt"]),
+            ("third-byte-space", b" M ab file.txt\0", &["ab file.txt"]),
+            (
+                "spaces",
+                b"?? path with spaces.txt\0",
+                &["path with spaces.txt"],
+            ),
+            (
+                "tab-newline",
+                b"?? tab\tand\nnewline\0",
+                &["tab\tand\nnewline"],
+            ),
+            ("untracked", b"?? new.txt\0", &["new.txt"]),
+            ("deleted", b" D gone.txt\0", &["gone.txt"]),
+            (
+                "rename",
+                b"R  destination.txt\0source.txt\0",
+                &["destination.txt", "source.txt"],
+            ),
+            (
+                "rename-third-byte-space",
+                b"R  ab destination.txt\0ab forbidden.txt\0",
+                &["ab destination.txt", "ab forbidden.txt"],
+            ),
+            (
+                "copy",
+                b" C copied.txt\0original.txt\0",
+                &["copied.txt", "original.txt"],
+            ),
+            (
+                "index-rename",
+                b"R  destination.txt\0source.txt\0",
+                &["destination.txt", "source.txt"],
+            ),
+            (
+                "worktree-rename",
+                b" R destination.txt\0source.txt\0",
+                &["destination.txt", "source.txt"],
+            ),
+        ];
+        for (name, bytes, expected) in cases {
+            let actual =
+                parse_status_paths(bytes, &root).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let expected = expected
+                .iter()
+                .map(|path| root.join(path))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                actual.into_iter().collect::<BTreeSet<_>>(),
+                expected,
+                "{name}"
+            );
+        }
+        for malformed in [
+            &b" M unterminated"[..],
+            &b" M path\0\0"[..],
+            &b" M path\0R  destination\0"[..],
+            &b"R  destination\0\0"[..],
+            &b"M "[..],
+            &b"xY path\0"[..],
+            &b"   path\0"[..],
+            &b"?  path\0"[..],
+            &b" M path\0bad-token\0"[..],
+            &b" M /absolute\0"[..],
+            &b" M ../escape\0"[..],
+        ] {
+            assert!(
+                parse_status_paths(malformed, &root).is_err(),
+                "{malformed:?}"
+            );
+        }
+        assert!(parse_nul_paths(b"file\0", &root).is_ok());
+        assert!(parse_nul_paths(b"../escape\0", &root).is_err());
+        assert!(parse_nul_paths(b"/absolute\0", &root).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn real_git_rename_preserves_both_paths_including_ab_space_source() {
+        let root = temp_dir("rename-real-git");
+        init_repo(&root);
+        std::fs::write(root.join("ab forbidden.txt"), b"forbidden\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new(execution::host_git_path().unwrap())
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("Git starts");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["add", "--", "ab forbidden.txt"]);
+        git(&["commit", "-q", "-m", "add forbidden source"]);
+        std::fs::rename(root.join("ab forbidden.txt"), root.join("renamed.txt")).unwrap();
+        let observed = observe_with_policy(&root, &session(&root), false)
+            .await
+            .expect("real rename observation succeeds");
+        assert!(observed.changed.contains(&root.join("ab forbidden.txt")));
+        assert!(observed.changed.contains(&root.join("renamed.txt")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rooted_and_drive_relative_git_paths_are_rejected_before_join() {
+        let root = temp_dir("windows-paths");
+        for unsafe_path in [b"C:outside.txt".as_slice(), b"\\rooted.txt".as_slice()] {
+            assert!(
+                resolve_git_path_bytes(unsafe_path, &root).is_err(),
+                "{unsafe_path:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_git_path_round_trips_losslessly() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let root = temp_dir("non-utf8");
+        init_repo(&root);
+        let name = OsString::from_vec(vec![b'n', b'o', b'n', b'u', b't', b'f', b'8', b'-', 0xff]);
+        let path = root.join(name);
+        if std::fs::write(&path, b"bytes\n").is_err() {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let observed = observe_with_policy(&root, &session(&root), false)
+            .await
+            .expect("raw Git path must be representable on Unix");
+        assert!(observed.changed.contains(&path));
+        assert_eq!(path.file_name().unwrap().as_bytes().last(), Some(&0xff));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(not(windows))]

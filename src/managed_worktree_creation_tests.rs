@@ -3189,16 +3189,10 @@ impl crate::writer::ReviewerBackend for CandidateReviewer {
 
 #[test]
 fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
-    // This plan deliberately carries no `COMMAND_EXIT` check. `COMMAND_EXIT` is
-    // pure observation, and a pure observation carried by a sandbox wrapper has
-    // no host-proven requested-command completion on Linux or macOS, so such a
-    // check can never pass there and the Task would block. On Windows the command
-    // path is also approval-gated. There is therefore no platform on which a
-    // managed `COMMAND_EXIT` completes today.
-    //
-    // The replacement coverage below is for the Verifier's own host-owned Git
-    // observation, which is what actually reports the managed execution root. The
-    // narrower property that a `COMMAND_EXIT` with `cwd: null` resolves to the
+    // This plan deliberately carries no `COMMAND_EXIT` check. Model-authored
+    // command verification is unsupported; the host-owned Git observation below
+    // is the mechanism that reports the managed execution root. The narrower
+    // property that a legacy `COMMAND_EXIT` with `cwd: null` resolves to the
     // execution root is no longer covered in managed mode, and the security
     // closure handoff records that as a known coverage gap.
     let mut fixture = Fixture::new("phase4-e2e-isolation");
