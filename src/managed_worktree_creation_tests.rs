@@ -3449,7 +3449,15 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
         .unwrap();
     assert_eq!(
         verified_second.tasks()[&second_task_id].status(),
-        crate::task::TaskStatus::Completed
+        crate::task::TaskStatus::Completed,
+        "second verification details: {}; evidence: {}; side_effect_state: {:?}",
+        serde_json::to_string(verified_second.tasks()[&second_task_id].verification_results())
+            .unwrap(),
+        serde_json::to_string(verified_second.tasks()[&second_task_id].evidence()).unwrap(),
+        verified_second.tasks()[&second_task_id]
+            .latest_attempt()
+            .unwrap()
+            .side_effect_state()
     );
     assert_eq!(git(&fixture.primary, &["status", "--porcelain"]), "");
 }
@@ -3554,7 +3562,7 @@ fn verifier_git_path_spelling_matches_managed_scope_and_primary_root_mode() {
     let escaped =
         crate::verifier::resolve_git_path_for_test("junction-escape/secret.txt", candidate)
             .unwrap();
-    assert!(escaped.starts_with(&std::fs::canonicalize(&outside).unwrap()));
+    assert!(escaped.starts_with(&crate::config::canonical_path(&outside).unwrap()));
     assert!(!escaped.starts_with(candidate));
     assert!(
         !crate::verifier::task_scope_allows_git_changes(&scope, &[escaped]),
