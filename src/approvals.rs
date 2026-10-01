@@ -255,16 +255,21 @@ async fn accept_test_approval_connection(
 pub(crate) async fn spawn_test_approval_responder(
     session_id: &str,
     expected_cwd: &Path,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
+) -> Result<(
+    tokio::task::JoinHandle<Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+)> {
     let path = config::socket_path(session_id)?;
     let expected_cwd = std::fs::canonicalize(expected_cwd)?;
     let mut listener = bind_listener(&path)?;
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
     let (probe_sender, probe_receiver) = tokio::sync::oneshot::channel();
+    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut stream = accept_test_approval_connection(&mut listener, ready_sender).await?;
         let mut probe_ready = Some(probe_sender);
         loop {
+            eprintln!("Windows test responder accepted a pipe connection");
             let mut line = String::new();
             let bytes_read = BufReader::new(&mut stream).read_line(&mut line).await?;
             if bytes_read == 0 {
@@ -276,17 +281,26 @@ pub(crate) async fn spawn_test_approval_responder(
                 continue;
             }
             let message: serde_json::Value = serde_json::from_str(&line)?;
-            anyhow::ensure!(message["type"] == "approval");
-            anyhow::ensure!(message["request"]["operation"] == "start_command");
-            let requested_cwd = message["request"]["cwd"]
-                .as_str()
-                .context("approval request omitted cwd")?;
-            anyhow::ensure!(
-                std::fs::canonicalize(requested_cwd)? == expected_cwd,
-                "Verifier command approval cwd did not match the managed candidate"
-            );
-            stream.write_all(b"allow\n").await?;
-            return Ok(());
+            eprintln!("Windows test responder message type={:?}", message["type"]);
+            match message["type"].as_str() {
+                Some("activity") => {}
+                Some("approval") => {
+                    anyhow::ensure!(message["request"]["operation"] == "start_command");
+                    let requested_cwd = message["request"]["cwd"]
+                        .as_str()
+                        .context("approval request omitted cwd")?;
+                    anyhow::ensure!(
+                        std::fs::canonicalize(requested_cwd)? == expected_cwd,
+                        "Verifier command approval cwd did not match the managed candidate"
+                    );
+                    stream.write_all(b"allow\n").await?;
+                }
+                other => anyhow::bail!("unexpected test approval message type: {other:?}"),
+            }
+            stream = tokio::select! {
+                _ = &mut shutdown_receiver => return Ok(()),
+                accepted = listener.accept() => accepted?,
+            };
         }
     });
     match ready_receiver.await {
@@ -323,13 +337,7 @@ pub(crate) async fn spawn_test_approval_responder(
         }
     }
     match probe_receiver.await {
-        Ok(Ok(())) => {
-            eprintln!(
-                "Windows test responder armed for real approval on {}",
-                path.display()
-            );
-            Ok(task)
-        }
+        Ok(Ok(())) => Ok((task, shutdown_sender)),
         Ok(Err(detail)) => {
             let _ = task.await;
             anyhow::bail!("test approval listener failed after probe: {detail}")
@@ -349,8 +357,16 @@ pub(crate) async fn spawn_test_approval_responder(
 pub(crate) async fn spawn_test_approval_responder(
     _session_id: &str,
     _expected_cwd: &Path,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    Ok(tokio::spawn(async { Ok(()) }))
+) -> Result<(
+    tokio::task::JoinHandle<Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+)> {
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = shutdown_receiver.await;
+        Ok(())
+    });
+    Ok((task, shutdown_sender))
 }
 
 /// Sends a one-way activity update to the `start` screen. Activity reporting is
