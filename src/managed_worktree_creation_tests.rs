@@ -3324,11 +3324,12 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
         .unwrap()
         .0
         .clone();
-    let revision_before_writer = fixture.goal(&goal_id).revision();
-    let result = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .unwrap();
+    let revision_before_writer = fixture.goal(&goal_id).revision();
+    let result = runtime
         .block_on(crate::writer::run_writer_attempt(
             &fixture.store,
             &fixture.session,
@@ -3356,36 +3357,21 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
     assert_eq!(git(&fixture.primary, &["status", "--porcelain"]), "");
     assert_eq!(result.cwd(), fixture.primary);
 
-    let verified = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            let (approval_responder, stop_approval_responder) =
-                crate::approvals::spawn_test_approval_responder(&fixture.session.id, &candidate)
-                    .await
-                    .unwrap();
-            let verification = crate::verifier::verify_task(
-                &fixture.store,
-                &fixture.session,
-                &goal_id,
-                &task_id,
-                result.revision(),
-            )
-            .await;
-            match verification {
-                Ok(verified) => {
-                    let _ = stop_approval_responder.send(());
-                    approval_responder.await.unwrap().unwrap();
-                    verified
-                }
-                Err(error) => {
-                    let _ = stop_approval_responder.send(());
-                    approval_responder.abort();
-                    panic!("Verifier failed: {error}");
-                }
-            }
-        });
+    let (approval_responder, stop_approval_responder) = runtime
+        .block_on(crate::approvals::spawn_test_approval_responder(
+            &fixture.session.id,
+            &candidate,
+        ))
+        .unwrap();
+    let verified = runtime
+        .block_on(crate::verifier::verify_task(
+            &fixture.store,
+            &fixture.session,
+            &goal_id,
+            &task_id,
+            result.revision(),
+        ))
+        .unwrap();
     assert_eq!(
         verified.tasks()[&task_id].status(),
         crate::task::TaskStatus::Completed,
@@ -3413,10 +3399,7 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
             },
         )
         .unwrap();
-    let second_result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+    let second_result = runtime
         .block_on(crate::writer::run_writer_attempt(
             &fixture.store,
             &fixture.session,
@@ -3435,10 +3418,7 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
         std::fs::read(candidate.join("src/foo.rs")).unwrap(),
         b"candidate-second\n"
     );
-    let verified_second = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+    let verified_second = runtime
         .block_on(crate::verifier::verify_task(
             &fixture.store,
             &fixture.session,
@@ -3447,6 +3427,8 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
             second_result.revision(),
         ))
         .unwrap();
+    let _ = stop_approval_responder.send(());
+    runtime.block_on(approval_responder).unwrap().unwrap();
     assert_eq!(
         verified_second.tasks()[&second_task_id].status(),
         crate::task::TaskStatus::Completed,
