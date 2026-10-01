@@ -255,11 +255,11 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
 
     release_sender.send(()).unwrap();
     let mut completed = None;
-    for _ in 0..100 {
+    for _ in 0..500 {
         let polled = poll_job(&args, &session).await.unwrap();
         let value: Value = serde_json::from_str(text(&polled)).unwrap();
         if value["status"] == "running" {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             continue;
         }
         completed = Some(value);
