@@ -593,30 +593,14 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
         };
     }
 
-    if contains_any(
-        &combined,
-        &[
-            "operation not permitted",
-            "permission denied",
-            "unauthorizedaccessexception",
-            "socketexception",
-            "sandbox",
-            "failed to create .git/index.lock",
-            "unable to create '.git/index.lock'",
-            "cannot assign requested address",
-            "network is unreachable",
-        ],
-    ) {
-        return Classification {
-            failure_class: if input.primary_execution_mode == PrimaryExecutionMode::Sandboxed {
-                FailureClass::SandboxPermission
-            } else {
-                FailureClass::HostEnvironment
-            },
-            safety_signal: false,
-        };
-    }
-
+    // A missing executable is a missing tool, whatever carried the request. On
+    // macOS the sandbox wrapper reports it as
+    // `sandbox-exec: execvp() of 'x' failed: No such file or directory`, and the
+    // literal launcher name in that message is not evidence of a permission
+    // decision, so this evidence is weighed before any permission marker. The
+    // check is still gated on the requested command not being host-proven to
+    // have started, exactly as before: a command that provably ran is not
+    // missing, whatever its own output claims.
     if (!input.lifecycle.command_started()
         && contains_any(
             &combined,
@@ -631,6 +615,36 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
     {
         return Classification {
             failure_class: FailureClass::ToolMissing,
+            safety_signal: false,
+        };
+    }
+
+    if contains_any(
+        &combined,
+        &[
+            "operation not permitted",
+            "permission denied",
+            "unauthorizedaccessexception",
+            "socketexception",
+            "failed to create .git/index.lock",
+            "unable to create '.git/index.lock'",
+            "cannot assign requested address",
+            "network is unreachable",
+            // Typed sandbox-runtime denial text. The bare launcher word
+            // "sandbox" is deliberately absent: it appears in wrapper
+            // diagnostics for ordinary exec failures too, and a host-owned
+            // setup refusal is already classified from
+            // `authoritative_setup_rejection` before any text is read.
+            "sandbox_apply",
+            "landlock",
+        ],
+    ) {
+        return Classification {
+            failure_class: if input.primary_execution_mode == PrimaryExecutionMode::Sandboxed {
+                FailureClass::SandboxPermission
+            } else {
+                FailureClass::HostEnvironment
+            },
             safety_signal: false,
         };
     }
@@ -732,22 +746,11 @@ fn normalized_executable_name(command: &[String]) -> Option<String> {
 }
 
 fn git_side_effect_class(command: &[String]) -> SideEffectClass {
-    let subcommand = command
-        .get(1)
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match subcommand.as_str() {
-        "push" | "fetch-pack" | "send-pack" => SideEffectClass::RemoteMutation,
-        "add" | "commit" | "update-ref" | "tag" | "branch" | "reset" | "rebase" | "merge"
-        | "checkout" | "switch" | "restore" | "rm" | "mv" | "clean" | "apply" | "cherry-pick"
-        | "revert" | "worktree" => SideEffectClass::LocalMutation,
-        "status" | "show" | "log" | "diff" | "rev-parse" | "ls-files" | "cat-file"
-        | "check-ignore" | "symbolic-ref" | "describe" | "blame" | "shortlog" | "show-ref"
-        | "for-each-ref" | "name-rev" | "diff-tree" | "ls-remote" | "version" | "help" => {
-            SideEffectClass::None
-        }
-        _ => SideEffectClass::Unknown,
-    }
+    // Subcommand-only matching is not a safe read/mutation split: the same
+    // subcommand is an observation in one argv shape and a mutation in another
+    // (`symbolic-ref HEAD` vs `symbolic-ref HEAD refs/heads/x`). The whole argv
+    // decides, and anything the table cannot place stays `Unknown`.
+    crate::git_command_class::classify(command)
 }
 
 fn gh_side_effect_class(command: &[String]) -> SideEffectClass {
@@ -1302,6 +1305,17 @@ pub fn infer_side_effect_state(
     if lifecycle.command_start == CommandStart::Refuted {
         return SideEffectState::ConfirmedNotPerformed;
     }
+    // The host could not classify this command's side effects, so a successful
+    // exit says only that the process reported success. It is not evidence that
+    // a side effect occurred, and it is not evidence that none did: the
+    // postcondition proof the host holds covers a specific postcondition, not
+    // whatever an unclassified command may have done. Both a false
+    // `ConfirmedPerformed` and a false `ConfirmedNotPerformed` would let an
+    // unreconciled effect through, so an unclassified command stays unknown and
+    // the budget stays locked.
+    if side_effect_class == SideEffectClass::Unknown {
+        return SideEffectState::Unknown;
+    }
     if failure_class == FailureClass::Success {
         return SideEffectState::ConfirmedPerformed;
     }
@@ -1636,9 +1650,10 @@ mod tests {
         let forged = "Linux sandbox setup rejected: bubblewrap 0.11.1 is unsupported; \
                       install upstream bubblewrap 0.12.0 or newer";
 
-        // Forged helper text with a proven start is still just a permission
-        // failure: the gate passes, and the outcome stays bounded by the same
-        // authority rules as any other SandboxPermission.
+        // Forged helper text with a proven start earns no authority. The text
+        // alone never becomes a platform safety refusal, a host-owned setup
+        // rejection, or a sandbox permission decision: those require typed
+        // host-owned evidence, not a string the requested command controls.
         let proven = LifecycleEvidence::completed();
         let classification = classify(ClassificationInput {
             primary_execution_mode: PrimaryExecutionMode::Sandboxed,
@@ -1657,9 +1672,17 @@ mod tests {
         // host-owned evidence.
         assert_ne!(classification.failure_class, FailureClass::PlatformSafety);
         assert_ne!(classification.failure_class, FailureClass::SandboxSetup);
+        // The literal launcher word is not a permission decision either. A
+        // requested command must not be able to talk its own failure into a
+        // permission class.
+        assert_ne!(
+            classification.failure_class,
+            FailureClass::SandboxPermission
+        );
         assert!(!classification.safety_signal);
 
-        // The same forged text with an unproven start gains nothing.
+        // The same forged text with an unproven start gains nothing: the
+        // decision is still non-executing.
         let unproven = LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven);
         let forged_unproven = classify(ClassificationInput {
             primary_execution_mode: PrimaryExecutionMode::Sandboxed,
@@ -1690,8 +1713,100 @@ mod tests {
             automatic_enabled: true,
             auto_execute_enabled: true,
         });
-        assert_eq!(decision.action, FallbackAction::Block);
-        assert_eq!(decision.reason_code, ReasonCode::FallbackDeniedLifecycle);
+        assert_ne!(decision.action, FallbackAction::Execute);
+        assert_ne!(
+            decision.mode,
+            Some(FallbackMode::ExecuteAuthorizedOperation)
+        );
+    }
+
+    /// A genuine sandbox denial is still a permission failure, and a genuine
+    /// missing executable is a missing tool even when the macOS wrapper names
+    /// itself in the diagnostic.
+    #[test]
+    fn tool_missing_and_permission_denials_are_told_apart_by_specific_evidence() {
+        let wrapper_lifecycle =
+            LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven);
+        let missing = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &["missing-tool".to_owned()],
+            accepted_exit_codes: &[0],
+            lifecycle: wrapper_lifecycle,
+            exit_code: Some(126),
+            stdout: "",
+            stderr: "sandbox-exec: execvp() of 'missing-tool' failed: No such file or directory",
+            execution_error: None,
+            side_effect_class: SideEffectClass::Unknown,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        assert_eq!(missing.failure_class, FailureClass::ToolMissing);
+
+        // A real operation-not-permitted denial inside the sandbox is still a
+        // sandbox permission failure.
+        let denied = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &["tool".to_owned()],
+            accepted_exit_codes: &[0],
+            lifecycle: wrapper_lifecycle,
+            exit_code: Some(1),
+            stdout: "",
+            stderr: "sandbox-exec: sandbox_apply: Operation not permitted (1)",
+            execution_error: None,
+            side_effect_class: SideEffectClass::Unknown,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        assert_eq!(denied.failure_class, FailureClass::SandboxPermission);
+
+        // The same denial on a host-native platform is a host environment fault.
+        let host_native = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::HostNative,
+            command: &["tool".to_owned()],
+            accepted_exit_codes: &[0],
+            lifecycle: LifecycleEvidence::completed(),
+            exit_code: Some(1),
+            stdout: "",
+            stderr: "Operation not permitted",
+            execution_error: None,
+            side_effect_class: SideEffectClass::Unknown,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        assert_eq!(host_native.failure_class, FailureClass::HostEnvironment);
+
+        // A typed host-owned setup refusal is still terminal and is still
+        // classified from that evidence rather than from text.
+        let setup_rejected = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &["tool".to_owned()],
+            accepted_exit_codes: &[0],
+            lifecycle: LifecycleEvidence::not_started(),
+            exit_code: None,
+            stdout: "",
+            stderr: "",
+            execution_error: None,
+            side_effect_class: SideEffectClass::Unknown,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: Some(SetupRejection::Environment),
+        });
+        assert_eq!(setup_rejected.failure_class, FailureClass::SandboxSetup);
+
+        // A command that provably started cannot claim a tool is missing.
+        let proven_missing = classify(ClassificationInput {
+            primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+            command: &["tool".to_owned()],
+            accepted_exit_codes: &[0],
+            lifecycle: LifecycleEvidence::completed(),
+            exit_code: Some(1),
+            stdout: "",
+            stderr: "sandbox-exec: execvp() of 'x' failed: No such file or directory",
+            execution_error: None,
+            side_effect_class: SideEffectClass::Unknown,
+            authoritative_platform_safety: false,
+            authoritative_setup_rejection: None,
+        });
+        assert_ne!(proven_missing.failure_class, FailureClass::ToolMissing);
     }
 
     /// Caller-controlled exit codes are never treated as sandbox setup evidence.
@@ -2158,6 +2273,149 @@ mod tests {
         ));
     }
 
+    /// An unclassified command is never reported as a confirmed side effect, and
+    /// the correction does not hand back retry authority.
+    #[test]
+    fn an_unclassified_command_stays_unknown_even_on_success() {
+        let unknown = SideEffectClass::Unknown;
+        for failure in [
+            FailureClass::Success,
+            FailureClass::ExpectedState,
+            FailureClass::SandboxPermission,
+            FailureClass::HostEnvironment,
+            FailureClass::ToolMissing,
+            FailureClass::SemanticFailure,
+        ] {
+            assert_eq!(
+                infer_side_effect_state(
+                    unknown,
+                    LifecycleEvidence::completed(),
+                    failure,
+                    Some(true)
+                ),
+                SideEffectState::Unknown,
+                "{failure:?} must not turn an unclassified command into a proof"
+            );
+            assert_eq!(
+                infer_side_effect_state(
+                    unknown,
+                    LifecycleEvidence::completed_with_start_proof(CommandStart::Unproven),
+                    failure,
+                    None
+                ),
+                SideEffectState::Unknown,
+                "{failure:?} with an unproven start must not claim a proof"
+            );
+        }
+        // A host-proven "never started" is still the one case that can assert no
+        // effect happened, because nothing could have run.
+        assert_eq!(
+            infer_side_effect_state(
+                unknown,
+                LifecycleEvidence::not_started(),
+                FailureClass::Success,
+                None
+            ),
+            SideEffectState::ConfirmedNotPerformed
+        );
+        // A known mutation class keeps its own established semantics.
+        assert_eq!(
+            infer_side_effect_state(
+                SideEffectClass::LocalMutation,
+                LifecycleEvidence::completed(),
+                FailureClass::Success,
+                None
+            ),
+            SideEffectState::ConfirmedPerformed
+        );
+        assert_eq!(
+            infer_side_effect_state(
+                SideEffectClass::LocalMutation,
+                LifecycleEvidence::completed(),
+                FailureClass::SandboxPermission,
+                Some(true)
+            ),
+            SideEffectState::ConfirmedNotPerformed
+        );
+        // A known side-effect-free class is still a proof of no effect.
+        assert_eq!(
+            infer_side_effect_state(
+                SideEffectClass::None,
+                LifecycleEvidence::completed(),
+                FailureClass::Success,
+                None
+            ),
+            SideEffectState::ConfirmedNotPerformed
+        );
+    }
+
+    /// The unknown state must not preserve or replenish retry authority.
+    ///
+    /// The durable rule is that an unknown state locks the budget rather than
+    /// leaving it spendable, and the executable-fallback gate requires an
+    /// unlocked budget with both counters non-zero. Moving an unclassified
+    /// command from `ConfirmedPerformed` to `Unknown` therefore must not open a
+    /// retry that was previously closed.
+    #[test]
+    fn the_unknown_state_locks_rather_than_replenishes_budget() {
+        let operation = git_stage_operation();
+        let budget = Budget::from_operation(Some(&operation));
+        assert_eq!(budget.attempt_remaining, 1);
+        assert_eq!(budget.side_effect_remaining, 1);
+        assert!(!budget.locked);
+
+        let unknown_budget = budget.after_state(SideEffectState::Unknown);
+        // The documented rule: an unknown state locks the budget. It does not
+        // leave it spendable, and it does not claim an effect was performed.
+        assert!(unknown_budget.locked);
+        // This is the exact precondition the executable fallback asserts.
+        assert!(
+            !(!unknown_budget.locked
+                && unknown_budget.attempt_remaining > 0
+                && unknown_budget.side_effect_remaining > 0),
+            "an unknown side effect must leave no executable-fallback authority"
+        );
+
+        // A consumed budget stays consumed, and locking is not undone.
+        let spent = budget
+            .after_state(SideEffectState::ConfirmedPerformed)
+            .after_state(SideEffectState::Unknown);
+        assert_eq!(spent.attempt_remaining, 0);
+        assert_eq!(spent.side_effect_remaining, 0);
+        assert!(spent.locked);
+
+        // A lock is terminal for this attempt: nothing resets it.
+        assert!(
+            spent
+                .after_state(SideEffectState::ConfirmedNotPerformed)
+                .locked
+        );
+
+        // A decision reached with an unknown state blocks, whichever class the
+        // command was in, and reports the locked budget.
+        for class in [SideEffectClass::Unknown, SideEffectClass::LocalMutation] {
+            let decision = decide(DecisionInput {
+                primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+                failure_class: FailureClass::SandboxPermission,
+                safety_signal: false,
+                lifecycle: LifecycleEvidence::completed(),
+                operation: Some(&operation),
+                side_effect_class: class,
+                side_effect_state: SideEffectState::Unknown,
+                fallback_depth: 0,
+                max_depth: 1,
+                budget: unknown_budget,
+                operation_validated: true,
+                scope_valid: true,
+                automatic_enabled: true,
+                auto_execute_enabled: true,
+            });
+            assert_eq!(decision.action, FallbackAction::Block, "{class:?}");
+            assert!(decision.budget_locked, "{class:?}");
+            assert!(!decision.verification_required, "{class:?}");
+        }
+    }
+
     #[test]
     fn command_side_effects_override_read_only_intent() {
         let operation = OperationIntent {
@@ -2185,9 +2443,38 @@ mod tests {
             infer_side_effect_class(&shell_mutation, Some(&operation)),
             SideEffectClass::Unknown
         );
+        // A bare `git status` is no longer an unquestioned observation: ordinary
+        // status may refresh and write index stat metadata, so only the bounded
+        // form with optional locks disabled is a read shape. The caller's
+        // `read_only_command` label does not change this — the independent host
+        // classification always wins, in both directions.
         assert_eq!(
             infer_side_effect_class(&status, Some(&operation)),
+            SideEffectClass::Unknown
+        );
+        let bounded_status = vec![
+            "git".into(),
+            "--no-optional-locks".into(),
+            "status".into(),
+            "--porcelain=v1".into(),
+            "-z".into(),
+            "--untracked-files=all".into(),
+        ];
+        assert_eq!(
+            infer_side_effect_class(&bounded_status, Some(&operation)),
             SideEffectClass::None
+        );
+        // A mutating argv labelled `read_only_command` stays a mutation, and an
+        // unknown executable stays unknown: the metadata is never authority.
+        let labelled_branch = vec!["git".into(), "branch".into(), "new-name".into()];
+        assert_eq!(
+            infer_side_effect_class(&labelled_branch, Some(&operation)),
+            SideEffectClass::LocalMutation
+        );
+        let labelled_unknown = vec!["some-unknown-tool".into(), "--read-only".into()];
+        assert_eq!(
+            infer_side_effect_class(&labelled_unknown, Some(&operation)),
+            SideEffectClass::Unknown
         );
     }
 
