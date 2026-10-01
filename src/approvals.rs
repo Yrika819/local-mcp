@@ -221,6 +221,28 @@ pub async fn request(
 }
 
 #[cfg(all(test, windows))]
+async fn accept_test_approval_connection(
+    listener: &mut SessionListener,
+    ready_sender: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+) -> Result<SessionStream> {
+    let accept = listener.accept();
+    tokio::pin!(accept);
+    let mut ready_sender = Some(ready_sender);
+    std::future::poll_fn(|context| {
+        let result = accept.as_mut().poll(context);
+        if let Some(sender) = ready_sender.take() {
+            let readiness = match &result {
+                std::task::Poll::Ready(Err(error)) => Err(error.to_string()),
+                std::task::Poll::Pending | std::task::Poll::Ready(Ok(_)) => Ok(()),
+            };
+            let _ = sender.send(readiness);
+        }
+        result
+    })
+    .await
+}
+
+#[cfg(all(test, windows))]
 #[allow(
     dead_code,
     reason = "Windows-only test responder is selected by a cfg-gated integration path."
@@ -230,47 +252,40 @@ pub(crate) async fn spawn_test_approval_responder(
     expected_cwd: &Path,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let path = config::socket_path(session_id)?;
-    eprintln!(
-        "Windows test responder session={session_id} pipe={}",
-        path.display()
-    );
     let expected_cwd = std::fs::canonicalize(expected_cwd)?;
     let mut listener = bind_listener(&path)?;
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (probe_sender, probe_receiver) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let accept = listener.accept();
-        tokio::pin!(accept);
-        let mut ready_sender = Some(ready_sender);
-        let mut stream = std::future::poll_fn(|context| {
-            let result = accept.as_mut().poll(context);
-            if let Some(sender) = ready_sender.take() {
-                let readiness = match &result {
-                    std::task::Poll::Ready(Err(error)) => Err(error.to_string()),
-                    std::task::Poll::Pending | std::task::Poll::Ready(Ok(_)) => Ok(()),
-                };
-                eprintln!("Windows test responder readiness={readiness:?}");
-                let _ = sender.send(readiness);
+        let mut stream = accept_test_approval_connection(&mut listener, ready_sender).await?;
+        let mut probe_ready = Some(probe_sender);
+        loop {
+            let mut line = String::new();
+            let bytes_read = BufReader::new(&mut stream).read_line(&mut line).await?;
+            if bytes_read == 0 {
+                if let Some(sender) = probe_ready.take() {
+                    stream = accept_test_approval_connection(&mut listener, sender).await?;
+                } else {
+                    stream = listener.accept().await?;
+                }
+                continue;
             }
-            result
-        })
-        .await?;
-        let mut line = String::new();
-        BufReader::new(&mut stream).read_line(&mut line).await?;
-        let message: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(message["type"] == "approval");
-        anyhow::ensure!(message["request"]["operation"] == "start_command");
-        let requested_cwd = message["request"]["cwd"]
-            .as_str()
-            .context("approval request omitted cwd")?;
-        anyhow::ensure!(
-            std::fs::canonicalize(requested_cwd)? == expected_cwd,
-            "Verifier command approval cwd did not match the managed candidate"
-        );
-        stream.write_all(b"allow\n").await?;
-        Ok(())
+            let message: serde_json::Value = serde_json::from_str(&line)?;
+            anyhow::ensure!(message["type"] == "approval");
+            anyhow::ensure!(message["request"]["operation"] == "start_command");
+            let requested_cwd = message["request"]["cwd"]
+                .as_str()
+                .context("approval request omitted cwd")?;
+            anyhow::ensure!(
+                std::fs::canonicalize(requested_cwd)? == expected_cwd,
+                "Verifier command approval cwd did not match the managed candidate"
+            );
+            stream.write_all(b"allow\n").await?;
+            return Ok(());
+        }
     });
     match ready_receiver.await {
-        Ok(Ok(())) => Ok(task),
+        Ok(Ok(())) => {}
         Ok(Err(detail)) => {
             let _ = task.await;
             anyhow::bail!("test approval listener failed before readiness: {detail}")
@@ -278,6 +293,39 @@ pub(crate) async fn spawn_test_approval_responder(
         Err(error) => {
             let _ = task.await;
             anyhow::bail!("test approval listener stopped before readiness: {error}")
+        }
+    }
+
+    // Wait until the server accepts and drains a disposable connection, then
+    // arms the replacement instance that will receive the real approval.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match ClientOptions::new().open(&path) {
+            Ok(probe) => {
+                drop(probe);
+                break;
+            }
+            Err(error)
+                if matches!(error.raw_os_error(), Some(2) | Some(231))
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                task.abort();
+                anyhow::bail!("test approval pipe probe failed: {error}")
+            }
+        }
+    }
+    match probe_receiver.await {
+        Ok(Ok(())) => Ok(task),
+        Ok(Err(detail)) => {
+            let _ = task.await;
+            anyhow::bail!("test approval listener failed after probe: {detail}")
+        }
+        Err(error) => {
+            task.abort();
+            anyhow::bail!("test approval pipe probe was not consumed: {error}")
         }
     }
 }
