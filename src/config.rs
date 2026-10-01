@@ -160,6 +160,20 @@ pub fn canonical_path(path: &Path) -> Result<PathBuf> {
     Ok(strip_verbatim_prefix(canonical))
 }
 
+/// Canonicalize a path using the spelling convention already present in a
+/// host-validated root. PRIMARY Windows roots retain `fs::canonicalize`'s
+/// verbatim form for compatibility, while managed roots retain the compact
+/// Git-compatible spelling stored in their durable ownership record.
+pub fn canonical_path_like(path: &Path, _reference_root: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    if _reference_root.to_string_lossy().starts_with(r"\\?\") {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve {}", path.display()));
+    }
+
+    canonical_path(path)
+}
+
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {

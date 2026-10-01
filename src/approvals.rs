@@ -202,11 +202,7 @@ pub async fn request(
         cwd,
     };
     let path = config::socket_path(session_id)?;
-    #[cfg(all(test, windows))]
-    eprintln!(
-        "Windows approval request session={session_id} pipe={}",
-        path.display()
-    );
+
     let mut stream = connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
@@ -269,7 +265,6 @@ pub(crate) async fn spawn_test_approval_responder(
         let mut stream = accept_test_approval_connection(&mut listener, ready_sender).await?;
         let mut probe_ready = Some(probe_sender);
         loop {
-            eprintln!("Windows test responder accepted a pipe connection");
             let mut line = String::new();
             let bytes_read = BufReader::new(&mut stream).read_line(&mut line).await?;
             if bytes_read == 0 {
@@ -281,7 +276,6 @@ pub(crate) async fn spawn_test_approval_responder(
                 continue;
             }
             let message: serde_json::Value = serde_json::from_str(&line)?;
-            eprintln!("Windows test responder message type={:?}", message["type"]);
             match message["type"].as_str() {
                 Some("activity") => {}
                 Some("approval") => {

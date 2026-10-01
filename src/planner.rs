@@ -803,7 +803,7 @@ fn normalize_planner_path(
         ));
     }
 
-    let canonical_goal_root = canonical_path_for_root(goal_root, goal_root).map_err(|_| {
+    let canonical_goal_root = config::canonical_path_like(goal_root, goal_root).map_err(|_| {
         PlannerError::PlanAuthorityViolation(
             "Goal execution root cannot be canonicalized".to_owned(),
         )
@@ -844,22 +844,13 @@ fn canonicalize_existing_prefix(
             ));
         }
     }
-    let mut resolved = canonical_path_for_root(&existing, spelling_root).map_err(|_| {
+    let mut resolved = config::canonical_path_like(&existing, spelling_root).map_err(|_| {
         PlannerError::PlanAuthorityViolation("path ancestor cannot be canonicalized".to_owned())
     })?;
     for component in suffix.iter().rev() {
         resolved.push(component);
     }
     Ok(resolved)
-}
-
-fn canonical_path_for_root(path: &Path, _spelling_root: &Path) -> anyhow::Result<PathBuf> {
-    #[cfg(windows)]
-    if _spelling_root.to_string_lossy().starts_with(r"\\?\") {
-        return std::fs::canonicalize(path).map_err(Into::into);
-    }
-
-    config::canonical_path(path)
 }
 
 fn contains_git_internal(path: &Path) -> bool {

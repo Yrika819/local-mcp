@@ -228,9 +228,6 @@ pub(crate) fn prepare(
         .ok_or_else(|| VerifierError::InvalidState("VERIFYING Task lacks attempt".to_owned()))?;
     let execution_root = crate::planner::execution_root_for_goal(&goal, session)
         .map_err(|error| VerifierError::InvalidState(error.to_string()))?;
-    let execution_root = fs::canonicalize(execution_root).map_err(|error| {
-        VerifierError::InvalidState(format!("execution root cannot be canonicalized: {error}"))
-    })?;
     Ok(Snapshot {
         goal_id: goal.id().clone(),
         revision: goal.revision(),
@@ -314,10 +311,7 @@ pub(crate) async fn evaluate(
             staged_paths: git.staged.clone(),
         });
         if git_for_scope {
-            let scope_ok = git.changed.iter().all(|path| {
-                in_allowed(path, snapshot.scope.allowed_paths())
-                    && !in_boundaries(path, snapshot.scope.forbidden_paths())
-            });
+            let scope_ok = task_scope_allows_git_changes(&snapshot.scope, &git.changed);
             observations.push(Observation {
                 index: None,
                 kind: "TASK_SCOPE_GATE".to_owned(),
@@ -918,7 +912,7 @@ fn resolve_path(path: &Path, root: &Path) -> Result<PathBuf, VerifierError> {
     } else {
         root.join(path)
     };
-    let resolved = canonicalize_existing_prefix(&absolute)?;
+    let resolved = canonicalize_existing_prefix(&absolute, root)?;
     if !resolved.starts_with(root) {
         return Err(VerifierError::InvalidState(format!(
             "verification path escapes Goal cwd: {}",
@@ -928,7 +922,10 @@ fn resolve_path(path: &Path, root: &Path) -> Result<PathBuf, VerifierError> {
     Ok(resolved)
 }
 
-fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, VerifierError> {
+fn canonicalize_existing_prefix(
+    path: &Path,
+    spelling_root: &Path,
+) -> Result<PathBuf, VerifierError> {
     let mut existing = path.to_path_buf();
     let mut suffix = Vec::new();
     while !existing.exists() {
@@ -944,13 +941,19 @@ fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, VerifierError> {
             ));
         }
     }
-    let mut resolved = fs::canonicalize(&existing).map_err(|error| {
+    let mut resolved = config::canonical_path_like(&existing, spelling_root).map_err(|error| {
         VerifierError::InvalidState(format!("cannot canonicalize verification path: {error}"))
     })?;
     for part in suffix.iter().rev() {
         resolved.push(part);
     }
     Ok(resolved)
+}
+
+pub(crate) fn task_scope_allows_git_changes(scope: &TaskScope, changed: &[PathBuf]) -> bool {
+    changed.iter().all(|path| {
+        in_allowed(path, scope.allowed_paths()) && !in_boundaries(path, scope.forbidden_paths())
+    })
 }
 
 fn in_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
@@ -1103,9 +1106,10 @@ async fn observe_git(
             "Goal cwd is not an observable Git worktree".to_owned(),
         ));
     }
-    let git_root = fs::canonicalize(top.stdout.trim()).map_err(|error| {
-        VerifierError::Observation(format!("cannot canonicalize Git root: {error}"))
-    })?;
+    let git_root =
+        config::canonical_path_like(Path::new(top.stdout.trim()), root).map_err(|error| {
+            VerifierError::Observation(format!("cannot canonicalize Git root: {error}"))
+        })?;
     if !root.starts_with(&git_root) {
         return Err(VerifierError::Observation(
             "Git root does not contain Goal cwd".to_owned(),
@@ -1188,6 +1192,15 @@ fn parse_nul_paths(stdout: &str, root: &Path) -> Result<Vec<PathBuf>, VerifierEr
     Ok(paths.into_iter().collect())
 }
 
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Windows-only path spelling regression fixture calls this helper on that target."
+)]
+pub(crate) fn resolve_git_path_for_test(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
+    resolve_git_path(raw, root)
+}
+
 fn resolve_git_path(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
     let path = Path::new(raw);
     if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
@@ -1195,7 +1208,7 @@ fn resolve_git_path(raw: &str, root: &Path) -> Result<PathBuf, VerifierError> {
             "Git emitted an unsafe path".to_owned(),
         ));
     }
-    canonicalize_existing_prefix(&root.join(path))
+    canonicalize_existing_prefix(&root.join(path), root)
 }
 
 #[cfg(all(test, not(windows)))]

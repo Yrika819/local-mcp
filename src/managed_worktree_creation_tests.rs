@@ -3502,6 +3502,66 @@ fn primary_planner_behavior_is_unchanged() {
     assert!(planner::execution_root_for_goal(&goal, &fixture.session).is_ok());
 }
 
+#[cfg(windows)]
+#[test]
+fn verifier_git_path_spelling_matches_managed_scope_and_primary_root_mode() {
+    let mut fixture = Fixture::new("verifier-path-spelling");
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    assert!(fixture.prepare_real(&goal_id).is_active());
+    let goal = fixture.goal(&goal_id);
+    let candidate = goal.managed_worktree().unwrap().worktree_root();
+
+    let proposal = planner::TaskScopeProposal {
+        allowed_paths: vec![PathBuf::from("tracked.txt")],
+        forbidden_paths: Vec::new(),
+        operation_kind: crate::task::TaskOperationKind::LocalMutation,
+        replay_safety: crate::task::ReplaySafety::VerifyBeforeRetry,
+    };
+    let scope = planner::validate_and_normalize_scope(
+        &proposal,
+        crate::task::WorkerKind::CodexWriter,
+        candidate,
+    )
+    .unwrap();
+    let observed_candidate_path =
+        crate::verifier::resolve_git_path_for_test("tracked.txt", candidate).unwrap();
+    assert_eq!(observed_candidate_path, scope.allowed_paths()[0]);
+    assert!(observed_candidate_path.starts_with(candidate));
+
+    let observed_primary_path =
+        crate::verifier::resolve_git_path_for_test("tracked.txt", goal.cwd()).unwrap();
+    assert_eq!(
+        observed_primary_path,
+        std::fs::canonicalize(goal.cwd().join("tracked.txt")).unwrap()
+    );
+
+    let outside = fixture.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "outside").unwrap();
+    let junction = candidate.join("junction-escape");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&outside)
+        .status()
+        .expect("failed to create test-owned junction");
+    assert!(
+        status.success(),
+        "mklink /J failed for {}",
+        junction.display()
+    );
+    let escaped =
+        crate::verifier::resolve_git_path_for_test("junction-escape/secret.txt", candidate)
+            .unwrap();
+    assert!(escaped.starts_with(&std::fs::canonicalize(&outside).unwrap()));
+    assert!(!escaped.starts_with(candidate));
+    assert!(
+        !crate::verifier::task_scope_allows_git_changes(&scope, &[escaped]),
+        "TASK_SCOPE_GATE must refuse Git paths resolved outside the managed root"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // H. Durable identity and forgery resistance
 // ---------------------------------------------------------------------------
