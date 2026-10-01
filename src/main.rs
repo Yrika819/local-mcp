@@ -75,6 +75,8 @@ mod process_group_ownership_tests;
 #[cfg(all(test, unix))]
 mod process_group_stress_tests;
 #[cfg(test)]
+mod replanner_compaction_tests;
+#[cfg(test)]
 mod replanner_replacement_tests;
 #[cfg(all(test, unix))]
 mod secure_fs_tests;
