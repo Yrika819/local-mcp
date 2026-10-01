@@ -462,6 +462,16 @@ mod tests {
         git(&["config", "user.email", "verifier@example.invalid"]);
         git(&["config", "user.name", "Verifier Observation Test"]);
         git(&["config", "commit.gpgsign", "false"]);
+        // Repository-local only. `git commit` can trigger Git's asynchronous
+        // auto-maintenance, which briefly creates and removes
+        // `.git/objects/maintenance.lock` on its own schedule. The write-freedom
+        // test below snapshots the whole worktree twice and compares it exactly,
+        // so that transient lock races the comparison and reports a write the
+        // observation never made. Disabling auto-maintenance here keeps the tree
+        // quiescent. No assertion and no snapshot exclusion is weakened, and the
+        // observation itself still runs against this repository unmodified.
+        git(&["config", "gc.auto", "0"]);
+        git(&["config", "maintenance.auto", "false"]);
         std::fs::write(root.join("tracked.txt"), b"observed\n").unwrap();
         git(&["add", "tracked.txt"]);
         git(&["commit", "-q", "-m", "initial"]);
