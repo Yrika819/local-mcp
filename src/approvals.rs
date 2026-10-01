@@ -202,6 +202,11 @@ pub async fn request(
         cwd,
     };
     let path = config::socket_path(session_id)?;
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "Windows approval request session={session_id} pipe={}",
+        path.display()
+    );
     let mut stream = connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
@@ -318,7 +323,13 @@ pub(crate) async fn spawn_test_approval_responder(
         }
     }
     match probe_receiver.await {
-        Ok(Ok(())) => Ok(task),
+        Ok(Ok(())) => {
+            eprintln!(
+                "Windows test responder armed for real approval on {}",
+                path.display()
+            );
+            Ok(task)
+        }
         Ok(Err(detail)) => {
             let _ = task.await;
             anyhow::bail!("test approval listener failed after probe: {detail}")
