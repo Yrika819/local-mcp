@@ -3389,8 +3389,13 @@ fn real_creation_planning_and_writer_mutate_only_the_managed_candidate() {
     assert_eq!(
         verified.tasks()[&task_id].status(),
         crate::task::TaskStatus::Completed,
-        "verification details: {}",
-        serde_json::to_string(verified.tasks()[&task_id].verification_results()).unwrap()
+        "verification details: {}; evidence: {}; side_effect_state: {:?}",
+        serde_json::to_string(verified.tasks()[&task_id].verification_results()).unwrap(),
+        serde_json::to_string(verified.tasks()[&task_id].evidence()).unwrap(),
+        verified.tasks()[&task_id]
+            .latest_attempt()
+            .unwrap()
+            .side_effect_state()
     );
     let readied_second = fixture
         .store
