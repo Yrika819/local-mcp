@@ -33,14 +33,26 @@ pub(crate) struct ReplannerRequest {
     completion_criteria: Vec<ReplannerCriterion>,
     criterion_bindings: Vec<ReplannerCriterionBindingSnapshot>,
     cwd: PathBuf,
+    /// The active execution graph, tiered by relevance. See
+    /// `ReplannerTaskDetail` and `replanner_context_plan`.
     tasks: Vec<ReplannerTaskSnapshot>,
+    /// A bounded, host-generated summary of superseded replacement history.
+    history: Vec<ReplannerHistoryEntry>,
+    /// How many superseded Tasks the `history` window does not show. Reported so
+    /// the model never mistakes a bounded window for the absence of history.
+    history_omitted_count: usize,
     pre_execution_plan_rejections: Vec<ReplannerPreExecutionPlanRejectionSnapshot>,
     consecutive_pre_execution_plan_rejection_count: usize,
     goal_blockers: Vec<ReplannerBlocker>,
+    /// How many durable Goal blockers `goal_blockers` does not show.
+    goal_blockers_omitted: usize,
     eligible_needs_replan_task_ids: Vec<String>,
     /// Durable failed-task replacement authorities the host will accept a
     /// `replace_tasks` proposal against. Typed, not prose.
     failed_task_replan_requests: Vec<ReplannerFailedTaskReplanRequest>,
+    /// How many unconsumed replacement authorities
+    /// `failed_task_replan_requests` does not show.
+    failed_task_replan_requests_omitted: usize,
     /// Host-derived, deterministic Task-sizing risk. The model must size work
     /// against these numbers instead of guessing token budgets.
     sizing: ReplannerSizingProfile,
@@ -121,6 +133,74 @@ struct ReadonlyOutputContract {
 
 const REPLANNER_PRE_EXECUTION_REJECTION_HISTORY_LIMIT: usize = 8;
 
+/// How many superseded Tasks appear in the host-generated history summary.
+///
+/// Bounded because history is what made the Replanner's own context grow: an
+/// unbounded summary would reintroduce exactly the amplification this branch
+/// removes, just in a smaller field. `history_omitted_count` reports whatever
+/// falls outside the window so the model knows the Goal has more history than it
+/// is shown, rather than believing there is none.
+pub(crate) const REPLANNER_HISTORY_SUMMARY_LIMIT: usize = 64;
+
+/// How many durable Goal blockers the request carries. `Goal.blockers` is
+/// append-only and otherwise unbounded, so the tail is kept and the remainder is
+/// reported in `goal_blockers_omitted`.
+pub(crate) const REPLANNER_GOAL_BLOCKER_LIMIT: usize = 32;
+
+/// How many unconsumed failed-task replan requests the request carries. Matches
+/// the `goal_resume` `maxItems: 8` MCP bound, so the number of authorities the
+/// host will accept is bounded by the same contract that created them. Every
+/// unconsumed trigger is still a full-detail seed, so a truncated authority token
+/// costs the model the ability to *name* that specific replacement, never the
+/// ability to see the work. The host validates against the complete durable list.
+pub(crate) const REPLANNER_REPLAN_REQUEST_LIMIT: usize = 8;
+
+/// How much model context each active Task is shown, host-selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReplannerTaskDetail {
+    /// The Task this invocation is about: a replan trigger or a resolvable
+    /// `NEEDS_REPLAN` Task. Replacement validation reads its attempts, effective
+    /// failure class, side-effect state, verification results, evidence, and
+    /// blockers to confirm the durable request authority still matches and that a
+    /// pre-execution trigger is pristine. Without these the model cannot
+    /// distinguish a size failure from an authority failure, and it has no basis
+    /// for the proposal at all.
+    Full,
+    /// A dependency ancestor, a dependent, or a Task bound to a completion
+    /// criterion. Enough structure to propose a legal edge or a criterion
+    /// rebinding against it, without any history body.
+    Structural,
+    /// Every other active Task. Identity, status, and topology only, which is what
+    /// is needed to reason about the graph and avoid proposing a cycle.
+    Compact,
+}
+
+/// One superseded Task, reduced to the fields that describe a replacement chain.
+///
+/// Host-generated and deterministic. Evidence bodies, attempt bodies, scope
+/// paths, and the superseded Task's own prose are deliberately absent: the model
+/// is never asked to summarize its own authority history back to itself as input
+/// authority, and it never needs the old bodies to name a successor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ReplannerHistoryEntry {
+    superseded_task_id: String,
+    status: TaskStatus,
+    /// The plan revision that created the superseded Task. This is the selection
+    /// key for the history window: entries are ordered by it descending, then by
+    /// `superseded_task_id` ascending, so most recent work is shown first and the
+    /// order is a total one.
+    superseded_plan_revision: u32,
+    /// The durable replan request this replacement consumed, when there was one.
+    replan_request_id: Option<String>,
+    committed_plan_revision: Option<u32>,
+    /// The Task or Tasks that took over, in durable order.
+    replaced_by: Vec<String>,
+    preserved_max_attempts: Option<u32>,
+    preserved_consumed_attempts: Option<u32>,
+    rebound_criterion_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct ReplannerPreExecutionPlanRejectionSnapshot {
     request_id: String,
@@ -145,23 +225,43 @@ struct ReplannerCriterionBindingSnapshot {
     task_ids: Vec<String>,
 }
 
+/// One active Task in the Replanner request.
+///
+/// A single array with a `detail` discriminator, so the existing prompt contract
+/// — an `EXISTING` reference must be an exact UUID from `request.tasks[].task_id`
+/// — keeps holding for every tier. Fields outside a Task's tier are *omitted*,
+/// never serialized as null, so the compacted representation cannot be mistaken
+/// for a Task that genuinely has no evidence.
+///
+/// `SUPERSEDED` Tasks never appear here at all. They are represented only by the
+/// bounded `history` summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct ReplannerTaskSnapshot {
     task_id: String,
-    title: String,
-    objective: String,
-    mandatory: bool,
+    detail: ReplannerTaskDetail,
     status: TaskStatus,
-    dependencies: Vec<String>,
+    mandatory: bool,
     worker: WorkerKind,
-    scope: TaskScope,
-    verification: Vec<VerificationSpec>,
-    verification_results: Vec<VerificationResult>,
-    evidence: Vec<crate::task::TaskEvidence>,
-    blockers: Vec<ReplannerBlocker>,
-    attempts: Vec<ReplannerAttemptSummary>,
-    max_attempts: u32,
+    dependencies: Vec<String>,
     created_plan_revision: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<TaskScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<Vec<VerificationSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_results: Option<Vec<VerificationResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<Vec<crate::task::TaskEvidence>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blockers: Option<Vec<ReplannerBlocker>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempts: Option<Vec<ReplannerAttemptSummary>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -197,6 +297,278 @@ impl ReplannerRequest {
     pub(crate) fn cwd(&self) -> &std::path::Path {
         &self.cwd
     }
+
+}
+
+/// The host's relevance decision for one Replanner invocation.
+///
+/// Every set is a `BTreeSet<TaskId>` and `Goal.tasks` is a `BTreeMap`, so the
+/// result is a pure function of durable state: no hash iteration, wall clock, or
+/// randomness can reach the prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplannerContextPlan {
+    full: BTreeSet<TaskId>,
+    structural: BTreeSet<TaskId>,
+    compact: BTreeSet<TaskId>,
+    history: Vec<TaskId>,
+    history_omitted: usize,
+}
+
+/// Decide how much of the Goal to show, from replacement-validation semantics
+/// rather than from a guess at a "reasonable" size.
+///
+/// * `full` — every unconsumed replacement trigger plus every resolvable
+///   `NEEDS_REPLAN` Task. These are the Tasks the Replanner is being invoked
+///   *for*.
+/// * `ancestors` — the trigger's transitive dependency ancestors, restricted to
+///   the active graph. This is exactly the legal prerequisite pool: replacement
+///   Tasks may depend on an existing Task, `task_ref_is_mandatory` needs each
+///   candidate's `mandatory` flag, and no active Task may depend on superseded
+///   work.
+/// * `dependents` — the trigger's transitive dependency descendants, restricted to
+///   the active graph. Replacing a Task rewires its dependents host-side, so the
+///   model needs the downstream identity and status to avoid proposing a cycle
+///   among new Tasks.
+/// * `criterion_bound` — every Task named by a `TASK_VERIFIED` requirement, which
+///   is the set whose bindings a replacement may have to follow.
+/// * `compact` — every other active Task, at topology only.
+///
+/// Superseded Tasks are excluded from all three tiers by construction, which is
+/// what makes the request insensitive to history.
+fn replanner_context_plan(
+    goal: &Goal,
+    eligible_needs_replan_task_ids: &[String],
+    unconsumed_replacement_triggers: &BTreeSet<TaskId>,
+) -> ReplannerContextPlan {
+    let active = goal
+        .tasks()
+        .iter()
+        .filter(|(_, task)| task.is_active_plan_authority())
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut full = unconsumed_replacement_triggers.clone();
+    for id in eligible_needs_replan_task_ids {
+        if let Ok(parsed) = TaskId::parse(id) {
+            full.insert(parsed);
+        }
+    }
+    full = full.intersection(&active).cloned().collect::<BTreeSet<_>>();
+
+    // Walk the durable dependency graph. Edges out of a superseded Task are
+    // historical and are never followed into the active set, because no active
+    // Task may depend on one.
+    let mut relevant = full.clone();
+    let mut frontier = full.clone();
+    while let Some(id) = frontier.pop_first() {
+        for dependency in goal
+            .tasks()
+            .get(&id)
+            .map(|task| task.dependencies().to_vec())
+            .unwrap_or_default()
+        {
+            let target = dependency.task_id().clone();
+            if active.contains(&target) && relevant.insert(target.clone()) {
+                frontier.insert(target);
+            }
+        }
+    }
+    // Dependents: the same walk in the other direction, over a reverse index
+    // built once from the active graph.
+    let mut reverse = BTreeMap::<TaskId, Vec<TaskId>>::new();
+    for (id, task) in goal.tasks() {
+        if !task.is_active_plan_authority() {
+            continue;
+        }
+        for dependency in task.dependencies() {
+            reverse
+                .entry(dependency.task_id().clone())
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    let mut dependents = BTreeSet::new();
+    let mut seen = full.clone();
+    let mut frontier = full.clone();
+    while let Some(id) = frontier.pop_first() {
+        for dependent in reverse.get(&id).cloned().unwrap_or_default() {
+            if seen.insert(dependent.clone()) {
+                dependents.insert(dependent.clone());
+                frontier.insert(dependent);
+            }
+        }
+    }
+    let criterion_bound = goal
+        .final_verification_spec()
+        .map(|spec| {
+            spec.criterion_bindings()
+                .iter()
+                .flat_map(|binding| binding.requirements().to_vec())
+                .map(|requirement| requirement.task_id().clone())
+                .filter(|id| active.contains(id))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let structural = relevant
+        .iter()
+        .chain(dependents.iter())
+        .chain(criterion_bound.iter())
+        .filter(|id| !full.contains(*id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let compact = active
+        .iter()
+        .filter(|id| !full.contains(id) && !structural.contains(id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    // Most recent history first, tie-broken by Task ID. `TaskId` is unique, so
+    // this is a total order and the window is reproducible.
+    let mut history = goal
+        .tasks()
+        .iter()
+        .filter(|(_, task)| !task.is_active_plan_authority())
+        .map(|(id, task)| (task.created_plan_revision(), id.clone()))
+        .collect::<Vec<_>>();
+    history.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let history_omitted = history
+        .len()
+        .saturating_sub(REPLANNER_HISTORY_SUMMARY_LIMIT);
+    history.truncate(REPLANNER_HISTORY_SUMMARY_LIMIT);
+    let history = history.into_iter().map(|(_, id)| id).collect();
+
+    ReplannerContextPlan {
+        full,
+        structural,
+        compact,
+        history,
+        history_omitted,
+    }
+}
+
+fn replanner_task_detail(plan: &ReplannerContextPlan, id: &TaskId) -> ReplannerTaskDetail {
+    if plan.full.contains(id) {
+        ReplannerTaskDetail::Full
+    } else if plan.structural.contains(id) {
+        ReplannerTaskDetail::Structural
+    } else {
+        ReplannerTaskDetail::Compact
+    }
+}
+
+fn replanner_task_snapshot(
+    goal: &Goal,
+    id: &TaskId,
+    detail: ReplannerTaskDetail,
+) -> ReplannerTaskSnapshot {
+    let task = goal.tasks().get(id).expect("planned Task exists");
+    let identity = |dependencies: &[crate::task::TaskDependency]| {
+        dependencies
+            .iter()
+            .map(|dependency| dependency.task_id().as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let blockers = || {
+        task.blockers()
+            .iter()
+            .map(|blocker| ReplannerBlocker {
+                code: blocker.code().to_owned(),
+                detail: blocker.detail().to_owned(),
+                mandatory: blocker.mandatory(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let structural_detail = !matches!(detail, ReplannerTaskDetail::Compact);
+    ReplannerTaskSnapshot {
+        task_id: id.as_str().to_owned(),
+        detail,
+        status: task.status(),
+        mandatory: task.mandatory(),
+        worker: task.worker(),
+        dependencies: identity(task.dependencies()),
+        created_plan_revision: task.created_plan_revision(),
+        title: structural_detail.then(|| task.title().to_owned()),
+        objective: structural_detail.then(|| task.objective().to_owned()),
+        scope: structural_detail.then(|| task.scope().clone()),
+        verification: structural_detail.then(|| task.verification_specs().to_vec()),
+        max_attempts: matches!(detail, ReplannerTaskDetail::Full).then(|| task.max_attempts()),
+        verification_results: matches!(detail, ReplannerTaskDetail::Full)
+            .then(|| task.verification_results().to_vec()),
+        evidence: matches!(detail, ReplannerTaskDetail::Full).then(|| task.evidence().to_vec()),
+        blockers: matches!(detail, ReplannerTaskDetail::Full).then(blockers),
+        attempts: matches!(detail, ReplannerTaskDetail::Full).then(|| {
+            task.attempts()
+                .iter()
+                .map(|attempt| ReplannerAttemptSummary {
+                    attempt_id: attempt.id().as_str().to_owned(),
+                    worker: attempt.worker(),
+                    outcome: attempt.outcome(),
+                    failure_class: attempt.failure_class(),
+                    effective_failure_class: Some(attempt.effective_failure_class()),
+                    operation_id: attempt.operation_id().map(str::to_owned),
+                    scope_identity: attempt.scope_identity().map(str::to_owned),
+                    side_effect_state: attempt.side_effect_state(),
+                    remaining_attempt_budget: attempt.remaining_attempt_budget(),
+                    remaining_side_effect_budget: attempt.remaining_side_effect_budget(),
+                })
+                .collect()
+        }),
+    }
+}
+
+fn replanner_history_entry(goal: &Goal, id: &TaskId) -> ReplannerHistoryEntry {
+    let mut entry = ReplannerHistoryEntry {
+        superseded_task_id: id.as_str().to_owned(),
+        status: TaskStatus::Superseded,
+        superseded_plan_revision: goal
+            .tasks()
+            .get(id)
+            .map(|task| task.created_plan_revision())
+            .unwrap_or_default(),
+        replan_request_id: None,
+        committed_plan_revision: None,
+        replaced_by: Vec::new(),
+        preserved_max_attempts: None,
+        preserved_consumed_attempts: None,
+        rebound_criterion_ids: Vec::new(),
+    };
+    for record in goal.failed_task_replacements() {
+        if record.replaced_task_id() != id {
+            continue;
+        }
+        entry.replan_request_id = Some(record.replan_request_id().to_owned());
+        entry.committed_plan_revision = Some(record.committed_plan_revision());
+        entry.replaced_by = record
+            .completion_closure_task_ids()
+            .iter()
+            .map(|task| task.as_str().to_owned())
+            .collect();
+        entry.preserved_max_attempts = Some(record.preserved_max_attempts());
+        entry.preserved_consumed_attempts = Some(record.preserved_consumed_attempts());
+        entry.rebound_criterion_ids = record
+            .rebound_criterion_ids()
+            .iter()
+            .map(|criterion| criterion.as_str().to_owned())
+            .collect();
+    }
+    for record in goal.pristine_plan_supersessions() {
+        if !record.affected_task_ids().contains(id) {
+            continue;
+        }
+        entry.committed_plan_revision = Some(record.committed_plan_revision());
+        entry.replaced_by = record
+            .replacement_task_ids()
+            .iter()
+            .map(|task| task.as_str().to_owned())
+            .collect();
+        entry.rebound_criterion_ids = record
+            .rebound_criterion_ids()
+            .iter()
+            .map(|criterion| criterion.as_str().to_owned())
+            .collect();
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -212,11 +584,15 @@ pub(crate) fn replanner_request_for_model_backend_test(cwd: PathBuf) -> Replanne
         criterion_bindings: Vec::new(),
         cwd,
         tasks: Vec::new(),
+        history: Vec::new(),
+        history_omitted_count: 0,
         pre_execution_plan_rejections: Vec::new(),
         consecutive_pre_execution_plan_rejection_count: 0,
         goal_blockers: Vec::new(),
+        goal_blockers_omitted: 0,
         eligible_needs_replan_task_ids: Vec::new(),
         failed_task_replan_requests: Vec::new(),
+        failed_task_replan_requests_omitted: 0,
         sizing: TaskSizingProfile::derive(0, 0),
         readonly_output_contract: ReadonlyOutputContract {
             max_evidence_items: planner::MAX_READONLY_EVIDENCE_ITEMS,
@@ -247,8 +623,14 @@ pub(crate) enum ReplannerError {
     Model(AgentError),
     ReplannerOutputInvalid(String),
     ReplannerSchemaViolation(String),
-    RevisionConflict { expected: u64, actual: u64 },
-    PlanConflict { expected: u32, actual: u32 },
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    PlanConflict {
+        expected: u32,
+        actual: u32,
+    },
     ReplanNotApplicable(String),
     ReplanAuthorityViolation(String),
     NoSafeReplan(String),
@@ -475,54 +857,43 @@ pub(crate) fn replanner_request_for_goal(
         ));
     }
 
-    let tasks = goal
-        .tasks()
-        .values()
-        .map(|task| ReplannerTaskSnapshot {
-            task_id: task.id().as_str().to_owned(),
-            title: task.title().to_owned(),
-            objective: task.objective().to_owned(),
-            mandatory: task.mandatory(),
-            status: task.status(),
-            dependencies: task
-                .dependencies()
-                .iter()
-                .map(|dependency| dependency.task_id().as_str().to_owned())
-                .collect(),
-            worker: task.worker(),
-            scope: task.scope().clone(),
-            verification: task.verification_specs().to_vec(),
-            verification_results: task.verification_results().to_vec(),
-            evidence: task.evidence().to_vec(),
-            blockers: task
-                .blockers()
-                .iter()
-                .map(|blocker| ReplannerBlocker {
-                    code: blocker.code().to_owned(),
-                    detail: blocker.detail().to_owned(),
-                    mandatory: blocker.mandatory(),
-                })
-                .collect(),
-            attempts: task
-                .attempts()
-                .iter()
-                .map(|attempt| ReplannerAttemptSummary {
-                    attempt_id: attempt.id().as_str().to_owned(),
-                    worker: attempt.worker(),
-                    outcome: attempt.outcome(),
-                    failure_class: attempt.failure_class(),
-                    effective_failure_class: Some(attempt.effective_failure_class()),
-                    operation_id: attempt.operation_id().map(str::to_owned),
-                    scope_identity: attempt.scope_identity().map(str::to_owned),
-                    side_effect_state: attempt.side_effect_state(),
-                    remaining_attempt_budget: attempt.remaining_attempt_budget(),
-                    remaining_side_effect_budget: attempt.remaining_side_effect_budget(),
-                })
-                .collect(),
-            max_attempts: task.max_attempts(),
-            created_plan_revision: task.created_plan_revision(),
+    // Unconsumed replacement authorities, and the Tasks they name. Every one of
+    // those triggers becomes a full-detail seed even if the authority list is
+    // later truncated, so a bounded authority window never hides the work.
+    let unconsumed_replacement_triggers = goal
+        .failed_task_replan_requests()
+        .iter()
+        .filter(|request| {
+            goal.find_failed_task_replacement(request.request_id())
+                .is_none()
         })
-        .collect();
+        .map(|request| request.trigger_task_id().clone())
+        .collect::<BTreeSet<_>>();
+
+    let plan = replanner_context_plan(
+        goal,
+        &eligible_needs_replan_task_ids,
+        &unconsumed_replacement_triggers,
+    );
+
+    // Grouped by tier, then by Task ID. A total order over a deterministic
+    // predicate, so the serialized request is byte-stable for identical state.
+    let ordered = plan
+        .full
+        .iter()
+        .chain(plan.structural.iter())
+        .chain(plan.compact.iter())
+        .map(|id| (replanner_task_detail(&plan, id), id.clone()))
+        .collect::<Vec<_>>();
+    let tasks = ordered
+        .into_iter()
+        .map(|(detail, id)| replanner_task_snapshot(goal, &id, detail))
+        .collect::<Vec<_>>();
+    let history = plan
+        .history
+        .iter()
+        .map(|id| replanner_history_entry(goal, id))
+        .collect::<Vec<_>>();
 
     let mut pre_execution_plan_rejections = goal
         .pre_execution_plan_rejections()
@@ -589,40 +960,69 @@ pub(crate) fn replanner_request_for_goal(
             .unwrap_or_default(),
         cwd: goal_root,
         tasks,
+        history,
+        history_omitted_count: plan.history_omitted,
         pre_execution_plan_rejections,
         consecutive_pre_execution_plan_rejection_count,
-        goal_blockers: goal
-            .blockers()
-            .iter()
-            .map(|blocker| ReplannerBlocker {
-                code: blocker.code().to_owned(),
-                detail: blocker.detail().to_owned(),
-                mandatory: blocker.mandatory(),
-            })
-            .collect(),
+        goal_blockers: {
+            // `Goal.blockers` is append-only and otherwise unbounded, so keep the
+            // most recent window and report the remainder explicitly.
+            let all = goal
+                .blockers()
+                .iter()
+                .map(|blocker| ReplannerBlocker {
+                    code: blocker.code().to_owned(),
+                    detail: blocker.detail().to_owned(),
+                    mandatory: blocker.mandatory(),
+                })
+                .collect::<Vec<_>>();
+            let omitted = all.len().saturating_sub(REPLANNER_GOAL_BLOCKER_LIMIT);
+            let kept = all.into_iter().skip(omitted).collect::<Vec<_>>();
+            (kept, omitted)
+        }
+        .0,
+        goal_blockers_omitted: {
+            let all = goal.blockers().len();
+            all.saturating_sub(REPLANNER_GOAL_BLOCKER_LIMIT)
+        },
         eligible_needs_replan_task_ids,
-        failed_task_replan_requests: goal
+        failed_task_replan_requests: {
+            let all = goal
+                .failed_task_replan_requests()
+                .iter()
+                .filter(|request| {
+                    goal.find_failed_task_replacement(request.request_id())
+                        .is_none()
+                })
+                .map(|request| ReplannerFailedTaskReplanRequest {
+                    replan_request_id: request.request_id().to_owned(),
+                    trigger_task_id: request.trigger_task_id().as_str().to_owned(),
+                    trigger_plan_revision: request.trigger_plan_revision(),
+                    policy: request.policy(),
+                    trigger_kind: request.trigger_kind(),
+                    trigger_failure_class: request.trigger_failure_class(),
+                    trigger_side_effect_state: request.trigger_side_effect_state(),
+                    remaining_attempt_budget: goal
+                        .tasks()
+                        .get(request.trigger_task_id())
+                        .map(|task| task.semantic_attempts_remaining()),
+                    reason: request.reason().to_owned(),
+                })
+                .collect::<Vec<_>>();
+            let omitted = all.len().saturating_sub(REPLANNER_REPLAN_REQUEST_LIMIT);
+            let kept = all.into_iter().skip(omitted).collect::<Vec<_>>();
+            (kept, omitted)
+        }
+        .0,
+        failed_task_replan_requests_omitted: goal
             .failed_task_replan_requests()
             .iter()
             .filter(|request| {
                 goal.find_failed_task_replacement(request.request_id())
                     .is_none()
             })
-            .map(|request| ReplannerFailedTaskReplanRequest {
-                replan_request_id: request.request_id().to_owned(),
-                trigger_task_id: request.trigger_task_id().as_str().to_owned(),
-                trigger_plan_revision: request.trigger_plan_revision(),
-                policy: request.policy(),
-                trigger_kind: request.trigger_kind(),
-                trigger_failure_class: request.trigger_failure_class(),
-                trigger_side_effect_state: request.trigger_side_effect_state(),
-                remaining_attempt_budget: goal
-                    .tasks()
-                    .get(request.trigger_task_id())
-                    .map(|task| task.semantic_attempts_remaining()),
-                reason: request.reason().to_owned(),
-            })
-            .collect(),
+            .count()
+            .saturating_sub(REPLANNER_REPLAN_REQUEST_LIMIT),
         sizing: planner::task_sizing_profile_for_goal(goal),
         readonly_output_contract: ReadonlyOutputContract {
             max_evidence_items: planner::MAX_READONLY_EVIDENCE_ITEMS,
@@ -793,15 +1193,15 @@ fn canonical_proposal_digest(value: &serde_json::Value) -> String {
 /// an overflow must saturate into a rejection rather than wrap into a smaller
 /// number that would admit an oversized plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PlanTotals {
-    active_tasks: usize,
-    active_dependency_edges: usize,
-    active_scope_paths: usize,
-    active_verification_entries: usize,
-    history_tasks: usize,
-    history_dependency_edges: usize,
-    history_scope_paths: usize,
-    history_verification_entries: usize,
+pub(crate) struct PlanTotals {
+    pub(crate) active_tasks: usize,
+    pub(crate) active_dependency_edges: usize,
+    pub(crate) active_scope_paths: usize,
+    pub(crate) active_verification_entries: usize,
+    pub(crate) history_tasks: usize,
+    pub(crate) history_dependency_edges: usize,
+    pub(crate) history_scope_paths: usize,
+    pub(crate) history_verification_entries: usize,
 }
 
 impl PlanTotals {

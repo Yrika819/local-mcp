@@ -549,6 +549,24 @@ impl PristinePlanSupersessionRecord {
     pub(crate) fn rejected_plan_revision(&self) -> u32 {
         self.rejected_plan_revision
     }
+    /// The plan revision this supersession published. Replanner history
+    /// summarization reports it so the model can tell a replacement chain's age
+    /// without reading any superseded Task body.
+    pub(crate) fn committed_plan_revision(&self) -> u32 {
+        self.committed_plan_revision
+    }
+    /// Every Task this supersession moved into durable history.
+    pub(crate) fn affected_task_ids(&self) -> &[TaskId] {
+        &self.affected_task_ids
+    }
+    /// The pristine replacement Tasks that took over, in durable order.
+    pub(crate) fn replacement_task_ids(&self) -> &[TaskId] {
+        &self.replacement_task_ids
+    }
+    /// The completion criteria that had to follow the replaced Tasks.
+    pub(crate) fn rebound_criterion_ids(&self) -> &[CompletionCriterionId] {
+        &self.rebound_criterion_ids
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,6 +786,13 @@ impl FailedTaskReplacementRecord {
         &self.replan_request_id
     }
 
+    /// The plan revision this replacement published. Replanner history
+    /// summarization reports it so the model can tell a replacement chain's age
+    /// without reading any superseded Task body.
+    pub(crate) fn committed_plan_revision(&self) -> u32 {
+        self.committed_plan_revision
+    }
+
     pub(crate) fn canonical_proposal_digest(&self) -> &str {
         &self.canonical_proposal_digest
     }
@@ -778,6 +803,11 @@ impl FailedTaskReplacementRecord {
 
     pub(crate) fn completion_closure_task_ids(&self) -> &[TaskId] {
         &self.completion_closure_task_ids
+    }
+
+    /// Every active dependent this transaction rewired off the replaced Task.
+    pub(crate) fn rewired_dependent_task_ids(&self) -> &[TaskId] {
+        &self.rewired_dependent_task_ids
     }
 
     pub(crate) fn preserved_max_attempts(&self) -> u32 {
