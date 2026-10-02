@@ -155,6 +155,21 @@ pub(crate) const REPLANNER_GOAL_BLOCKER_LIMIT: usize = 32;
 /// ability to see the work. The host validates against the complete durable list.
 pub(crate) const REPLANNER_REPLAN_REQUEST_LIMIT: usize = 8;
 
+/// The hard ceiling on the serialized Replanner request, enforced host-side
+/// before the model is invoked.
+///
+/// The real transport limit is `agent::MODEL_PROMPT_LIMIT` (256 KiB), and
+/// `GoalModelAgent::invoke` refuses anything larger — but only after a prompt
+/// string has been assembled, and it reports a generic
+/// `AgentError::InvalidConfiguration` that says nothing about which bound was hit.
+/// The fixed non-JSON cost of a Replanner prompt is the preamble, the role line,
+/// `REPLANNER_RULES`, `COMMON_VERIFICATION_SCHEMA` and the `DATA_BEGIN`/
+/// `DATA_END` framing, measured at under 10 KiB. 224 KiB therefore leaves more
+/// than 20 KiB of headroom, and a test pins
+/// `REPLANNER_REQUEST_MAX_BYTES + fixed overhead <= MODEL_PROMPT_LIMIT` so the
+/// margin cannot silently erode if the rules text grows.
+pub(crate) const REPLANNER_REQUEST_MAX_BYTES: usize = 224 * 1024;
+
 /// How much model context each active Task is shown, host-selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -298,6 +313,31 @@ impl ReplannerRequest {
         &self.cwd
     }
 
+    /// The exact byte length of the request as the model would receive it, before
+    /// the fixed prompt preamble and role rules are added. This is the quantity
+    /// `REPLANNER_REQUEST_MAX_BYTES` bounds.
+    pub(crate) fn serialized_size(&self) -> Result<usize, ReplannerError> {
+        serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .map_err(|_| ReplannerError::ReplannerContextTooLarge {
+                bytes: usize::MAX,
+                limit: REPLANNER_REQUEST_MAX_BYTES,
+            })
+    }
+
+    /// Enforce the hard request ceiling. Fails closed: the model is never invoked
+    /// with an oversized context, and the JSON is never truncated, because a
+    /// truncated proposal is unparseable and would hide the real condition.
+    pub(crate) fn enforce_size_ceiling(&self) -> Result<(), ReplannerError> {
+        let bytes = self.serialized_size()?;
+        if bytes > REPLANNER_REQUEST_MAX_BYTES {
+            return Err(ReplannerError::ReplannerContextTooLarge {
+                bytes,
+                limit: REPLANNER_REQUEST_MAX_BYTES,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The host's relevance decision for one Replanner invocation.
@@ -634,6 +674,18 @@ pub(crate) enum ReplannerError {
     ReplanNotApplicable(String),
     ReplanAuthorityViolation(String),
     NoSafeReplan(String),
+    /// The deterministic compact representation of the Replanner's own context
+    /// still exceeds the hard host request ceiling, so the model is not invoked
+    /// at all.
+    ///
+    /// This is a bounded terminal block, not a retry and not a new replan
+    /// request. In particular it must never be converted into another attempt of
+    /// the same shape: a Replanner whose input is too large would otherwise ask
+    /// for a Replanner, whose input is too large, forever.
+    ReplannerContextTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     Store(OrchestratorError),
 }
 
@@ -662,6 +714,10 @@ impl fmt::Display for ReplannerError {
                 write!(f, "replan exceeds Goal/session authority: {reason}")
             }
             Self::NoSafeReplan(reason) => write!(f, "no safe replan is available: {reason}"),
+            Self::ReplannerContextTooLarge { bytes, limit } => write!(
+                f,
+                "replanner request context is {bytes} bytes, over the {limit}-byte host ceiling: the model was not invoked"
+            ),
             Self::Store(error) => write!(f, "durable Goal operation failed: {error}"),
         }
     }
@@ -1202,6 +1258,11 @@ pub(crate) struct PlanTotals {
     pub(crate) history_dependency_edges: usize,
     pub(crate) history_scope_paths: usize,
     pub(crate) history_verification_entries: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn plan_totals_for_test(goal: &Goal) -> PlanTotals {
+    PlanTotals::of(goal)
 }
 
 impl PlanTotals {

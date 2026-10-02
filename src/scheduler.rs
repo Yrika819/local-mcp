@@ -693,6 +693,11 @@ fn map_replanner_error(error: &ReplannerError) -> SchedulerStepOutcome {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn map_replanner_error_for_test(error: &ReplannerError) -> SchedulerStepOutcome {
+    map_replanner_error(error)
+}
+
 fn map_store_or_lower(
     authority: SchedulerAuthority,
     error: &OrchestratorError,
