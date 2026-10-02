@@ -1453,7 +1453,7 @@ fn enforce_plan_budgets(
             "candidate plan exceeds the 1024 dependency-edge limit".to_owned(),
         ));
     }
-    if totals
+    if resulting
         .active_scope_paths
         .saturating_add(proposed_scope_paths)
         > planner::MAX_SCOPE_PATHS_TOTAL

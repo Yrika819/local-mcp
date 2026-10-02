@@ -2893,3 +2893,40 @@ fn a_serialization_failure_is_reported_as_such_and_not_as_a_size_overflow() {
         "the measured size must be the exact length the model receives"
     );
 }
+
+#[test]
+fn a_replacement_at_the_exact_scope_path_ceiling_is_admitted_too() {
+    // Regression guard for the review finding that supersession was credited to
+    // the Task and edge budgets but not to scope paths. The commit-time backstop
+    // only covers dependency edges, so a Goal at exactly the scope-path ceiling
+    // had no other path back: every proposal was refused for budget the dead Task
+    // no longer occupied.
+    let fixture = build(
+        "release-scope-paths",
+        Shape {
+            // 39 leaves x 26 paths + trigger + Writer = 1017, just under 1024.
+            leaf_tasks: 39,
+            criterion_bound_leaves: 39,
+            paths_per_leaf: 25,
+            ..Shape::default()
+        },
+    );
+    let before = crate::replanner::plan_totals_for_test(&fixture.goal);
+    assert!(
+        before.active_scope_paths <= planner::MAX_SCOPE_PATHS_TOTAL
+            && before.active_scope_paths + 26 > planner::MAX_SCOPE_PATHS_TOTAL,
+        "the active graph must sit just under the scope-path ceiling: {}",
+        before.active_scope_paths
+    );
+    let proposal = decomposed_replacement(&fixture, "synthetic-trigger-request");
+    let result = apply(&fixture, &proposal).expect(
+        "a replacement must be admissible at the scope-path ceiling once the dead Task releases its paths",
+    );
+    let after = crate::replanner::plan_totals_for_test(&result);
+    assert!(after.active_scope_paths <= planner::MAX_SCOPE_PATHS_TOTAL);
+    assert!(
+        after.history_scope_paths > 0,
+        "the superseded Task's scope paths must have moved into durable history"
+    );
+    result.validate().expect("committed Goal validates");
+}
