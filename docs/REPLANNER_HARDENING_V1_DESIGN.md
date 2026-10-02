@@ -280,16 +280,24 @@ replaced and by what — not the old evidence. A host-generated, deterministic
 `history` array of at most `REPLANNER_HISTORY_SUMMARY_LIMIT = 64` entries:
 
 ```
-superseded_task_id, status, replan_request_id, committed_plan_revision,
+superseded_task_id, status, superseded_plan_revision,
+replan_request_id, committed_plan_revision,
 replaced_by (sorted completion-closure / replacement Task ids),
 preserved_max_attempts, preserved_consumed_attempts,
 rebound_criterion_ids (sorted)
 ```
 
-Selection: superseded Tasks ordered by `(created_plan_revision desc, task_id asc)`
-— a total order, since `TaskId` is unique — truncated to 64, with
+`superseded_plan_revision` is the window's selection key, exposed so the ordering
+is self-evident to a reader of the prompt rather than implicit.
+
+Selection: superseded Tasks ordered by `(superseded_plan_revision desc,
+task_id asc)` — a total order, since `TaskId` is unique — truncated to 64, with
 `history_omitted_count` reporting the remainder so the model knows history exists
-beyond the window rather than believing the Goal has none. No evidence bodies, no
+beyond the window rather than believing the Goal has none.
+
+`replaced_by` names the Task that took over *at the time*. In a multi-round chain
+that successor may itself have been superseded later, so the assertion is that the
+name resolves durably, not that it is still active. No evidence bodies, no
 attempt bodies, no paths, no prose from the model itself. The model is never asked
 to summarize its own authority history back to itself as input.
 
@@ -389,7 +397,8 @@ existing test. New test groups:
 - byte ceiling: the margin assertion; an oversized compact request fails closed
   with the typed error; the model is never invoked; the condition does not
   recursively request another replan.
-- non-amplification: the 0..1024 superseded-Task sweep.
+- non-amplification: the 0/8/32/64/128 superseded-Task sweep with the active graph
+  held constant, plus the per-Task payload invariant at each depth.
 - determinism: byte-identical request across repeated construction.
 - large synthetic Goals: small normal; 30–40 Task PokéCPU-like; near active
   limit; many superseded plus small active graph; deep dependency chain; broad
@@ -414,5 +423,32 @@ existing test. New test groups:
 8. `goal_status` shape, Planner behavior, Writer behavior, Verifier behavior,
    Managed Worktrees, approval, sandbox, and Windows experimental status are
    unchanged.
+
+## 10. Measured result
+
+Before/after serialized Replanner request bytes, over the same deterministic
+synthetic Goals (`src/replanner_compaction_tests.rs`):
+
+| shape | active | history | before | after |
+| --- | --- | --- | --- | --- |
+| small | 6 | 0 | 6,998 | 6,943 |
+| 30-40 Task PokéCPU-like | 38 | 0 | 29,127 | 27,051 |
+| PokéCPU-like with history | 38 | 24 | 63,157 | 36,425 |
+| history-heavy | 8 | 64 | **148,977** | **32,659** |
+| deep dependency chain | 26 | 0 | 21,827 | 20,507 |
+| broad fan-out | 26 | 0 | 26,589 | 25,267 |
+| many unrelated completed | 48 | 0 | 57,817 | 34,977 |
+| blocker and criterion weight | 8 | 0 | 16,076 | 19,112 |
+
+Non-amplification sweep, active graph constant at 8 Tasks: 7.6 KB, 10.4 KB,
+18.7 KB, 29.6 KB, 29.3 KB at 0, 8, 32, 64, 128 superseded Tasks — flat past the
+bounded window, where the pre-change request grew proportionally to every
+superseded Task body.
+
+Two honest notes. `blocker and criterion weight` grows slightly, because padded
+criterion prose is semantically load-bearing and is deliberately never truncated.
+And the ceiling test uses that same shape deliberately: 64 criteria at the
+`goal_start` limit of 8192 characters is a Goal that genuinely cannot fit in any
+transport, so it must fail closed rather than be silently cut.
 
 **REPLANNER_HARDENING_V1_FROZEN**
