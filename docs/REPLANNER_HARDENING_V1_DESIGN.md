@@ -328,11 +328,20 @@ explicit omitted count so the omission is visible rather than silent:
 - `goal_blockers`: at most `REPLANNER_GOAL_BLOCKER_LIMIT = 32`, keeping the most
   recent 32, plus `goal_blockers_omitted`.
 - `failed_task_replan_requests`: at most
-  `REPLANNER_REPLAN_REQUEST_LIMIT = 8`, matching the `goal_resume` `maxItems: 8`
-  MCP bound, plus `failed_task_replan_requests_omitted`. Every unconsumed trigger
-  is still a `full` seed (5.1 step 4), so a truncated authority token costs the
-  model the ability to *name* that specific replacement, never the ability to see
-  the work. The host validates against the complete durable request list.
+  `REPLANNER_REPLAN_REQUEST_LIMIT = 8`, plus
+  `failed_task_replan_requests_omitted`. Every unconsumed trigger is still a `full`
+  seed (5.1 step 4), so a truncated authority token costs the model the ability to
+  *name* that specific replacement, never the ability to see the work. The host
+  validates against the complete durable request list.
+
+  The bound is chosen for boundedness, not to mirror an input limit: `goal_resume`
+  accepts at most 8 requests **per call**, and a Goal may be resumed repeatedly, so
+  more than 8 unconsumed authorities is reachable. Once `plan_revision` advances,
+  every request whose `trigger_plan_revision` is stale becomes unusable for *any*
+  proposal, so truncation does not change whether an old authority can be acted on
+  — it only bounds how many the model is shown. Narrowing this window trades model
+  capability for a hard bound on request size, which is the direction section 2
+  requires when context is under pressure.
 
 `pre_execution_plan_rejections` is already bounded to 8
 (`REPLANNER_PRE_EXECUTION_REJECTION_HISTORY_LIMIT`) and is unchanged.
