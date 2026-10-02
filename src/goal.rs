@@ -805,11 +805,6 @@ impl FailedTaskReplacementRecord {
         &self.completion_closure_task_ids
     }
 
-    /// Every active dependent this transaction rewired off the replaced Task.
-    pub(crate) fn rewired_dependent_task_ids(&self) -> &[TaskId] {
-        &self.rewired_dependent_task_ids
-    }
-
     pub(crate) fn preserved_max_attempts(&self) -> u32 {
         self.preserved_max_attempts
     }

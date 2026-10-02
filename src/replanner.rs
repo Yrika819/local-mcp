@@ -142,6 +142,18 @@ const REPLANNER_PRE_EXECUTION_REJECTION_HISTORY_LIMIT: usize = 8;
 /// is shown, rather than believing there is none.
 pub(crate) const REPLANNER_HISTORY_SUMMARY_LIMIT: usize = 64;
 
+/// How many successor Tasks and rebound criteria a single history entry names.
+///
+/// Bounded per entry, not only per window. `completion_closure_task_ids` can hold
+/// up to `MAX_PLAN_TASKS` ids and `rebound_criterion_ids` up to the 64 criteria
+/// `goal_start` accepts, so an unbounded entry multiplied by a 64-entry window can
+/// exceed the request ceiling on its own and terminally block a Goal whose active
+/// plan is perfectly repairable. The model only needs to know *that* a Task was
+/// replaced and *by how much*; the full closure is host-durable and the host
+/// revalidates it anyway.
+pub(crate) const REPLANNER_HISTORY_CLOSURE_LIMIT: usize = 8;
+pub(crate) const REPLANNER_HISTORY_CRITERION_LIMIT: usize = 8;
+
 /// How many durable Goal blockers the request carries. `Goal.blockers` is
 /// append-only and otherwise unbounded, so the tail is kept and the remainder is
 /// reported in `goal_blockers_omitted`.
@@ -209,11 +221,17 @@ struct ReplannerHistoryEntry {
     /// The durable replan request this replacement consumed, when there was one.
     replan_request_id: Option<String>,
     committed_plan_revision: Option<u32>,
-    /// The Task or Tasks that took over, in durable order.
+    /// The Tasks that took over, in durable order, capped at
+    /// `REPLANNER_HISTORY_CLOSURE_LIMIT`.
     replaced_by: Vec<String>,
+    /// How many further successor Tasks this entry does not name.
+    replaced_by_omitted: usize,
     preserved_max_attempts: Option<u32>,
     preserved_consumed_attempts: Option<u32>,
+    /// The rebound criteria, capped at `REPLANNER_HISTORY_CRITERION_LIMIT`.
     rebound_criterion_ids: Vec<String>,
+    /// How many further rebound criteria this entry does not name.
+    rebound_criterion_ids_omitted: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -313,21 +331,29 @@ impl ReplannerRequest {
         &self.cwd
     }
 
-    /// The exact byte length of the request as the model would receive it, before
-    /// the fixed prompt preamble and role rules are added. This is the quantity
-    /// `REPLANNER_REQUEST_MAX_BYTES` bounds.
+    /// Serialize once and report the exact byte length the model would receive,
+    /// before the fixed prompt preamble and role rules are added. This is the
+    /// quantity `REPLANNER_REQUEST_MAX_BYTES` bounds.
     pub(crate) fn serialized_size(&self) -> Result<usize, ReplannerError> {
-        serde_json::to_vec(self)
-            .map(|bytes| bytes.len())
-            .map_err(|_| ReplannerError::ReplannerContextTooLarge {
-                bytes: usize::MAX,
-                limit: REPLANNER_REQUEST_MAX_BYTES,
-            })
+        Ok(self.to_prompt_json()?.len())
+    }
+
+    /// The single serialization of the request, shared by the size ceiling and
+    /// the model call so the replan hot path does not pay for it twice.
+    pub(crate) fn to_prompt_json(&self) -> Result<String, ReplannerError> {
+        // A serialization failure is not a size failure. Reporting it as one
+        // would print a nonsense byte count and hide the real condition, which is
+        // the diagnosability defect this ceiling exists to remove.
+        serde_json::to_string(self).map_err(|_| ReplannerError::ReplannerContextUnserializable)
     }
 
     /// Enforce the hard request ceiling. Fails closed: the model is never invoked
     /// with an oversized context, and the JSON is never truncated, because a
     /// truncated proposal is unparseable and would hide the real condition.
+    ///
+    /// The production backend bounds the single serialization it already performs
+    /// rather than calling this, so the replan hot path never serializes twice.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn enforce_size_ceiling(&self) -> Result<(), ReplannerError> {
         let bytes = self.serialized_size()?;
         if bytes > REPLANNER_REQUEST_MAX_BYTES {
@@ -487,6 +513,20 @@ fn replanner_context_plan(
     }
 }
 
+/// Durable failed-task replan requests the host will still accept a
+/// `replace_tasks` proposal against: recorded, and not yet consumed by a
+/// replacement record. One linear scan, shared by the seed derivation and the
+/// prompt's authority window so the two cannot disagree.
+fn unconsumed_replan_requests(goal: &Goal) -> Vec<&crate::goal::FailedTaskReplanRequest> {
+    goal.failed_task_replan_requests()
+        .iter()
+        .filter(|request| {
+            goal.find_failed_task_replacement(request.request_id())
+                .is_none()
+        })
+        .collect()
+}
+
 fn replanner_task_detail(plan: &ReplannerContextPlan, id: &TaskId) -> ReplannerTaskDetail {
     if plan.full.contains(id) {
         ReplannerTaskDetail::Full
@@ -557,6 +597,15 @@ fn replanner_task_snapshot(
     }
 }
 
+/// Take the leading `limit` entries of a durable ordered id list and report how
+/// many were dropped. The ids stay in durable order, so the window is
+/// reproducible for identical state.
+fn bounded_ids<'a>(ids: impl Iterator<Item = &'a str>, limit: usize) -> (Vec<String>, usize) {
+    let all = ids.map(str::to_owned).collect::<Vec<_>>();
+    let omitted = all.len().saturating_sub(limit);
+    (all.into_iter().take(limit).collect(), omitted)
+}
+
 fn replanner_history_entry(goal: &Goal, id: &TaskId) -> ReplannerHistoryEntry {
     let mut entry = ReplannerHistoryEntry {
         superseded_task_id: id.as_str().to_owned(),
@@ -569,9 +618,11 @@ fn replanner_history_entry(goal: &Goal, id: &TaskId) -> ReplannerHistoryEntry {
         replan_request_id: None,
         committed_plan_revision: None,
         replaced_by: Vec::new(),
+        replaced_by_omitted: 0,
         preserved_max_attempts: None,
         preserved_consumed_attempts: None,
         rebound_criterion_ids: Vec::new(),
+        rebound_criterion_ids_omitted: 0,
     };
     for record in goal.failed_task_replacements() {
         if record.replaced_task_id() != id {
@@ -579,34 +630,42 @@ fn replanner_history_entry(goal: &Goal, id: &TaskId) -> ReplannerHistoryEntry {
         }
         entry.replan_request_id = Some(record.replan_request_id().to_owned());
         entry.committed_plan_revision = Some(record.committed_plan_revision());
-        entry.replaced_by = record
-            .completion_closure_task_ids()
-            .iter()
-            .map(|task| task.as_str().to_owned())
-            .collect();
+        (entry.replaced_by, entry.replaced_by_omitted) = bounded_ids(
+            record
+                .completion_closure_task_ids()
+                .iter()
+                .map(|task| task.as_str()),
+            REPLANNER_HISTORY_CLOSURE_LIMIT,
+        );
         entry.preserved_max_attempts = Some(record.preserved_max_attempts());
         entry.preserved_consumed_attempts = Some(record.preserved_consumed_attempts());
-        entry.rebound_criterion_ids = record
-            .rebound_criterion_ids()
-            .iter()
-            .map(|criterion| criterion.as_str().to_owned())
-            .collect();
+        (
+            entry.rebound_criterion_ids,
+            entry.rebound_criterion_ids_omitted,
+        ) = bounded_ids(
+            record.rebound_criterion_ids().iter().map(|id| id.as_str()),
+            REPLANNER_HISTORY_CRITERION_LIMIT,
+        );
     }
     for record in goal.pristine_plan_supersessions() {
         if !record.affected_task_ids().contains(id) {
             continue;
         }
         entry.committed_plan_revision = Some(record.committed_plan_revision());
-        entry.replaced_by = record
-            .replacement_task_ids()
-            .iter()
-            .map(|task| task.as_str().to_owned())
-            .collect();
-        entry.rebound_criterion_ids = record
-            .rebound_criterion_ids()
-            .iter()
-            .map(|criterion| criterion.as_str().to_owned())
-            .collect();
+        (entry.replaced_by, entry.replaced_by_omitted) = bounded_ids(
+            record
+                .replacement_task_ids()
+                .iter()
+                .map(|task| task.as_str()),
+            REPLANNER_HISTORY_CLOSURE_LIMIT,
+        );
+        (
+            entry.rebound_criterion_ids,
+            entry.rebound_criterion_ids_omitted,
+        ) = bounded_ids(
+            record.rebound_criterion_ids().iter().map(|id| id.as_str()),
+            REPLANNER_HISTORY_CRITERION_LIMIT,
+        );
     }
     entry
 }
@@ -686,6 +745,10 @@ pub(crate) enum ReplannerError {
         bytes: usize,
         limit: usize,
     },
+    /// The request could not be serialized at all. Distinct from
+    /// `ReplannerContextTooLarge`: it is a host encoding fault, not a size
+    /// judgement, and conflating the two would misreport the cause.
+    ReplannerContextUnserializable,
     Store(OrchestratorError),
 }
 
@@ -717,6 +780,10 @@ impl fmt::Display for ReplannerError {
             Self::ReplannerContextTooLarge { bytes, limit } => write!(
                 f,
                 "replanner request context is {bytes} bytes, over the {limit}-byte host ceiling: the model was not invoked"
+            ),
+            Self::ReplannerContextUnserializable => write!(
+                f,
+                "replanner request context could not be serialized: the model was not invoked"
             ),
             Self::Store(error) => write!(f, "durable Goal operation failed: {error}"),
         }
@@ -951,6 +1018,59 @@ pub(crate) fn replanner_request_for_goal(
         .map(|id| replanner_history_entry(goal, id))
         .collect::<Vec<_>>();
 
+    // `Goal.blockers` is append-only and otherwise unbounded, so keep the most
+    // recent window and report the remainder explicitly.
+    let all_goal_blockers = goal
+        .blockers()
+        .iter()
+        .map(|blocker| ReplannerBlocker {
+            code: blocker.code().to_owned(),
+            detail: blocker.detail().to_owned(),
+            mandatory: blocker.mandatory(),
+        })
+        .collect::<Vec<_>>();
+    let goal_blocker_omitted = all_goal_blockers
+        .len()
+        .saturating_sub(REPLANNER_GOAL_BLOCKER_LIMIT);
+    let goal_blocker_window = (
+        all_goal_blockers
+            .into_iter()
+            .skip(goal_blocker_omitted)
+            .collect::<Vec<ReplannerBlocker>>(),
+        goal_blocker_omitted,
+    );
+
+    // One pass over the durable request list. This filter is a linear scan of the
+    // replacement records per request, so it is computed once and shared with the
+    // seed derivation above rather than repeated per field.
+    let all_replan_requests = unconsumed_replan_requests(goal)
+        .into_iter()
+        .map(|request| ReplannerFailedTaskReplanRequest {
+            replan_request_id: request.request_id().to_owned(),
+            trigger_task_id: request.trigger_task_id().as_str().to_owned(),
+            trigger_plan_revision: request.trigger_plan_revision(),
+            policy: request.policy(),
+            trigger_kind: request.trigger_kind(),
+            trigger_failure_class: request.trigger_failure_class(),
+            trigger_side_effect_state: request.trigger_side_effect_state(),
+            remaining_attempt_budget: goal
+                .tasks()
+                .get(request.trigger_task_id())
+                .map(|task| task.semantic_attempts_remaining()),
+            reason: request.reason().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let replan_request_omitted = all_replan_requests
+        .len()
+        .saturating_sub(REPLANNER_REPLAN_REQUEST_LIMIT);
+    let replan_request_window = (
+        all_replan_requests
+            .into_iter()
+            .skip(replan_request_omitted)
+            .collect::<Vec<ReplannerFailedTaskReplanRequest>>(),
+        replan_request_omitted,
+    );
+
     let mut pre_execution_plan_rejections = goal
         .pre_execution_plan_rejections()
         .iter()
@@ -1020,65 +1140,15 @@ pub(crate) fn replanner_request_for_goal(
         history_omitted_count: plan.history_omitted,
         pre_execution_plan_rejections,
         consecutive_pre_execution_plan_rejection_count,
-        goal_blockers: {
-            // `Goal.blockers` is append-only and otherwise unbounded, so keep the
-            // most recent window and report the remainder explicitly.
-            let all = goal
-                .blockers()
-                .iter()
-                .map(|blocker| ReplannerBlocker {
-                    code: blocker.code().to_owned(),
-                    detail: blocker.detail().to_owned(),
-                    mandatory: blocker.mandatory(),
-                })
-                .collect::<Vec<_>>();
-            let omitted = all.len().saturating_sub(REPLANNER_GOAL_BLOCKER_LIMIT);
-            let kept = all.into_iter().skip(omitted).collect::<Vec<_>>();
-            (kept, omitted)
-        }
-        .0,
-        goal_blockers_omitted: {
-            let all = goal.blockers().len();
-            all.saturating_sub(REPLANNER_GOAL_BLOCKER_LIMIT)
-        },
+        // Both bounded vectors are windowed exactly once, and each window's
+        // omitted count comes from the same collection as the window itself. A
+        // separate recomputation could drift from the vector the model reads,
+        // turning one contract into two disagreeing ones.
+        goal_blockers: goal_blocker_window.0,
+        goal_blockers_omitted: goal_blocker_window.1,
         eligible_needs_replan_task_ids,
-        failed_task_replan_requests: {
-            let all = goal
-                .failed_task_replan_requests()
-                .iter()
-                .filter(|request| {
-                    goal.find_failed_task_replacement(request.request_id())
-                        .is_none()
-                })
-                .map(|request| ReplannerFailedTaskReplanRequest {
-                    replan_request_id: request.request_id().to_owned(),
-                    trigger_task_id: request.trigger_task_id().as_str().to_owned(),
-                    trigger_plan_revision: request.trigger_plan_revision(),
-                    policy: request.policy(),
-                    trigger_kind: request.trigger_kind(),
-                    trigger_failure_class: request.trigger_failure_class(),
-                    trigger_side_effect_state: request.trigger_side_effect_state(),
-                    remaining_attempt_budget: goal
-                        .tasks()
-                        .get(request.trigger_task_id())
-                        .map(|task| task.semantic_attempts_remaining()),
-                    reason: request.reason().to_owned(),
-                })
-                .collect::<Vec<_>>();
-            let omitted = all.len().saturating_sub(REPLANNER_REPLAN_REQUEST_LIMIT);
-            let kept = all.into_iter().skip(omitted).collect::<Vec<_>>();
-            (kept, omitted)
-        }
-        .0,
-        failed_task_replan_requests_omitted: goal
-            .failed_task_replan_requests()
-            .iter()
-            .filter(|request| {
-                goal.find_failed_task_replacement(request.request_id())
-                    .is_none()
-            })
-            .count()
-            .saturating_sub(REPLANNER_REPLAN_REQUEST_LIMIT),
+        failed_task_replan_requests: replan_request_window.0,
+        failed_task_replan_requests_omitted: replan_request_window.1,
         sizing: planner::task_sizing_profile_for_goal(goal),
         readonly_output_contract: ReadonlyOutputContract {
             max_evidence_items: planner::MAX_READONLY_EVIDENCE_ITEMS,
@@ -1297,9 +1367,12 @@ impl PlanTotals {
         totals
     }
 
-    /// The durable history this proposal would leave behind: the current history
-    /// plus every active Task it supersedes. Nothing is deleted, so the totals
-    /// only ever grow, and the history ceilings are what keeps that bounded.
+    /// The totals this proposal would leave behind: every active Task it
+    /// supersedes moves out of the active execution graph and into durable
+    /// history, carrying its edges, scope paths, and verification entries with
+    /// it. Nothing is deleted, so the history half only ever grows, and the
+    /// history ceilings are what keeps that bounded; the active half shrinks by
+    /// exactly the contribution `PlanTotals::of` added for those Tasks.
     fn history_after_superseding(&self, goal: &Goal, superseded: &BTreeSet<TaskId>) -> Self {
         let mut totals = *self;
         for id in superseded {
@@ -1345,26 +1418,33 @@ impl PlanTotals {
 /// Enforce the active-plan ceilings against the active execution graph only, and
 /// the separate durable-history ceilings against the history this proposal would
 /// leave behind.
+///
+/// `superseded` is the host-derived set of durable Tasks this proposal moves into
+/// history. It is a parameter rather than re-derived here so the caller and this
+/// function cannot disagree about what is being superseded, and so the budget can
+/// be exercised directly against real durable state.
 fn enforce_plan_budgets(
     goal: &Goal,
-    proposal: &ReplanProposal,
+    superseded: &BTreeSet<TaskId>,
     proposed_tasks: usize,
     proposed_dependency_edges: usize,
     proposed_scope_paths: usize,
     proposed_verification_entries: usize,
 ) -> Result<(), ReplannerError> {
     let totals = PlanTotals::of(goal);
-    if totals
-        .active_tasks
-        .saturating_add(proposed_tasks)
-        .saturating_sub(superseded_task_count(goal, proposal))
-        > planner::MAX_PLAN_TASKS
-    {
+    // Post-supersession active totals. Every Task this proposal supersedes leaves
+    // the active execution graph, so its edges, scope paths, and verification
+    // entries leave the *active* budget too. Checking the four dimensions against
+    // the pre-supersession base would leave the exact defect this branch removes
+    // alive at the ceiling: a repair of a wide Task would still be refused for
+    // budget the dead Task no longer occupies.
+    let resulting = totals.history_after_superseding(goal, superseded);
+    if resulting.active_tasks.saturating_add(proposed_tasks) > planner::MAX_PLAN_TASKS {
         return Err(ReplannerError::ReplannerSchemaViolation(
             "candidate plan exceeds the 128 Task host limit".to_owned(),
         ));
     }
-    if totals
+    if resulting
         .active_dependency_edges
         .saturating_add(proposed_dependency_edges)
         > planner::MAX_PLAN_DEPENDENCY_EDGES
@@ -1382,7 +1462,7 @@ fn enforce_plan_budgets(
             "candidate plan exceeds the 1024 scope-path limit".to_owned(),
         ));
     }
-    if totals
+    if resulting
         .active_verification_entries
         .saturating_add(proposed_verification_entries)
         > planner::MAX_VERIFICATION_TOTAL
@@ -1395,7 +1475,6 @@ fn enforce_plan_budgets(
     // Superseded history must not become literally unbounded. These ceilings are
     // separate from, and never traded against, the active-plan ceilings: a Goal
     // may legitimately hold a full active plan *and* a long replacement history.
-    let resulting = totals.history_after_superseding(goal, &superseded_task_ids(goal, proposal));
     if resulting.history_tasks > planner::MAX_DURABLE_SUPERSEDED_TASKS
         || resulting.history_dependency_edges > planner::MAX_DURABLE_SUPERSEDED_DEPENDENCY_EDGES
         || resulting.history_scope_paths > planner::MAX_DURABLE_SUPERSEDED_SCOPE_PATHS
@@ -1409,17 +1488,26 @@ fn enforce_plan_budgets(
     Ok(())
 }
 
-/// How many active Tasks this proposal supersedes, so the active Task ceiling
-/// counts a replacement as size-neutral.
-fn superseded_task_count(goal: &Goal, proposal: &ReplanProposal) -> usize {
-    superseded_task_ids(goal, proposal)
-        .iter()
-        .filter(|id| {
-            goal.tasks()
-                .get(*id)
-                .is_some_and(|task| task.is_active_plan_authority())
-        })
-        .count()
+/// A test seam over the real budget function, so each durable-history ceiling can
+/// be driven over its bound against a real durable Goal without constructing a
+/// thousand replacement transactions first.
+#[cfg(test)]
+pub(crate) fn enforce_plan_budgets_for_test(
+    goal: &Goal,
+    superseded: &BTreeSet<TaskId>,
+    proposed_tasks: usize,
+    proposed_dependency_edges: usize,
+    proposed_scope_paths: usize,
+    proposed_verification_entries: usize,
+) -> Result<(), ReplannerError> {
+    enforce_plan_budgets(
+        goal,
+        superseded,
+        proposed_tasks,
+        proposed_dependency_edges,
+        proposed_scope_paths,
+        proposed_verification_entries,
+    )
 }
 
 /// Every durable Task this proposal would move into history, host-derived.
@@ -1612,7 +1700,7 @@ fn parse_and_validate_proposal(
         );
     enforce_plan_budgets(
         goal,
-        &proposal,
+        &superseded_task_ids(goal, &proposal),
         proposal.add_tasks.len(),
         proposed_dependency_edges,
         proposed_scope_paths,
