@@ -152,6 +152,15 @@ history and are charged to the history budget below, not the active budget.
 
 No numeric active limit changes. Only the population being summed changes.
 
+Every superseded Task leaves the active graph carrying its edges, scope paths, and
+verification entries with it, so all four checks sum the **post-supersession**
+active totals. Crediting supersession to the Task count alone would leave the
+original defect alive at the ceiling for the other three dimensions: a Goal
+sitting exactly at the edge, scope-path, or verification ceiling could still not
+be repaired, because the Task it replaces kept spending budget it no longer
+occupies. A proposal that genuinely grows the active graph — one that supersedes
+nothing — is still refused.
+
 The commit-time backstop in `Goal::apply_task_replacements` (`src/goal.rs:2209`),
 which re-counts the *resulting* graph exactly, is switched to the same active
 predicate so the validator and the commit-time authority agree. Leaving them
@@ -295,6 +304,16 @@ task_id asc)` — a total order, since `TaskId` is unique — truncated to 64, w
 `history_omitted_count` reporting the remainder so the model knows history exists
 beyond the window rather than believing the Goal has none.
 
+`replaced_by` and `rebound_criterion_ids` are additionally capped **per entry** at
+`REPLANNER_HISTORY_CLOSURE_LIMIT` and `REPLANNER_HISTORY_CRITERION_LIMIT` (8 each),
+with `replaced_by_omitted` and `rebound_criterion_ids_omitted` reporting the
+remainder. A per-window cap alone is not a bound: `completion_closure_task_ids` can
+hold up to `MAX_PLAN_TASKS` ids and `rebound_criterion_ids` up to the 64 criteria
+`goal_start` accepts, so 64 unbounded entries could put the summary over the
+request ceiling by itself and terminally block a Goal whose active plan was
+perfectly repairable. The model only needs to know that a Task was replaced and by
+how much; the full closure is host-durable and the host revalidates it anyway.
+
 `replaced_by` names the Task that took over *at the time*. In a multi-round chain
 that successor may itself have been superseded later, so the assertion is that the
 name resolves durably, not that it is still active. No evidence bodies, no
@@ -342,12 +361,19 @@ immediately after serialization and before the model is invoked:
 REPLANNER_REQUEST_MAX_BYTES = 224 KiB (229376)
 ```
 
-Margin: the fixed non-JSON prompt cost is `PROMPT_PREAMBLE` + `ROLE:` + 
-`REPLANNER_RULES` (8611 B) + `COMMON_VERIFICATION_SCHEMA` (841 B) + the
-`DATA_BEGIN`/`DATA_END` framing, measured at under 10 KiB. 229376 + ~10 KiB stays
-below 262144 with roughly 23 KiB of headroom. A test pins
-`REPLANNER_REQUEST_MAX_BYTES + measured_fixed_overhead <= MODEL_PROMPT_LIMIT` so the
-margin cannot silently erode if the rules text grows.
+Margin: the fixed non-JSON prompt cost is `PROMPT_PREAMBLE` + `ROLE:` +
+`REPLANNER_RULES` + `COMMON_VERIFICATION_SCHEMA` + the `DATA_BEGIN`/`DATA_END`
+framing. `REPLANNER_RULES` grew in this branch to describe the tiered context and
+the history summary, so the cost must be measured rather than quoted. The
+production code exposes `goal_backends::replanner_prompt_overhead_bytes()`, which
+composes the identical `prompt()` call with the identical role-rules string and an
+empty request, and a test pins
+`REPLANNER_REQUEST_MAX_BYTES + measured_overhead <= MODEL_PROMPT_LIMIT`. The test
+measures the real constants, so the margin cannot silently erode if the rules text
+grows. The ceiling also narrows the accept band: any request JSON between the
+ceiling and the transport limit, which was previously deliverable, is now a
+bounded terminal block. That is the intended trade, and the band is small relative
+to the compaction's savings.
 
 On exceeding it, the Replanner fails closed with a new typed variant
 `ReplannerError::ReplannerContextTooLarge { bytes, limit }`. That maps through
@@ -365,12 +391,12 @@ history does **not** imply that the next Replanner request grows proportionally 
 all history.
 
 The mechanism is section 5 evaluated on the PokéCPU shape. History contributes to
-the request only through `history` (capped at 64 entries of fixed small fields) and
-`history_omitted_count` (an integer). It contributes nothing to `tasks`, because
-superseded Tasks are excluded from all three tiers by construction (5.1 step 5).
-So a Goal can accumulate up to 1024 superseded Tasks and the request grows by at
-most the difference between "fewer than 64 history entries" and "exactly 64",
-after which it is flat.
+the request only through `history` — capped at 64 entries, each with id lists
+capped at 8, so at most 64 x (8 + 8) identifiers — and `history_omitted_count` (an
+integer). It contributes nothing to `tasks`, because superseded Tasks are excluded
+from all three tiers by construction (5.1 step 5). So a Goal can accumulate up to
+1024 superseded Tasks and the request grows by at most the difference between
+"fewer than 64 history entries" and "exactly 64", after which it is flat.
 
 Regression tests build synthetic Goals with a roughly constant active affected
 subgraph and 0, 8, 32, 64, 128, 256, 512, and 1024 superseded Tasks, and assert the
@@ -386,9 +412,14 @@ existing test. New test groups:
   are active; the predicate is `is_active_plan_authority()`.
 - quota separation: history above the old total-128 ceiling still admits a legal
   replacement; an actually oversized *active* graph is still rejected — for task
-  count, dependency edges, scope paths, and verification entries separately.
-- history ceilings: each of the four is enforced; no existing-Goal shape can trip
-  it.
+  count, dependency edges, scope paths, and verification entries separately, each
+  using a proposal that supersedes nothing so it actually reaches the budget
+  check rather than being refused earlier for an unrelated reason; and a
+  replacement at the exact ceiling is admitted, because the Task it replaces
+  releases its budget.
+- history ceilings: each of the four is proven to fire on its rejection path,
+  against a fixture that is inside every *active* ceiling so the refusal can only
+  have come from the history budget; no existing-Goal shape can trip it.
 - context compaction: each tier contains exactly the intended ids; omitted fields
   are absent; evidence bodies and attempts of non-seed Tasks never appear; full
   superseded Task bodies never appear.
@@ -396,7 +427,9 @@ existing test. New test groups:
   host-generated.
 - byte ceiling: the margin assertion; an oversized compact request fails closed
   with the typed error; the model is never invoked; the condition does not
-  recursively request another replan.
+  recursively request another replan; a serialization failure is distinguished from
+  a size overflow; and the bounded history summary cannot exceed the ceiling on
+  its own.
 - non-amplification: the 0/8/32/64/128 superseded-Task sweep with the active graph
   held constant, plus the per-Task payload invariant at each depth.
 - determinism: byte-identical request across repeated construction.
@@ -413,7 +446,8 @@ existing test. New test groups:
 2. Durable history is never deleted, pruned, or rewritten.
 3. Active quota values are unchanged; only the summed population changes.
 4. Four explicit history ceilings are added, all strictly above any value an
-   existing Goal can hold, so no migration and no schema bump.
+   existing Goal can hold, so no migration and no schema bump. Each is proven to
+   fire.
 5. Model context is a bounded, deterministic, host-selected relevance snapshot; the
    host still validates against the complete durable Goal.
 6. Compaction never adds authority. Omitted context yields rejection, not
