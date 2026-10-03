@@ -228,6 +228,13 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo build --locked --bin codex-linux-sandbox
 
+      # The Writer commits through this host-owned helper so that an atomic file
+      # publication still runs inside the platform sandbox. Several tests drive the
+      # real Writer mutation path, and `cargo test` builds a bin *test harness*
+      # rather than the bin itself, so the helper has to be built explicitly first.
+      - name: Build the atomic publication helper
+        run: cargo build --locked --bin atomic-publish
+
       - name: Run tests
         run: cargo test --locked --all-targets
 
