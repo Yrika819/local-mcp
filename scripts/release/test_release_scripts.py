@@ -150,10 +150,24 @@ class TargetMatrixTest(unittest.TestCase):
         for key in ("linux-x86_64", "linux-aarch64"):
             self.assertIn("codex-linux-sandbox", targets.get(key).required_helpers)
 
+    def test_every_platform_ships_the_writer_commit_helper(self) -> None:
+        # `atomic-publish` performs the Writer commit. On Unix it runs inside the
+        # platform sandbox so atomicity does not cost containment; the host refuses
+        # to publish rather than falling back to an unsandboxed in-process write, so
+        # an archive without it would silently weaken the Writer's authority model.
+        for key, target in targets.TARGETS.items():
+            if key.startswith("windows"):
+                self.assertIn("atomic-publish.exe", target.required_helpers)
+            else:
+                self.assertIn("atomic-publish", target.required_helpers)
+
     def test_non_linux_targets_never_ship_the_linux_helper(self) -> None:
         for key in ("macos-x86_64", "macos-aarch64", "windows-x86_64", "windows-aarch64"):
             target = targets.get(key)
-            self.assertEqual(target.required_helpers, ())
+            # macOS/Windows sandbox through the system runtime or not at all, so
+            # they must not carry the Linux helper. The Writer commit helper is a
+            # different thing entirely and is still required.
+            self.assertNotIn("codex-linux-sandbox", target.required_helpers)
             self.assertIn("codex-linux-sandbox", target.forbidden)
 
     def test_documented_experimental_targets_are_marked_in_the_matrix(self) -> None:
@@ -303,6 +317,8 @@ class PackageTest(unittest.TestCase):
         write_macho(binary, verify_package.MACHO_CPU_X86_64)
         helper = stage / "codex-linux-sandbox"
         write_macho(helper, verify_package.MACHO_CPU_X86_64)
+        commit = stage / "atomic-publish"
+        write_macho(commit, verify_package.MACHO_CPU_X86_64)
         result = subprocess.run(
             [
                 sys.executable,
@@ -319,6 +335,8 @@ class PackageTest(unittest.TestCase):
                 f"local-mcp={binary}",
                 "--binary",
                 f"codex-linux-sandbox={helper}",
+                "--binary",
+                f"atomic-publish={commit}",
             ],
             capture_output=True,
             text=True,
@@ -410,6 +428,8 @@ class VerifyTest(unittest.TestCase):
         write_elf(binary, verify_package.ELF_MACHINE_AARCH64)
         helper = stage / "codex-linux-sandbox"
         write_elf(helper, verify_package.ELF_MACHINE_AARCH64)
+        commit = stage / "atomic-publish"
+        write_elf(commit, verify_package.ELF_MACHINE_AARCH64)
         out_dir = self.out / "wrong-arch-out"
         subprocess.run(
             [
@@ -427,6 +447,8 @@ class VerifyTest(unittest.TestCase):
                 f"local-mcp={binary}",
                 "--binary",
                 f"codex-linux-sandbox={helper}",
+                "--binary",
+                f"atomic-publish={commit}",
             ],
             check=True,
             capture_output=True,
