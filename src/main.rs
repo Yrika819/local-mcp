@@ -5,6 +5,7 @@
 
 mod agent;
 mod approvals;
+mod atomic_publish_frame;
 #[cfg(target_os = "linux")]
 mod bubblewrap_support;
 mod config;
@@ -42,6 +43,7 @@ mod task_store;
 mod verifier;
 mod verifier_git_observation;
 mod worker_capability;
+mod workspace_publish;
 mod writer;
 
 #[cfg(test)]

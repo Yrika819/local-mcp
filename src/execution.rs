@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, config, fallback, sandbox};
+use crate::{approvals, atomic_publish_frame, config, fallback, sandbox, workspace_publish};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(20);
@@ -24,44 +24,102 @@ pub(crate) enum ExecutionOutcome {
     Background(BackgroundExecution),
 }
 
-pub(crate) async fn write_file_content(
-    absolute: &Path,
-    parent: &Path,
-    content: &str,
+/// Publish a host-authorized Writer file change atomically, inside the sandbox.
+///
+/// On Unix this runs the host-owned `atomic-publish` helper **through**
+/// `sandbox::run`, with the validated parent as the only writable root — exactly the
+/// containment the previous `sh -c 'cat > "$1"'` implementation had. The boundary is
+/// unchanged; only the mechanism is different, which is what makes the publication
+/// atomic without granting any new authority.
+///
+/// On Windows there is no application sandbox (see `sandbox::build_sandbox_process`),
+/// so the helper is executed directly and keeps the same structured, shell-free commit.
+pub(crate) async fn publish_workspace_write(
+    request: crate::writer::WriterWriteRequest<'_>,
 ) -> Result<sandbox::Output> {
-    #[cfg(unix)]
-    {
-        let command = vec![
-            "sh".to_owned(),
-            "-c".to_owned(),
-            "cat > \"$1\"".to_owned(),
-            "local-mcp-write".to_owned(),
-            absolute.display().to_string(),
-        ];
-        let root = parent.to_owned();
-        sandbox::run(
-            &command,
-            parent,
-            std::slice::from_ref(&root),
-            Some(content.as_bytes()),
-        )
-        .await
-    }
-    #[cfg(windows)]
-    {
-        // Windows has no application sandbox here, so avoid depending on a
-        // shell utility for the file-edit operation.
-        let _ = parent;
-        tokio::fs::write(absolute, content).await?;
-        Ok(sandbox::Output {
-            status: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-            command_start: sandbox::CommandStart::Proven,
-        })
-    }
+    let helper = atomic_publish_helper()?;
+    let parent = request.parent.to_path_buf();
+    let frame = encode_publish_frame(&request)?;
+    sandbox::run(
+        &[helper],
+        request.parent,
+        std::slice::from_ref(&parent),
+        Some(&frame),
+    )
+    .await
 }
 
+/// Resolve the host-owned publication helper next to this executable.
+///
+/// The path is derived from the host's own executable directory and is never
+/// model-influenced. When the helper is absent the publication is refused rather than
+/// silently falling back to a non-atomic write.
+fn atomic_publish_helper() -> Result<String> {
+    let executable_dir = std::env::current_exe()
+        .context("local-mcp executable has no path")?
+        .parent()
+        .context("local-mcp executable has no parent directory")?
+        .to_path_buf();
+    let name = if cfg!(windows) {
+        "atomic-publish.exe"
+    } else {
+        "atomic-publish"
+    };
+    let mut candidates = vec![executable_dir.join(name)];
+    // `cargo test` runs the harness from `target/<profile>/deps`, so the helper built
+    // into `target/<profile>/` is one level up. This mirrors the existing
+    // `codex-linux-sandbox` lookup.
+    if let Some(parent) = executable_dir.parent() {
+        candidates.push(parent.join(name));
+    }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
+    anyhow::bail!(
+        "atomic publication helper is missing; looked in {}",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Frame the request for the helper.
+///
+/// The frame is version-tagged and length-prefixed. The model supplies `content` only;
+/// the parent, target, preimage and request identity are all host-derived, so this
+/// function never encodes an authority-bearing value that came from the model.
+fn encode_publish_frame(request: &crate::writer::WriterWriteRequest<'_>) -> Result<Vec<u8>> {
+    let (kind, digest) = match request.expected_preimage {
+        workspace_publish::ExpectedPreimage::Absent => (0u8, String::new()),
+        workspace_publish::ExpectedPreimage::Sha256(sha256) => (1u8, sha256.clone()),
+    };
+    let parent = request.parent.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "writer parent path is not valid UTF-8: {}",
+            request.parent.display()
+        )
+    })?;
+    let target = request.path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "writer target path is not valid UTF-8: {}",
+            request.path.display()
+        )
+    })?;
+    Ok(atomic_publish_frame::encode(
+        atomic_publish_frame::EncodedRequest {
+            parent,
+            target,
+            preimage_kind: kind,
+            preimage_digest: &digest,
+            request_id: request.request_id,
+            content: request.content.as_bytes(),
+        },
+    ))
+}
 pub(crate) async fn execute(args: &Value, session: &config::Session) -> Result<ExecutionOutcome> {
     let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
 

@@ -26,6 +26,7 @@ use crate::task::{
     VerificationSpec, WorkerKind, WorkerReport,
 };
 use crate::task_store::TaskStore;
+use crate::workspace_publish::{self, ExpectedPreimage};
 
 pub(crate) const MAX_WRITER_RESULT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_WRITER_OPERATIONS: usize = 32;
@@ -88,12 +89,23 @@ pub(crate) trait ReviewerBackend {
     fn review(&self, request: &ReviewerRequest) -> Result<Vec<u8>, WriterError>;
 }
 
+/// A single host-authorized Writer publication.
+///
+/// The preimage and request identity are passed explicitly rather than being looked up
+/// again, so the durable expectation and the durable request id used for staging are
+/// exactly the ones the caller validated. The model never populates any of these.
+pub(crate) struct WriterWriteRequest<'a> {
+    pub path: &'a Path,
+    pub parent: &'a Path,
+    pub content: &'a str,
+    pub expected_preimage: &'a ExpectedPreimage,
+    pub request_id: &'a str,
+}
+
 pub(crate) trait WriteBoundary {
     fn write<'a>(
         &'a self,
-        absolute: &'a Path,
-        parent: &'a Path,
-        content: &'a str,
+        request: WriterWriteRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>;
 }
 
@@ -102,11 +114,9 @@ struct ExecutionWriteBoundary;
 impl WriteBoundary for ExecutionWriteBoundary {
     fn write<'a>(
         &'a self,
-        absolute: &'a Path,
-        parent: &'a Path,
-        content: &'a str,
+        request: WriterWriteRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>> {
-        Box::pin(execution::write_file_content(absolute, parent, content))
+        Box::pin(execution::publish_workspace_write(request))
     }
 }
 
@@ -543,17 +553,19 @@ pub(crate) async fn run_writer_attempt_with_boundary<
             }
         };
 
-    let scope_identity = sha256_hex(
-        operations
+    // Authority/evidence identity. Uses a lossless, length-prefixed, version-tagged
+    // encoding so two distinct host paths can never collapse onto one identity through
+    // lossy text rendering, and so field boundaries are unambiguous.
+    let scope_identity = workspace_publish::scope_identity(
+        &operations
             .iter()
-            .flat_map(|operation| {
-                let mut bytes = operation.path.to_string_lossy().as_bytes().to_vec();
-                bytes.push(0);
-                bytes.extend_from_slice(sha256_hex(operation.content.as_bytes()).as_bytes());
-                bytes
+            .map(|operation| {
+                (
+                    operation.path.clone(),
+                    sha256_hex(operation.content.as_bytes()),
+                )
             })
-            .collect::<Vec<_>>()
-            .as_slice(),
+            .collect::<Vec<_>>(),
     );
     let operation_id = format!("phase5-writer:{}", request.attempt_id);
 
@@ -601,6 +613,29 @@ pub(crate) async fn run_writer_attempt_with_boundary<
         })?;
 
     for (index, (operation, request_id)) in operations.iter().zip(&request_ids).enumerate() {
+        // Commit-time revalidation, immediately before the durable APPLYING boundary.
+        //
+        // `materialize_operations` observed the preimage earlier; between then and now
+        // the host persisted a durable intent, so an external actor may have edited the
+        // target. Re-resolving the path and re-checking the preimage here means a stale
+        // proposal is refused rather than silently overwriting someone else's work.
+        //
+        // A refusal returns `PreimageMismatch`, which the caller maps to a
+        // non-mutating NeedsReplan: no durable intent exists and no target is touched.
+        if let Err(error) = revalidate_before_commit(&current, session, task_id, operation) {
+            let detail = error.to_string();
+            block_before_mutation(
+                store,
+                session,
+                goal_id,
+                task_id,
+                &request,
+                "WRITER_PREIMAGE_CHANGED",
+                &detail,
+            )?;
+            return Err(error);
+        }
+
         durable = store.mutate_goal_snapshot(
             &session.id,
             goal_id,
@@ -617,11 +652,15 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 Ok(())
             },
         )?;
-        let output = boundary
-            .write(&operation.path, &operation.parent, &operation.content)
+        boundary
+            .write(WriterWriteRequest {
+                path: &operation.path,
+                parent: &operation.parent,
+                content: &operation.content,
+                expected_preimage: &commit_preimage(&operation.expected_preimage),
+                request_id,
+            })
             .await
-            .map_err(|error| WriterError::MutationFailed(error.to_string()))?;
-        execution::render_output(output)
             .map_err(|error| WriterError::MutationFailed(error.to_string()))?;
         let post = observe_file_state(&operation.path)?;
         let expected_digest = sha256_hex(operation.content.as_bytes());
@@ -647,7 +686,6 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 Ok(())
             },
         )?;
-        let _ = request_id;
     }
 
     let post_states = operations
@@ -1317,12 +1355,27 @@ fn resolve_scoped_write_path(
     allowed_paths: &[PathBuf],
     forbidden_paths: &[PathBuf],
 ) -> Result<(PathBuf, PathBuf), WriterError> {
-    let path = Path::new(raw);
     if raw.starts_with(":(") {
         return Err(WriterError::AuthorityViolation(
             "Git pathspec magic is not allowed in writer paths".to_owned(),
         ));
     }
+    resolve_absolute_write_path(Path::new(raw), goal_root, allowed_paths, forbidden_paths)
+}
+
+/// Apply every path-authority rule to a resolved `Path`.
+///
+/// Split out from [`resolve_scoped_write_path`] so the commit-time revalidation can
+/// re-derive the answer from an already-resolved path without converting it to a
+/// lossy string first. The model supplies paths as UTF-8 text, but a resolved path can
+/// inherit non-UTF-8 bytes from the execution root, and re-checking a lossy rendering
+/// of it would be checking a different path than the one being committed.
+fn resolve_absolute_write_path(
+    path: &Path,
+    goal_root: &Path,
+    allowed_paths: &[PathBuf],
+    forbidden_paths: &[PathBuf],
+) -> Result<(PathBuf, PathBuf), WriterError> {
     if path
         .components()
         .any(|component| component == Component::ParentDir)
@@ -1508,6 +1561,70 @@ fn preimage_matches(state: &FileState, expectation: &PreimageExpectation) -> boo
             state.exists && state.sha256.as_deref() == Some(sha256.as_str())
         }
     }
+}
+
+/// Translate the Writer's durable expectation into the publication primitive's
+/// expectation. These are two views of one fact, not two independent decisions.
+fn commit_preimage(expectation: &PreimageExpectation) -> ExpectedPreimage {
+    match expectation {
+        PreimageExpectation::Absent => ExpectedPreimage::Absent,
+        PreimageExpectation::Sha256 { sha256 } => ExpectedPreimage::Sha256(sha256.clone()),
+    }
+}
+
+/// Re-run every authority and preimage check immediately before the commit boundary.
+///
+/// This deliberately repeats work `materialize_operations` already did. That earlier
+/// observation is stale by the time the commit runs: a durable intent has been
+/// persisted in between. Re-deriving the answer from current filesystem state is the
+/// entire point - the Writer must not trust a preimage it observed minutes ago.
+///
+/// Refusing here is fail-closed. A target that changed, that became a directory, that
+/// turned into a symlink, or whose parent or scope authority changed is never
+/// overwritten.
+fn revalidate_before_commit(
+    goal: &Goal,
+    session: &config::Session,
+    task_id: &TaskId,
+    operation: &MaterializedWrite,
+) -> Result<(), WriterError> {
+    let task = goal.tasks().get(task_id).ok_or_else(|| {
+        WriterError::AuthorityViolation(
+            "writer Task is missing during commit revalidation".to_owned(),
+        )
+    })?;
+    if task.worker() != WorkerKind::CodexWriter {
+        return Err(WriterError::AuthorityViolation(
+            "only CODEX_WRITER may commit writer operations".to_owned(),
+        ));
+    }
+    let goal_root = crate::planner::execution_root_for_goal(goal, session)
+        .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
+    let goal_root = fs::canonicalize(goal_root).map_err(|_| {
+        WriterError::AuthorityViolation("execution root cannot be canonicalized".to_owned())
+    })?;
+
+    // Re-resolve the exact same path through the same authority rules. If the path
+    // now resolves somewhere else - because a parent became a symlink, or the target
+    // became a link, or a scope boundary moved - this is refused.
+    let (resolved, parent) = resolve_absolute_write_path(
+        &operation.path,
+        &goal_root,
+        task.scope().allowed_paths(),
+        task.scope().forbidden_paths(),
+    )?;
+    if resolved != operation.path || parent != operation.parent {
+        return Err(WriterError::AuthorityViolation(format!(
+            "writer path authority changed before commit: {}",
+            operation.path.display()
+        )));
+    }
+
+    let observed = observe_file_state(&resolved)?;
+    if !preimage_matches(&observed, &operation.expected_preimage) {
+        return Err(WriterError::PreimageMismatch(resolved));
+    }
+    Ok(())
 }
 
 fn finish_valid_non_mutating_result(
@@ -1855,6 +1972,342 @@ mod tests {
         }
     }
 
+    /// A boundary that performs the real atomic publication, so tests exercise the
+    /// production commit path rather than a stand-in.
+    struct RealWriteBoundary;
+
+    impl WriteBoundary for RealWriteBoundary {
+        fn write<'a>(
+            &'a self,
+            request: WriterWriteRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                crate::workspace_publish::publish(crate::workspace_publish::PublishRequest {
+                    destination: request.path,
+                    parent: request.parent,
+                    expected_preimage: request.expected_preimage,
+                    request_id: request.request_id,
+                    content: request.content.as_bytes(),
+                })
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                Ok(sandbox::Output {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    command_start: sandbox::CommandStart::Proven,
+                })
+            })
+        }
+    }
+
+    /// A boundary that mutates the target from "outside" the Writer immediately
+    /// before the real commit runs, deterministically reproducing the race that a
+    /// sleep-based test could only approximate.
+    struct RacingWriteBoundary {
+        external: std::path::PathBuf,
+        external_bytes: &'static [u8],
+    }
+
+    impl WriteBoundary for RacingWriteBoundary {
+        fn write<'a>(
+            &'a self,
+            request: WriterWriteRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                // The external actor wins between APPLYING and publication.
+                std::fs::write(&self.external, self.external_bytes)?;
+                crate::workspace_publish::publish(crate::workspace_publish::PublishRequest {
+                    destination: request.path,
+                    parent: request.parent,
+                    expected_preimage: request.expected_preimage,
+                    request_id: request.request_id,
+                    content: request.content.as_bytes(),
+                })
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                Ok(sandbox::Output {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    command_start: sandbox::CommandStart::Proven,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_external_edit_before_the_commit_point_is_never_overwritten() {
+        let fixture = lease_fixture();
+        let target = fixture.root.join("target.txt");
+        std::fs::write(&target, b"before\n").unwrap();
+
+        let result = run_writer_attempt_with_boundary(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            fixture.revision,
+            &ExistingFileWriter,
+            &PassingReviewer,
+            &RacingWriteBoundary {
+                external: target.clone(),
+                external_bytes: b"someone else wrote this\n",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"someone else wrote this\n",
+            "the external actor's content must survive the Writer attempt"
+        );
+        assert!(
+            result.is_err(),
+            "the Writer must refuse a stale preimage rather than report success"
+        );
+
+        // The race landed after the durable APPLYING boundary, so the honest durable
+        // state is "mutation in flight, unproven" - never APPLIED, which would be a
+        // fabricated success.
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let task = &goal.tasks()[&fixture.first];
+        let intent = task.latest_attempt().unwrap().mutation_intent();
+        if let Some(intent) = intent {
+            assert_eq!(
+                intent.state(),
+                crate::mutation::MutationIntentState::Applying,
+                "a refused commit must leave the intent unproven, not APPLIED"
+            );
+            assert_ne!(
+                intent.state(),
+                crate::mutation::MutationIntentState::Applied,
+                "a refused commit must never be recorded as applied"
+            );
+        }
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    /// The host-side gate runs before the durable APPLYING boundary, so a target that
+    /// changed between materialization and the commit is refused while the intent is
+    /// still PREPARED - which is what lets recovery classify it as not performed.
+    #[test]
+    fn commit_time_revalidation_refuses_a_preimage_that_changed_after_materialization() {
+        let fixture = lease_fixture();
+        let target = fixture.root.join("target.txt");
+        std::fs::write(&target, b"before\n").unwrap();
+
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let operations = materialize_operations(
+            &goal,
+            &fixture.session,
+            &fixture.first,
+            &[WriterOperation::WriteUtf8 {
+                path: "target.txt".to_owned(),
+                expected_preimage: PreimageExpectation::Sha256 {
+                    sha256: sha256_hex(b"before\n"),
+                },
+                content: "after\n".to_owned(),
+            }],
+        )
+        .unwrap();
+
+        // The gate agrees while the target still matches.
+        revalidate_before_commit(&goal, &fixture.session, &fixture.first, &operations[0]).unwrap();
+
+        // An external edit invalidates the observation materialization made.
+        std::fs::write(&target, b"external\n").unwrap();
+        let error =
+            revalidate_before_commit(&goal, &fixture.session, &fixture.first, &operations[0])
+                .unwrap_err();
+        assert!(
+            matches!(error, WriterError::PreimageMismatch(_)),
+            "expected a preimage refusal, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"external\n",
+            "the external edit must survive revalidation"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn commit_time_revalidation_refuses_a_target_that_became_a_directory() {
+        let fixture = lease_fixture();
+        let target = fixture.root.join("target.txt");
+        std::fs::write(&target, b"before\n").unwrap();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let operations = materialize_operations(
+            &goal,
+            &fixture.session,
+            &fixture.first,
+            &[WriterOperation::WriteUtf8 {
+                path: "target.txt".to_owned(),
+                expected_preimage: PreimageExpectation::Sha256 {
+                    sha256: sha256_hex(b"before\n"),
+                },
+                content: "after\n".to_owned(),
+            }],
+        )
+        .unwrap();
+
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(
+            revalidate_before_commit(&goal, &fixture.session, &fixture.first, &operations[0])
+                .is_err(),
+            "a regular file replaced by a directory must be refused"
+        );
+        assert!(target.is_dir(), "the directory must survive untouched");
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_time_revalidation_refuses_a_target_that_became_a_symlink() {
+        let fixture = lease_fixture();
+        let target = fixture.root.join("target.txt");
+        let outside = fixture.root.join("outside.txt");
+        std::fs::write(&outside, b"secret\n").unwrap();
+        std::fs::write(&target, b"before\n").unwrap();
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let operations = materialize_operations(
+            &goal,
+            &fixture.session,
+            &fixture.first,
+            &[WriterOperation::WriteUtf8 {
+                path: "target.txt".to_owned(),
+                expected_preimage: PreimageExpectation::Sha256 {
+                    sha256: sha256_hex(b"before\n"),
+                },
+                content: "after\n".to_owned(),
+            }],
+        )
+        .unwrap();
+
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+
+        assert!(
+            revalidate_before_commit(&goal, &fixture.session, &fixture.first, &operations[0])
+                .is_err(),
+            "a target replaced by a symlink must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"secret\n",
+            "a symlink must never be followed to overwrite its target"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_real_commit_path_publishes_atomically_and_leaves_no_debris() {
+        let fixture = lease_fixture();
+        let target = fixture.root.join("target.txt");
+        std::fs::write(&target, b"before\n").unwrap();
+
+        run_writer_attempt_with_boundary(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            fixture.revision,
+            &ExistingFileWriter,
+            &PassingReviewer,
+            &RealWriteBoundary,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"after\n");
+        let debris: Vec<_> = std::fs::read_dir(&fixture.root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".staged"))
+            .collect();
+        assert!(debris.is_empty(), "atomic commit left staged debris behind");
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_multi_file_attempt_publishes_each_operation_independently() {
+        let fixture = lease_fixture();
+        let first = fixture.root.join("one.txt");
+        let second = fixture.root.join("two.txt");
+        std::fs::write(&first, b"one-before\n").unwrap();
+        std::fs::write(&second, b"two-before\n").unwrap();
+
+        run_writer_attempt_with_boundary(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            fixture.revision,
+            &TwoFileWriter {
+                first: first.clone(),
+                second: second.clone(),
+            },
+            &AnyFileReviewer,
+            &RealWriteBoundary,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&first).unwrap(), b"one-after\n");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two-after\n");
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    /// Proposes two independent WRITE_UTF8 operations against existing files.
+    struct TwoFileWriter {
+        first: std::path::PathBuf,
+        second: std::path::PathBuf,
+    }
+
+    impl WriterBackend for TwoFileWriter {
+        fn propose(&self, request: &WriterRequest) -> Result<Vec<u8>, WriterError> {
+            let first = crate::workspace_publish::sha256_hex(b"one-before\n");
+            let second = crate::workspace_publish::sha256_hex(b"two-before\n");
+            Ok(serde_json::json!({
+                "goal_id": request.goal_id(),
+                "task_id": request.task_id(),
+                "attempt_id": request.attempt_id(),
+                "goal_revision": request.goal_revision(),
+                "plan_revision": request.plan_revision(),
+                "status":"candidate_complete",
+                "summary":"two files written",
+                "evidence":[],
+                "proposed_operations":[
+                    {"kind":"WRITE_UTF8","path": self.first.to_string_lossy(),
+                     "expected_preimage":{"kind":"SHA256","sha256":first},
+                     "content":"one-after\n"},
+                    {"kind":"WRITE_UTF8","path": self.second.to_string_lossy(),
+                     "expected_preimage":{"kind":"SHA256","sha256":second},
+                     "content":"two-after\n"}
+                ]
+            })
+            .to_string()
+            .into_bytes())
+        }
+    }
+
     #[test]
     fn ready_writer_checkpoint_reserves_single_workspace_mutation_lease() {
         use crate::task::TaskStatus;
@@ -1919,6 +2372,27 @@ mod tests {
                     },
                     "content": "after\n"
                 }]
+            })
+            .to_string()
+            .into_bytes())
+        }
+    }
+
+    /// Accepts a review of any number of files, so multi-file attempts can be
+    /// exercised without the single-file fixture's shape assertions.
+    struct AnyFileReviewer;
+
+    impl ReviewerBackend for AnyFileReviewer {
+        fn review(&self, request: &ReviewerRequest) -> Result<Vec<u8>, WriterError> {
+            Ok(serde_json::json!({
+                "goal_id": request.goal_id(),
+                "task_id": request.task_id(),
+                "attempt_id": request.attempt_id(),
+                "goal_revision": request.goal_revision(),
+                "plan_revision": request.plan_revision(),
+                "summary": "reviewed",
+                "blocking_findings": 0,
+                "evidence": [{"kind":"reasoning_reference","value":"deterministic fixture"}]
             })
             .to_string()
             .into_bytes())
@@ -2021,9 +2495,7 @@ mod tests {
     impl WriteBoundary for InspectingWriteBoundary<'_> {
         fn write<'a>(
             &'a self,
-            _absolute: &'a std::path::Path,
-            _parent: &'a std::path::Path,
-            _content: &'a str,
+            _request: WriterWriteRequest<'a>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
         > {
@@ -2078,14 +2550,12 @@ mod tests {
     impl WriteBoundary for WriteThenFailBoundary {
         fn write<'a>(
             &'a self,
-            absolute: &'a std::path::Path,
-            _parent: &'a std::path::Path,
-            content: &'a str,
+            request: WriterWriteRequest<'a>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
         > {
             Box::pin(async move {
-                std::fs::write(absolute, content)?;
+                std::fs::write(request.path, request.content)?;
                 anyhow::bail!("injected crash after successful filesystem write")
             })
         }
