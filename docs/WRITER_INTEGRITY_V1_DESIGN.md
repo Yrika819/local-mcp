@@ -162,15 +162,24 @@ For each Writer operation, in this exact order:
 11. Postimage observed and SHA-256 verified (existing).
 12. Durable operation becomes **APPLIED** only after postimage verification (existing).
 
-Steps 6 and 7 are ordered deliberately: the preimage gate runs *before* the durable
-APPLYING boundary is crossed, so a stale preimage never produces a durable intent that
-claims a mutation was in flight. The helper re-checks the preimage again as its very
-last action before publication (§6), so the gate is enforced twice with only the
-unavoidable publication window between.
+Steps 6 and 7 are ordered deliberately: the commit-time gate runs **before** the durable
+intent is written, and before the APPLYING boundary. That placement is what makes a
+refusal recoverable. Taken *before* PREPARED, a refusal has provably mutated nothing, so
+it resolves exactly like a stale proposal at materialization — a non-mutating
+`NeedsReplan` with no durable intent for reconciliation to reason about. Taken *after*
+PREPARED, the same refusal would leave a `Blocked` task holding a live mutation intent,
+and because a durable intent means the mutation may have happened, no reconciliation
+rule may safely clear it: the Goal would stall with no legal path forward.
+
+The helper re-checks the preimage again as its very last action before publication
+(§6), so the gate is enforced twice, and the remaining window between the two is the
+documented residual race.
 
 If the commit-time revalidation fails, the Writer returns `PreimageMismatch`, which the
-existing caller maps to `finish_valid_non_mutating_result` with `NeedsReplan`. No
-durable intent exists, no target is touched, and the durable model stays consistent.
+existing caller maps to `finish_valid_non_mutating_result` with `NeedsReplan`. No durable
+intent exists, no target is touched, and the durable model stays consistent. A
+*path-authority* failure at the same gate is a pre-mutation refusal and is blocked under
+the existing `WRITER_OPERATION_REJECTED` code, which recovery already knows how to clear.
 
 ## 5. Same-directory staging and temporary-file ownership
 
@@ -264,13 +273,17 @@ exactly. No new durable state is added, and no serialized field changes shape.
 
 Ordering guarantee, matching §4:
 
-- `PREPARED` is persisted **before** any target mutation.
-- The commit-time preimage gate runs **before** `BeginOperation`, so a stale preimage
-  cannot be recorded as an in-flight mutation.
+- `PREPARED` is persisted **before** any target mutation, and only after the
+  commit-time preimage gate has passed for every operation.
+- The commit-time preimage gate runs **before** `PREPARED`, so a stale preimage can
+  never be recorded as an in-flight mutation.
 - `BeginOperation` (which crosses the intent to `APPLYING`) is persisted **before**
   publication.
 - `CompleteOperation` (`APPLIED`) is persisted **only after** postimage verification
   succeeds.
+- A refusal caught by the helper's own pre-publication gate lands after `APPLYING` with
+  the target unchanged. That is deliberately left to reconcile as `Unknown`: the durable
+  intent means the mutation may have happened, so the host must not claim it did not.
 
 Because the sandboxed helper is spawned between `BeginOperation` and publication, a
 crash in that span leaves `APPLYING` with an unproven target — exactly the state the
