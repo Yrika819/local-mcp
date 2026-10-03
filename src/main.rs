@@ -49,6 +49,8 @@ mod writer;
 #[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
+mod atomic_publish_tests;
+#[cfg(test)]
 mod goal_backends_tests;
 #[cfg(test)]
 mod goal_finalizer_tests;

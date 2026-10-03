@@ -1111,6 +1111,102 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// A session rooted at a scratch directory, for exercising the write_file
+    /// preimage contract without touching a real project.
+    fn write_file_session(label: &str) -> (config::Session, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("local-mcp-write-file-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        (
+            config::Session {
+                id: format!("write-file-{}", Uuid::new_v4()),
+                cwd: root.clone(),
+                permitted_directories: vec![root.clone()],
+            },
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn write_file_updates_an_existing_utf8_file() {
+        let (session, root) = write_file_session("existing");
+        let target = root.join("a.txt");
+        std::fs::write(&target, b"old\n").unwrap();
+
+        write_file(
+            &serde_json::json!({"path": "a.txt", "content": "new\n"}),
+            &session,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_a_new_file() {
+        let (session, root) = write_file_session("create");
+        let target = root.join("new.txt");
+
+        write_file(
+            &serde_json::json!({"path": "new.txt", "content": "hello\n"}),
+            &session,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The confirmed defect: a read failure used to be swallowed with
+    /// `unwrap_or_default()`, so an unreadable file was treated as empty and then
+    /// overwritten. It must now fail with the file untouched.
+    #[tokio::test]
+    async fn write_file_refuses_a_non_utf8_existing_file_without_mutating_it() {
+        let (session, root) = write_file_session("nonutf8");
+        let target = root.join("binary.dat");
+        let original = vec![0xffu8, 0xfe, 0x00, 0x41];
+        std::fs::write(&target, &original).unwrap();
+
+        let error = write_file(
+            &serde_json::json!({"path": "binary.dat", "content": "replacement\n"}),
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("non-UTF-8"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            original,
+            "a file the host could not decode must never be overwritten"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_a_target_that_became_a_directory() {
+        let (session, root) = write_file_session("isdir");
+        std::fs::create_dir(root.join("thing")).unwrap();
+
+        assert!(
+            write_file(
+                &serde_json::json!({"path": "thing", "content": "x"}),
+                &session
+            )
+            .await
+            .is_err(),
+            "a directory destination must be refused"
+        );
+        assert!(root.join("thing").is_dir(), "the directory must survive");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn detects_supported_image_types() {
         assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));

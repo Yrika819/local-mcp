@@ -18,6 +18,16 @@
 //!    no `cmd /c`, no PowerShell, and therefore no shell quoting or path-encoding
 //!    ambiguity anywhere in the commit path.
 
+// This module is compiled into two binaries by design: the host, which uses the
+// identity and digest helpers, and the `atomic-publish` commit helper, which uses
+// `publish`. Each binary therefore sees part of this API as unused. That is an
+// artifact of where the module is compiled, not an unreachable path, so the allow is
+// scoped here rather than turned off repository-wide.
+#![allow(
+    dead_code,
+    reason = "compiled into both the host and the commit helper, which each use half of it"
+)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -624,6 +634,10 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Unix uses the raw `OsStr` bytes; Windows uses the native UTF-16 code units. Both are
 /// exact, so distinct host paths stay distinct.
+#[allow(
+    dead_code,
+    reason = "identity encoding is used by the host, not by the commit helper"
+)]
 pub(crate) fn path_identity_bytes(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
     {
@@ -650,6 +664,10 @@ pub(crate) fn path_identity_bytes(path: &Path) -> Vec<u8> {
 /// encoding is unambiguous: `(path A, content B)` cannot collide with `(path C,
 /// content D)` merely because the concatenation was ambiguous. The version tag keeps a
 /// new value distinguishable from anything produced by an older scheme.
+#[allow(
+    dead_code,
+    reason = "identity encoding is used by the host, not by the commit helper"
+)]
 pub(crate) fn scope_identity(operations: &[(PathBuf, String)]) -> String {
     let mut framed = Vec::new();
     framed.extend_from_slice(b"local-mcp/scope-identity/v1\0");

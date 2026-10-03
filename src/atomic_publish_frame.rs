@@ -18,9 +18,26 @@ pub(crate) const MAGIC: &[u8] = b"local-mcp/atomic-publish/v1\n";
 ///
 /// The kind travels as a distinct byte rather than being inferred from a digest string,
 /// so `ABSENT` and `SHA256` can never be confused for one another.
+/// The preimage kind byte travels as a distinct value rather than being inferred from
+/// a digest string, so `ABSENT` and `SHA256` can never be confused for one another.
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 pub(crate) const PREIMAGE_ABSENT: u8 = 0;
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 pub(crate) const PREIMAGE_SHA256: u8 = 1;
 
+/// Encoding is host-side; decoding is helper-side. Both live in this one module so the
+/// two binaries that include it cannot drift, which means each sees half the API as
+/// unused. That is a per-binary false positive, not dead code.
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 pub(crate) struct EncodedRequest<'a> {
     pub parent: &'a str,
     pub target: &'a str,
@@ -30,6 +47,10 @@ pub(crate) struct EncodedRequest<'a> {
     pub content: &'a [u8],
 }
 
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 pub(crate) struct DecodedRequest {
     pub parent: String,
     pub target: String,
@@ -39,6 +60,10 @@ pub(crate) struct DecodedRequest {
     pub content: Vec<u8>,
 }
 
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 pub(crate) fn encode(request: EncodedRequest<'_>) -> Vec<u8> {
     let EncodedRequest {
         parent,
@@ -65,6 +90,10 @@ fn push_bytes(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 fn take<'a>(input: &mut &'a [u8], len: usize) -> io::Result<&'a [u8]> {
     if input.len() < len {
         return Err(io::Error::new(
@@ -77,12 +106,20 @@ fn take<'a>(input: &mut &'a [u8], len: usize) -> io::Result<&'a [u8]> {
     Ok(head)
 }
 
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 fn take_bytes<'a>(input: &mut &'a [u8]) -> io::Result<&'a [u8]> {
     let len =
         u32::from_le_bytes(take(input, 4)?.try_into().expect("a 4-byte slice is a u32")) as usize;
     take(input, len)
 }
 
+#[allow(
+    dead_code,
+    reason = "the host binary encodes and the helper binary decodes"
+)]
 pub(crate) fn decode(mut input: &[u8]) -> io::Result<DecodedRequest> {
     let magic = take(&mut input, MAGIC.len())?;
     if magic != MAGIC {
