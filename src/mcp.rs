@@ -18,6 +18,7 @@ use crate::goal::{GoalId, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
 use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
 use crate::task_store::TaskStore;
+use crate::workspace_publish;
 use crate::{approvals, config, execution, fallback, goal_api, sandbox};
 
 struct Job {
@@ -586,10 +587,47 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         .await?,
         "user denied host-native write_file"
     );
-    let previous = tokio::fs::read_to_string(&absolute)
-        .await
-        .unwrap_or_default();
-    let output = execution::write_file_content(&absolute, &parent, content).await?;
+    // Read the real previous content, and refuse to mutate when it cannot be read.
+    //
+    // Treating a read failure or non-UTF-8 content as "empty" would let a write destroy
+    // bytes the host never actually saw. `write_file` is a UTF-8 text tool, so an
+    // existing non-UTF-8 file is a hard refusal rather than something to silently
+    // overwrite. Absence, by contrast, is a legitimate empty previous state for diff.
+    let existing = requested.symlink_metadata().is_ok();
+    let previous = if existing {
+        let bytes = tokio::fs::read(&absolute)
+            .await
+            .with_context(|| format!("failed to read existing file {}", absolute.display()))?;
+        String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "refusing to overwrite a non-UTF-8 file with a UTF-8 text write: {}",
+                absolute.display()
+            )
+        })?
+    } else {
+        String::new()
+    };
+
+    // Capture the preimage now and enforce it at the commit point, so a concurrent
+    // edit between this read and publication is refused rather than clobbered.
+    let expected_preimage = if existing {
+        workspace_publish::ExpectedPreimage::Sha256(workspace_publish::sha256_hex(
+            previous.as_bytes(),
+        ))
+    } else {
+        workspace_publish::ExpectedPreimage::Absent
+    };
+
+    // The same host-owned primitive the Writer uses, so this path is atomic too.
+    let request_id = Uuid::new_v4().to_string();
+    let output = execution::publish_workspace_write(crate::writer::WriterWriteRequest {
+        path: &absolute,
+        parent: &parent,
+        content,
+        expected_preimage: &expected_preimage,
+        request_id: &request_id,
+    })
+    .await?;
     let result = render_output(output);
     let (added, removed, diff) = render_diff(&previous, content);
     let title = format!(

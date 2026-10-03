@@ -343,7 +343,10 @@ impl MutationIntent {
             {
                 return Err(corrupt("MutationIntent operation path is invalid"));
             }
-            let path = operation.path.to_string_lossy().to_string();
+            // De-duplicate on the lossless path byte representation. `to_string_lossy`
+            // maps every distinct non-UTF-8 path onto the same replacement text, so
+            // using it here would conflate two different host paths into one identity.
+            let path = crate::workspace_publish::path_identity_bytes(&operation.path);
             if !paths.insert(path) {
                 return Err(corrupt("MutationIntent has duplicate operation path"));
             }
