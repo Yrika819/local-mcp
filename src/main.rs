@@ -86,6 +86,8 @@ mod replanner_replacement_tests;
 mod secure_fs_tests;
 #[cfg(test)]
 mod verifier_tests;
+#[cfg(test)]
+mod writer_stress_tests;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
