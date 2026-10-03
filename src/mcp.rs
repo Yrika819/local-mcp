@@ -1127,6 +1127,12 @@ mod tests {
         )
     }
 
+    /// The happy-path and content-contract cases are Unix-only because `write_file` is
+    /// host-native and approval-gated on Windows. The Windows half of the publication
+    /// contract is covered directly against `workspace_publish`, which needs no
+    /// approval server; what is specific to Windows at this layer is the approval gate
+    /// itself, covered by `write_file_still_requires_live_approval_on_windows`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_file_updates_an_existing_utf8_file() {
         let (session, root) = write_file_session("existing");
@@ -1144,6 +1150,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_file_creates_a_new_file() {
         let (session, root) = write_file_session("create");
@@ -1163,6 +1170,7 @@ mod tests {
     /// The confirmed defect: a read failure used to be swallowed with
     /// `unwrap_or_default()`, so an unreadable file was treated as empty and then
     /// overwritten. It must now fail with the file untouched.
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_file_refuses_a_non_utf8_existing_file_without_mutating_it() {
         let (session, root) = write_file_session("nonutf8");
@@ -1189,6 +1197,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_file_refuses_a_target_that_became_a_directory() {
         let (session, root) = write_file_session("isdir");
@@ -1204,6 +1213,32 @@ mod tests {
             "a directory destination must be refused"
         );
         assert!(root.join("thing").is_dir(), "the directory must survive");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The publication change must not have weakened the Windows host-native approval
+    /// gate: without a live approval server the write still fails closed, and no file is
+    /// created. This is the Windows-specific half of the write_file contract.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn write_file_still_requires_live_approval_on_windows() {
+        let (session, root) = write_file_session("approval");
+        let target = root.join("must-not-appear.txt");
+
+        let result = write_file(
+            &serde_json::json!({"path": "must-not-appear.txt", "content": "requires approval"}),
+            &session,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "host-native write_file must fail closed without live approval"
+        );
+        assert!(
+            !target.exists(),
+            "write_file must not create a file before host-native approval"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
