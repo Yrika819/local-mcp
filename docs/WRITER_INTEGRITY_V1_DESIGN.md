@@ -126,10 +126,18 @@ The helper is:
   selects the helper, never supplies its arguments, and never supplies authority-bearing
   fields.
 
-The helper is invoked with structured argv (`--parent`, `--target`, `--preimage-kind`,
-`--preimage-sha256`, `--content-sha256`) and receives the content on stdin, so shell
-quoting and path-encoding ambiguity are removed (this also closes defect C's sibling
-concern on the Writer path).
+The helper is host-selected and **never model-invoked**. The host resolves its path
+from its own executable directory and passes a **structured, length-prefixed, version-
+tagged request frame on stdin** — not argv, and not a shell. Carrying the request on
+stdin rather than in argv removes shell quoting and argument-count ambiguity entirely,
+and it keeps the helper a pure mechanism: the model cannot select the program, cannot
+choose the destination, and cannot supply the preimage or request identity. Only
+`content` originates with the model, which is the model's actual job.
+
+A missing helper is a refusal. There is no fallback to an unsandboxed in-process
+write, because that fallback would be the authority widening this branch exists to
+avoid. The helper therefore ships in every release archive
+(`scripts/release/targets.py`), on every platform.
 
 ## 4. The commit contract
 
@@ -287,8 +295,12 @@ Staged-file permissions:
   staged file via `fchmod` before publication, so **an existing executable file does not
   silently lose its executable bit**, and an ordinary non-executable file does not
   silently become executable.
-- **New file**: created with ordinary workspace semantics (`0o666` masked by umask),
-  not private-state `0600`.
+- **New file**: created with ordinary workspace semantics (umask-masked `0666`), not
+  private-state `0600`.
+- **setuid/setgid/sticky are deliberately dropped** (`mode & 0o777`). A truncating
+  in-place write also clears those bits, so preserving them would make the atomic path
+  strictly *wider* than the behaviour it replaces, leaving a privileged file holding
+  new, model-authored content. Narrowing is acceptable here; widening is not.
 
 **Stated metadata limitation.** Only Unix permission bits are preserved. Ownership,
 ACLs, xattrs, and macOS resource forks are **not** preserved across the replacement,
@@ -296,6 +308,34 @@ because the staged inode is a new object. On Windows the read-only attribute is 
 carried over, and `MOVEFILE_REPLACE_EXISTING` inherits the destination's security
 descriptor in the normal way. This is reported rather than hidden; widening the metadata
 contract would need a broader platform design that is out of scope here.
+
+**Stated debris limitation.** A crash strictly between `link()` and the following
+`unlink()` leaves the staging name as a *second hard link* to the already-published
+inode. It is inert — it is not a target, and recovery reads only target paths — but it
+is user-visible litter that a later attempt under the *same* durable request id reaps,
+while an attempt under a new request id does not. This is deliberately not "fixed" with
+a pattern sweep, which the task forbids and which would risk deleting user files. The
+window is bounded by two adjacent syscalls.
+
+## 13a. Windows publication
+
+Windows has no application sandbox in this program; `sandbox::build_sandbox_process`
+execs the requested command directly and documents that this is argv execution plus a
+restricted environment, not a filesystem or network boundary. `sandbox::run` therefore
+exists on Windows too, returning that same behaviour, so a caller can request a
+sandboxed-shaped run on either platform without its own `cfg` split.
+
+This is **not** an authority widening: the previous Windows path was already an
+unrestricted in-process `tokio::fs::write`, gated by the same MCP approval. Replacing
+it with a helper that performs the identical commit shell-free changes the mechanism,
+not the authority.
+
+Windows specifics: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` is the no-clobber
+primitive and with it the replace primitive (always with `MOVEFILE_WRITE_THROUGH`);
+`ERROR_FILE_EXISTS`/`ERROR_ALREADY_EXISTS` (80/183) map to `TargetAppeared`. Directory
+fsync has no reliable Windows equivalent, so `MOVEFILE_WRITE_THROUGH` carries the
+durability requirement. Junction/reparse escape remains refused upstream in
+`config::validate_path_authority`. Windows remains experimental per `SECURITY.md`.
 
 ## 9. Path-identity encoding
 
@@ -377,9 +417,15 @@ with distinct messages, the cases that matter to recovery:
 
 preimage mismatch, path-authority changed, staging failure, staged-write failure,
 staged-sync failure, publication conflict (expected-`ABSENT` target appeared),
-publication I/O failure, and postimage mismatch. Temp cleanup never masks the primary
-causal error, never deletes an unproven path, and never converts an uncertain target
-state into "not performed".
+publication I/O failure, and postimage mismatch.
+
+The helper emits a stable `goallatch-publish-error:<class>` token on stderr, and the
+host maps it to the corresponding failure. This keeps the taxonomy honest rather than
+collapsing every refusal into one "write failed": a preimage mismatch, a concurrent
+target, and a publication whose outcome is unknown all mean different things to
+recovery. A non-zero helper status is always treated as a refusal, never as success.
+Temp cleanup never masks the primary causal error, never deletes an unproven path, and
+never converts an uncertain target state into "not performed".
 
 ## 14. Preserved Phase 4 / security-closure behavior
 

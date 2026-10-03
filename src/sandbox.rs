@@ -575,6 +575,27 @@ pub async fn run(
         .map_err(|error| error.error)
 }
 
+/// Windows has no application sandbox in this program: `build_sandbox_process` execs
+/// the requested command directly and documents that this is argv execution plus a
+/// restricted environment, not a filesystem or network boundary.
+///
+/// This entry point exists so a caller can request a sandboxed run on either platform
+/// without a `cfg` split of its own. On Windows it applies the same argv execution and
+/// restricted environment that every other Windows command already gets, and grants no
+/// containment it does not already have.
+#[cfg(not(unix))]
+pub async fn run(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    let _ = writable_roots;
+    run_tracked(command, cwd, &[], stdin)
+        .await
+        .map_err(|error| error.error)
+}
+
 pub async fn run_unrestricted(
     command: &[String],
     cwd: &Path,

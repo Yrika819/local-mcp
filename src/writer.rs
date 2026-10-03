@@ -473,8 +473,8 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 goal_id,
                 task_id,
                 &request,
-                "WRITER_BACKEND_ERROR",
-                &detail,
+                request.goal_revision,
+                TaskBlocker::new("WRITER_BACKEND_ERROR".to_owned(), detail, true),
             )?;
             return Err(error);
         }
@@ -490,8 +490,8 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 goal_id,
                 task_id,
                 &request,
-                "WRITER_OUTPUT_REJECTED",
-                &detail,
+                request.goal_revision,
+                TaskBlocker::new("WRITER_OUTPUT_REJECTED".to_owned(), detail, true),
             )?;
             return Err(error);
         }
@@ -546,8 +546,8 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                     goal_id,
                     task_id,
                     &request,
-                    "WRITER_OPERATION_REJECTED",
-                    &detail,
+                    request.goal_revision,
+                    TaskBlocker::new("WRITER_OPERATION_REJECTED".to_owned(), detail, true),
                 )?;
                 return Err(error);
             }
@@ -612,6 +612,67 @@ pub(crate) async fn run_writer_attempt_with_boundary<
             Ok(())
         })?;
 
+    /// Classify a failed publication from the helper's machine-readable marker.
+    ///
+    /// The helper distinguishes refusals (destination provably untouched) from a publication
+    /// whose outcome it cannot prove. That distinction is what recovery needs, so it is
+    /// preserved rather than collapsed into one generic error.
+    fn classify_publish_failure(output: &sandbox::Output, path: &Path) -> WriterError {
+        let marker = output
+            .stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(PUBLISH_ERROR_MARKER))
+            .map(str::trim);
+        let detail = match marker {
+            Some("preimage") => format!("writer preimage mismatch at commit: {}", path.display()),
+            Some("not-regular") => {
+                format!(
+                    "writer target is no longer a regular file: {}",
+                    path.display()
+                )
+            }
+            Some("staging") => {
+                format!("writer could not stage the replacement: {}", path.display())
+            }
+            Some("staging-sync") => {
+                format!(
+                    "writer could not sync the staged replacement: {}",
+                    path.display()
+                )
+            }
+            Some("target-appeared") => format!(
+                "writer refused to replace a target that appeared concurrently: {}",
+                path.display()
+            ),
+            Some("publish") => {
+                format!(
+                    "writer publication left the target state unknown: {}",
+                    path.display()
+                )
+            }
+            Some("postimage") => {
+                format!("writer postimage mismatch for {}", path.display())
+            }
+            _ => format!(
+                "writer publication failed for {}: {}",
+                path.display(),
+                output.stderr.trim()
+            ),
+        };
+        match marker {
+            Some("preimage") => WriterError::PreimageMismatch(path.to_path_buf()),
+            Some("not-regular") | Some("target-appeared") => {
+                WriterError::AuthorityViolation(detail)
+            }
+            Some("publish") => WriterError::MutationFailed(detail),
+            _ => WriterError::MutationFailed(detail),
+        }
+    }
+
+    /// Marker the helper writes to stderr so the host can classify a refusal without
+    /// parsing a human-readable sentence.
+    pub(crate) const PUBLISH_ERROR_MARKER: &str = "goallatch-publish-error:";
+
     for (index, (operation, request_id)) in operations.iter().zip(&request_ids).enumerate() {
         // Commit-time revalidation, immediately before the durable APPLYING boundary.
         //
@@ -630,8 +691,8 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 goal_id,
                 task_id,
                 &request,
-                "WRITER_PREIMAGE_CHANGED",
-                &detail,
+                durable.revision(),
+                TaskBlocker::new("WRITER_PREIMAGE_CHANGED".to_owned(), detail, true),
             )?;
             return Err(error);
         }
@@ -652,7 +713,7 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 Ok(())
             },
         )?;
-        boundary
+        let output = boundary
             .write(WriterWriteRequest {
                 path: &operation.path,
                 parent: &operation.parent,
@@ -662,6 +723,12 @@ pub(crate) async fn run_writer_attempt_with_boundary<
             })
             .await
             .map_err(|error| WriterError::MutationFailed(error.to_string()))?;
+        // A non-zero helper status is a refusal, not a success. Without this check a
+        // failed publication would be reported as a postimage mismatch and the typed
+        // failure taxonomy recovery depends on would be lost.
+        if output.status != 0 {
+            return Err(classify_publish_failure(&output, &operation.path));
+        }
         let post = observe_file_state(&operation.path)?;
         let expected_digest = sha256_hex(operation.content.as_bytes());
         if !post.exists || post.sha256.as_deref() != Some(expected_digest.as_str()) {
@@ -1676,22 +1743,25 @@ fn finish_valid_non_mutating_result(
         .map_err(WriterError::from)
 }
 
+/// `expected_revision` must be the revision the caller currently holds.
+///
+/// The three pre-materialization call sites still hold `request.goal_revision`, but the
+/// commit-time gate runs *after* the durable PREPARED intent was persisted, which has
+/// already advanced the store revision. Passing the request's original revision there
+/// would always conflict and silently discard the refusal it is trying to record.
 fn block_before_mutation(
     store: &TaskStore,
     session: &config::Session,
     goal_id: &GoalId,
     task_id: &TaskId,
     request: &WriterRequest,
-    code: &str,
-    detail: &str,
+    expected_revision: u64,
+    blocker: TaskBlocker,
 ) -> Result<Goal, WriterError> {
     store
-        .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
+        .mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
             ensure_active_attempt_store(goal, task_id, request)?;
-            goal.task_add_blocker(
-                task_id,
-                TaskBlocker::new(code.to_owned(), detail.to_owned(), true),
-            )?;
+            goal.task_add_blocker(task_id, blocker)?;
             goal.transition_task(
                 task_id,
                 TaskStatus::Blocked,
@@ -2028,6 +2098,115 @@ mod tests {
                     content: request.content.as_bytes(),
                 })
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+                Ok(sandbox::Output {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    command_start: sandbox::CommandStart::Proven,
+                })
+            })
+        }
+    }
+
+    /// Drives a host-gate refusal through the *real* attempt loop.
+    ///
+    /// Testing `revalidate_before_commit` in isolation is not enough: the refusal path
+    /// records a blocker through the durable store, and that store write runs after the
+    /// PREPARED intent (and, here, a completed first operation) has already advanced the
+    /// revision. A direct unit test would miss a stale-revision conflict there and
+    /// silently discard the refusal the operator needs to see.
+    #[tokio::test]
+    async fn a_commit_time_preimage_change_is_recorded_not_swallowed_by_a_revision_conflict() {
+        use crate::task::TaskStatus;
+
+        let fixture = lease_fixture();
+        let first = fixture.root.join("one.txt");
+        let second = fixture.root.join("two.txt");
+        std::fs::write(&first, b"one-before\n").unwrap();
+        std::fs::write(&second, b"two-before\n").unwrap();
+
+        let outcome = run_writer_attempt_with_boundary(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            &fixture.first,
+            fixture.revision,
+            &TwoFileWriter {
+                first: first.clone(),
+                second: second.clone(),
+            },
+            &AnyFileReviewer,
+            // Committing operation 0 is what invalidates operation 1's preimage, so the
+            // gate that must refuse is the one guarding the *second* operation - which by
+            // then runs against a store revision several commits ahead of the request's.
+            &FirstCommitInvalidatesSecondBoundary {
+                second: second.clone(),
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a preimage that changed before the commit must not succeed"
+        );
+        let rendered = outcome.unwrap_err().to_string();
+        assert!(
+            !rendered.contains("RevisionConflict"),
+            "the refusal was swallowed by a store revision conflict: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"one-after\n",
+            "the operation that was already committed stays committed"
+        );
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            b"two-external\n",
+            "the external edit must survive the refused operation"
+        );
+
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let task = &goal.tasks()[&fixture.first];
+        assert_eq!(task.status(), TaskStatus::Blocked);
+        assert!(
+            task.blockers()
+                .iter()
+                .any(|blocker| blocker.code() == "WRITER_PREIMAGE_CHANGED"),
+            "the preimage-change blocker was not recorded"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    /// Commits operation 0 for real, then lets an external actor rewrite operation 1's
+    /// target. Operation 1's host-side gate must then refuse before its boundary runs.
+    struct FirstCommitInvalidatesSecondBoundary {
+        second: std::path::PathBuf,
+    }
+
+    impl WriteBoundary for FirstCommitInvalidatesSecondBoundary {
+        fn write<'a>(
+            &'a self,
+            request: WriterWriteRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if request.path == self.second {
+                    anyhow::bail!("the commit-time gate must refuse before this boundary")
+                }
+                crate::workspace_publish::publish(crate::workspace_publish::PublishRequest {
+                    destination: request.path,
+                    parent: request.parent,
+                    expected_preimage: request.expected_preimage,
+                    request_id: request.request_id,
+                    content: request.content.as_bytes(),
+                })
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                // The external actor wins the race for the next operation's target.
+                std::fs::write(&self.second, b"two-external\n")?;
                 Ok(sandbox::Output {
                     status: 0,
                     stdout: String::new(),

@@ -81,10 +81,11 @@ fn main() {
     }) {
         Ok(()) => std::process::exit(0),
         Err(error) => {
-            // The exit status distinguishes a refusal, where the destination is provably
-            // untouched, from a publication whose outcome this process cannot prove.
-            // Recovery keys its decision on the target's observed digest, never on
-            // this code, but a precise code keeps the host's error honest.
+            // The class is emitted as a stable token so the host can tell a refusal
+            // (destination provably untouched) from a publication whose outcome cannot
+            // be proven. That distinction drives recovery and must not depend on
+            // parsing a human-readable sentence.
+            eprintln!("goallatch-publish-error:{}", error.class());
             eprintln!("atomic-publish failed: {error}");
             std::process::exit(1);
         }
