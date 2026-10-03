@@ -5,16 +5,25 @@ proves an archive is correct) import this module, so a name, a binary, or a
 layout can never drift between the code that builds a release asset and the
 code that later rejects one.
 
-The one layout rule that is not negotiable: on Linux, `local-mcp` resolves the
+The layout rules that are not negotiable: on Linux, `local-mcp` resolves the
 `codex-linux-sandbox` helper as a *sibling* of its own executable
 (`src/sandbox.rs`, `build_sandbox_process`), and refuses to run when that file
 is absent. A Linux archive that ships only `local-mcp` is not a smaller
 release, it is a broken one, so the two binaries travel together and
 `verify_package.py` fails if either is missing.
 
-macOS and Windows deliberately ship `local-mcp` alone. macOS sandboxes through
-the system `sandbox-exec`, and Windows has no equivalent process sandbox at
-all, so neither platform has a helper to ship.
+Every platform also ships `atomic-publish`, and for a stronger reason than
+convenience: it is the component that performs the Writer's file commit
+(`src/workspace_publish.rs`). On Unix it runs *inside* the platform sandbox so
+that making the commit atomic does not also make it less contained, and on
+Windows it is the shell-free commit mechanism. `local-mcp` resolves it as a
+sibling of its own executable and refuses to publish rather than falling back
+to an unsandboxed in-process write, so an archive missing it would silently
+lose the containment the Writer's authority model depends on.
+
+macOS and Windows deliberately do not ship `codex-linux-sandbox`: macOS sandboxes
+through the system `sandbox-exec`, and Windows has no equivalent process sandbox at
+all, so neither platform has that helper to ship.
 """
 
 from __future__ import annotations
@@ -153,8 +162,9 @@ def _linux(arch: str, rust_target: str, runner: str, runner_arch: str) -> Target
         binaries=("local-mcp",),
         # Shipped together with local-mcp, not optionally: the sandbox helper is
         # resolved as a sibling executable and the server refuses to start a
-        # sandboxed command without it.
-        required_helpers=("codex-linux-sandbox",),
+        # sandboxed command without it. `atomic-publish` ships on every platform
+        # because it performs the Writer commit; see the module docstring.
+        required_helpers=("codex-linux-sandbox", "atomic-publish"),
         # ARM64 builds are native in CI, but the current Linux sandbox
         # capability evidence documents x86_64 only; keep the ARM asset
         # explicitly experimental until sandbox behavior is validated on a
@@ -178,7 +188,9 @@ TARGETS: Dict[str, Target] = {
             archive_suffix="tar.gz",
             binaries=("local-mcp",),
             # Seats are provided by the system sandbox-exec; there is no
-            # in-tree helper to ship on this platform.
+            # in-tree sandbox helper to ship on this platform. The Writer commit
+            # helper still is required, because it runs inside that Seatbelt seat.
+            required_helpers=("atomic-publish",),
             forbidden=("codex-linux-sandbox",),
         ),
         Target(
@@ -190,6 +202,7 @@ TARGETS: Dict[str, Target] = {
             runner_arch="ARM64",
             archive_suffix="tar.gz",
             binaries=("local-mcp",),
+            required_helpers=("atomic-publish",),
             forbidden=("codex-linux-sandbox",),
         ),
         Target(
@@ -201,6 +214,10 @@ TARGETS: Dict[str, Target] = {
             runner_arch="X64",
             archive_suffix="zip",
             binaries=("local-mcp.exe",),
+            # Windows has no Unix-equivalent process sandbox for Public v1. The
+            # Writer commit helper is still required: it is the shell-free commit
+            # mechanism, and it inherits the existing Windows approval gate.
+            required_helpers=("atomic-publish.exe",),
             # Windows has no Unix-equivalent process sandbox for Public v1.
             forbidden=("codex-linux-sandbox", "codex-linux-sandbox.exe"),
             experimental=True,
@@ -217,6 +234,7 @@ TARGETS: Dict[str, Target] = {
             runner_arch="ARM64",
             archive_suffix="zip",
             binaries=("local-mcp.exe",),
+            required_helpers=("atomic-publish.exe",),
             forbidden=("codex-linux-sandbox", "codex-linux-sandbox.exe"),
             experimental=True,
             carries_modes=False,
