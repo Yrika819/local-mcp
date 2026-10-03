@@ -7,12 +7,10 @@
 //! publication out of the sandbox, these tests would show the containment disappearing
 //! rather than silently trading it away for correctness.
 
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-#[cfg(unix)]
 fn scratch(label: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("local-mcp-publish-int-{label}-{}", Uuid::new_v4()));
@@ -27,27 +25,54 @@ fn nested_sandbox_unavailable() -> bool {
 }
 
 #[cfg(unix)]
-mod unix_tests {
+fn helper() -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .map(|dir| dir.join("atomic-publish"))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .and_then(|dir| dir.parent())
+                .map(|dir| dir.join("atomic-publish"))
+        })
+        .filter(|path| path.is_file())
+        .expect("the atomic-publish helper must be built alongside the test binary")
+}
+
+#[cfg(windows)]
+fn helper() -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .map(|dir| dir.join("atomic-publish.exe"))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .and_then(|dir| dir.parent())
+                .map(|dir| dir.join("atomic-publish.exe"))
+        })
+        .filter(|path| path.is_file())
+        .expect("the atomic-publish helper must be built alongside the test binary")
+}
+
+/// The commit path itself, on every platform.
+///
+/// On Unix this runs inside the platform sandbox; on Windows it runs through the same
+/// argv execution every other Windows command gets. Either way this is the production
+/// route: framed request on stdin, atomic publication, no shell.
+mod shared_tests {
     use super::*;
 
     use crate::atomic_publish_frame::{self, EncodedRequest, PREIMAGE_ABSENT, PREIMAGE_SHA256};
     use crate::sandbox;
 
-    fn helper() -> PathBuf {
-        std::env::current_exe()
-            .unwrap()
-            .parent()
-            .map(|dir| dir.join("atomic-publish"))
-            .filter(|path| path.is_file())
-            .or_else(|| {
-                std::env::current_exe()
-                    .unwrap()
-                    .parent()
-                    .and_then(|dir| dir.parent())
-                    .map(|dir| dir.join("atomic-publish"))
-            })
-            .filter(|path| path.is_file())
-            .expect("the atomic-publish helper must be built alongside the test binary")
+    fn sha256(bytes: &[u8]) -> String {
+        crate::workspace_publish::sha256_hex(bytes)
     }
 
     async fn publish(
@@ -76,15 +101,8 @@ mod unix_tests {
         .unwrap()
     }
 
-    fn sha256(bytes: &[u8]) -> String {
-        crate::workspace_publish::sha256_hex(bytes)
-    }
-
     #[tokio::test]
-    async fn the_sandboxed_helper_creates_and_replaces_atomically() {
-        if nested_sandbox_unavailable() {
-            return;
-        }
+    async fn the_helper_creates_and_replaces_atomically() {
         let root = scratch("roundtrip");
         let target = root.join("a.txt");
 
@@ -109,18 +127,12 @@ mod unix_tests {
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".staged"))
             .collect();
-        assert!(
-            debris.is_empty(),
-            "sandboxed publication left staged debris"
-        );
+        assert!(debris.is_empty(), "publication left staged debris");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
-    async fn the_sandboxed_helper_refuses_a_stale_preimage_without_mutating() {
-        if nested_sandbox_unavailable() {
-            return;
-        }
+    async fn the_helper_refuses_a_stale_preimage_without_mutating() {
         let root = scratch("stale");
         let target = root.join("a.txt");
         std::fs::write(&target, b"external\n").unwrap();
@@ -142,6 +154,63 @@ mod unix_tests {
             "the external content must survive a refused commit"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The expected-ABSENT no-clobber guarantee, proven through the real helper.
+    #[tokio::test]
+    async fn an_appearing_target_is_never_clobbered() {
+        let root = scratch("noclobber");
+        let target = root.join("a.txt");
+        assert!(!target.exists());
+        // The external actor wins before publication.
+        std::fs::write(&target, b"external\n").unwrap();
+
+        let result = publish(&root, &target, PREIMAGE_ABSENT, "", "req-4", b"writer\n").await;
+        assert_ne!(result.status, 0);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"external\n",
+            "an absent-expectation commit must never replace a target that appeared"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+mod unix_tests {
+    use super::*;
+
+    use crate::atomic_publish_frame::{self, EncodedRequest, PREIMAGE_SHA256};
+    use crate::sandbox;
+
+    fn sha256(bytes: &[u8]) -> String {
+        crate::workspace_publish::sha256_hex(bytes)
+    }
+
+    async fn publish(
+        parent: &Path,
+        target: &Path,
+        kind: u8,
+        digest: &str,
+        request_id: &str,
+        content: &[u8],
+    ) -> sandbox::Output {
+        let frame = atomic_publish_frame::encode(EncodedRequest {
+            parent: &parent.to_string_lossy(),
+            target: &target.to_string_lossy(),
+            preimage_kind: kind,
+            preimage_digest: digest,
+            request_id,
+            content,
+        });
+        sandbox::run(
+            &[helper().to_string_lossy().into_owned()],
+            parent,
+            std::slice::from_ref(&parent.to_path_buf()),
+            Some(&frame),
+        )
+        .await
+        .unwrap()
     }
 
     /// The containment property that the whole design exists to preserve: publication

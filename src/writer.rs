@@ -2164,8 +2164,8 @@ mod tests {
             &fixture.first,
             fixture.revision,
             &TwoFileWriter {
-                first: first.clone(),
-                second: second.clone(),
+                first: "one.txt",
+                second: "two.txt",
             },
             &AnyFileReviewer,
             &FirstCommitInvalidatesSecondBoundary {
@@ -2554,8 +2554,8 @@ mod tests {
             &fixture.first,
             fixture.revision,
             &TwoFileWriter {
-                first: first.clone(),
-                second: second.clone(),
+                first: "one.txt",
+                second: "two.txt",
             },
             &AnyFileReviewer,
             &RealWriteBoundary,
@@ -2569,9 +2569,14 @@ mod tests {
     }
 
     /// Proposes two independent WRITE_UTF8 operations against existing files.
+    ///
+    /// Paths are proposed *relative* to the Goal cwd, matching `ExistingFileWriter`.
+    /// An absolute temp path would be spelled with whatever the platform's `temp_dir`
+    /// returns, which on Windows is an 8.3 short name that does not compare equal to
+    /// the canonical execution root the host resolves against.
     struct TwoFileWriter {
-        first: std::path::PathBuf,
-        second: std::path::PathBuf,
+        first: &'static str,
+        second: &'static str,
     }
 
     impl WriterBackend for TwoFileWriter {
@@ -2588,10 +2593,10 @@ mod tests {
                 "summary":"two files written",
                 "evidence":[],
                 "proposed_operations":[
-                    {"kind":"WRITE_UTF8","path": self.first.to_string_lossy(),
+                    {"kind":"WRITE_UTF8","path": self.first,
                      "expected_preimage":{"kind":"SHA256","sha256":first},
                      "content":"one-after\n"},
-                    {"kind":"WRITE_UTF8","path": self.second.to_string_lossy(),
+                    {"kind":"WRITE_UTF8","path": self.second,
                      "expected_preimage":{"kind":"SHA256","sha256":second},
                      "content":"two-after\n"}
                 ]
