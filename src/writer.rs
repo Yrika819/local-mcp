@@ -593,6 +593,60 @@ pub(crate) async fn run_writer_attempt_with_boundary<
             .collect(),
     )
     .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
+
+    // Commit-time revalidation, before any durable mutation intent exists.
+    //
+    // `materialize_operations` observed each preimage earlier; between then and the
+    // commit the host persists a durable intent, so an external edit in that window
+    // would otherwise be silently overwritten.
+    //
+    // This runs *before* the PREPARED intent is written on purpose. A refusal taken
+    // here has provably mutated nothing, so it resolves the same way the existing
+    // materialization refusal does - a non-mutating NeedsReplan, with no durable
+    // intent for recovery to reconcile. Blocking the task after the intent exists
+    // would instead leave a state no reconciliation rule can clear.
+    //
+    // The helper re-checks the preimage again immediately before publication, so the
+    // gate is enforced twice; the residual window between the two is the one the
+    // design documents.
+    let precommit = store.load_goal(&session.id, goal_id)?;
+    for operation in &operations {
+        if let Err(error) = revalidate_before_commit(&precommit, session, task_id, operation) {
+            return match error {
+                // The target changed under us. Nothing was written, so this is the
+                // same non-mutating outcome as a stale proposal at materialization.
+                WriterError::PreimageMismatch(_) => finish_valid_non_mutating_result(
+                    store,
+                    session,
+                    goal_id,
+                    task_id,
+                    &request,
+                    &WriterResult {
+                        status: WriterStatus::NeedsReplan,
+                        proposed_operations: Vec::new(),
+                        ..result
+                    },
+                    &report_digest,
+                ),
+                // Path authority changed: a pre-mutation authority refusal, recorded
+                // under the existing code that recovery already knows how to clear.
+                other => {
+                    let detail = other.to_string();
+                    block_before_mutation(
+                        store,
+                        session,
+                        goal_id,
+                        task_id,
+                        &request,
+                        request.goal_revision,
+                        TaskBlocker::new("WRITER_OPERATION_REJECTED".to_owned(), detail, true),
+                    )?;
+                    Err(other)
+                }
+            };
+        }
+    }
+
     let mut durable =
         store.mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, _now| {
             ensure_active_attempt_store(goal, task_id, &request)?;
@@ -674,29 +728,6 @@ pub(crate) async fn run_writer_attempt_with_boundary<
     pub(crate) const PUBLISH_ERROR_MARKER: &str = "goallatch-publish-error:";
 
     for (index, (operation, request_id)) in operations.iter().zip(&request_ids).enumerate() {
-        // Commit-time revalidation, immediately before the durable APPLYING boundary.
-        //
-        // `materialize_operations` observed the preimage earlier; between then and now
-        // the host persisted a durable intent, so an external actor may have edited the
-        // target. Re-resolving the path and re-checking the preimage here means a stale
-        // proposal is refused rather than silently overwriting someone else's work.
-        //
-        // A refusal returns `PreimageMismatch`, which the caller maps to a
-        // non-mutating NeedsReplan: no durable intent exists and no target is touched.
-        if let Err(error) = revalidate_before_commit(&current, session, task_id, operation) {
-            let detail = error.to_string();
-            block_before_mutation(
-                store,
-                session,
-                goal_id,
-                task_id,
-                &request,
-                durable.revision(),
-                TaskBlocker::new("WRITER_PREIMAGE_CHANGED".to_owned(), detail, true),
-            )?;
-            return Err(error);
-        }
-
         durable = store.mutate_goal_snapshot(
             &session.id,
             goal_id,
@@ -2108,16 +2139,17 @@ mod tests {
         }
     }
 
-    /// Drives a host-gate refusal through the *real* attempt loop.
+    /// A target that changes after the durable intent exists must be refused *and* must
+    /// never be recorded as applied.
     ///
-    /// Testing `revalidate_before_commit` in isolation is not enough: the refusal path
-    /// records a blocker through the durable store, and that store write runs after the
-    /// PREPARED intent (and, here, a completed first operation) has already advanced the
-    /// revision. A direct unit test would miss a stale-revision conflict there and
-    /// silently discard the refusal the operator needs to see.
+    /// Here the race is injected during operation 0's commit, so it is caught by the
+    /// helper's own pre-publication gate rather than the host's earlier one. Both are
+    /// refusals, but only this one leaves durable state behind - and the durable state
+    /// is what recovery reads. It must therefore be `Applying` (unproven), never
+    /// `Applied`, and never a success.
     #[tokio::test]
-    async fn a_commit_time_preimage_change_is_recorded_not_swallowed_by_a_revision_conflict() {
-        use crate::task::TaskStatus;
+    async fn a_change_after_the_durable_intent_is_refused_and_never_marked_applied() {
+        use crate::mutation::{MutationIntentState, MutationOperationState};
 
         let fixture = lease_fixture();
         let first = fixture.root.join("one.txt");
@@ -2136,9 +2168,6 @@ mod tests {
                 second: second.clone(),
             },
             &AnyFileReviewer,
-            // Committing operation 0 is what invalidates operation 1's preimage, so the
-            // gate that must refuse is the one guarding the *second* operation - which by
-            // then runs against a store revision several commits ahead of the request's.
             &FirstCommitInvalidatesSecondBoundary {
                 second: second.clone(),
             },
@@ -2147,12 +2176,7 @@ mod tests {
 
         assert!(
             outcome.is_err(),
-            "a preimage that changed before the commit must not succeed"
-        );
-        let rendered = outcome.unwrap_err().to_string();
-        assert!(
-            !rendered.contains("RevisionConflict"),
-            "the refusal was swallowed by a store revision conflict: {rendered}"
+            "a changed preimage must not produce a successful attempt"
         );
         assert_eq!(
             std::fs::read(&first).unwrap(),
@@ -2162,7 +2186,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&second).unwrap(),
             b"two-external\n",
-            "the external edit must survive the refused operation"
+            "the external edit must survive: the refused operation must not overwrite it"
         );
 
         let goal = fixture
@@ -2170,18 +2194,39 @@ mod tests {
             .load_goal(&fixture.session.id, &fixture.goal_id)
             .unwrap();
         let task = &goal.tasks()[&fixture.first];
-        assert_eq!(task.status(), TaskStatus::Blocked);
+        let intent = task
+            .latest_attempt()
+            .and_then(|attempt| attempt.mutation_intent())
+            .expect("a durable intent exists because the race landed after PREPARED");
+        assert_eq!(
+            intent.state(),
+            MutationIntentState::Applying,
+            "the intent must record the mutation as unproven"
+        );
+        assert_ne!(
+            intent.state(),
+            MutationIntentState::Applied,
+            "a refused commit must never be recorded as applied"
+        );
         assert!(
-            task.blockers()
-                .iter()
-                .any(|blocker| blocker.code() == "WRITER_PREIMAGE_CHANGED"),
-            "the preimage-change blocker was not recorded"
+            task.latest_attempt().unwrap().worker_report().is_none(),
+            "a refused attempt must not report a successful worker result"
+        );
+        // Operation 0 genuinely happened; operation 1 must not be claimed as applied.
+        let applied = intent
+            .operations()
+            .iter()
+            .filter(|operation| operation.state() == MutationOperationState::Applied)
+            .count();
+        assert_eq!(
+            applied, 1,
+            "only the operation that actually committed may be applied"
         );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     /// Commits operation 0 for real, then lets an external actor rewrite operation 1's
-    /// target. Operation 1's host-side gate must then refuse before its boundary runs.
+    /// target. Operation 1's pre-commit gate must then refuse before any write.
     struct FirstCommitInvalidatesSecondBoundary {
         second: std::path::PathBuf,
     }
@@ -2195,7 +2240,7 @@ mod tests {
         > {
             Box::pin(async move {
                 if request.path == self.second {
-                    anyhow::bail!("the commit-time gate must refuse before this boundary")
+                    anyhow::bail!("the pre-commit gate must refuse before this boundary")
                 }
                 crate::workspace_publish::publish(crate::workspace_publish::PublishRequest {
                     destination: request.path,
@@ -2215,6 +2260,75 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// The pre-commit gate runs before the durable intent is written, so a refusal
+    /// there has provably mutated nothing and leaves the store untouched for the caller
+    /// to resolve as a non-mutating NeedsReplan.
+    ///
+    /// This placement is the point: taking the same refusal *after* PREPARED would leave
+    /// a Blocked task holding a live mutation intent that no reconciliation rule can
+    /// clear, because a durable intent means the mutation may have happened.
+    #[tokio::test]
+    async fn a_pre_commit_refusal_leaves_the_store_untouched() {
+        let fixture = lease_fixture();
+        let target = fixture.root.join("target.txt");
+        std::fs::write(&target, b"before\n").unwrap();
+
+        let goal = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let operations = materialize_operations(
+            &goal,
+            &fixture.session,
+            &fixture.first,
+            &[WriterOperation::WriteUtf8 {
+                path: "target.txt".to_owned(),
+                expected_preimage: PreimageExpectation::Sha256 {
+                    sha256: sha256_hex(b"before\n"),
+                },
+                content: "after\n".to_owned(),
+            }],
+        )
+        .unwrap();
+
+        // The gate agrees while the target still matches.
+        revalidate_before_commit(&goal, &fixture.session, &fixture.first, &operations[0]).unwrap();
+
+        // Now the external actor wins, and the gate refuses.
+        std::fs::write(&target, b"external\n").unwrap();
+        let error =
+            revalidate_before_commit(&goal, &fixture.session, &fixture.first, &operations[0])
+                .unwrap_err();
+        assert!(
+            matches!(error, WriterError::PreimageMismatch(_)),
+            "expected a preimage refusal, got {error}"
+        );
+
+        // A refusal at this point writes nothing durable of its own: no intent, no
+        // blocker, no task transition. Everything is the caller's decision.
+        let after = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let task = &after.tasks()[&fixture.first];
+        assert!(
+            task.blockers().is_empty(),
+            "the gate must not record a blocker of its own"
+        );
+        assert!(
+            task.latest_attempt()
+                .and_then(|attempt| attempt.mutation_intent())
+                .is_none(),
+            "a refused commit must leave no durable intent for recovery to reconcile"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"external\n",
+            "the external edit must survive"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     #[tokio::test]

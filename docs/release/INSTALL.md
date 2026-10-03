@@ -52,12 +52,22 @@ Two executables, and **both are required**:
 
 - `local-mcp` — the MCP server and approval UI.
 - `codex-linux-sandbox` — the Bubblewrap sandbox helper.
+- `atomic-publish` — the file-commit helper (see below).
 
-They must be installed in the **same directory**. `local-mcp` locates the
-helper as a sibling of its own executable and refuses to run a sandboxed
-command if it is missing. Copying only `local-mcp` to your `PATH` produces an
-install that appears to work and then fails the first time it tries to run a
-command.
+They must be installed in the **same directory**. `local-mcp` locates both helpers
+as siblings of its own executable and refuses to run a sandboxed command, or to
+commit a file write, if the relevant one is missing. Copying only `local-mcp` to
+your `PATH` produces an install that appears to work and then fails the first
+time it tries to run a command or write a file.
+
+### `atomic-publish`, and why every platform needs it
+
+`atomic-publish` performs the actual file commit the Writer uses. On Unix it
+runs *inside* the platform sandbox, which is what lets a write become atomic
+without also becoming less contained; on Windows it is the shell-free commit
+mechanism. There is no fallback to an in-process write when it is missing,
+because that fallback would give up the containment the Writer's authority model
+depends on. Every release archive ships it.
 
 ### Install
 
@@ -65,7 +75,8 @@ command.
 tar -xzf local-mcp-v0.1.0-linux-x86_64.tar.gz
 sudo install -d /usr/local/lib/local-mcp
 sudo install -m 0755 local-mcp-v0.1.0-linux-x86_64/local-mcp \
-  local-mcp-v0.1.0-linux-x86_64/codex-linux-sandbox /usr/local/lib/local-mcp/
+  local-mcp-v0.1.0-linux-x86_64/codex-linux-sandbox \
+  local-mcp-v0.1.0-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
 ```
 
 Both were installed with mode `0755`; the archive preserves that. Put them on
@@ -119,14 +130,20 @@ vendored OpenSSL does not require a separate system OpenSSL library. Exact
 
 ### What is in the archive
 
-One executable, `local-mcp`. There is no helper to install: macOS sandboxes
-through the system `sandbox-exec`, which is part of the OS.
+Two executables, and **both are required**:
+
+- `local-mcp` — the MCP server and approval UI.
+- `atomic-publish` — the file-commit helper. macOS sandboxes through the system
+  `sandbox-exec`, which is part of the OS, so there is no sandbox helper to
+  install — but the commit still has to happen inside that sandbox, and this is
+  the program that does it. Omitting it makes every file write fail.
 
 ### Install
 
 ```sh
 tar -xzf local-mcp-v0.1.0-macos-aarch64.tar.gz
 install -m 0755 local-mcp-v0.1.0-macos-aarch64/local-mcp /usr/local/bin/local-mcp
+install -m 0755 local-mcp-v0.1.0-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
 ```
 
 The binary links to system libraries as listed by `otool -L` in the release
@@ -137,6 +154,7 @@ extracted:
 
 ```sh
 xattr -d com.apple.quarantine /usr/local/bin/local-mcp
+xattr -d com.apple.quarantine /usr/local/bin/atomic-publish
 ```
 
 Removing the attribute is your decision; it only suppresses the first-run
@@ -154,16 +172,24 @@ against `SHA256SUMS`.
 
 ### What is in the archive
 
-One executable, `local-mcp.exe`.
+Two executables, and **both are required**:
+
+- `local-mcp.exe` — the MCP server and approval UI.
+- `atomic-publish.exe` — the file-commit helper. Windows has no process
+  sandbox, so there is no sandbox helper to install, but the commit is still the
+  shell-free mechanism that performs the write. Omitting it makes every file
+  write fail.
 
 ### Install
 
-Extract the zip, then either add the directory to `PATH` or copy the binary
-somewhere already on it:
+Extract the zip, then either add the directory to `PATH` or copy the binaries
+somewhere already on it. Both must end up in the same directory:
 
 ```powershell
 Expand-Archive -Path local-mcp-v0.1.0-windows-x86_64.zip -DestinationPath .
-Copy-Item local-mcp-v0.1.0-windows-x86_64\local-mcp.exe C:\tools\local-mcp.exe
+New-Item -ItemType Directory -Force C:\tools | Out-Null
+Copy-Item local-mcp-v0.1.0-windows-x86_64\local-mcp.exe C:\tools\
+Copy-Item local-mcp-v0.1.0-windows-x86_64\atomic-publish.exe C:\tools\
 ```
 
 ```powershell

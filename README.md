@@ -130,8 +130,11 @@ available from the
 [v0.1.0 release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.0);
 see [the installation guide](docs/release/INSTALL.md) for platform-specific
 instructions. For a version that has no published release yet, use the source
-build above or the optional Nix flake. On Linux, the release archive includes
-the required `codex-linux-sandbox` sibling helper.
+build above or the optional Nix flake. Every release archive also includes the
+required `atomic-publish` sibling helper, which performs the file commit; on
+Linux the archive additionally includes `codex-linux-sandbox`. Both must be
+installed next to `local-mcp`, and a write fails if the commit helper is
+missing.
 
 The session working directory is the directory where `local-mcp start` was run;
 there is no separate persistent cwd setting. On Linux and macOS, sandboxed calls are
