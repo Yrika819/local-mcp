@@ -27,17 +27,22 @@
 //! content    : u64 len | bytes
 //! ```
 
+// This binary is a thin, test-free entry point: the wire format is covered by
+// `atomic_publish_frame`'s own tests and the commit itself by `workspace_publish`'s.
+// Both modules are compiled into this binary, so in the `--test` target there is no
+// `main` entry point reaching them and the compiler would otherwise report the whole
+// publication path as dead code. That is an artifact of where the code is compiled,
+// not an unreachable path.
+#![cfg_attr(
+    test,
+    allow(dead_code, reason = "the helper has no entry point in the test target")
+)]
+
 #[path = "../workspace_publish.rs"]
 mod workspace_publish;
 
 #[path = "../atomic_publish_frame.rs"]
 mod atomic_publish_frame;
-
-mod frame {
-    pub(crate) use crate::atomic_publish_frame::{
-        DecodedRequest as Request, EncodedRequest, PREIMAGE_ABSENT, PREIMAGE_SHA256, decode, encode,
-    };
-}
 
 fn main() {
     let mut input = Vec::new();
@@ -45,7 +50,7 @@ fn main() {
         eprintln!("atomic-publish cannot read its request: {error}");
         std::process::exit(64);
     }
-    let request = match frame::decode(&input) {
+    let request = match crate::atomic_publish_frame::decode(&input) {
         Ok(request) => request,
         Err(error) => {
             eprintln!("atomic-publish rejected its request: {error}");
@@ -54,8 +59,8 @@ fn main() {
     };
 
     let expected = match request.preimage_kind {
-        frame::PREIMAGE_ABSENT => workspace_publish::ExpectedPreimage::Absent,
-        frame::PREIMAGE_SHA256 => {
+        crate::atomic_publish_frame::PREIMAGE_ABSENT => workspace_publish::ExpectedPreimage::Absent,
+        crate::atomic_publish_frame::PREIMAGE_SHA256 => {
             workspace_publish::ExpectedPreimage::Sha256(request.preimage_digest)
         }
         other => {
@@ -83,34 +88,5 @@ fn main() {
             eprintln!("atomic-publish failed: {error}");
             std::process::exit(1);
         }
-    }
-}
-
-#[cfg(test)]
-mod frame_tests {
-    use super::atomic_publish_frame::{self, EncodedRequest, PREIMAGE_ABSENT, PREIMAGE_SHA256};
-
-    #[test]
-    fn a_frame_round_trips_exactly() {
-        let encoded = atomic_publish_frame::encode(EncodedRequest {
-            parent: "/p",
-            target: "/p/a.txt",
-            preimage_kind: PREIMAGE_SHA256,
-            preimage_digest: &"ab".repeat(32),
-            request_id: "req-1",
-            content: b"hello",
-        });
-        let decoded = atomic_publish_frame::decode(&encoded).unwrap();
-        assert_eq!(decoded.parent, "/p");
-        assert_eq!(decoded.target, "/p/a.txt");
-        assert_eq!(decoded.preimage_kind, PREIMAGE_SHA256);
-        assert_eq!(decoded.preimage_digest, "ab".repeat(32));
-        assert_eq!(decoded.request_id, "req-1");
-        assert_eq!(decoded.content, b"hello");
-    }
-
-    #[test]
-    fn a_frame_for_a_missing_helper_input_is_rejected() {
-        assert!(atomic_publish_frame::decode(b"").is_err());
     }
 }
