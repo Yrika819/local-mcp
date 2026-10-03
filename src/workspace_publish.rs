@@ -68,6 +68,26 @@ pub(crate) enum PublishError {
     PostimageMismatch { path: PathBuf },
 }
 
+/// Stable machine-readable classification of a publication outcome.
+///
+/// The host needs to distinguish a refusal, where the destination is provably
+/// untouched, from a publication whose outcome cannot be proven. That distinction is
+/// what recovery keys its decision on, so it survives as a token rather than being
+/// re-parsed from a human-readable sentence.
+impl PublishError {
+    pub(crate) const fn class(&self) -> &'static str {
+        match self {
+            Self::PreimageMismatch { .. } => "preimage",
+            Self::NotARegularFile { .. } => "not-regular",
+            Self::Staging { .. } => "staging",
+            Self::StagingSync { .. } => "staging-sync",
+            Self::TargetAppeared { .. } => "target-appeared",
+            Self::Publish { .. } => "publish",
+            Self::PostimageMismatch { .. } => "postimage",
+        }
+    }
+}
+
 impl std::fmt::Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -223,17 +243,20 @@ fn matches_preimage(observed: Option<&(u64, String)>, expected: &ExpectedPreimag
     }
 }
 
-/// The permission bits an existing destination should hand to its replacement.
+/// The permission bits an existing destination hands to its replacement.
 ///
 /// Atomic replacement changes inode identity, so an existing executable file would
-/// otherwise silently lose its executable bit. This carries the mode across the
-/// replacement. It deliberately preserves *only* mode bits; ownership, ACLs, and
-/// xattrs are not carried, and the design says so rather than implying otherwise.
+/// otherwise silently lose its executable bit.
+///
+/// Only the ordinary `0o777` permission bits are carried. setuid/setgid/sticky are
+/// deliberately dropped: a truncating in-place write also clears them, so preserving
+/// them would make the atomic path *wider* than the behaviour it replaces, leaving a
+/// privileged file holding new, model-authored content.
 #[cfg(unix)]
 fn inherit_mode(destination: &Path) -> io::Result<Option<u32>> {
     match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            Ok(Some(metadata.permissions().mode() & 0o7777))
+            Ok(Some(metadata.permissions().mode() & 0o777))
         }
         _ => Ok(None),
     }
@@ -308,11 +331,12 @@ fn staging_path(
     Ok(parent.join(format!(".{stem}.{short}.{safe}.staged")))
 }
 
-/// Remove a staged file, but only one this process could have created.
+/// Remove a staged file, but only one this host created for this exact request.
 ///
-/// This never deletes an arbitrary user file: the path must match the exact staged
-/// naming shape, be a regular file, and (on Unix) be owned by the effective user.
-/// There is deliberately no "delete anything matching *.staged" cleanup anywhere.
+/// This never sweeps: there is no "delete anything matching *.staged" cleanup
+/// anywhere. The path must be a regular file owned by the effective user and must
+/// carry the host's staging suffix. Callers only ever pass a path they derived from a
+/// durable request id, which is what keeps the name unforgeable in practice.
 fn remove_owned_staging(path: &Path) {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return;
@@ -371,18 +395,11 @@ pub(crate) fn publish(request: PublishRequest<'_>) -> Result<(), PublishError> {
     let mode = inherit_mode(destination).unwrap_or(None);
 
     let staged = staging_path(parent, destination, request_id)?;
-    // A leftover from a crashed attempt with the same durable identity means the bytes
-    // on disk are unknown. Refuse rather than reuse them.
+    // A staged file under this exact name can only have come from an earlier crash of
+    // this same durable request: the name is a pure function of the destination file
+    // name and the request id, and request ids are unique per operation. Removing it
+    // is therefore bounded and provably ours, rather than a pattern sweep.
     remove_owned_staging(&staged);
-    if staged.exists() {
-        return Err(PublishError::Staging {
-            path: staged,
-            source: io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a staged file for this request already exists",
-            ),
-        });
-    }
 
     let result = stage_and_publish(
         &staged,
@@ -516,7 +533,9 @@ fn link_into_place(staged: &Path, destination: &Path) -> Result<(), PublishError
         });
     }
 
-    // The staged name now has a second link; drop it so the debris does not linger.
+    // The destination now owns the inode. Dropping the staging name is best-effort:
+    // if the process dies first the leftover is a second hard link to published
+    // content, which is inert and reaped by the next attempt under this same request.
     let _ = fs::remove_file(staged);
     Ok(())
 }

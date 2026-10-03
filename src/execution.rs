@@ -51,9 +51,13 @@ pub(crate) async fn publish_workspace_write(
 
 /// Resolve the host-owned publication helper next to this executable.
 ///
-/// The path is derived from the host's own executable directory and is never
-/// model-influenced. When the helper is absent the publication is refused rather than
-/// silently falling back to a non-atomic write.
+/// The path comes from the host's own executable directory and is never
+/// model-influenced. Only that directory is searched in production. The
+/// `deps`-parent fallback exists solely so `cargo test` can find the helper built
+/// into the profile directory, and is compiled out otherwise; an unconditional
+/// fallback would let a binary one level above the install prefix stand in for the
+/// commit mechanism. When the helper is absent the publication is refused rather than
+/// falling back to a non-atomic write.
 fn atomic_publish_helper() -> Result<String> {
     let executable_dir = std::env::current_exe()
         .context("local-mcp executable has no path")?
@@ -65,12 +69,16 @@ fn atomic_publish_helper() -> Result<String> {
     } else {
         "atomic-publish"
     };
+    #[cfg_attr(
+        not(test),
+        allow(unused_mut, reason = "only the test build adds a fallback candidate")
+    )]
     let mut candidates = vec![executable_dir.join(name)];
-    // `cargo test` runs the harness from `target/<profile>/deps`, so the helper built
-    // into `target/<profile>/` is one level up. This mirrors the existing
-    // `codex-linux-sandbox` lookup.
-    if let Some(parent) = executable_dir.parent() {
-        candidates.push(parent.join(name));
+    #[cfg(test)]
+    if executable_dir.file_name().is_some_and(|dir| dir == "deps")
+        && let Some(profile_dir) = executable_dir.parent()
+    {
+        candidates.push(profile_dir.join(name));
     }
     for candidate in &candidates {
         if candidate.is_file() {
