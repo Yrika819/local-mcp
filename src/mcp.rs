@@ -56,7 +56,35 @@ use crate::{approvals, config, execution, fallback, goal_api, sandbox};
     )
 )]
 pub async fn serve() -> Result<()> {
-    serve_with_io(tokio::io::stdin(), tokio::io::stdout()).await
+    // Production entry point: this process owns the registry, so a clean stdin
+    // EOF is the shutdown that stops its background jobs.
+    serve_with_io(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        ShutdownPolicy::ReleaseAllJobs,
+    )
+    .await
+}
+
+/// What a transport does with retained background jobs when its input ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownPolicy {
+    /// Terminate and drop every retained job. Correct for the production server,
+    /// which owns the whole registry: on a clean shutdown nothing should survive.
+    ReleaseAllJobs,
+    /// Leave the registry untouched.
+    ///
+    /// The in-process harness serves a duplex owned by one test, while the
+    /// registry is process-global. Releasing on its EOF would let one finishing
+    /// test delete jobs that a *concurrently running* test still owns.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "only the in-process test harness selects this policy"
+        )
+    )]
+    LeaveRegistry,
 }
 
 /// Runs the MCP request loop over the provided async reader/writer pair.
@@ -65,7 +93,11 @@ pub async fn serve() -> Result<()> {
 /// testable without a real process: tests can drive requests through an
 /// in-memory duplex stream and assert on the raw framed responses.
 #[cfg_attr(test, allow(dead_code, reason = "reached through the transport tests"))]
-pub(crate) async fn serve_with_io<R, W>(reader: R, writer: W) -> Result<()>
+pub(crate) async fn serve_with_io<R, W>(
+    reader: R,
+    writer: W,
+    shutdown: ShutdownPolicy,
+) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -230,7 +262,9 @@ where
     writer_handle
         .await
         .context("response writer task panicked")??;
-    release_all_jobs().await;
+    if shutdown == ShutdownPolicy::ReleaseAllJobs {
+        release_all_jobs().await;
+    }
     Ok(())
 }
 
@@ -1996,7 +2030,11 @@ mod tests {
 
         let (client_tx, server_rx) = tokio::io::duplex(65536);
         let (server_tx, client_rx) = tokio::io::duplex(65536);
-        let server = tokio::spawn(serve_with_io(server_rx, server_tx));
+        let server = tokio::spawn(serve_with_io(
+            server_rx,
+            server_tx,
+            ShutdownPolicy::LeaveRegistry,
+        ));
 
         let mut writer = client_tx;
         for request in requests {
@@ -2086,7 +2124,11 @@ mod tests {
 
         let (client_tx, server_rx) = tokio::io::duplex(65536);
         let (server_tx, client_rx) = tokio::io::duplex(65536);
-        let server = tokio::spawn(serve_with_io(server_rx, server_tx));
+        let server = tokio::spawn(serve_with_io(
+            server_rx,
+            server_tx,
+            ShutdownPolicy::LeaveRegistry,
+        ));
 
         let mut writer = client_tx;
         for i in 0..32 {

@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use crate::mcp::{
-    Frame, JSONRPC_RESOURCE_LIMIT, Pool, acquire_admission, admission_pool, bounded_error_response,
-    frame_reader, is_control_plane, serve_with_io, write_message, write_response_or_substitute,
+    Frame, JSONRPC_RESOURCE_LIMIT, Pool, ShutdownPolicy, acquire_admission, admission_pool,
+    bounded_error_response, frame_reader, is_control_plane, serve_with_io, write_message,
+    write_response_or_substitute,
 };
 use crate::resource_limits::{
     CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_COMMAND_STDOUT_BYTES,
@@ -32,7 +33,11 @@ use crate::resource_limits::{
 async fn serve_lines(input: &str) -> Vec<Value> {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let (response_writer, response_reader) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(serve_with_io(server, response_writer));
+    let server_task = tokio::spawn(serve_with_io(
+        server,
+        response_writer,
+        ShutdownPolicy::LeaveRegistry,
+    ));
     client.write_all(input.as_bytes()).await.unwrap();
     client.shutdown().await.unwrap();
     server_task.await.unwrap().unwrap();
