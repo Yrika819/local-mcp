@@ -261,7 +261,11 @@ What exists instead:
   results, and never touches another Session's jobs. It is exercised directly by
   tests.
 * Explicit **server** shutdown (stdin EOF) terminates and drops every job the
-  server holds. That is the shutdown the process actually has.
+  server holds. That is the shutdown the process actually has. It is selected
+  through an explicit `ShutdownPolicy` rather than being implicit, because the
+  registry is process-global while the in-process test harness serves a duplex
+  owned by a single test — without that distinction a finishing test would delete
+  jobs that a concurrently running test still owns.
 
 Retention in the absence of a Session signal is therefore bounded by the
 per-Session ceiling, the global ceiling and the TTL, rather than by teardown.
