@@ -21,6 +21,14 @@ pub enum FailureClass {
     /// started. Terminal: the request must not be retried outside the sandbox.
     SandboxSetup,
     TransportFailure,
+    /// A frozen resource bound was reached: output, a frame, a file, a
+    /// directory, or background-job capacity.
+    ///
+    /// This is a *resource* verdict, not an authority one. It is terminal and is
+    /// never re-derived from caller-controlled output text, so flooding bytes
+    /// that happen to contain "permission denied" cannot forge a permission
+    /// verdict and cannot restore retry authority.
+    ResourceLimit,
     Unknown,
 }
 
@@ -37,6 +45,7 @@ impl FailureClass {
             Self::PlatformSafety => "PLATFORM_SAFETY",
             Self::SandboxSetup => "SANDBOX_SETUP",
             Self::TransportFailure => "TRANSPORT_FAILURE",
+            Self::ResourceLimit => "RESOURCE_LIMIT",
             Self::Unknown => "UNKNOWN",
         }
     }
@@ -142,6 +151,9 @@ pub enum ReasonCode {
     FallbackDeniedLifecycle,
     FallbackDeniedPrimaryExecutionMode,
     NoFallbackSandboxSetupRejected,
+    /// A resource bound was reached. Terminal: a bounded resource never becomes
+    /// executable fallback authority.
+    NoFallbackResourceLimit,
 }
 
 impl ReasonCode {
@@ -170,6 +182,7 @@ impl ReasonCode {
             Self::FallbackDeniedLifecycle => "FALLBACK_DENIED_LIFECYCLE",
             Self::FallbackDeniedPrimaryExecutionMode => "FALLBACK_DENIED_PRIMARY_EXECUTION_MODE",
             Self::NoFallbackSandboxSetupRejected => "NO_FALLBACK_SANDBOX_SETUP_REJECTED",
+            Self::NoFallbackResourceLimit => "NO_FALLBACK_RESOURCE_LIMIT",
         }
     }
 }
@@ -943,6 +956,14 @@ pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
                 false,
             );
         }
+        FailureClass::ResourceLimit => {
+            return decision(
+                FallbackAction::Block,
+                ReasonCode::NoFallbackResourceLimit,
+                None,
+                false,
+            );
+        }
         _ => {}
     }
 
@@ -1106,7 +1127,10 @@ pub fn decide(input: DecisionInput<'_>) -> FallbackDecision {
         | FailureClass::ExpectedState
         | FailureClass::SemanticFailure
         | FailureClass::PlatformSafety
-        | FailureClass::SandboxSetup => unreachable!(),
+        | FailureClass::SandboxSetup
+        // Both are returned above as terminal blocks. They are listed here only
+        // so this match stays exhaustive.
+        | FailureClass::ResourceLimit => unreachable!(),
     }
 }
 

@@ -35,6 +35,7 @@ mod planner;
 mod process_group;
 mod readonly_worker;
 mod replanner;
+mod resource_limits;
 mod sandbox;
 mod scheduler;
 mod secure_fs;
@@ -82,6 +83,8 @@ mod process_group_stress_tests;
 mod replanner_compaction_tests;
 #[cfg(test)]
 mod replanner_replacement_tests;
+#[cfg(all(test, unix))]
+mod resource_bounds_process_tests;
 #[cfg(all(test, unix))]
 mod secure_fs_tests;
 #[cfg(test)]

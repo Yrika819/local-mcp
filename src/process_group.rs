@@ -56,7 +56,6 @@ use std::process::ExitStatus;
 #[cfg(unix)]
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use crate::exec_ready::BusyProgramRetry;
@@ -157,25 +156,6 @@ impl ProcessGroup {
         }
     }
 
-    /// Capture the complete output of the group and terminate it.
-    ///
-    /// Equivalent to waiting for a child with its output, except that
-    /// termination is observed without reaping, so the group can still be
-    /// signalled afterwards.
-    pub(crate) async fn terminate_and_capture(&mut self) -> io::Result<CapturedOutput> {
-        drop(self.child.stdin.take());
-        let mut stdout = self.child.stdout.take();
-        let mut stderr = self.child.stderr.take();
-        let (stdout, stderr) = tokio::join!(drain(stdout.as_mut()), drain(stderr.as_mut()));
-        let status = self.wait_termination().await?;
-        self.terminate();
-        Ok(CapturedOutput {
-            status,
-            stdout: stdout.unwrap_or_default(),
-            stderr: stderr.unwrap_or_default(),
-        })
-    }
-
     /// Whether a negative process-group signal is currently permitted.
     #[cfg(all(test, unix))]
     pub(crate) fn owns_process_group(&self) -> bool {
@@ -202,17 +182,6 @@ impl Drop for ProcessGroup {
         #[cfg(unix)]
         self.ownership.terminate_group();
         let _ = self.child.start_kill();
-    }
-}
-
-async fn drain<R>(reader: Option<&mut R>) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffer = Vec::new();
-    match reader {
-        Some(reader) => reader.read_to_end(&mut buffer).await.map(|_| buffer),
-        None => Ok(buffer),
     }
 }
 

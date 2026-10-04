@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -157,16 +157,29 @@ impl std::error::Error for RunError {}
 
 struct AbortOnDrop<T> {
     handle: Option<JoinHandle<T>>,
+    /// Whether this handle has already been polled to completion.
+    ///
+    /// A `JoinHandle` that has returned `Ready` panics if it is polled again, so
+    /// cleanup must be able to tell "still running" from "already joined". This
+    /// is not theoretical: a stream can breach its bound and complete while the
+    /// other stream is still draining, and both are then cleaned up together.
+    completed: bool,
 }
 
 impl<T> AbortOnDrop<T> {
     fn new(handle: JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
+            completed: false,
         }
     }
 
     async fn abort_and_join(&mut self) {
+        if self.completed {
+            // Already joined. Awaiting the handle again would panic.
+            self.handle.take();
+            return;
+        }
         if let Some(handle) = self.handle.as_ref() {
             handle.abort();
         }
@@ -183,13 +196,18 @@ impl<T> std::future::Future for AbortOnDrop<T> {
         self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        std::pin::Pin::new(
-            self.get_mut()
-                .handle
-                .as_mut()
-                .expect("aborted task handle is missing"),
-        )
-        .poll(context)
+        let this = self.get_mut();
+        let handle = this
+            .handle
+            .as_mut()
+            .expect("aborted task handle is missing");
+        match std::pin::Pin::new(handle).poll(context) {
+            std::task::Poll::Ready(result) => {
+                this.completed = true;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
@@ -501,10 +519,20 @@ pub(crate) async fn run_tracked_with_path(
             .map_err(|error| RunError::new(error.into(), true, false))?;
     }
 
-    let output = group
-        .terminate_and_capture()
-        .await
-        .map_err(|error| RunError::new(error.into(), true, false))?;
+    let capture = terminate_and_capture_bounded(&mut group).await;
+    let output = match capture.output {
+        Ok(output) => output,
+        Err(failure) => {
+            // `command_started` stays true: a process was launched and observed,
+            // and the failure says nothing about whether the requested command
+            // performed its side effects.
+            return Err(RunError::new(
+                anyhow::Error::new(failure),
+                true,
+                capture.leader_finished,
+            ));
+        }
+    };
     Ok(Output {
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -753,11 +781,13 @@ pub(crate) async fn run_unrestricted_clean_raw_with_limits(
     stdout_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
         stdout,
         stdout_limit,
+        CaptureStream::Stdout,
         Arc::clone(&state),
     ))));
     stderr_task = Some(AbortOnDrop::new(tokio::spawn(capture_bounded(
         stderr,
         stderr_limit,
+        CaptureStream::Stderr,
         Arc::clone(&state),
     ))));
     if let Some(bytes) = stdin {
@@ -887,6 +917,13 @@ pub(crate) async fn run_unrestricted_clean_raw_with_limits(
 struct CaptureState {
     too_large: AtomicBool,
     failed: AtomicBool,
+    /// Which stream first exceeded its bound, as `stream as usize + 1`; `0`
+    /// when no stream has overflowed.
+    ///
+    /// The trusted-Git runner bounds both streams independently and reports a
+    /// single condition, so it never reads this. The generic runner must report
+    /// *which* bound was reached so the failure names the right resource.
+    overflowed: AtomicUsize,
     notify: Notify,
 }
 
@@ -895,9 +932,40 @@ impl CaptureState {
         Self {
             too_large: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            overflowed: AtomicUsize::new(0),
             notify: Notify::new(),
         }
     }
+
+    fn record_overflow(&self, stream: CaptureStream) {
+        // First writer wins, so the reported stream is the one that actually
+        // breached its bound first rather than whichever task was scheduled last.
+        let _ = self.overflowed.compare_exchange(
+            0,
+            stream as usize + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.too_large.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    /// The stream that exceeded its bound, if any.
+    fn overflowed_stream(&self) -> Option<CaptureStream> {
+        match self.overflowed.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(CaptureStream::Stdout),
+            _ => Some(CaptureStream::Stderr),
+        }
+    }
+}
+
+/// Which of a child's two output pipes a bound applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum CaptureStream {
+    Stdout = 0,
+    Stderr = 1,
 }
 
 #[derive(Debug)]
@@ -919,9 +987,12 @@ impl std::fmt::Display for CaptureError {
     }
 }
 
+impl std::error::Error for CaptureError {}
+
 async fn capture_bounded<R>(
     mut reader: R,
     limit: usize,
+    stream: CaptureStream,
     state: Arc<CaptureState>,
 ) -> Result<Vec<u8>, CaptureError>
 where
@@ -933,8 +1004,7 @@ where
         match reader.read(&mut buffer).await {
             Ok(0) => return Ok(output),
             Ok(read) if output.len().saturating_add(read) > limit => {
-                state.too_large.store(true, Ordering::Release);
-                state.notify.notify_one();
+                state.record_overflow(stream);
                 return Err(CaptureError::TooLarge);
             }
             Ok(read) => output.extend_from_slice(&buffer[..read]),
@@ -998,7 +1068,254 @@ async fn cleanup_bounded_child(
     finished
 }
 
-async fn run_unrestricted_inner(
+/// Why a bounded generic capture produced no output.
+///
+/// Every variant is host-authored and carries no captured content, so the
+/// diagnostic reporting a rejected stream stays small and bounded: it never
+/// echoes the output that was discarded, the offending argv, or a path list.
+#[derive(Debug)]
+enum CaptureFailure {
+    /// A stream produced more bytes than its bound allows. The whole process
+    /// group has already been terminated before this value is constructed.
+    OutputLimit { stream: CaptureStream },
+    /// The child exposed no pipe for a stream the host must capture.
+    MissingPipe,
+    /// The host could not observe termination, or could not read a pipe.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for CaptureFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::resource_limits::ResourceLimit;
+        match self {
+            // The message states that output was discarded rather than truncated
+            // into something that looks like complete stdout/stderr.
+            Self::OutputLimit {
+                stream: CaptureStream::Stdout,
+            } => write!(
+                formatter,
+                "{}: output was discarded and the process group was terminated",
+                ResourceLimit::CommandStdout
+            ),
+            Self::OutputLimit {
+                stream: CaptureStream::Stderr,
+            } => write!(
+                formatter,
+                "{}: output was discarded and the process group was terminated",
+                ResourceLimit::CommandStderr
+            ),
+            Self::MissingPipe => formatter.write_str("command has no output pipe"),
+            Self::Io(error) => write!(formatter, "command output capture failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureFailure {}
+
+impl CaptureFailure {
+    fn output_limit(stream: CaptureStream) -> Self {
+        Self::OutputLimit { stream }
+    }
+}
+
+/// Result of bounded generic capture, plus the lifecycle evidence the fallback
+/// classifier needs.
+///
+/// `leader_finished` reports whether the group leader was observed to terminate.
+/// It is deliberately independent of whether output was captured: a command that
+/// flooded its bound and was killed did not run to completion.
+struct GenericCapture {
+    output: std::result::Result<crate::process_group::CapturedOutput, CaptureFailure>,
+    leader_finished: bool,
+}
+
+/// Capture a launched process group's output under independent byte bounds.
+///
+/// This is the generic command capture path. It differs from the trusted-Git
+/// runner in three ways that matter:
+///
+/// * There is no command deadline. A long command runs until it finishes or is
+///   stopped, so waiting for the leader here is deliberately unbounded.
+/// * Both bounds are the frozen generic limits, not Git-specific ones.
+/// * After the leader terminates, both pipes get a bounded grace to reach EOF.
+///   A descendant that inherited stdout/stderr and outlived its parent is the one
+///   way capture can outlast the command; bounding that is what keeps a stray
+///   descendant from holding the read open forever.
+///
+/// Overflow is detected while reading, so exactly `limit` bytes is preserved and
+/// `limit + 1` is rejected without ever residing in memory. When either bound is
+/// breached the process group is terminated rather than merely abandoned, because
+/// stopping the read while the child runs would leave descendants alive.
+async fn terminate_and_capture_bounded(group: &mut ProcessGroup) -> GenericCapture {
+    use crate::resource_limits::{MAX_COMMAND_STDERR_BYTES, MAX_COMMAND_STDOUT_BYTES};
+
+    // Closing stdin first lets a child that reads to EOF finish promptly.
+    drop(group.take_stdin());
+    let Some(stdout) = group.take_stdout() else {
+        return GenericCapture {
+            output: Err(CaptureFailure::MissingPipe),
+            leader_finished: false,
+        };
+    };
+    let Some(stderr) = group.take_stderr() else {
+        return GenericCapture {
+            output: Err(CaptureFailure::MissingPipe),
+            leader_finished: false,
+        };
+    };
+    // Independent tasks with independent bounds: two full pipes can never block
+    // each other, and one noisy stream cannot spend the other's budget.
+    let state = Arc::new(CaptureState::new());
+    let mut stdout_task = AbortOnDrop::new(tokio::spawn(capture_bounded(
+        stdout,
+        MAX_COMMAND_STDOUT_BYTES,
+        CaptureStream::Stdout,
+        Arc::clone(&state),
+    )));
+    let mut stderr_task = AbortOnDrop::new(tokio::spawn(capture_bounded(
+        stderr,
+        MAX_COMMAND_STDERR_BYTES,
+        CaptureStream::Stderr,
+        Arc::clone(&state),
+    )));
+
+    let termination = loop {
+        if let Some(stream) = state.overflowed_stream() {
+            break Err(CaptureFailure::output_limit(stream));
+        }
+        if state.failed.load(Ordering::Acquire) {
+            break Err(CaptureFailure::Io(std::io::Error::other(
+                "command output capture failed",
+            )));
+        }
+        tokio::select! {
+            result = group.wait_termination() => break result.map_err(CaptureFailure::Io),
+            _ = state.notify.notified() => {}
+        }
+    };
+
+    let status = match termination {
+        Err(failure) => {
+            // Overflow, a failed read, or an unobservable leader: the child may
+            // still be running, so the group is terminated before reporting.
+            let leader_finished =
+                cleanup_generic_child(group, &mut stdout_task, &mut stderr_task).await;
+            return GenericCapture {
+                output: Err(failure),
+                leader_finished,
+            };
+        }
+        Ok(status) => {
+            // Overflow can win the same instant the leader exits. Overflow still
+            // takes precedence, because the retained bytes would exceed the bound.
+            if let Some(stream) = state.overflowed_stream() {
+                let leader_finished =
+                    cleanup_generic_child(group, &mut stdout_task, &mut stderr_task).await;
+                return GenericCapture {
+                    output: Err(CaptureFailure::output_limit(stream)),
+                    leader_finished,
+                };
+            }
+            status
+        }
+    };
+
+    let (stdout, stderr) = tokio::join!(
+        finish_generic_stream(&mut stdout_task, CaptureStream::Stdout),
+        finish_generic_stream(&mut stderr_task, CaptureStream::Stderr),
+    );
+
+    // The leader is gone; terminate the group so no descendant survives the
+    // command, matching the pre-existing cleanup discipline.
+    group.terminate();
+
+    let (stdout, stderr) = match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        (Err(failure), _) | (_, Err(failure)) => {
+            stdout_task.abort_and_join().await;
+            stderr_task.abort_and_join().await;
+            return GenericCapture {
+                output: Err(failure),
+                leader_finished: true,
+            };
+        }
+    };
+    GenericCapture {
+        output: Ok(crate::process_group::CapturedOutput {
+            status,
+            stdout,
+            stderr,
+        }),
+        leader_finished: true,
+    }
+}
+
+type GenericCaptureTask = AbortOnDrop<Result<Vec<u8>, CaptureError>>;
+
+/// Tear down a generic command group and unwind both capture tasks.
+///
+/// Returns whether the group leader was observed to terminate, which is the
+/// lifecycle evidence a resource failure has to carry.
+async fn cleanup_generic_child(
+    group: &mut ProcessGroup,
+    stdout_task: &mut GenericCaptureTask,
+    stderr_task: &mut GenericCaptureTask,
+) -> bool {
+    // The grace starts when cleanup starts. Computing it earlier would expire it
+    // during a legitimately long command.
+    let cleanup_deadline =
+        tokio::time::Instant::now() + crate::resource_limits::COMMAND_CLEANUP_GRACE;
+    group.terminate();
+    let finished = matches!(
+        tokio::time::timeout_at(cleanup_deadline, group.wait_termination()).await,
+        Ok(Ok(_))
+    );
+    group.terminate();
+    stdout_task.abort_and_join().await;
+    stderr_task.abort_and_join().await;
+    finished
+}
+
+/// [`finish_capture_task`] for a task that is always present.
+async fn finish_present_capture_task(
+    task: &mut GenericCaptureTask,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, CaptureError> {
+    match tokio::time::timeout_at(deadline, &mut *task).await {
+        Ok(Ok(Ok(output))) => Ok(output),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_)) | Err(_) => Err(CaptureError::DidNotFinish),
+    }
+}
+
+/// Finish one bounded stream after the leader has terminated.
+///
+/// The leader's exit does not close the pipes: a descendant may still hold them.
+/// Both streams are awaited concurrently by the caller, so neither can starve the
+/// other, and once the drain grace elapses this reader is unwound, so no reader
+/// task outlives the capture.
+async fn finish_generic_stream(
+    task: &mut GenericCaptureTask,
+    stream: CaptureStream,
+) -> std::result::Result<Vec<u8>, CaptureFailure> {
+    use crate::resource_limits::COMMAND_CAPTURE_DRAIN_GRACE;
+    let drain_deadline = tokio::time::Instant::now() + COMMAND_CAPTURE_DRAIN_GRACE;
+    match finish_present_capture_task(task, drain_deadline).await {
+        // The stream finished inside the drain grace.
+        Ok(bytes) => Ok(bytes),
+        Err(CaptureError::TooLarge) => Err(CaptureFailure::output_limit(stream)),
+        Err(error) => {
+            // Either the reader was cancelled or a descendant held this pipe open
+            // past the drain grace. The reader is unwound rather than left
+            // blocked, and the caller terminates the group so the descendant
+            // holding it does not survive either.
+            task.abort_and_join().await;
+            Err(CaptureFailure::Io(std::io::Error::other(error)))
+        }
+    }
+}
+
+pub(crate) async fn run_unrestricted_inner(
     command: &[String],
     cwd: &Path,
     stdin: Option<&[u8]>,
@@ -1040,10 +1357,19 @@ async fn run_unrestricted_inner(
             .await
             .map_err(|error| RunError::new(error.into(), true, false))?;
     }
-    let output = group
-        .terminate_and_capture()
-        .await
-        .map_err(|error| RunError::new(error.into(), true, false))?;
+    let capture = terminate_and_capture_bounded(&mut group).await;
+    let output = match capture.output {
+        Ok(output) => output,
+        Err(failure) => {
+            // See `run_tracked_with_path`: an output bound is never evidence that
+            // the command did not run.
+            return Err(RunError::new(
+                anyhow::Error::new(failure),
+                true,
+                capture.leader_finished,
+            ));
+        }
+    };
     Ok(Output {
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1602,5 +1928,226 @@ assert not present, present
 
         std::fs::remove_dir_all(workspace)?;
         Ok(())
+    }
+}
+
+/// Resource Bounds V1: bounded generic capture.
+///
+/// These drive the reader directly with an injected stream, so the exact-limit
+/// and limit+1 boundaries are deterministic and independent of any real
+/// program's scheduling. Process-level behavior (group termination, descendants,
+/// retry safety) lives in `resource_bounds_process_tests`.
+///
+/// The feeder is a separate, abortable task. That matters: a correct reader
+/// *stops* at its bound, so a fixture that insisted on writing all its bytes
+/// would block on a full pipe. Blocking there would be a property of the
+/// fixture, not of the host.
+#[cfg(test)]
+mod bounded_capture_tests {
+    use super::*;
+    use crate::resource_limits::{MAX_COMMAND_STDERR_BYTES, MAX_COMMAND_STDOUT_BYTES};
+
+    /// Write exactly `bytes` into a duplex stream, then close it so the reader
+    /// sees EOF.
+    async fn feed(mut writer: tokio::io::DuplexStream, bytes: usize) {
+        let block = vec![b'x'; bytes.min(64 * 1024)];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let take = remaining.min(block.len());
+            if tokio::io::AsyncWriteExt::write_all(&mut writer, &block[..take])
+                .await
+                .is_err()
+            {
+                return;
+            }
+            remaining -= take;
+        }
+    }
+
+    fn pipe() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        tokio::io::duplex(64 * 1024)
+    }
+
+    #[tokio::test]
+    async fn stdout_at_exactly_the_limit_is_preserved_whole() {
+        let (mut reader, writer) = pipe();
+        let state = Arc::new(CaptureState::new());
+        let limit = MAX_COMMAND_STDOUT_BYTES;
+        let feeder = tokio::spawn(feed(writer, limit));
+        let captured = capture_bounded(
+            &mut reader,
+            limit,
+            CaptureStream::Stdout,
+            Arc::clone(&state),
+        )
+        .await;
+        feeder.abort();
+        let captured = captured.expect("exactly the limit must be accepted");
+        assert_eq!(captured.len(), limit);
+        assert!(captured.iter().all(|byte| *byte == b'x'));
+        assert!(
+            !state.too_large.load(Ordering::Acquire),
+            "a result at exactly the limit must not report overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_one_byte_over_the_limit_is_rejected() {
+        let (mut reader, writer) = pipe();
+        let state = Arc::new(CaptureState::new());
+        let limit = MAX_COMMAND_STDOUT_BYTES;
+        let feeder = tokio::spawn(feed(writer, limit + 1));
+        let captured = capture_bounded(
+            &mut reader,
+            limit,
+            CaptureStream::Stdout,
+            Arc::clone(&state),
+        )
+        .await;
+        feeder.abort();
+        assert!(
+            matches!(captured, Err(CaptureError::TooLarge)),
+            "limit + 1 must be rejected deterministically"
+        );
+        assert!(state.too_large.load(Ordering::Acquire));
+        assert_eq!(state.overflowed_stream(), Some(CaptureStream::Stdout));
+    }
+
+    #[tokio::test]
+    async fn stderr_at_exactly_the_limit_is_preserved_whole() {
+        let (mut reader, writer) = pipe();
+        let state = Arc::new(CaptureState::new());
+        let limit = MAX_COMMAND_STDERR_BYTES;
+        let feeder = tokio::spawn(feed(writer, limit));
+        let captured = capture_bounded(
+            &mut reader,
+            limit,
+            CaptureStream::Stderr,
+            Arc::clone(&state),
+        )
+        .await;
+        feeder.abort();
+        let captured = captured.expect("exactly the limit must be accepted");
+        assert_eq!(captured.len(), limit);
+        assert!(!state.too_large.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn stderr_one_byte_over_the_limit_is_rejected() {
+        let (mut reader, writer) = pipe();
+        let state = Arc::new(CaptureState::new());
+        let limit = MAX_COMMAND_STDERR_BYTES;
+        let feeder = tokio::spawn(feed(writer, limit + 1));
+        let captured = capture_bounded(
+            &mut reader,
+            limit,
+            CaptureStream::Stderr,
+            Arc::clone(&state),
+        )
+        .await;
+        feeder.abort();
+        assert!(matches!(captured, Err(CaptureError::TooLarge)));
+        assert_eq!(state.overflowed_stream(), Some(CaptureStream::Stderr));
+    }
+
+    #[tokio::test]
+    async fn the_two_streams_are_bounded_independently() {
+        // Neither stream may spend the other's budget: each reader carries its
+        // own limit, so a full stdout cannot shrink what stderr may retain.
+        let state = Arc::new(CaptureState::new());
+        let (mut stdout_reader, stdout_writer) = pipe();
+        let (mut stderr_reader, stderr_writer) = pipe();
+        let stdout_feeder = tokio::spawn(feed(stdout_writer, 1024));
+        let stderr_feeder = tokio::spawn(feed(stderr_writer, 2048));
+        let (stdout, stderr) = tokio::join!(
+            capture_bounded(
+                &mut stdout_reader,
+                1024,
+                CaptureStream::Stdout,
+                Arc::clone(&state)
+            ),
+            capture_bounded(
+                &mut stderr_reader,
+                2048,
+                CaptureStream::Stderr,
+                Arc::clone(&state)
+            ),
+        );
+        stdout_feeder.abort();
+        stderr_feeder.abort();
+        assert_eq!(stdout.expect("stdout within its own limit").len(), 1024);
+        assert_eq!(stderr.expect("stderr within its own limit").len(), 2048);
+        assert!(!state.too_large.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn both_streams_flooding_simultaneously_are_each_rejected() {
+        // Two full pipes must not deadlock each other, and both readers must
+        // reach their own verdict rather than one starving the other.
+        let state = Arc::new(CaptureState::new());
+        let (mut stdout_reader, stdout_writer) = pipe();
+        let (mut stderr_reader, stderr_writer) = pipe();
+        let stdout_feeder = tokio::spawn(feed(stdout_writer, 8 * 1024));
+        let stderr_feeder = tokio::spawn(feed(stderr_writer, 8 * 1024));
+        let (stdout, stderr) = tokio::join!(
+            capture_bounded(
+                &mut stdout_reader,
+                4096,
+                CaptureStream::Stdout,
+                Arc::clone(&state)
+            ),
+            capture_bounded(
+                &mut stderr_reader,
+                4096,
+                CaptureStream::Stderr,
+                Arc::clone(&state)
+            ),
+        );
+        stdout_feeder.abort();
+        stderr_feeder.abort();
+        assert!(matches!(stdout, Err(CaptureError::TooLarge)));
+        assert!(matches!(stderr, Err(CaptureError::TooLarge)));
+        assert!(state.too_large.load(Ordering::Acquire));
+        assert!(state.overflowed_stream().is_some());
+    }
+
+    #[tokio::test]
+    async fn overflow_is_detected_before_the_flood_is_retained() {
+        // The bound is checked against the incoming chunk before anything is
+        // appended, so a flood cannot accumulate first and be measured later.
+        let (mut reader, writer) = pipe();
+        let state = Arc::new(CaptureState::new());
+        let feeder = tokio::spawn(feed(writer, 1024 * 1024));
+        let captured =
+            capture_bounded(&mut reader, 4096, CaptureStream::Stdout, Arc::clone(&state)).await;
+        feeder.abort();
+        assert!(matches!(captured, Err(CaptureError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn the_first_breach_is_the_one_reported() {
+        // Both readers may breach; the reported stream is the one that breached
+        // first, not whichever task happened to be scheduled last.
+        let state = Arc::new(CaptureState::new());
+        state.record_overflow(CaptureStream::Stdout);
+        state.record_overflow(CaptureStream::Stderr);
+        assert_eq!(state.overflowed_stream(), Some(CaptureStream::Stdout));
+    }
+
+    #[tokio::test]
+    async fn the_capture_failure_message_names_the_resource_and_drops_the_output() {
+        let stdout = CaptureFailure::output_limit(CaptureStream::Stdout).to_string();
+        let stderr = CaptureFailure::output_limit(CaptureStream::Stderr).to_string();
+        assert!(stdout.contains("command stdout"));
+        assert!(stderr.contains("command stderr"));
+        for message in [&stdout, &stderr] {
+            assert!(message.contains("discarded"));
+            assert!(message.contains("terminated"));
+            assert!(
+                message.len() < 256,
+                "a resource error must stay small, got {} bytes",
+                message.len()
+            );
+        }
     }
 }
