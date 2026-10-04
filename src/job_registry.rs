@@ -264,6 +264,12 @@ impl JobRegistry {
         self.jobs.len()
     }
 
+    /// Any retained job identifier, for stress-audit iteration.
+    #[cfg(test)]
+    pub(crate) fn first_job_id_for_test(&self) -> Option<Uuid> {
+        self.jobs.keys().next().copied()
+    }
+
     /// Whether a job id is currently registered, for assertions in existing tests.
     #[cfg(test)]
     pub(crate) fn contains_key_for_test(&self, job_id: &Uuid) -> bool {
