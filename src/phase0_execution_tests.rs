@@ -195,7 +195,7 @@ async fn stop_job_cancellation_kills_sandboxed_process_group() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\n/bin/sleep 5 &\nprintf '%s' \"$!\" > '{}'\nexec /bin/sleep 5\n",
+            "#!/bin/sh\n/bin/sleep 30 &\nprintf '%s' \"$!\" > '{}'\nexec /bin/sleep 30\n",
             pid_path.display()
         ),
     )

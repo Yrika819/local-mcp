@@ -156,10 +156,13 @@ On overflow the sequence is fixed:
 Stopping capture alone would leave descendants running and the group alive, so
 termination is not optional.
 
-**stdin is written only after both readers exist**, and under a deadline. A child
-that writes more than the pipe buffer before draining stdin would otherwise block
-on its own write while the host blocks on `write_all`: a deadlock with no deadline
-to break it, since the generic path deliberately has no command timeout.
+Stdin is written only after both readers exist, and under a **dedicated** deadline
+(`COMMAND_STDIN_WRITE_GRACE`, 30s) rather than the post-termination cleanup grace. A
+stdin write only completes as fast as the child drains its pipe, so the budget has
+to cover child startup as well as transfer: `codex_fallback` writes a ~192 KiB
+prompt, several times any pipe buffer, into a Node CLI whose startup alone can take
+seconds. Reusing a 500 ms cleanup budget here would turn a working call into a
+reliable failure — the same category of mistake as deriving a bound from raw bytes.
 
 The overflow failure carries the typed `ResourceLimitError` rather than wrapping
 it, because `anyhow::Error::downcast_ref` searches its own context chain and not
@@ -209,6 +212,13 @@ would leave a live process with no registry entry and no way to stop it.
 `execute` deliberately performs **no** capacity pre-check: a command that finishes
 inside the foreground window never creates a job, and refusing it because the
 registry is full would couple the most-used tool to background-job occupancy.
+
+The trade this makes: a refused `execute` has already spawned a process by the time
+the ceiling is discovered. That process is terminated immediately, and the ceiling
+on how many can exist at once is the transport's execution admission pool
+(`EXECUTION_PERMITS`), which is itself bounded — so the failure mode is "spawn then
+stop", not unbounded process creation. The pre-check, which this removes, was a
+*rate* limiter rather than a correctness guarantee.
 
 If either the per-Session or the global ceiling is reached, creating a *new* job
 fails with a deterministic resource-limit error. A running job is never evicted
@@ -353,6 +363,32 @@ itself bounded; it is not made unlimited.
 request-frame-too-large, file-too-large, directory-too-large, and job-capacity
 failures are all resource failures and are **not** reported as sandbox permission
 denied, tool missing, or an authority violation.
+
+A resource failure carries a typed `ResourceLimitError`, not a formatted string,
+and the type is preserved across every boundary it has to survive: through
+`anyhow` (which searches its own context chain, not an inner error's `source()`
+chain), through the rendered attempt payload attached as a context, and into the
+transport's distinct JSON-RPC code. A bound that reaches the caller as a generic
+server error is a defect.
+
+Error messages are truncated on a character boundary. A byte-index cut inside a
+multi-byte character would panic inside `String::truncate`, taking the dispatch
+task down and leaving the client waiting on that request id forever; error text
+routinely carries non-ASCII from a path or from command output.
+
+## 14a. Known gaps in this version
+
+Two text-returning results are not covered by a method-level bound and rely on the
+response-frame assertion alone:
+
+* `goal_status` / `goal_result` render one view entry per durable Task, per blocker,
+  and per blocker detail. The active Task graph is capped, but superseded Tasks and
+  blockers accumulate over a long replan history, so a very old Goal can produce a
+  large view. Paginating or truncating these is explicitly out of scope for this
+  phase; the response assertion means such a reply becomes a bounded resource
+  error rather than an oversized frame. **This is the recommended follow-up.**
+* `session_info` renders a host-created `Session` (id, cwd, permitted directories),
+  which is small by construction but has no explicit assertion.
 
 ## 15. Compatibility
 

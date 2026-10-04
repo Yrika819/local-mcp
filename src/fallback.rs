@@ -540,18 +540,21 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
         };
     }
 
-    if !input.lifecycle.host_reached {
+    // A host-owned resource bound is terminal, and is classified before the
+    // command's own output is inspected. It is checked here, alongside the other
+    // host-owned authority markers and *above* the `host_reached` gate: a
+    // resource failure must not be downgraded to a transport diagnosis if it
+    // arrives with an unobserved lifecycle.
+    if input.authoritative_resource_limit.is_some() {
         return Classification {
-            failure_class: FailureClass::TransportFailure,
+            failure_class: FailureClass::ResourceLimit,
             safety_signal: false,
         };
     }
 
-    // A host-owned resource bound is terminal, and is classified before the
-    // command's own output is inspected.
-    if input.authoritative_resource_limit.is_some() {
+    if !input.lifecycle.host_reached {
         return Classification {
-            failure_class: FailureClass::ResourceLimit,
+            failure_class: FailureClass::TransportFailure,
             safety_signal: false,
         };
     }

@@ -156,15 +156,23 @@ impl JobRegistry {
     /// another Session's job.
     pub(crate) fn can_admit(&mut self, now: Instant, session_id: &str) -> Result<()> {
         self.collect_expired(now);
+        // Typed rather than formatted, so the transport reports a resource
+        // failure instead of a generic server error.
         anyhow::ensure!(
             self.count_for_session(session_id) < MAX_BACKGROUND_JOBS_PER_SESSION,
-            "{}: stop or poll a retained job before starting another",
-            ResourceLimit::BackgroundJobsPerSession
+            "{}",
+            crate::resource_limits::limit_error(
+                ResourceLimit::BackgroundJobsPerSession,
+                "stop or poll a retained job before starting another",
+            )
         );
         anyhow::ensure!(
             self.jobs.len() < MAX_BACKGROUND_JOBS_GLOBAL,
-            "{}: stop or poll a retained job before starting another",
-            ResourceLimit::BackgroundJobsGlobal
+            "{}",
+            crate::resource_limits::limit_error(
+                ResourceLimit::BackgroundJobsGlobal,
+                "stop or poll a retained job before starting another",
+            )
         );
         Ok(())
     }

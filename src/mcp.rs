@@ -1262,18 +1262,29 @@ pub(crate) async fn acquire_admission(
 /// A JSON-RPC error response whose message is guaranteed to fit in a frame.
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
 pub(crate) fn bounded_error_response(id: Value, code: i64, message: &str) -> Value {
-    let mut message = message.to_owned();
-    if message.len() > MAX_ERROR_MESSAGE_BYTES {
-        message.truncate(
-            message
-                .char_indices()
-                .nth(MAX_ERROR_MESSAGE_BYTES)
-                .map(|(index, _)| index)
-                .unwrap_or(MAX_ERROR_MESSAGE_BYTES),
-        );
-        message.push_str("… (truncated)");
+    let was_truncated = message.len() > MAX_ERROR_MESSAGE_BYTES;
+    let mut bounded = truncate_on_char_boundary(message, MAX_ERROR_MESSAGE_BYTES);
+    if was_truncated {
+        bounded.push('…');
     }
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":bounded}})
+}
+
+/// Truncate to at most `limit` bytes without ever splitting a character.
+///
+/// A byte-index cut would panic inside `String::truncate` whenever it landed
+/// mid-character, and error text can be multi-byte: a path or command output
+/// containing non-ASCII would take the dispatch task down with it, leaving the
+/// client waiting on that request id forever.
+fn truncate_on_char_boundary(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 /// One newline-delimited request frame.

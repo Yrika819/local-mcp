@@ -840,7 +840,13 @@ pub(crate) async fn run_unrestricted_clean_raw_with_limits(
             )
             .await;
             return Err(RunError::new(
-                anyhow::anyhow!("bounded Git command output limit exceeded"),
+                // Typed, so the transport reports a resource failure rather than a
+                // generic server error. This runs on the trusted-Git path, which
+                // keeps its own caps but shares the resource taxonomy.
+                crate::resource_limits::limit_error(
+                    crate::resource_limits::ResourceLimit::CommandStdout,
+                    "bounded Git command output was discarded and the process group was terminated",
+                ),
                 true,
                 finished,
             ));
@@ -1103,8 +1109,6 @@ impl std::fmt::Display for CaptureFailure {
 impl std::error::Error for CaptureFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            // Exposed so `anyhow::Error::downcast_ref` finds the typed resource
-            // marker through this wrapper.
             Self::OutputLimit(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::MissingPipe => None,
@@ -1221,7 +1225,7 @@ async fn terminate_and_capture_bounded(
             };
         };
         let stdin_deadline =
-            tokio::time::Instant::now() + crate::resource_limits::COMMAND_CLEANUP_GRACE;
+            tokio::time::Instant::now() + crate::resource_limits::COMMAND_STDIN_WRITE_GRACE;
         let written = tokio::time::timeout_at(stdin_deadline, child_stdin.write_all(bytes)).await;
         if !matches!(written, Ok(Ok(()))) {
             let leader_finished =

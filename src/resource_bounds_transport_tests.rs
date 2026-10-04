@@ -352,6 +352,24 @@ async fn an_oversized_response_does_not_end_the_session() {
 }
 
 #[tokio::test]
+async fn an_output_overflow_reports_the_resource_code_to_the_transport() {
+    // Drives the full boundary the previous fix missed: a successful overflow must
+    // still be *typed* after the rendered payload is attached, so the transport
+    // emits the resource code rather than a generic server error.
+    let overflow = crate::resource_limits::limit_error(
+        crate::resource_limits::ResourceLimit::CommandStdout,
+        "the attempt failed and its output was discarded",
+    )
+    .context("{\"exit_code\":null,\"stdout\":\"\",\"stderr\":\"\"}");
+    assert!(
+        overflow
+            .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+            .is_some(),
+        "the marker must survive the payload error boundary that the transport reads"
+    );
+}
+
+#[tokio::test]
 async fn an_oversized_error_message_is_itself_bounded() {
     // An oversized diagnostic must not be able to produce an oversized response.
     let huge = "m".repeat(MAX_ERROR_MESSAGE_BYTES * 10);
@@ -362,8 +380,43 @@ async fn an_oversized_error_message_is_itself_bounded() {
         "a bounded error must fit in a frame"
     );
     let message = response["error"]["message"].as_str().unwrap();
-    assert!(message.len() <= MAX_ERROR_MESSAGE_BYTES + 32);
-    assert!(message.contains("truncated"));
+    assert!(message.len() <= MAX_ERROR_MESSAGE_BYTES + 8);
+    assert!(message.contains('…'));
+}
+
+#[tokio::test]
+async fn a_multi_byte_error_message_is_truncated_without_panicking() {
+    // A byte-index cut inside a multi-byte character would panic inside
+    // `String::truncate`, taking the dispatch task down and leaving the client
+    // waiting on that request id forever. Error text can carry non-ASCII from a
+    // path or from command output, so this is reachable, not theoretical.
+    let wide = "日".repeat(MAX_ERROR_MESSAGE_BYTES);
+    let narrow_boundary = "é".repeat(MAX_ERROR_MESSAGE_BYTES / 2 + 1);
+    for message in [
+        wide,
+        narrow_boundary,
+        "é".repeat(MAX_ERROR_MESSAGE_BYTES * 4),
+    ] {
+        let response = bounded_error_response(json!(7), JSONRPC_RESOURCE_LIMIT, &message);
+        let rendered = response["error"]["message"].as_str().unwrap().to_owned();
+        assert!(
+            rendered.chars().count() <= MAX_ERROR_MESSAGE_BYTES,
+            "truncation must be measured in characters too"
+        );
+        assert!(
+            rendered.len() <= MAX_ERROR_MESSAGE_BYTES + 8,
+            "truncation must stay bounded, got {} bytes",
+            rendered.len()
+        );
+        assert_eq!(response["id"], 7);
+    }
+}
+
+#[tokio::test]
+async fn a_short_multi_byte_error_message_is_passed_through_unchanged() {
+    let message = "パスが拒否されました";
+    let response = bounded_error_response(json!(8), -32000, message);
+    assert_eq!(response["error"]["message"], message);
 }
 
 #[tokio::test]

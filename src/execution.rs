@@ -1162,7 +1162,7 @@ async fn process_sandboxed_attempt_with_codex_override(
                     Some(false),
                     Some(&format!("{fallback_error:#}")),
                 );
-                anyhow::bail!(payload);
+                return Err(payload_error(payload, resource_limit));
             }
         }
     }
@@ -1188,7 +1188,29 @@ async fn process_sandboxed_attempt_with_codex_override(
     ) {
         Ok(payload)
     } else {
-        anyhow::bail!(payload)
+        Err(payload_error(payload, resource_limit))
+    }
+}
+
+/// Build the failure an unsuccessful attempt returns.
+///
+/// The payload is a rendered JSON diagnostic and the transport error taxonomy
+/// must still see it as a *resource* failure rather than a generic server error.
+/// `anyhow::bail!(payload)` would take only the string and drop the type, so the
+/// typed marker is re-attached here as the error's source; `downcast_ref` finds
+/// it through the context chain.
+fn payload_error(
+    payload: String,
+    resource_limit: Option<crate::resource_limits::ResourceLimit>,
+) -> anyhow::Error {
+    let error = anyhow::anyhow!(payload);
+    match resource_limit {
+        Some(limit) => anyhow::Error::new(crate::resource_limits::ResourceLimitError::new(
+            limit,
+            "the attempt failed and its output was discarded",
+        ))
+        .context(error),
+        None => error,
     }
 }
 

@@ -93,6 +93,17 @@ pub(crate) const COMMAND_CAPTURE_DRAIN_GRACE: std::time::Duration =
 /// to terminate and for capture tasks to unwind.
 pub(crate) const COMMAND_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long the host waits to finish writing a command's stdin.
+///
+/// This is deliberately *not* [`COMMAND_CLEANUP_GRACE`]. A stdin write only
+/// completes as fast as the child drains its pipe, so the budget has to cover the
+/// child's startup as well as the transfer: `codex_fallback` writes a prompt of
+/// roughly 192 KiB, several times any pipe buffer, into a Node CLI whose startup
+/// alone can take seconds. A post-termination cleanup budget is the wrong
+/// quantity here and would turn a working call into a reliable failure.
+pub(crate) const COMMAND_STDIN_WRITE_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // File and directory tools
 // ---------------------------------------------------------------------------
