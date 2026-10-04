@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -10,27 +8,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::execution::ExecutionPolicy;
 use crate::goal::{GoalId, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
 use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
+use crate::job_registry::{self, Job};
 use crate::task_store::TaskStore;
 use crate::workspace_publish;
 use crate::{approvals, config, execution, fallback, goal_api, sandbox};
-
-struct Job {
-    session_id: String,
-    command: String,
-    handle: JoinHandle<Result<String>>,
-}
-
-fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
-    static JOBS: OnceLock<Mutex<HashMap<Uuid, Job>>> = OnceLock::new();
-    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 /// Maximum number of requests that may be dispatched concurrently.
 ///
@@ -166,7 +153,23 @@ where
     writer_handle
         .await
         .context("response writer task panicked")??;
+    release_all_jobs().await;
     Ok(())
+}
+
+/// Terminate every retained background job on explicit server shutdown.
+///
+/// This is the shutdown the owning process actually has: stdin EOF. It stops the
+/// jobs it holds and drops their retained results. It is **not** a system-wide
+/// process killer, and it does not reach jobs owned by another MCP server
+/// process. Abnormal parent death (a kill rather than a clean EOF) is a separate,
+/// later concern and is deliberately not handled here.
+async fn release_all_jobs() {
+    // Collect first: the registry lock must not be held across an await.
+    let released = job_registry::registry().release_all();
+    for job in released {
+        job.terminate().await;
+    }
 }
 
 /// Writes one complete, newline-delimited JSON-RPC frame.
@@ -660,11 +663,13 @@ async fn execution_outcome(
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
+    ensure_job_capacity(session).await?;
     let outcome = execution::execute(args, session).await?;
     execution_outcome(session, outcome).await
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
+    ensure_job_capacity(session).await?;
     let job = execution::start_command(args, session).await?;
     store_execution_job(session, job).await
 }
@@ -728,21 +733,31 @@ async fn process_sandboxed_attempt(
     .await
 }
 
+/// Refuse to start a new background command when the registry has no room.
+///
+/// Checked *before* any process is spawned, so hitting a ceiling costs nothing
+/// and never leaves a command running without somewhere to retain its result.
+async fn ensure_job_capacity(session: &config::Session) -> Result<()> {
+    job_registry::registry().can_admit(job_registry::now(), &session.id)
+}
+
 async fn store_job(
     session: &config::Session,
     rendered_command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: tokio::task::JoinHandle<Result<String>>,
     activity: &str,
 ) -> Result<Value> {
-    let job_id = Uuid::new_v4();
-    jobs().lock().unwrap().insert(
-        job_id,
-        Job {
-            session_id: session.id.clone(),
-            command: rendered_command.clone(),
-            handle,
-        },
-    );
+    let job_id = job_registry::new_job_id();
+    {
+        // Capacity and retention happen under one lock so they cannot disagree.
+        let mut jobs = job_registry::registry();
+        jobs.can_admit(job_registry::now(), &session.id)?;
+        jobs.insert(
+            job_registry::now(),
+            job_id,
+            Job::new(session.id.clone(), rendered_command.clone(), handle),
+        );
+    }
     approvals::activity(
         &session.id,
         format!("{activity} {rendered_command}"),
@@ -766,47 +781,24 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let job_id = required_job_id(args)?;
-    let job = {
-        let mut jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
-        if job.handle.is_finished() {
-            Some(
-                jobs.remove(&job_id)
-                    .context("finished job missing under lock")?,
-            )
-        } else {
-            None
-        }
-    };
+    let job =
+        { job_registry::registry().take_if_finished(job_registry::now(), job_id, &session.id)? };
     let Some(job) = job else {
         return text_result(json!({"status":"running","job_id":job_id}).to_string());
     };
 
     after_finished_removal().await;
-    let result = job.handle.await.context("background command task failed")?;
-    text_result(result?)
+    text_result(job.join().await?)
 }
 
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
-    let job = {
-        let mut jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
-        jobs.remove(&job_id).unwrap()
-    };
-    job.handle.abort();
-    let _ = job.handle.await;
+    let job = job_registry::registry().take(job_registry::now(), job_id, &session.id)?;
+    let command = job.command().to_owned();
+    job.terminate().await;
     approvals::activity(
         &session.id,
-        format!("Stopped {}", job.command),
+        format!("Stopped {command}"),
         Some(format!("└ job {job_id}")),
     )
     .await;

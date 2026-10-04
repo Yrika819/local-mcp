@@ -1630,7 +1630,13 @@ pub(crate) fn shell_word(value: &str) -> String {
     }
 }
 
+/// A short activity-timeline digest of a command result.
+///
+/// The start UI echoes this for every completed command, so it is bounded
+/// independently of the capture limit: a flood that fits inside the capture
+/// bounds must not turn into an unbounded approval-UI render.
 fn command_summary(text: &str) -> Option<String> {
+    use crate::resource_limits::MAX_COMMAND_SUMMARY_BYTES;
     let value: Value = serde_json::from_str(text).ok()?;
     let stdout = value
         .get("stdout")
@@ -1644,16 +1650,22 @@ fn command_summary(text: &str) -> Option<String> {
         .trim_end();
     let output = if stdout.is_empty() { stderr } else { stdout };
     if output.is_empty() {
-        None
-    } else {
-        Some(
-            output
-                .lines()
-                .map(|line| format!("└ {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        return None;
     }
+    let mut rendered = String::new();
+    let mut truncated = false;
+    for line in output.lines() {
+        let entry = format!("└ {line}\n");
+        if rendered.len().saturating_add(entry.len()) > MAX_COMMAND_SUMMARY_BYTES {
+            truncated = true;
+            break;
+        }
+        rendered.push_str(&entry);
+    }
+    if truncated {
+        rendered.push_str("└ … output truncated for the activity timeline\n");
+    }
+    Some(rendered)
 }
 
 pub(crate) fn render_output(output: sandbox::Output) -> Result<String> {

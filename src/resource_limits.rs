@@ -61,10 +61,6 @@ pub(crate) const MAX_COMMAND_STDERR_BYTES: usize = 1024 * 1024;
 ///
 /// The start UI echoes command output, so the summary itself needs a bound
 /// independent of the capture limit.
-#[expect(
-    dead_code,
-    reason = "Consumed by the job-registry slice of Resource Bounds V1."
-)]
 pub(crate) const MAX_COMMAND_SUMMARY_BYTES: usize = 8 * 1024;
 
 /// How long the host waits for both pipes to reach EOF after the group leader
@@ -136,10 +132,6 @@ pub(crate) const MAX_BACKGROUND_JOBS_GLOBAL: usize = 32;
 /// Retention period for a finished, unpolled background result.
 ///
 /// Monotonic. Running jobs are never expired by this.
-#[expect(
-    dead_code,
-    reason = "Consumed by the job-registry slice of Resource Bounds V1."
-)]
 pub(crate) const FINISHED_JOB_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 // ---------------------------------------------------------------------------

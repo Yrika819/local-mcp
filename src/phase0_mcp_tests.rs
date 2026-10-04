@@ -274,7 +274,7 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("unknown job_id")
+            .contains("unknown or expired job_id")
     );
 
     let _ = tokio::fs::remove_dir_all(cwd).await;
@@ -309,13 +309,13 @@ async fn finished_poll_atomically_owns_job_before_concurrent_stop() {
         .take()
         .unwrap()
         .expect_err("stop must not remove a job already owned by finished poll");
-    assert!(stop.to_string().contains("unknown job_id"));
+    assert!(stop.to_string().contains("unknown or expired job_id"));
     assert!(
         poll_job(&args, &session)
             .await
             .unwrap_err()
             .to_string()
-            .contains("unknown job_id")
+            .contains("unknown or expired job_id")
     );
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }
@@ -354,7 +354,7 @@ async fn job_stop_unknown_owner_and_failure_are_frozen() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("unknown job_id")
+            .contains("unknown or expired job_id")
     );
 
     let failed_handle = tokio::spawn(async { anyhow::bail!("phase0 background failure") });
@@ -423,13 +423,25 @@ async fn goal_lifecycle_operations_leave_legacy_job_authority_untouched() {
 
     let args = json!({"session_id": session.id});
     goal_api::goal_status(&args, &session, &store).unwrap();
-    assert!(jobs().lock().unwrap().contains_key(&legacy_job_id));
+    assert!(
+        crate::job_registry::registry().contains_key_for_test(&legacy_job_id),
+        "goal status must not disturb a retained job"
+    );
     goal_api::goal_pause(&args, &session, &store).unwrap();
-    assert!(jobs().lock().unwrap().contains_key(&legacy_job_id));
+    assert!(
+        crate::job_registry::registry().contains_key_for_test(&legacy_job_id),
+        "goal pause must not disturb a retained job"
+    );
     goal_api::goal_resume(&args, &session, &store).unwrap();
-    assert!(jobs().lock().unwrap().contains_key(&legacy_job_id));
+    assert!(
+        crate::job_registry::registry().contains_key_for_test(&legacy_job_id),
+        "goal resume must not disturb a retained job"
+    );
     goal_api::goal_cancel(&args, &session, &store).unwrap();
-    assert!(jobs().lock().unwrap().contains_key(&legacy_job_id));
+    assert!(
+        crate::job_registry::registry().contains_key_for_test(&legacy_job_id),
+        "goal cancel must not disturb a retained job"
+    );
 
     let stopped = stop_job(&json!({"job_id": legacy_job_id.to_string()}), &session)
         .await

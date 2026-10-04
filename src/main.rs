@@ -20,6 +20,7 @@ mod goal_backends;
 mod goal_finalizer;
 mod goal_runner;
 mod goal_verifier;
+mod job_registry;
 mod managed_worktree;
 mod managed_worktree_create;
 mod managed_worktree_discovery;
