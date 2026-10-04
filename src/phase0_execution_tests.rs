@@ -20,11 +20,12 @@ async fn phase0_execution_wait_for_pid(path: &Path) -> libc::pid_t {
 
 #[cfg(unix)]
 async fn phase0_execution_wait_for_process_exit(pid: libc::pid_t) -> bool {
-    // A grandchild that is killed is reparented and reaped by init, and under the
-    // parallel load of the full suite that can take noticeably longer than the
-    // half second this used to allow. The assertion is unchanged; only how long it
-    // waits for the kernel to observe the exit is.
-    for _ in 0..500 {
+    // `kill(pid, 0)` still succeeds on a *zombie*, and a killed grandchild is not
+    // reaped until `init` gets to it. Under the parallel load of the full suite
+    // that can take well over a second, so the budget is generous. The assertion
+    // is unchanged; only how long it waits for the kernel is. The fixture sleeps
+    // for 30s, well past this budget, so a pass cannot come from natural expiry.
+    for _ in 0..1500 {
         if unsafe { libc::kill(pid, 0) } == -1 {
             return true;
         }

@@ -22,8 +22,9 @@ use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
 use crate::job_registry::{self, Job};
 use crate::resource_limits::{
     CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_OUTPUT_BYTES,
-    MAX_IMAGE_RAW_BYTES, MAX_MCP_REQUEST_FRAME_BYTES, MAX_MCP_RESPONSE_FRAME_BYTES,
-    MAX_READ_FILE_BYTES, MAX_WRITE_FILE_CONTENT_BYTES, MAX_WRITE_PREIMAGE_BYTES,
+    MAX_DISPATCH_ERROR_MESSAGE_BYTES, MAX_IMAGE_RAW_BYTES, MAX_MCP_REQUEST_FRAME_BYTES,
+    MAX_MCP_RESPONSE_FRAME_BYTES, MAX_READ_FILE_BYTES, MAX_RESOURCE_ERROR_MESSAGE_BYTES,
+    MAX_WRITE_FILE_CONTENT_BYTES, MAX_WRITE_PREIMAGE_BYTES,
 };
 use crate::task_store::TaskStore;
 use crate::workspace_publish;
@@ -291,14 +292,11 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let encoded = serde_json::to_vec(message)?;
-    anyhow::ensure!(
+    crate::resource_limits::ensure_resource(
         encoded.len() <= MAX_MCP_RESPONSE_FRAME_BYTES,
-        "{}",
-        crate::resource_limits::limit_error(
-            crate::resource_limits::ResourceLimit::McpResponseFrame,
-            "response exceeded the maximum and was not written",
-        )
-    );
+        crate::resource_limits::ResourceLimit::McpResponseFrame,
+        "response exceeded the maximum and was not written",
+    )?;
     writer.write_all(&encoded).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
@@ -620,14 +618,11 @@ pub(crate) async fn read_regular_file_bounded(
         .read_to_end(&mut bytes)
         .await
         .with_context(|| format!("failed to read {}", path.display()))?;
-    anyhow::ensure!(
+    crate::resource_limits::ensure_resource(
         read <= limit,
-        "{}",
-        crate::resource_limits::limit_error(
-            failure,
-            "content was not read and nothing was truncated",
-        )
-    );
+        failure,
+        "content was not read and nothing was truncated",
+    )?;
     Ok(bytes)
 }
 
@@ -730,14 +725,11 @@ pub(crate) async fn list_directory(path: &Path) -> Result<String> {
     // One separator per name, matching the joined rendering exactly.
     let mut rendered_bytes = 0_usize;
     while let Some(entry) = entries.next_entry().await? {
-        anyhow::ensure!(
+        crate::resource_limits::ensure_resource(
             names.len() < MAX_DIRECTORY_ENTRIES,
-            "{}",
-            crate::resource_limits::limit_error(
-                crate::resource_limits::ResourceLimit::DirectoryEntries,
-                "the listing was refused whole rather than truncated",
-            )
-        );
+            crate::resource_limits::ResourceLimit::DirectoryEntries,
+            "the listing was refused whole rather than truncated",
+        )?;
         let suffix = if entry.file_type().await?.is_dir() {
             "/"
         } else {
@@ -745,14 +737,11 @@ pub(crate) async fn list_directory(path: &Path) -> Result<String> {
         };
         let name = format!("{}{}", entry.file_name().to_string_lossy(), suffix);
         rendered_bytes = rendered_bytes.saturating_add(name.len()).saturating_add(1);
-        anyhow::ensure!(
+        crate::resource_limits::ensure_resource(
             rendered_bytes <= MAX_DIRECTORY_OUTPUT_BYTES,
-            "{}",
-            crate::resource_limits::limit_error(
-                crate::resource_limits::ResourceLimit::DirectoryOutputBytes,
-                "the listing was refused whole rather than truncated",
-            )
-        );
+            crate::resource_limits::ResourceLimit::DirectoryOutputBytes,
+            "the listing was refused whole rather than truncated",
+        )?;
         names.push(name);
     }
     names.sort();
@@ -779,14 +768,11 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     // Bounded before any filesystem mutation, so an oversized write performs zero
     // mutation and never prompts for an approval it cannot use. The global
     // request-frame ceiling remains the outer defense.
-    anyhow::ensure!(
+    crate::resource_limits::ensure_resource(
         content.len() <= MAX_WRITE_FILE_CONTENT_BYTES,
-        "{}",
-        crate::resource_limits::limit_error(
-            crate::resource_limits::ResourceLimit::WriteFileContent,
-            "nothing was written",
-        )
-    );
+        crate::resource_limits::ResourceLimit::WriteFileContent,
+        "nothing was written",
+    )?;
     #[cfg(windows)]
     anyhow::ensure!(
         approvals::request(
@@ -1161,13 +1147,6 @@ const JSONRPC_SERVER_ERROR: i64 = -32000;
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
 pub(crate) const JSONRPC_RESOURCE_LIMIT: i64 = -32001;
 
-/// Longest error message the transport will render into a response frame.
-///
-/// A failure must never be able to produce an oversized response: a caller that
-/// triggers an error with a very large diagnostic still gets a small answer.
-#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
-pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
-
 /// Which bounded admission pool a request may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
@@ -1260,10 +1239,22 @@ pub(crate) async fn acquire_admission(
 }
 
 /// A JSON-RPC error response whose message is guaranteed to fit in a frame.
+///
+/// The bound is **code-dependent**. A resource failure is small by construction
+/// and is capped tightly. An ordinary dispatch failure is not: a failing `execute`
+/// returns its diagnostic as the message, and that diagnostic embeds the captured
+/// stdout and stderr, so a tight cap would truncate a compiler error or a failing
+/// test suite to its first few lines. Both ceilings are derived from frozen
+/// limits rather than invented, and each still leaves the frame assertion intact.
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
 pub(crate) fn bounded_error_response(id: Value, code: i64, message: &str) -> Value {
-    let was_truncated = message.len() > MAX_ERROR_MESSAGE_BYTES;
-    let mut bounded = truncate_on_char_boundary(message, MAX_ERROR_MESSAGE_BYTES);
+    let limit = if code == JSONRPC_RESOURCE_LIMIT {
+        MAX_RESOURCE_ERROR_MESSAGE_BYTES
+    } else {
+        MAX_DISPATCH_ERROR_MESSAGE_BYTES
+    };
+    let was_truncated = message.len() > limit;
+    let mut bounded = truncate_on_char_boundary(message, limit);
     if was_truncated {
         bounded.push('…');
     }

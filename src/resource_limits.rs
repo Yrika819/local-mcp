@@ -209,6 +209,14 @@ const _: () =
 const _: () = assert!(MAX_WRITE_FILE_CONTENT_BYTES <= MAX_MCP_REQUEST_FRAME_BYTES);
 const _: () = assert!(MAX_EXECUTE_ARGV_TOTAL_BYTES <= MAX_MCP_REQUEST_FRAME_BYTES);
 
+// An ordinary dispatch failure carries the command's own diagnostics, so its
+// message ceiling is the output ceilings. It must still fit inside a response
+// frame once the payload is escaped as a string value.
+const _: () = assert!(
+    MAX_DISPATCH_ERROR_MESSAGE_BYTES * JSON_ESCAPE_WORST_CASE <= MAX_MCP_RESPONSE_FRAME_BYTES
+);
+const _: () = assert!(MAX_RESOURCE_ERROR_MESSAGE_BYTES < MAX_DISPATCH_ERROR_MESSAGE_BYTES);
+
 // A job must be able to hold its own argv within one request frame.
 const _: () =
     assert!(MAX_EXECUTE_ARGV_TOTAL_BYTES <= MAX_EXECUTE_ARGV_ITEMS * MAX_EXECUTE_ARG_BYTES);
@@ -344,6 +352,41 @@ impl ResourceLimitError {
 /// Build a resource-limit error carrying a fixed sentence.
 pub(crate) fn limit_error(limit: ResourceLimit, detail: &'static str) -> anyhow::Error {
     ResourceLimitError::new(limit, detail).into()
+}
+
+/// Longest error message the transport renders for a **resource** failure.
+///
+/// A resource failure is small by construction — it states the resource and its
+/// ceiling and nothing else — so it is capped tightly. A failure must never be
+/// able to produce an oversized response.
+pub(crate) const MAX_RESOURCE_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// Longest error message for an **ordinary** dispatch failure.
+///
+/// This must not be tight. A failing `execute` returns its diagnostic as the error
+/// message, and that diagnostic embeds the captured stdout and stderr, so capping
+/// it at a few hundred bytes would truncate a compiler error or a failing test
+/// suite to its first few lines — exactly the information a caller needs. The
+/// bound is therefore derived from the command output ceilings rather than
+/// invented, and asserted below to leave room inside the response frame.
+pub(crate) const MAX_DISPATCH_ERROR_MESSAGE_BYTES: usize =
+    MAX_COMMAND_STDOUT_BYTES + MAX_COMMAND_STDERR_BYTES + 8 * 1024;
+
+/// Enforce a bound, returning a **typed** resource failure.
+///
+/// `anyhow::ensure!(condition, "{}", limit_error(..))` would be wrong here:
+/// formatting an error into a message discards its type, so the transport could
+/// no longer tell a resource refusal from an ordinary server error.
+pub(crate) fn ensure_resource(
+    condition: bool,
+    limit: ResourceLimit,
+    detail: &'static str,
+) -> anyhow::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(limit_error(limit, detail))
+    }
 }
 
 #[cfg(test)]

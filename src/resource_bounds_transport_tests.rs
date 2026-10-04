@@ -15,13 +15,13 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use crate::mcp::{
-    Frame, JSONRPC_RESOURCE_LIMIT, MAX_ERROR_MESSAGE_BYTES, Pool, acquire_admission,
-    admission_pool, bounded_error_response, frame_reader, is_control_plane, serve_with_io,
-    write_message, write_response_or_substitute,
+    Frame, JSONRPC_RESOURCE_LIMIT, Pool, acquire_admission, admission_pool, bounded_error_response,
+    frame_reader, is_control_plane, serve_with_io, write_message, write_response_or_substitute,
 };
 use crate::resource_limits::{
-    CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_MCP_REQUEST_FRAME_BYTES,
-    MAX_MCP_RESPONSE_FRAME_BYTES,
+    CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_COMMAND_STDOUT_BYTES,
+    MAX_DISPATCH_ERROR_MESSAGE_BYTES, MAX_MCP_REQUEST_FRAME_BYTES, MAX_MCP_RESPONSE_FRAME_BYTES,
+    MAX_RESOURCE_ERROR_MESSAGE_BYTES,
 };
 
 /// Drive the transport with `input` and return the raw response lines.
@@ -371,17 +371,47 @@ async fn an_output_overflow_reports_the_resource_code_to_the_transport() {
 
 #[tokio::test]
 async fn an_oversized_error_message_is_itself_bounded() {
-    // An oversized diagnostic must not be able to produce an oversized response.
-    let huge = "m".repeat(MAX_ERROR_MESSAGE_BYTES * 10);
-    let response = bounded_error_response(json!(1), -32000, &huge);
+    // A resource failure is small by construction and is capped tightly. An
+    // ordinary dispatch failure is not: it carries the command's own diagnostics.
+    let huge = "m".repeat(MAX_RESOURCE_ERROR_MESSAGE_BYTES * 10);
+    let response = bounded_error_response(json!(1), JSONRPC_RESOURCE_LIMIT, &huge);
     let encoded = serde_json::to_vec(&response).unwrap();
     assert!(
         encoded.len() <= MAX_MCP_RESPONSE_FRAME_BYTES,
         "a bounded error must fit in a frame"
     );
     let message = response["error"]["message"].as_str().unwrap();
-    assert!(message.len() <= MAX_ERROR_MESSAGE_BYTES + 8);
+    assert!(message.len() <= MAX_RESOURCE_ERROR_MESSAGE_BYTES + 8);
     assert!(message.contains('…'));
+}
+
+#[tokio::test]
+async fn an_ordinary_failure_keeps_its_diagnostics() {
+    // The regression this guards: a single tight cap was truncating *every*
+    // dispatch error, so a failing `execute` lost nearly all of its captured
+    // stderr and a caller saw the first few lines of a compiler error instead.
+    let diagnostics = "e".repeat(MAX_COMMAND_STDOUT_BYTES);
+    let payload = format!("{{\"exit_code\":1,\"stdout\":\"\",\"stderr\":\"{diagnostics}\"}}");
+    assert!(
+        payload.len() <= MAX_DISPATCH_ERROR_MESSAGE_BYTES,
+        "a maxed-out command's payload must fit the dispatch error ceiling"
+    );
+    let response = bounded_error_response(json!(4), -32000, &payload);
+    let message = response["error"]["message"].as_str().unwrap();
+    assert_eq!(
+        message, payload,
+        "an ordinary failure must reach the caller untruncated"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_failure_is_still_bounded() {
+    let absurd = "x".repeat(MAX_DISPATCH_ERROR_MESSAGE_BYTES * 2);
+    let response = bounded_error_response(json!(5), -32000, &absurd);
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.len() <= MAX_DISPATCH_ERROR_MESSAGE_BYTES + 8);
+    assert!(message.contains('…'));
+    assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_MCP_RESPONSE_FRAME_BYTES);
 }
 
 #[tokio::test]
@@ -390,26 +420,38 @@ async fn a_multi_byte_error_message_is_truncated_without_panicking() {
     // `String::truncate`, taking the dispatch task down and leaving the client
     // waiting on that request id forever. Error text can carry non-ASCII from a
     // path or from command output, so this is reachable, not theoretical.
-    let wide = "日".repeat(MAX_ERROR_MESSAGE_BYTES);
-    let narrow_boundary = "é".repeat(MAX_ERROR_MESSAGE_BYTES / 2 + 1);
-    for message in [
-        wide,
-        narrow_boundary,
-        "é".repeat(MAX_ERROR_MESSAGE_BYTES * 4),
-    ] {
-        let response = bounded_error_response(json!(7), JSONRPC_RESOURCE_LIMIT, &message);
-        let rendered = response["error"]["message"].as_str().unwrap().to_owned();
-        assert!(
-            rendered.chars().count() <= MAX_ERROR_MESSAGE_BYTES,
-            "truncation must be measured in characters too"
-        );
-        assert!(
-            rendered.len() <= MAX_ERROR_MESSAGE_BYTES + 8,
-            "truncation must stay bounded, got {} bytes",
-            rendered.len()
-        );
-        assert_eq!(response["id"], 7);
+    let cases = [
+        "日".repeat(MAX_RESOURCE_ERROR_MESSAGE_BYTES),
+        "é".repeat(MAX_RESOURCE_ERROR_MESSAGE_BYTES / 2 + 1),
+        "é".repeat(MAX_RESOURCE_ERROR_MESSAGE_BYTES * 4),
+    ];
+    for message in cases {
+        for (code, limit) in [
+            (JSONRPC_RESOURCE_LIMIT, MAX_RESOURCE_ERROR_MESSAGE_BYTES),
+            (-32000, MAX_DISPATCH_ERROR_MESSAGE_BYTES),
+        ] {
+            let response = bounded_error_response(json!(7), code, &message);
+            let rendered = response["error"]["message"].as_str().unwrap().to_owned();
+            assert!(
+                rendered.len() <= limit + 8,
+                "truncation must stay within the ceiling for code {code}, got {} bytes",
+                rendered.len()
+            );
+            assert_eq!(response["id"], 7);
+        }
     }
+    // And the case that actually panicked before: a byte-index cut inside a
+    // multi-byte character on the code whose ceiling bites here.
+    let over_resource_ceiling = "日".repeat(MAX_RESOURCE_ERROR_MESSAGE_BYTES);
+    assert!(
+        over_resource_ceiling.len() > MAX_RESOURCE_ERROR_MESSAGE_BYTES,
+        "the fixture must exceed the byte ceiling while staying under the char count"
+    );
+    let response = bounded_error_response(json!(7), JSONRPC_RESOURCE_LIMIT, &over_resource_ceiling);
+    assert!(
+        response["error"]["message"].as_str().unwrap().len()
+            <= MAX_RESOURCE_ERROR_MESSAGE_BYTES + 8
+    );
 }
 
 #[tokio::test]

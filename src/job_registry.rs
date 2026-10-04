@@ -158,22 +158,16 @@ impl JobRegistry {
         self.collect_expired(now);
         // Typed rather than formatted, so the transport reports a resource
         // failure instead of a generic server error.
-        anyhow::ensure!(
+        crate::resource_limits::ensure_resource(
             self.count_for_session(session_id) < MAX_BACKGROUND_JOBS_PER_SESSION,
-            "{}",
-            crate::resource_limits::limit_error(
-                ResourceLimit::BackgroundJobsPerSession,
-                "stop or poll a retained job before starting another",
-            )
-        );
-        anyhow::ensure!(
+            ResourceLimit::BackgroundJobsPerSession,
+            "stop or poll a retained job before starting another",
+        )?;
+        crate::resource_limits::ensure_resource(
             self.jobs.len() < MAX_BACKGROUND_JOBS_GLOBAL,
-            "{}",
-            crate::resource_limits::limit_error(
-                ResourceLimit::BackgroundJobsGlobal,
-                "stop or poll a retained job before starting another",
-            )
-        );
+            ResourceLimit::BackgroundJobsGlobal,
+            "stop or poll a retained job before starting another",
+        )?;
         Ok(())
     }
 

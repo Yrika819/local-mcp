@@ -168,14 +168,11 @@ pub(crate) fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
     if let Some(requested) = args.get("cwd").and_then(Value::as_str) {
         // Bounded before it is resolved or authorized. Path authority itself is
         // unchanged: this only refuses a field far larger than any real path.
-        anyhow::ensure!(
+        crate::resource_limits::ensure_resource(
             requested.len() <= crate::resource_limits::MAX_EXECUTE_PATH_BYTES,
-            "{}",
-            crate::resource_limits::limit_error(
-                crate::resource_limits::ResourceLimit::ExecutePathBytes,
-                "no command was started",
-            )
-        );
+            crate::resource_limits::ResourceLimit::ExecutePathBytes,
+            "no command was started",
+        )?;
     }
     let path = args
         .get("cwd")
@@ -199,35 +196,26 @@ pub(crate) fn required_command(args: &Value) -> Result<Vec<String>> {
         .get("command")
         .and_then(Value::as_array)
         .context("missing command")?;
-    anyhow::ensure!(
+    crate::resource_limits::ensure_resource(
         items.len() <= MAX_EXECUTE_ARGV_ITEMS,
-        "{}",
-        crate::resource_limits::limit_error(
-            ResourceLimit::ExecuteArgvItems,
-            "no command was started",
-        )
-    );
+        ResourceLimit::ExecuteArgvItems,
+        "no command was started",
+    )?;
     let mut command = Vec::with_capacity(items.len());
     let mut total = 0_usize;
     for item in items {
         let value = item.as_str().context("command entries must be strings")?;
-        anyhow::ensure!(
+        crate::resource_limits::ensure_resource(
             value.len() <= MAX_EXECUTE_ARG_BYTES,
-            "{}",
-            crate::resource_limits::limit_error(
-                ResourceLimit::ExecuteArgBytes,
-                "no command was started",
-            )
-        );
+            ResourceLimit::ExecuteArgBytes,
+            "no command was started",
+        )?;
         total = total.saturating_add(value.len());
-        anyhow::ensure!(
+        crate::resource_limits::ensure_resource(
             total <= MAX_EXECUTE_ARGV_TOTAL_BYTES,
-            "{}",
-            crate::resource_limits::limit_error(
-                ResourceLimit::ExecuteArgvTotalBytes,
-                "no command was started",
-            )
-        );
+            ResourceLimit::ExecuteArgvTotalBytes,
+            "no command was started",
+        )?;
         command.push(value.to_owned());
     }
     Ok(command)
