@@ -86,6 +86,8 @@ mod replanner_compaction_tests;
 mod replanner_replacement_tests;
 #[cfg(all(test, unix))]
 mod resource_bounds_process_tests;
+#[cfg(test)]
+mod resource_bounds_transport_tests;
 #[cfg(all(test, unix))]
 mod secure_fs_tests;
 #[cfg(test)]

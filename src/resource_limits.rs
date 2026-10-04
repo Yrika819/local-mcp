@@ -273,16 +273,39 @@ impl fmt::Display for ResourceLimit {
 
 impl std::error::Error for ResourceLimit {}
 
-/// Build a resource-limit error carrying a fixed sentence.
+/// A resource bound was reached.
 ///
-/// The sentence is host-authored and never embeds caller-supplied content, so a
-/// rejected request cannot inflate the diagnostic that reports its rejection.
-#[expect(
-    dead_code,
-    reason = "Used by the transport and file slices of Resource Bounds V1."
-)]
+/// This is a typed marker, not just a message: the transport downcasts to it to
+/// emit a distinct JSON-RPC code, so a resource failure is never reported as an
+/// ordinary server error and never as a permission or authority failure.
+///
+/// The rendered message is fixed, host-authored text plus the resource name and
+/// ceiling. It never embeds caller-supplied content, so a rejected request cannot
+/// inflate the diagnostic that reports its rejection.
+#[derive(Debug)]
+pub(crate) struct ResourceLimitError {
+    limit: ResourceLimit,
+    detail: &'static str,
+}
+
+impl fmt::Display for ResourceLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.limit, self.detail)
+    }
+}
+
+impl std::error::Error for ResourceLimitError {}
+
+impl ResourceLimitError {
+    #[cfg(test)]
+    pub(crate) fn limit(&self) -> ResourceLimit {
+        self.limit
+    }
+}
+
+/// Build a resource-limit error carrying a fixed sentence.
 pub(crate) fn limit_error(limit: ResourceLimit, detail: &'static str) -> anyhow::Error {
-    anyhow::anyhow!("{limit}: {detail}")
+    ResourceLimitError { limit, detail }.into()
 }
 
 #[cfg(test)]
@@ -324,10 +347,27 @@ mod tests {
 
     #[test]
     fn limit_error_names_the_resource_and_the_ceiling() {
-        let rendered = limit_error(ResourceLimit::CommandStdout, "output truncated").to_string();
+        let error = limit_error(ResourceLimit::CommandStdout, "output truncated");
+        let rendered = error.to_string();
         assert!(rendered.contains("command stdout"));
         assert!(rendered.contains(&MAX_COMMAND_STDOUT_BYTES.to_string()));
         assert!(rendered.contains("output truncated"));
+        assert!(
+            error.downcast_ref::<ResourceLimitError>().is_some(),
+            "a resource failure must be a typed marker, not just a string"
+        );
+    }
+
+    #[test]
+    fn a_resource_error_stays_small_and_never_echoes_caller_content() {
+        // The worst realistic detail is still a fixed sentence; nothing derived
+        // from a request is ever rendered.
+        let error = ResourceLimitError {
+            limit: ResourceLimit::McpRequestFrame,
+            detail: "request frame exceeded the maximum and was discarded",
+        };
+        assert!(error.to_string().len() < 256);
+        assert_eq!(error.limit(), ResourceLimit::McpRequestFrame);
     }
 
     #[test]

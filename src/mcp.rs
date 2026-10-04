@@ -7,7 +7,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+// The in-process harness reads *responses* with a `BufReader`, which is fine:
+// responses are host-produced and already bounded. The request side deliberately
+// does not use `BufReader`.
+#[cfg(test)]
+use tokio::io::BufReader;
 use uuid::Uuid;
 
 use crate::execution::ExecutionPolicy;
@@ -15,11 +20,17 @@ use crate::goal::{GoalId, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
 use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
 use crate::job_registry::{self, Job};
+use crate::resource_limits::{
+    CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_MCP_REQUEST_FRAME_BYTES,
+    MAX_MCP_RESPONSE_FRAME_BYTES,
+};
 use crate::task_store::TaskStore;
 use crate::workspace_publish;
 use crate::{approvals, config, execution, fallback, goal_api, sandbox};
 
-/// Maximum number of requests that may be dispatched concurrently.
+/// Total transport concurrency lives in [`crate::resource_limits`] as
+/// `MAX_CONCURRENT_REQUESTS`, and is split here into a reserved control-plane
+/// pool and an execution pool whose sum is asserted at compile time to equal it.
 ///
 /// This is a transport-level bound only: it prevents an unbounded number of
 /// in-flight requests from exhausting runtime resources while keeping the
@@ -27,8 +38,6 @@ use crate::{approvals, config, execution, fallback, goal_api, sandbox};
 /// mutation authority is *not* enforced here; it remains serialized by the
 /// OS-backed per-session Goal lock and optimistic revision checks in
 /// [`crate::task_store::TaskStore`].
-const MAX_CONCURRENT_REQUESTS: usize = 32;
-
 /// Entry point for the MCP stdio server.
 ///
 /// The transport is deliberately **concurrent**: each inbound request is
@@ -53,7 +62,8 @@ pub async fn serve() -> Result<()> {
 /// Splitting the I/O handles out of [`serve`] keeps the concurrency logic
 /// testable without a real process: tests can drive requests through an
 /// in-memory duplex stream and assert on the raw framed responses.
-async fn serve_with_io<R, W>(reader: R, writer: W) -> Result<()>
+#[cfg_attr(test, allow(dead_code, reason = "reached through the transport tests"))]
+pub(crate) async fn serve_with_io<R, W>(reader: R, writer: W) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -71,26 +81,74 @@ where
         Ok::<(), anyhow::Error>(())
     });
 
-    // Bound the number of concurrently in-flight dispatch tasks. A permit is
-    // held for the lifetime of one request's dispatch, so at most
-    // `MAX_CONCURRENT_REQUESTS` handlers run at once. Permits are `async` and
-    // are acquired *before* a task is spawned, which means the read loop is
-    // throttled, not the response path.
-    let dispatch_permits =
-        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));
+    // Admission is split across two bounded pools that sum to the same total as
+    // before. A single pool meant 32 long-running `execute` calls could exhaust
+    // transport capacity, including the ability to read a `poll_job` or
+    // `stop_job` request at all. Control-plane requests now draw on a reserved
+    // pool so the control plane stays usable under execution saturation.
+    let control_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(CONTROL_PLANE_PERMITS));
+    let execution_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(EXECUTION_PERMITS));
 
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
+    // Read straight from the stream through a bounded incremental frame reader.
+    // No `BufReader` is involved: it would bypass its own buffer for a read the
+    // size of a full chunk, stranding buffered bytes, and it would also
+    // reintroduce the "accumulate the whole line before inspecting it" contract
+    // this bound exists to avoid.
+    let mut reader = frame_reader(reader);
+    loop {
+        // Framing is bounded before parsing, and both happen before a dispatch
+        // permit is acquired, so a far-too-large request neither allocates
+        // without limit nor consumes a worker permit to be rejected.
+        let frame = reader.next_frame(MAX_MCP_REQUEST_FRAME_BYTES).await?;
+        let Some(frame) = frame else {
+            break;
+        };
+        let line = match frame {
+            Frame::Empty => continue,
+            Frame::TooLarge => {
+                // Reported without parsing: an oversized frame is never parsed as
+                // JSON, valid or not. The frame has already been consumed, so the
+                // connection continues on the next frame boundary.
+                let error = crate::resource_limits::limit_error(
+                    crate::resource_limits::ResourceLimit::McpRequestFrame,
+                    "request frame exceeded the maximum and was discarded without parsing",
+                );
+                response_tx
+                    .send(bounded_error_response(
+                        Value::Null,
+                        JSONRPC_RESOURCE_LIMIT,
+                        &format!("{error:#}"),
+                    ))
+                    .await
+                    .context("response writer task terminated unexpectedly")?;
+                continue;
+            }
+            Frame::Complete(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    response_tx
+                        .send(bounded_error_response(
+                            Value::Null,
+                            JSONRPC_SERVER_ERROR,
+                            "request frame is not valid UTF-8",
+                        ))
+                        .await
+                        .context("response writer task terminated unexpectedly")?;
+                    continue;
+                }
+            },
+        };
         let request: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(error) => {
                 // Malformed JSON is answered immediately; it is not a valid
                 // request and must not consume a dispatch permit.
                 response_tx
-                    .send(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}))
+                    .send(bounded_error_response(
+                        Value::Null,
+                        -32700,
+                        &error.to_string(),
+                    ))
                     .await
                     .context("response writer task terminated unexpectedly")?;
                 continue;
@@ -103,15 +161,18 @@ where
         }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
 
-        // Throttle inbound requests when the dispatch pool is saturated. This
-        // await is the only point where the read loop may pause; lightweight
-        // control-plane requests are therefore never stuck behind a long
-        // `goal_run` that is still being dispatched.
-        let permit = dispatch_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .context("dispatch permit semaphore closed unexpectedly")?;
+        let admitted = acquire_admission(&request, &control_permits, &execution_permits).await;
+        let permit = match admitted {
+            Ok(permit) => permit,
+            Err(reason) => {
+                // Refused before any work starts. Reported as a resource failure,
+                // never as an authority or permission failure.
+                let _ = response_tx
+                    .send(bounded_error_response(id, JSONRPC_RESOURCE_LIMIT, reason))
+                    .await;
+                continue;
+            }
+        };
         let response_tx = response_tx.clone();
         tokio::spawn(async move {
             // Hold the permit for the entire dispatch so the concurrency bound
@@ -138,7 +199,18 @@ where
             let response = match outcome {
                 Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                 Err(error) => {
-                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
+                    // A resource bound keeps its own code, so a client can tell
+                    // "too large" from "failed" and a resource failure is never
+                    // presented as an authority or permission failure.
+                    let code = if error
+                        .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+                        .is_some()
+                    {
+                        JSONRPC_RESOURCE_LIMIT
+                    } else {
+                        JSONRPC_SERVER_ERROR
+                    };
+                    bounded_error_response(id, code, &format!("{error:#}"))
                 }
             };
             // If the client disconnected the writer task will have terminated;
@@ -179,13 +251,26 @@ async fn release_all_jobs() {
 /// `AsyncWrite` implementation (stdout in production, an in-memory duplex in
 /// tests). Each call writes the serialized message and its trailing newline
 /// and flushes, so frames can never be partially written or interleaved.
-async fn write_message<W>(writer: &mut W, message: &Value) -> Result<()>
+///
+/// The global response bound is asserted here, before any byte is written.
+/// Method-level bounds are what make a normal response small; this is the
+/// defence in depth that guarantees no oversized frame ever reaches the socket,
+/// and it fails by returning a bounded error rather than truncating valid JSON.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) async fn write_message<W>(writer: &mut W, message: &Value) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    writer
-        .write_all(serde_json::to_string(message)?.as_bytes())
-        .await?;
+    let encoded = serde_json::to_vec(message)?;
+    anyhow::ensure!(
+        encoded.len() <= MAX_MCP_RESPONSE_FRAME_BYTES,
+        "{}",
+        crate::resource_limits::limit_error(
+            crate::resource_limits::ResourceLimit::McpResponseFrame,
+            "response exceeded the maximum and was not written",
+        )
+    );
+    writer.write_all(&encoded).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
@@ -906,8 +991,244 @@ pub(crate) fn parse_goal_run_args(args: &Value) -> Result<GoalRunArgs> {
     Ok(request)
 }
 
-/// Upper bound for host-owned lower-authority diagnostics exposed over MCP.
+/// Upper bound on host-owned lower-authority diagnostics exposed over MCP.
 const MAX_GOAL_RUN_STOP_DETAIL_BYTES: usize = 8 * 1024;
+
+/// JSON-RPC code for an ordinary dispatch failure.
+const JSONRPC_SERVER_ERROR: i64 = -32000;
+
+/// JSON-RPC code for a resource bound being reached.
+///
+/// Distinct from the generic server error so a client can tell "you asked for
+/// more than GoalLatch will hold" from "the request failed", and so a resource
+/// failure is never presented as an authority or permission failure.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) const JSONRPC_RESOURCE_LIMIT: i64 = -32001;
+
+/// Longest error message the transport will render into a response frame.
+///
+/// A failure must never be able to produce an oversized response: a caller that
+/// triggers an error with a very large diagnostic still gets a small answer.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// Which bounded admission pool a request may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) enum Pool {
+    /// Reserved for lightweight control-plane requests, so polling and stopping
+    /// stay usable while execution work saturates.
+    Control,
+    /// Everything else, including execution and orchestration.
+    Execution,
+}
+
+/// Whether a request belongs to the control plane.
+///
+/// Control-plane requests are map lookups and state reads, so they never need to
+/// queue behind a long-running command. Everything unrecognized falls into the
+/// execution pool, so unknown or malformed traffic can never occupy reserved
+/// control capacity.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) fn is_control_plane(method: &str, tool: &str) -> bool {
+    match method {
+        // Protocol methods that perform no work.
+        "initialize" | "ping" | "tools/list" | "resources/list" | "prompts/list" => true,
+        // Notifications are dropped before dispatch, so they must not consume an
+        // execution permit either.
+        m if m.starts_with("notifications/") => true,
+        "tools/call" => matches!(
+            tool,
+            "poll_job"
+                | "stop_job"
+                | "session_info"
+                | "goal_status"
+                | "goal_pause"
+                | "goal_resume"
+                | "goal_cancel"
+                | "goal_result"
+                | "codex_fallback"
+        ),
+        _ => false,
+    }
+}
+
+/// The admission pool for a parsed request.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) fn admission_pool(request: &Value) -> Pool {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool = request
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if is_control_plane(method, tool) {
+        Pool::Control
+    } else {
+        Pool::Execution
+    }
+}
+
+/// Reserve dispatch capacity for one request.
+///
+/// Control-plane requests **wait** for a reserved permit, and that wait is short
+/// because control work is a map lookup or a state read.
+///
+/// Execution requests do **not** wait. They reserve capacity without blocking,
+/// because a reader that blocks on a saturated execution pool is exactly the
+/// starvation this split exists to prevent: a `poll_job` queued behind a full
+/// `execute` pool would never even be read. An execution request that finds the
+/// pool full is refused immediately with a bounded resource error instead, which
+/// is deterministic, costs no memory, and lets the client retry.
+///
+/// The error string is fixed and host-authored: it never echoes request content.
+pub(crate) async fn acquire_admission(
+    request: &Value,
+    control: &std::sync::Arc<tokio::sync::Semaphore>,
+    execution: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    match admission_pool(request) {
+        Pool::Control => control
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "control dispatch capacity closed"),
+        Pool::Execution => execution
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "execution dispatch capacity exhausted"),
+    }
+}
+
+/// A JSON-RPC error response whose message is guaranteed to fit in a frame.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) fn bounded_error_response(id: Value, code: i64, message: &str) -> Value {
+    let mut message = message.to_owned();
+    if message.len() > MAX_ERROR_MESSAGE_BYTES {
+        message.truncate(
+            message
+                .char_indices()
+                .nth(MAX_ERROR_MESSAGE_BYTES)
+                .map(|(index, _)| index)
+                .unwrap_or(MAX_ERROR_MESSAGE_BYTES),
+        );
+        message.push_str("… (truncated)");
+    }
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+
+/// One newline-delimited request frame.
+#[derive(Debug)]
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) enum Frame {
+    /// A complete frame at or under the limit, without its newline.
+    Complete(Vec<u8>),
+    /// An empty line, which the protocol ignores.
+    Empty,
+    /// A frame that exceeded the limit.
+    ///
+    /// The remainder was consumed and discarded, so the next read starts on a
+    /// frame boundary and protocol state stays deterministic.
+    TooLarge,
+}
+
+/// Incremental newline-delimited frame reader with a hard per-frame bound.
+///
+/// This deliberately does **not** use `AsyncBufReadExt::lines()`: that API must
+/// accumulate the whole line before a caller can inspect it, so a single large
+/// line without a newline would allocate without limit.
+///
+/// Two properties matter and are easy to get wrong:
+///
+/// * The bound is applied *while* reading. At `limit + 1` bytes the reader stops
+///   retaining and discards the rest of the frame, so an oversized frame costs
+///   bounded memory, no JSON is parsed, and no partial request is dispatched.
+///   Reaching the limit and going over it are distinguished exactly, not by a
+///   post-hoc length check.
+/// * Bytes already read past a frame's newline are **kept**, not dropped. A
+///   single read routinely returns several frames; discarding the tail would
+///   silently lose requests.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) struct FrameReader<R> {
+    inner: R,
+    /// Bytes read from `inner` that belong to a later frame.
+    ///
+    /// Bounded by one read chunk: whatever follows a newline is at most the rest
+    /// of the chunk that contained it.
+    pushback: Vec<u8>,
+    scratch: [u8; 8192],
+}
+
+impl<R> FrameReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pushback: Vec::new(),
+            scratch: [0_u8; 8192],
+        }
+    }
+}
+
+impl<R> FrameReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    /// Read the next frame, retaining at most `limit` bytes of it.
+    #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+    pub(crate) async fn next_frame(&mut self, limit: usize) -> std::io::Result<Option<Frame>> {
+        let mut frame: Vec<u8> = Vec::with_capacity(limit.min(8192));
+        let mut over = false;
+        loop {
+            if !self.pushback.is_empty() {
+                let pending = std::mem::take(&mut self.pushback);
+                for (index, &byte) in pending.iter().enumerate() {
+                    if byte == b'\n' {
+                        // Keep everything after this frame for the next call.
+                        self.pushback.extend_from_slice(&pending[index + 1..]);
+                        return Ok(Some(match (over, frame.is_empty()) {
+                            (false, true) => Frame::Empty,
+                            (false, false) => Frame::Complete(frame),
+                            (true, _) => Frame::TooLarge,
+                        }));
+                    }
+                    if over {
+                        continue;
+                    }
+                    if frame.len() == limit {
+                        // Exactly one byte past the bound: stop retaining, keep
+                        // consuming to the end of the frame.
+                        over = true;
+                        continue;
+                    }
+                    frame.push(byte);
+                }
+            }
+
+            let read = match self.inner.read(&mut self.scratch).await {
+                Ok(0) => {
+                    // EOF. A trailing frame without a newline is still delivered
+                    // when it is within the bound; an oversized one is dropped.
+                    return Ok(match (over, frame.is_empty()) {
+                        (false, false) => Some(Frame::Complete(frame)),
+                        _ => None,
+                    });
+                }
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            self.pushback.extend_from_slice(&self.scratch[..read]);
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) fn frame_reader<R>(inner: R) -> FrameReader<R> {
+    FrameReader::new(inner)
+}
 
 pub(crate) fn serialize_goal_run_result(result: &GoalRunResult) -> String {
     let trace = result
@@ -1099,6 +1420,9 @@ fn render_output(output: sandbox::Output) -> Result<String> {
     execution::render_output(output)
 }
 
+// Resource Bounds V1 transport tests live in `resource_bounds_transport_tests`
+// and are registered at the crate root, because `phase0_execution_tests.rs`
+// includes this file and would otherwise compile the module a second time.
 #[cfg(test)]
 mod tests {
     use super::*;
