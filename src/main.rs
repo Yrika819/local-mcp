@@ -84,6 +84,8 @@ mod process_group_stress_tests;
 mod replanner_compaction_tests;
 #[cfg(test)]
 mod replanner_replacement_tests;
+#[cfg(test)]
+mod resource_bounds_file_tests;
 #[cfg(all(test, unix))]
 mod resource_bounds_process_tests;
 #[cfg(test)]

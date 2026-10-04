@@ -237,7 +237,9 @@ async fn an_oversized_frame_costs_no_worker_permit() {
 
 #[tokio::test]
 async fn a_response_at_the_limit_is_written() {
-    let (writer_half, mut reader) = tokio::io::duplex(64 * 1024);
+    // A wide pipe: a response at the cap is tens of megabytes, and a narrow one
+    // turns this into thousands of round trips.
+    let (writer_half, mut reader) = tokio::io::duplex(8 * 1024 * 1024);
     let payload = "j".repeat(MAX_MCP_RESPONSE_FRAME_BYTES - 128);
     let message = json!({"jsonrpc":"2.0","id":1,"result":payload});
     let encoded = serde_json::to_vec(&message).unwrap();
@@ -267,7 +269,7 @@ async fn a_response_at_the_limit_is_written() {
 }
 
 #[tokio::test]
-async fn a_response_over_the_limit_is_refused_before_any_byte_is_written() {
+async fn an_oversized_response_is_refused_rather_than_truncated_or_written() {
     let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
     let payload = "k".repeat(MAX_MCP_RESPONSE_FRAME_BYTES);
     let message = json!({"jsonrpc":"2.0","id":1,"result":payload});
@@ -286,19 +288,9 @@ async fn a_response_over_the_limit_is_refused_before_any_byte_is_written() {
         .is_err(),
         "nothing may be written for a refused response, or the frame would be partial"
     );
+    // And it is a bounded resource failure, not a silently shortened JSON frame.
     let rendered = format!("{error:#}");
     assert!(rendered.contains("mcp response frame"), "{rendered}");
-}
-
-#[tokio::test]
-async fn an_oversized_response_is_not_silently_truncated() {
-    let (mut writer, _reader) = tokio::io::duplex(64 * 1024);
-    let message = json!({"jsonrpc":"2.0","id":1,"result":"l".repeat(MAX_MCP_RESPONSE_FRAME_BYTES)});
-    let error = write_message(&mut writer, &message).await.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("response frame"),
-        "the failure must be a bounded resource error"
-    );
 }
 
 #[tokio::test]

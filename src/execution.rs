@@ -165,6 +165,18 @@ pub(crate) fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
 }
 
 pub(crate) fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
+    if let Some(requested) = args.get("cwd").and_then(Value::as_str) {
+        // Bounded before it is resolved or authorized. Path authority itself is
+        // unchanged: this only refuses a field far larger than any real path.
+        anyhow::ensure!(
+            requested.len() <= crate::resource_limits::MAX_EXECUTE_PATH_BYTES,
+            "{}",
+            crate::resource_limits::limit_error(
+                crate::resource_limits::ResourceLimit::ExecutePathBytes,
+                "no command was started",
+            )
+        );
+    }
     let path = args
         .get("cwd")
         .and_then(Value::as_str)
@@ -174,17 +186,51 @@ pub(crate) fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
     config::validate_path_authority(session, &path, config::PathIntent::ExecutionCwd)
 }
 
+/// The `command` argument of an execute-style request, under frozen bounds.
+///
+/// The declared JSON Schema is documentation only — nothing validates against it
+/// — so every bound is enforced here in host code. A tiny command name must not
+/// be able to carry hundreds of megabytes of arguments.
 pub(crate) fn required_command(args: &Value) -> Result<Vec<String>> {
-    args.get("command")
+    use crate::resource_limits::{
+        MAX_EXECUTE_ARG_BYTES, MAX_EXECUTE_ARGV_ITEMS, MAX_EXECUTE_ARGV_TOTAL_BYTES, ResourceLimit,
+    };
+    let items = args
+        .get("command")
         .and_then(Value::as_array)
-        .context("missing command")?
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_owned)
-                .context("command entries must be strings")
-        })
-        .collect()
+        .context("missing command")?;
+    anyhow::ensure!(
+        items.len() <= MAX_EXECUTE_ARGV_ITEMS,
+        "{}",
+        crate::resource_limits::limit_error(
+            ResourceLimit::ExecuteArgvItems,
+            "no command was started",
+        )
+    );
+    let mut command = Vec::with_capacity(items.len());
+    let mut total = 0_usize;
+    for item in items {
+        let value = item.as_str().context("command entries must be strings")?;
+        anyhow::ensure!(
+            value.len() <= MAX_EXECUTE_ARG_BYTES,
+            "{}",
+            crate::resource_limits::limit_error(
+                ResourceLimit::ExecuteArgBytes,
+                "no command was started",
+            )
+        );
+        total = total.saturating_add(value.len());
+        anyhow::ensure!(
+            total <= MAX_EXECUTE_ARGV_TOTAL_BYTES,
+            "{}",
+            crate::resource_limits::limit_error(
+                ResourceLimit::ExecuteArgvTotalBytes,
+                "no command was started",
+            )
+        );
+        command.push(value.to_owned());
+    }
+    Ok(command)
 }
 
 #[derive(Clone)]

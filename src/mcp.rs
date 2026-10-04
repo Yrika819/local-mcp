@@ -21,8 +21,9 @@ use crate::goal_backends::ProductionGoalBackends;
 use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
 use crate::job_registry::{self, Job};
 use crate::resource_limits::{
-    CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_MCP_REQUEST_FRAME_BYTES,
-    MAX_MCP_RESPONSE_FRAME_BYTES,
+    CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_OUTPUT_BYTES,
+    MAX_IMAGE_RAW_BYTES, MAX_MCP_REQUEST_FRAME_BYTES, MAX_MCP_RESPONSE_FRAME_BYTES,
+    MAX_READ_FILE_BYTES, MAX_WRITE_FILE_CONTENT_BYTES, MAX_WRITE_PREIMAGE_BYTES,
 };
 use crate::task_store::TaskStore;
 use crate::workspace_publish;
@@ -467,9 +468,16 @@ async fn call_tool(params: &Value) -> Result<Value> {
                 &requested,
                 config::PathIntent::ReadExisting,
             )?;
-            let result = tokio::fs::read_to_string(&path)
-                .await
-                .context("failed to read file");
+            let result = read_regular_file_bounded(
+                &path,
+                MAX_READ_FILE_BYTES,
+                crate::resource_limits::ResourceLimit::ReadFile,
+            )
+            .await
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|_| anyhow::anyhow!("file is not valid UTF-8: {}", path.display()))
+            });
             report_result(
                 &session.id,
                 format!("Read {}", display_path(&path, &session.cwd)),
@@ -550,6 +558,51 @@ fn display_path<'a>(path: &'a Path, session_cwd: &Path) -> std::borrow::Cow<'a, 
         .to_string_lossy()
 }
 
+/// Read a regular file, refusing content at or above `limit`.
+///
+/// The bound is applied by reading at most `limit + 1` bytes and checking whether
+/// that extra byte arrived, rather than trusting metadata: a file can grow
+/// between the stat and the read, and metadata alone is not proof.
+///
+/// Requiring a regular file is what keeps a FIFO, device or socket from becoming
+/// an unbounded blocking stream. Path authority is unchanged by this: it is
+/// checked before the file is opened, exactly as before.
+///
+/// There is no silent truncation. Over-limit content is refused whole.
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "asserted by the resource bounds file tests")
+)]
+pub(crate) async fn read_regular_file_bounded(
+    path: &Path,
+    limit: usize,
+    failure: crate::resource_limits::ResourceLimit,
+) -> Result<Vec<u8>> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "not a regular file: {}", path.display());
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    // `limit + 1` is the only way to distinguish "exactly at the limit" from
+    // "over the limit" without retaining more than the bound allows.
+    let mut bytes = Vec::new();
+    let read = tokio::io::AsyncReadExt::take(&mut file, limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    anyhow::ensure!(
+        read <= limit,
+        "{}",
+        crate::resource_limits::limit_error(
+            failure,
+            "content was not read and nothing was truncated",
+        )
+    );
+    Ok(bytes)
+}
+
 fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
 }
@@ -558,15 +611,15 @@ async fn get_image(path: &Path) -> Result<Value> {
     let path = tokio::fs::canonicalize(&path)
         .await
         .with_context(|| format!("cannot resolve image {}", path.display()))?;
-    let metadata = tokio::fs::metadata(&path).await?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "image path is not a file: {}",
-        path.display()
-    );
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("cannot read image {}", path.display()))?;
+    // Bounded before base64: base64 expands the payload by 4/3, so an unbounded
+    // raw read would become a larger unbounded response.
+    let bytes = read_regular_file_bounded(
+        &path,
+        MAX_IMAGE_RAW_BYTES,
+        crate::resource_limits::ResourceLimit::ImageRaw,
+    )
+    .await
+    .with_context(|| format!("cannot read image {}", path.display()))?;
     let mime_type = image_mime_type(&bytes)
         .with_context(|| format!("unsupported image format: {}", path.display()))?;
     Ok(json!({
@@ -629,16 +682,50 @@ fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
     execution::cwd(args, session)
 }
 
-async fn list_directory(path: &Path) -> Result<String> {
+/// Render a directory listing under frozen entry-count and byte bounds.
+///
+/// The rendering is unchanged from before: names are accumulated, sorted, and
+/// joined with newlines. What is new is that both bounds are applied *during*
+/// accumulation, so an over-bound directory is refused whole rather than being
+/// materialized first. It is never presented as a complete listing that is
+/// quietly incomplete.
+///
+/// Both bounds matter independently: many short names stay under the byte cap,
+/// while fewer long names can breach it.
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "asserted by the resource bounds file tests")
+)]
+pub(crate) async fn list_directory(path: &Path) -> Result<String> {
     let mut entries = tokio::fs::read_dir(path).await?;
-    let mut names = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    // One separator per name, matching the joined rendering exactly.
+    let mut rendered_bytes = 0_usize;
     while let Some(entry) = entries.next_entry().await? {
+        anyhow::ensure!(
+            names.len() < MAX_DIRECTORY_ENTRIES,
+            "{}",
+            crate::resource_limits::limit_error(
+                crate::resource_limits::ResourceLimit::DirectoryEntries,
+                "the listing was refused whole rather than truncated",
+            )
+        );
         let suffix = if entry.file_type().await?.is_dir() {
             "/"
         } else {
             ""
         };
-        names.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
+        let name = format!("{}{}", entry.file_name().to_string_lossy(), suffix);
+        rendered_bytes = rendered_bytes.saturating_add(name.len()).saturating_add(1);
+        anyhow::ensure!(
+            rendered_bytes <= MAX_DIRECTORY_OUTPUT_BYTES,
+            "{}",
+            crate::resource_limits::limit_error(
+                crate::resource_limits::ResourceLimit::DirectoryOutputBytes,
+                "the listing was refused whole rather than truncated",
+            )
+        );
+        names.push(name);
     }
     names.sort();
     Ok(names.join("\n"))
@@ -661,6 +748,17 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         .get("content")
         .and_then(Value::as_str)
         .context("missing content")?;
+    // Bounded before any filesystem mutation, so an oversized write performs zero
+    // mutation and never prompts for an approval it cannot use. The global
+    // request-frame ceiling remains the outer defense.
+    anyhow::ensure!(
+        content.len() <= MAX_WRITE_FILE_CONTENT_BYTES,
+        "{}",
+        crate::resource_limits::limit_error(
+            crate::resource_limits::ResourceLimit::WriteFileContent,
+            "nothing was written",
+        )
+    );
     #[cfg(windows)]
     anyhow::ensure!(
         approvals::request(
@@ -683,9 +781,17 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     // overwrite. Absence, by contrast, is a legitimate empty previous state for diff.
     let existing = requested.symlink_metadata().is_ok();
     let previous = if existing {
-        let bytes = tokio::fs::read(&absolute)
-            .await
-            .with_context(|| format!("failed to read existing file {}", absolute.display()))?;
+        // Bounded too: reading the whole previous file to build a preimage and
+        // diff would otherwise be an unbounded read on the mutation path.
+        let bytes = read_regular_file_bounded(
+            &absolute,
+            MAX_WRITE_PREIMAGE_BYTES,
+            crate::resource_limits::ResourceLimit::WriteFilePreimage,
+        )
+        .await?;
+        // Treating a read failure or non-UTF-8 content as "empty" would let a
+        // write destroy bytes the host never actually saw, so an existing
+        // non-UTF-8 file stays a hard refusal.
         String::from_utf8(bytes).map_err(|_| {
             anyhow::anyhow!(
                 "refusing to overwrite a non-UTF-8 file with a UTF-8 text write: {}",
