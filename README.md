@@ -167,6 +167,29 @@ commands instead of holding one MCP tool call open indefinitely. Use
 `start_command` when a primary command should run in the background
 immediately without the 30-second foreground wait.
 
+### Resource limits
+
+GoalLatch bounds how much memory a single call can use, so an unusually large
+input, output, file, or backlog of background jobs cannot grow without limit.
+Reaching a limit is reported as a resource failure; it is never reported as a
+permission or approval problem, and it never means a command that already
+started did nothing.
+
+- Command output is captured under a fixed limit. A command that exceeds it is
+  terminated together with its process group, and the call fails saying the
+  output was discarded. Redirect noisy output to a file and read that instead.
+- `read_file` and `get_image` return a file whole or fail; they never return a
+  silently shortened file. `list_directory` likewise refuses a directory it
+  cannot render in full rather than presenting a partial listing as complete.
+- `write_file` refuses oversized content without writing anything.
+- Background jobs are retained per session and overall. A finished job that is
+  never polled expires after 15 minutes, and starting a job beyond the limit is
+  refused; poll or stop a retained job to free capacity. A running job is never
+  displaced to make room for another.
+
+Control-plane calls such as `poll_job` and `stop_job` keep working while command
+execution is saturated, up to their own bounded capacity.
+
 ## Codex fallback policy V2
 
 Codex fallback is enabled by default and can be disabled with
