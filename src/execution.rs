@@ -938,37 +938,46 @@ async fn process_sandboxed_attempt_with_codex_override(
     // command. Only the latter grants fallback authority, and only host-owned
     // evidence may establish it. A sandbox helper that rejected setup and exited
     // is a helper lifecycle, not a command lifecycle.
-    let (lifecycle, exit_code, stdout, stderr, execution_error, setup_rejection) = match attempt {
-        Ok(output) => (
-            fallback::LifecycleEvidence::completed_with_start_proof(output.command_start),
-            Some(output.status),
-            output.stdout,
-            output.stderr,
-            None,
-            None,
-        ),
-        Err(error) => (
-            fallback::LifecycleEvidence {
-                host_reached: true,
-                // The executed process starting is not evidence that the requested
-                // command started: where a wrapper is used the wrapper is the
-                // process. Only a process that provably never started proves the
-                // requested command never started.
-                command_start: if error.command_started {
-                    sandbox::CommandStart::Unproven
-                } else {
-                    sandbox::CommandStart::Refuted
+    let (lifecycle, exit_code, stdout, stderr, execution_error, setup_rejection, resource_limit) =
+        match attempt {
+            Ok(output) => (
+                fallback::LifecycleEvidence::completed_with_start_proof(output.command_start),
+                Some(output.status),
+                output.stdout,
+                output.stderr,
+                None,
+                None,
+                None,
+            ),
+            Err(error) => (
+                fallback::LifecycleEvidence {
+                    host_reached: true,
+                    // The executed process starting is not evidence that the requested
+                    // command started: where a wrapper is used the wrapper is the
+                    // process. Only a process that provably never started proves the
+                    // requested command never started.
+                    command_start: if error.command_started {
+                        sandbox::CommandStart::Unproven
+                    } else {
+                        sandbox::CommandStart::Refuted
+                    },
+                    command_finished: false,
+                    process_finished: error.command_finished,
                 },
-                command_finished: false,
-                process_finished: error.command_finished,
-            },
-            None,
-            String::new(),
-            String::new(),
-            Some(format!("{:#}", error.error)),
-            error.setup_rejection,
-        ),
-    };
+                None,
+                String::new(),
+                String::new(),
+                Some(format!("{:#}", error.error)),
+                error.setup_rejection,
+                // Preserved as a typed marker. An output-limit failure must be
+                // classified as a terminal resource failure, never re-derived from
+                // the very output the host just discarded.
+                error
+                    .error
+                    .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+                    .map(|resource_error| resource_error.limit()),
+            ),
+        };
 
     let side_effect_class = fallback::infer_side_effect_class(command, policy.operation.as_ref());
     let classification = fallback::classify(fallback::ClassificationInput {
@@ -983,6 +992,7 @@ async fn process_sandboxed_attempt_with_codex_override(
         side_effect_class,
         authoritative_platform_safety: false,
         authoritative_setup_rejection: setup_rejection,
+        authoritative_resource_limit: resource_limit,
     });
 
     let local_not_performed_proof = if let Some(stage) = policy.validated_git_stage_paths.as_ref()
@@ -1532,6 +1542,7 @@ pub(crate) async fn codex_fallback(
         authoritative_platform_safety: explicit_failure_class
             == Some(fallback::FailureClass::PlatformSafety),
         authoritative_setup_rejection: None,
+        authoritative_resource_limit: None,
     });
 
     if safety_probe.safety_signal

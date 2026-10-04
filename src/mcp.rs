@@ -77,7 +77,10 @@ where
     let writer_handle = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(response) = response_rx.recv().await {
-            write_message(&mut writer, &response).await?;
+            // Never end this task on a per-frame failure: returning here would drop
+            // the receiver, after which every later response is silently discarded
+            // and the client waits forever.
+            write_response_or_substitute(&mut writer, &response).await;
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -243,6 +246,31 @@ async fn release_all_jobs() {
     for job in released {
         job.terminate().await;
     }
+}
+
+/// Write one response, replacing it with a bounded error frame if it does not fit.
+///
+/// This is what keeps a single oversized result from bricking the transport. An
+/// earlier version let `write_message`'s error end the writer task, which dropped
+/// the response receiver: every later response was then discarded silently while
+/// the server kept running the client's commands.
+///
+/// Returns whether the frame itself was written.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
+pub(crate) async fn write_response_or_substitute<W>(writer: &mut W, response: &Value) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if write_message(writer, response).await.is_ok() {
+        return true;
+    }
+    let id = response.get("id").cloned().unwrap_or(Value::Null);
+    let replacement = bounded_error_response(
+        id,
+        JSONRPC_RESOURCE_LIMIT,
+        "response exceeded the maximum and was not written",
+    );
+    write_message(writer, &replacement).await.is_ok()
 }
 
 /// Writes one complete, newline-delimited JSON-RPC frame.
@@ -854,13 +882,16 @@ async fn execution_outcome(
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    ensure_job_capacity(session).await?;
+    // No capacity pre-check here on purpose: a command that finishes inside the
+    // foreground window never creates a job, and refusing it because the registry
+    // is full would couple the most-used tool to background-job occupancy.
+    // `store_job` is the authoritative gate, and it terminates a command it
+    // cannot retain.
     let outcome = execution::execute(args, session).await?;
     execution_outcome(session, outcome).await
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
-    ensure_job_capacity(session).await?;
     let job = execution::start_command(args, session).await?;
     store_execution_job(session, job).await
 }
@@ -924,30 +955,49 @@ async fn process_sandboxed_attempt(
     .await
 }
 
-/// Refuse to start a new background command when the registry has no room.
-///
-/// Checked *before* any process is spawned, so hitting a ceiling costs nothing
-/// and never leaves a command running without somewhere to retain its result.
-async fn ensure_job_capacity(session: &config::Session) -> Result<()> {
-    job_registry::registry().can_admit(job_registry::now(), &session.id)
-}
-
 async fn store_job(
     session: &config::Session,
     rendered_command: String,
     handle: tokio::task::JoinHandle<Result<String>>,
     activity: &str,
 ) -> Result<Value> {
+    /// Outcome of trying to retain a job.
+    enum Admission {
+        Retained,
+        /// Refused, with the job handed back so its process can be stopped.
+        Refused {
+            error: anyhow::Error,
+            job: Job,
+        },
+    }
+
     let job_id = job_registry::new_job_id();
-    {
-        // Capacity and retention happen under one lock so they cannot disagree.
+    // Capacity and retention happen under one lock, so they cannot disagree, and
+    // the lock is released before anything is awaited.
+    let admission = {
         let mut jobs = job_registry::registry();
-        jobs.can_admit(job_registry::now(), &session.id)?;
-        jobs.insert(
-            job_registry::now(),
-            job_id,
-            Job::new(session.id.clone(), rendered_command.clone(), handle),
-        );
+        match jobs.can_admit(job_registry::now(), &session.id) {
+            Ok(()) => {
+                jobs.insert(
+                    job_registry::now(),
+                    job_id,
+                    Job::new(session.id.clone(), rendered_command.clone(), handle),
+                );
+                Admission::Retained
+            }
+            Err(error) => Admission::Refused {
+                error,
+                job: Job::new(session.id.clone(), rendered_command.clone(), handle),
+            },
+        }
+    };
+    if let Admission::Refused { error, job } = admission {
+        // The command was already spawned by the time its result is stored.
+        // Dropping the `JoinHandle` would *detach* the task rather than stop it,
+        // leaving a live process with no registry entry and no way to terminate
+        // it, so the job is stopped explicitly before the refusal is returned.
+        job.terminate().await;
+        return Err(error);
     }
     approvals::activity(
         &session.id,

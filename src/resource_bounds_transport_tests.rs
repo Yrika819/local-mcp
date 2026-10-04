@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use crate::mcp::{
     Frame, JSONRPC_RESOURCE_LIMIT, MAX_ERROR_MESSAGE_BYTES, Pool, acquire_admission,
     admission_pool, bounded_error_response, frame_reader, is_control_plane, serve_with_io,
-    write_message,
+    write_message, write_response_or_substitute,
 };
 use crate::resource_limits::{
     CONTROL_PLANE_PERMITS, EXECUTION_PERMITS, MAX_MCP_REQUEST_FRAME_BYTES,
@@ -291,6 +291,64 @@ async fn an_oversized_response_is_refused_rather_than_truncated_or_written() {
     // And it is a bounded resource failure, not a silently shortened JSON frame.
     let rendered = format!("{error:#}");
     assert!(rendered.contains("mcp response frame"), "{rendered}");
+}
+
+#[tokio::test]
+async fn an_oversized_response_does_not_end_the_session() {
+    // The blocker this guards: `write_message` used to fail, the writer task used
+    // to propagate that with `?`, and every later response was then silently
+    // dropped. One ordinary command that flooded stdout could wedge the whole
+    // transport while the server kept executing the client's commands.
+    let (writer_half, mut reader) = tokio::io::duplex(1024 * 1024);
+    let huge = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": "z".repeat(MAX_MCP_RESPONSE_FRAME_BYTES + 1024)
+    });
+
+    // Write both frames while draining concurrently: the oversized frame is far
+    // larger than the pipe, so a sequential write would block forever.
+    let write_side = async move {
+        let mut writer = writer_half;
+        let substituted = write_response_or_substitute(&mut writer, &huge).await;
+        let ordinary = json!({"jsonrpc":"2.0","id":2,"result":"ok"});
+        let ordinary_written = write_response_or_substitute(&mut writer, &ordinary).await;
+        drop(writer);
+        (substituted, ordinary_written)
+    };
+    let read_side = async {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut buffered = tokio::io::BufReader::new(&mut reader);
+        while buffered.read_line(&mut line).await.unwrap() > 0 {
+            lines.push(serde_json::from_str::<Value>(&line).unwrap());
+            line.clear();
+        }
+        lines
+    };
+    let ((substituted, ordinary_written), lines) = tokio::join!(write_side, read_side);
+
+    assert!(
+        substituted,
+        "a bounded replacement frame must still be written for the oversized one"
+    );
+    assert!(
+        ordinary_written,
+        "an oversized response must not prevent later responses"
+    );
+    assert_eq!(lines.len(), 2, "exactly one frame per response: {lines:?}");
+
+    assert_eq!(lines[0]["id"], 1);
+    assert_eq!(
+        lines[0]["error"]["code"], JSONRPC_RESOURCE_LIMIT,
+        "an oversized frame must be reported as a bounded resource failure"
+    );
+    assert!(
+        lines[0].get("result").is_none(),
+        "an oversized frame must never be written truncated"
+    );
+    assert_eq!(lines[1]["id"], 2);
+    assert_eq!(lines[1]["result"], "ok");
 }
 
 #[tokio::test]

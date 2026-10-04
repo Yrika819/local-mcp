@@ -197,6 +197,7 @@ fn host_native_permission_failure_is_not_labeled_sandbox_permission() {
         side_effect_class: fallback::SideEffectClass::LocalMutation,
         authoritative_platform_safety: false,
         authoritative_setup_rejection: None,
+        authoritative_resource_limit: None,
     });
     assert_eq!(
         classification.failure_class,

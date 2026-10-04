@@ -187,9 +187,42 @@ async fn an_overflow_is_terminal_and_never_selects_executable_fallback() {
         Budget, DecisionInput, FailureClass, FallbackAction, LifecycleEvidence,
         PrimaryExecutionMode, ReasonCode, SideEffectClass, SideEffectState, decide,
     };
+    // Driven through the real `classify` path from a real resource-limit error,
+    // not by hand-constructing the failure class: the previous version of this
+    // test asserted on a value production never actually produced.
+    let resource_error = crate::resource_limits::limit_error(
+        crate::resource_limits::ResourceLimit::CommandStdout,
+        "output was discarded and the process group was terminated",
+    );
+    let classification = crate::fallback::classify(crate::fallback::ClassificationInput {
+        command: &["sh".to_owned(), "-c".to_owned(), "echo".to_owned()],
+        accepted_exit_codes: &[0],
+        primary_execution_mode: PrimaryExecutionMode::Sandboxed,
+        lifecycle: LifecycleEvidence {
+            host_reached: true,
+            command_start: crate::sandbox::CommandStart::Unproven,
+            command_finished: false,
+            process_finished: false,
+        },
+        exit_code: None,
+        stdout: "",
+        stderr: "",
+        execution_error: Some("output was discarded"),
+        side_effect_class: SideEffectClass::LocalMutation,
+        authoritative_platform_safety: false,
+        authoritative_setup_rejection: None,
+        authoritative_resource_limit: Some(crate::resource_limits::ResourceLimit::CommandStdout),
+    });
+    assert_eq!(
+        classification.failure_class,
+        FailureClass::ResourceLimit,
+        "a host-owned resource bound must classify as a terminal resource failure"
+    );
+    assert!(!classification.safety_signal);
+
     let decision = decide(DecisionInput {
-        failure_class: FailureClass::ResourceLimit,
-        safety_signal: false,
+        failure_class: classification.failure_class,
+        safety_signal: classification.safety_signal,
         primary_execution_mode: PrimaryExecutionMode::Sandboxed,
         lifecycle: LifecycleEvidence {
             host_reached: true,
@@ -215,4 +248,42 @@ async fn an_overflow_is_terminal_and_never_selects_executable_fallback() {
     );
     assert_eq!(decision.reason_code, ReasonCode::NoFallbackResourceLimit);
     assert!(decision.mode.is_none());
+
+    // The marker must survive the `anyhow` boundary, which is what the transport
+    // and the classifier both rely on.
+    let anyhow_error = crate::sandbox::CaptureFailure::output_limit_error_for_test(
+        crate::sandbox::CaptureStream::Stdout,
+    );
+    assert!(
+        anyhow_error
+            .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+            .is_some(),
+        "a capture overflow must remain a typed resource marker through anyhow"
+    );
+    let _ = resource_error;
+}
+
+#[tokio::test]
+async fn a_flooding_capture_failure_classifies_as_a_resource_limit() {
+    // End to end through the real capture: the typed marker produced by an actual
+    // output overflow must reach the classifier intact.
+    let command = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "head -c {} /dev/zero",
+            crate::resource_limits::MAX_COMMAND_STDOUT_BYTES + 1
+        ),
+    ];
+    let error = crate::sandbox::run_unrestricted_inner(&command, &cwd(), None, false)
+        .await
+        .expect_err("overflow must fail");
+    assert!(
+        error
+            .error
+            .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+            .is_some(),
+        "an overflow must be a typed resource marker, got: {:#}",
+        error.error
+    );
 }

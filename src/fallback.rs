@@ -507,6 +507,14 @@ pub struct ClassificationInput<'a> {
     /// output is deliberately not consulted: the helper and the requested command
     /// are both untrusted with respect to fallback authority.
     pub authoritative_setup_rejection: Option<SetupRejection>,
+    /// A host-owned resource bound that was reached, when the failure was one.
+    ///
+    /// This is the only authority for classifying a resource failure. Like
+    /// `authoritative_setup_rejection` it is consulted before any text is read,
+    /// because the requested command fully controls its own output: without a
+    /// typed marker, a flood of bytes containing "permission denied" could be
+    /// misread as a permission verdict.
+    pub authoritative_resource_limit: Option<crate::resource_limits::ResourceLimit>,
 }
 
 pub fn classify(input: ClassificationInput<'_>) -> Classification {
@@ -535,6 +543,15 @@ pub fn classify(input: ClassificationInput<'_>) -> Classification {
     if !input.lifecycle.host_reached {
         return Classification {
             failure_class: FailureClass::TransportFailure,
+            safety_signal: false,
+        };
+    }
+
+    // A host-owned resource bound is terminal, and is classified before the
+    // command's own output is inspected.
+    if input.authoritative_resource_limit.is_some() {
+        return Classification {
+            failure_class: FailureClass::ResourceLimit,
             safety_signal: false,
         };
     }
@@ -1491,6 +1508,7 @@ mod tests {
             side_effect_class: SideEffectClass::None,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(classification.failure_class, FailureClass::ExpectedState);
         let decision = decision_for(
@@ -1529,6 +1547,7 @@ mod tests {
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(
             classification.failure_class,
@@ -1576,6 +1595,7 @@ mod tests {
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(classification.failure_class, FailureClass::HostEnvironment);
     }
@@ -1635,6 +1655,7 @@ mod tests {
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         let decision = decide(DecisionInput {
             primary_execution_mode: PrimaryExecutionMode::Sandboxed,
@@ -1691,6 +1712,7 @@ mod tests {
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         // The text alone never becomes a platform safety refusal: that requires
         // host-owned evidence.
@@ -1720,6 +1742,7 @@ mod tests {
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         let decision = decide(DecisionInput {
             primary_execution_mode: PrimaryExecutionMode::Sandboxed,
@@ -1763,6 +1786,7 @@ mod tests {
             side_effect_class: SideEffectClass::Unknown,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(missing.failure_class, FailureClass::ToolMissing);
 
@@ -1780,6 +1804,7 @@ mod tests {
             side_effect_class: SideEffectClass::Unknown,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(denied.failure_class, FailureClass::SandboxPermission);
 
@@ -1796,6 +1821,7 @@ mod tests {
             side_effect_class: SideEffectClass::Unknown,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(host_native.failure_class, FailureClass::HostEnvironment);
 
@@ -1813,6 +1839,7 @@ mod tests {
             side_effect_class: SideEffectClass::Unknown,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: Some(SetupRejection::Environment),
+            authoritative_resource_limit: None,
         });
         assert_eq!(setup_rejected.failure_class, FailureClass::SandboxSetup);
 
@@ -1829,6 +1856,7 @@ mod tests {
             side_effect_class: SideEffectClass::Unknown,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_ne!(proven_missing.failure_class, FailureClass::ToolMissing);
     }
@@ -1849,6 +1877,7 @@ mod tests {
                 side_effect_class: SideEffectClass::LocalMutation,
                 authoritative_platform_safety: false,
                 authoritative_setup_rejection: None,
+                authoritative_resource_limit: None,
             });
             assert_ne!(
                 classification.failure_class,
@@ -1903,6 +1932,7 @@ mod tests {
                 side_effect_class: SideEffectClass::LocalMutation,
                 authoritative_platform_safety: false,
                 authoritative_setup_rejection: Some(rejection),
+                authoritative_resource_limit: None,
             });
             assert_eq!(classification.failure_class, expected_class);
             let decision = decide(DecisionInput {
@@ -2076,6 +2106,7 @@ mod tests {
             side_effect_class: SideEffectClass::LocalMutation,
             authoritative_platform_safety: true,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(classification.failure_class, FailureClass::PlatformSafety);
         let decision = decision_for(
@@ -2106,6 +2137,7 @@ mod tests {
             side_effect_class: SideEffectClass::None,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(classification.failure_class, FailureClass::SemanticFailure);
         let decision = decision_for(
@@ -2195,6 +2227,7 @@ mod tests {
             side_effect_class: SideEffectClass::None,
             authoritative_platform_safety: false,
             authoritative_setup_rejection: None,
+            authoritative_resource_limit: None,
         });
         assert_eq!(classification.failure_class, FailureClass::ToolMissing);
         let decision = decision_for(

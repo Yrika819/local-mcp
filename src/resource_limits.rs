@@ -40,6 +40,21 @@ pub(crate) const MAX_MCP_REQUEST_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// bounds have already kept every realistic result well inside it.
 pub(crate) const MAX_MCP_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Worst-case JSON expansion applied to caller-visible text, in bytes out per byte
+/// in.
+///
+/// `serde_json` renders a control byte as `\u0000` (6 bytes). A command result is
+/// serialized *twice* — once by `render_output`, then again when it is embedded as
+/// a string value by `text_result` — so the second pass re-escapes each backslash
+/// and a single raw byte costs up to 7. A single-pass value such as `read_file`
+/// costs up to 6.
+///
+/// This factor exists because a bound derived from raw byte counts alone is wrong:
+/// 4 MiB of NUL bytes on stdout is a perfectly ordinary command, and it
+/// serializes to a frame well over twice its own size. Every text-returning bound
+/// below is asserted against this factor at compile time.
+pub(crate) const JSON_ESCAPE_WORST_CASE: usize = 7;
+
 // ---------------------------------------------------------------------------
 // Generic command output capture
 // ---------------------------------------------------------------------------
@@ -49,13 +64,13 @@ pub(crate) const MAX_MCP_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Bounded independently of stderr, and enforced while reading rather than after
 /// the full stream has been accumulated.
-pub(crate) const MAX_COMMAND_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_COMMAND_STDOUT_BYTES: usize = 1536 * 1024;
 
 /// Largest captured stderr for a generic invocation.
 ///
-/// Matches the existing trusted-Git diagnostic bound. Trusted-Git and
-/// model/agent paths keep their own stricter caps and are not bound by these.
-pub(crate) const MAX_COMMAND_STDERR_BYTES: usize = 1024 * 1024;
+/// Trusted-Git and model/agent paths keep their own stricter caps and are not
+/// bound by these.
+pub(crate) const MAX_COMMAND_STDERR_BYTES: usize = 256 * 1024;
 
 /// Bytes retained for activity-timeline diagnostics.
 ///
@@ -83,7 +98,7 @@ pub(crate) const COMMAND_CLEANUP_GRACE: std::time::Duration = std::time::Duratio
 // ---------------------------------------------------------------------------
 
 /// Largest file `read_file` will return in full.
-pub(crate) const MAX_READ_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_READ_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Largest **raw** image file, before base64 expansion.
 pub(crate) const MAX_IMAGE_RAW_BYTES: usize = 8 * 1024 * 1024;
@@ -92,16 +107,17 @@ pub(crate) const MAX_IMAGE_RAW_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_WRITE_FILE_CONTENT_BYTES: usize = 256 * 1024;
 
 /// Largest existing file `write_file` will read to build a preimage and diff.
-pub(crate) const MAX_WRITE_PREIMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_WRITE_PREIMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Largest number of entries `list_directory` will accumulate.
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 20_000;
 
 /// Largest rendered `list_directory` listing.
+/// Largest aggregate rendered-listing byte bound.
 ///
 /// Deliberately independent of [`MAX_DIRECTORY_ENTRIES`]: many short names stay
 /// under the byte cap, while fewer long names can breach it.
-pub(crate) const MAX_DIRECTORY_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_DIRECTORY_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Command arguments
@@ -158,17 +174,24 @@ const _: () = assert!(CONTROL_PLANE_PERMITS + EXECUTION_PERMITS == MAX_CONCURREN
 // Both pools must be non-empty, or the control plane could not run at all.
 const _: () = assert!(CONTROL_PLANE_PERMITS > 0 && EXECUTION_PERMITS > 0);
 
-// base64 expands by 4/3 and adds up to four padding characters. A raw image must
-// still fit inside one response frame once encoded and wrapped in JSON.
+// base64 expands by 4/3 and adds up to four padding characters. The base64
+// alphabet needs no JSON escaping, so a raw image needs only the encoded size.
 const _: () = assert!(MAX_IMAGE_RAW_BYTES / 3 * 4 + 4 <= MAX_MCP_RESPONSE_FRAME_BYTES);
 
-// A method result must be able to fit in the frame that carries it.
-const _: () = assert!(MAX_READ_FILE_BYTES <= MAX_MCP_RESPONSE_FRAME_BYTES);
-const _: () = assert!(MAX_DIRECTORY_OUTPUT_BYTES <= MAX_MCP_RESPONSE_FRAME_BYTES);
+// A command result is escaped twice on its way into a response frame: once by
+// `render_output`, then again when `text_result` embeds it as a string value.
+// Deriving this bound from raw byte counts alone would let an ordinary binary
+// command produce a frame several times its own size.
+const _: () = assert!(
+    (MAX_COMMAND_STDOUT_BYTES + MAX_COMMAND_STDERR_BYTES) * JSON_ESCAPE_WORST_CASE
+        <= MAX_MCP_RESPONSE_FRAME_BYTES
+);
 
-// A command result embeds both captured streams in one frame.
+// These are escaped once, but are held to the stricter two-pass factor so a
+// single constant covers every text-returning bound.
+const _: () = assert!(MAX_READ_FILE_BYTES * JSON_ESCAPE_WORST_CASE <= MAX_MCP_RESPONSE_FRAME_BYTES);
 const _: () =
-    assert!(MAX_COMMAND_STDOUT_BYTES + MAX_COMMAND_STDERR_BYTES <= MAX_MCP_RESPONSE_FRAME_BYTES);
+    assert!(MAX_DIRECTORY_OUTPUT_BYTES * JSON_ESCAPE_WORST_CASE <= MAX_MCP_RESPONSE_FRAME_BYTES);
 
 // The request frame is the outer defense for every input-side bound, so no
 // method-level input bound may exceed it.
@@ -297,7 +320,11 @@ impl fmt::Display for ResourceLimitError {
 impl std::error::Error for ResourceLimitError {}
 
 impl ResourceLimitError {
-    #[cfg(test)]
+    pub(crate) fn new(limit: ResourceLimit, detail: &'static str) -> Self {
+        Self { limit, detail }
+    }
+
+    /// The bounded resource that was reached.
     pub(crate) fn limit(&self) -> ResourceLimit {
         self.limit
     }
@@ -305,7 +332,7 @@ impl ResourceLimitError {
 
 /// Build a resource-limit error carrying a fixed sentence.
 pub(crate) fn limit_error(limit: ResourceLimit, detail: &'static str) -> anyhow::Error {
-    ResourceLimitError { limit, detail }.into()
+    ResourceLimitError::new(limit, detail).into()
 }
 
 #[cfg(test)]
@@ -316,13 +343,13 @@ mod tests {
     fn ceilings_match_the_documented_values() {
         assert_eq!(MAX_MCP_REQUEST_FRAME_BYTES, 8 * 1024 * 1024);
         assert_eq!(MAX_MCP_RESPONSE_FRAME_BYTES, 16 * 1024 * 1024);
-        assert_eq!(MAX_COMMAND_STDOUT_BYTES, 4 * 1024 * 1024);
-        assert_eq!(MAX_COMMAND_STDERR_BYTES, 1024 * 1024);
-        assert_eq!(MAX_READ_FILE_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MAX_COMMAND_STDOUT_BYTES, 1536 * 1024);
+        assert_eq!(MAX_COMMAND_STDERR_BYTES, 256 * 1024);
+        assert_eq!(MAX_READ_FILE_BYTES, 2 * 1024 * 1024);
         assert_eq!(MAX_IMAGE_RAW_BYTES, 8 * 1024 * 1024);
         assert_eq!(MAX_WRITE_FILE_CONTENT_BYTES, 256 * 1024);
         assert_eq!(MAX_DIRECTORY_ENTRIES, 20_000);
-        assert_eq!(MAX_DIRECTORY_OUTPUT_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_DIRECTORY_OUTPUT_BYTES, 2 * 1024 * 1024);
         assert_eq!(MAX_EXECUTE_ARGV_ITEMS, 256);
         assert_eq!(MAX_EXECUTE_ARG_BYTES, 64 * 1024);
         assert_eq!(MAX_EXECUTE_ARGV_TOTAL_BYTES, 512 * 1024);
@@ -332,6 +359,47 @@ mod tests {
         assert_eq!(
             CONTROL_PLANE_PERMITS + EXECUTION_PERMITS,
             MAX_CONCURRENT_REQUESTS
+        );
+    }
+
+    #[test]
+    fn an_ordinary_binary_command_result_fits_inside_one_response_frame() {
+        // The regression that motivated `JSON_ESCAPE_WORST_CASE`: a command that
+        // writes its entire stdout budget of NUL bytes exits successfully, and its
+        // result must still fit, or an ordinary command would produce a frame the
+        // transport refuses to write.
+        let raw = MAX_COMMAND_STDOUT_BYTES;
+        let rendered = serde_json::to_string(&"\0".repeat(raw)).unwrap();
+        let framed = serde_json::json!({"content":[{"type":"text","text":rendered}]});
+        assert!(
+            framed.to_string().len() <= MAX_MCP_RESPONSE_FRAME_BYTES,
+            "measured worst-case command frame {} must fit in {MAX_MCP_RESPONSE_FRAME_BYTES}",
+            framed.to_string().len()
+        );
+        // The declared factor must not be optimistic about the measurement. The first
+        // serialization pass alone costs exactly 6 bytes per control byte (plus the
+        // two surrounding quotes); the second pass re-escapes each backslash,
+        // which is what makes the full frame 7x.
+        assert!(
+            rendered.len() <= raw * 6 + 2,
+            "measured first-pass size {} exceeds 6x plus quotes",
+            rendered.len()
+        );
+        assert!(
+            framed.to_string().len() <= raw * JSON_ESCAPE_WORST_CASE + 4096,
+            "measured frame size {} exceeds the declared factor {JSON_ESCAPE_WORST_CASE}",
+            framed.to_string().len()
+        );
+    }
+
+    #[test]
+    fn a_maximum_read_file_result_fits_inside_one_response_frame() {
+        let raw = MAX_READ_FILE_BYTES;
+        let framed = serde_json::json!({"content":[{"type":"text","text":"\0".repeat(raw)}]});
+        assert!(
+            framed.to_string().len() <= MAX_MCP_RESPONSE_FRAME_BYTES,
+            "measured worst-case read_file frame {} must fit in {MAX_MCP_RESPONSE_FRAME_BYTES}",
+            framed.to_string().len()
         );
     }
 
@@ -362,10 +430,10 @@ mod tests {
     fn a_resource_error_stays_small_and_never_echoes_caller_content() {
         // The worst realistic detail is still a fixed sentence; nothing derived
         // from a request is ever rendered.
-        let error = ResourceLimitError {
-            limit: ResourceLimit::McpRequestFrame,
-            detail: "request frame exceeded the maximum and was discarded",
-        };
+        let error = ResourceLimitError::new(
+            ResourceLimit::McpRequestFrame,
+            "request frame exceeded the maximum and was discarded",
+        );
         assert!(error.to_string().len() < 256);
         assert_eq!(error.limit(), ResourceLimit::McpRequestFrame);
     }

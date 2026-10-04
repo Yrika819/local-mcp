@@ -510,16 +510,7 @@ pub(crate) async fn run_tracked_with_path(
         .context("failed to start primary command")
         .map_err(RunError::not_started)?;
 
-    if let Some(bytes) = stdin
-        && let Some(mut child_stdin) = group.take_stdin()
-    {
-        child_stdin
-            .write_all(bytes)
-            .await
-            .map_err(|error| RunError::new(error.into(), true, false))?;
-    }
-
-    let capture = terminate_and_capture_bounded(&mut group).await;
+    let capture = terminate_and_capture_bounded(&mut group, stdin).await;
     let output = match capture.output {
         Ok(output) => output,
         Err(failure) => {
@@ -527,7 +518,7 @@ pub(crate) async fn run_tracked_with_path(
             // and the failure says nothing about whether the requested command
             // performed its side effects.
             return Err(RunError::new(
-                anyhow::Error::new(failure),
+                failure.into_anyhow(),
                 true,
                 capture.leader_finished,
             ));
@@ -962,8 +953,12 @@ impl CaptureState {
 
 /// Which of a child's two output pipes a bound applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "asserted by the resource bounds tests")
+)]
 #[repr(usize)]
-enum CaptureStream {
+pub(crate) enum CaptureStream {
     Stdout = 0,
     Stderr = 1,
 }
@@ -1074,10 +1069,19 @@ async fn cleanup_bounded_child(
 /// diagnostic reporting a rejected stream stays small and bounded: it never
 /// echoes the output that was discarded, the offending argv, or a path list.
 #[derive(Debug)]
-enum CaptureFailure {
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "asserted by the resource bounds tests")
+)]
+pub(crate) enum CaptureFailure {
     /// A stream produced more bytes than its bound allows. The whole process
     /// group has already been terminated before this value is constructed.
-    OutputLimit { stream: CaptureStream },
+    ///
+    /// The typed [`crate::resource_limits::ResourceLimitError`] is carried rather
+    /// than flattened to text, because the fallback classifier must recognise it
+    /// as a terminal resource failure instead of re-deriving a verdict from the
+    /// very output the host just discarded.
+    OutputLimit(crate::resource_limits::ResourceLimitError),
     /// The child exposed no pipe for a stream the host must capture.
     MissingPipe,
     /// The host could not observe termination, or could not read a pipe.
@@ -1086,35 +1090,58 @@ enum CaptureFailure {
 
 impl std::fmt::Display for CaptureFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::resource_limits::ResourceLimit;
         match self {
             // The message states that output was discarded rather than truncated
             // into something that looks like complete stdout/stderr.
-            Self::OutputLimit {
-                stream: CaptureStream::Stdout,
-            } => write!(
-                formatter,
-                "{}: output was discarded and the process group was terminated",
-                ResourceLimit::CommandStdout
-            ),
-            Self::OutputLimit {
-                stream: CaptureStream::Stderr,
-            } => write!(
-                formatter,
-                "{}: output was discarded and the process group was terminated",
-                ResourceLimit::CommandStderr
-            ),
+            Self::OutputLimit(error) => write!(formatter, "{error}"),
             Self::MissingPipe => formatter.write_str("command has no output pipe"),
             Self::Io(error) => write!(formatter, "command output capture failed: {error}"),
         }
     }
 }
 
-impl std::error::Error for CaptureFailure {}
+impl std::error::Error for CaptureFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Exposed so `anyhow::Error::downcast_ref` finds the typed resource
+            // marker through this wrapper.
+            Self::OutputLimit(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::MissingPipe => None,
+        }
+    }
+}
 
 impl CaptureFailure {
     fn output_limit(stream: CaptureStream) -> Self {
-        Self::OutputLimit { stream }
+        use crate::resource_limits::ResourceLimit;
+        let limit = match stream {
+            CaptureStream::Stdout => ResourceLimit::CommandStdout,
+            CaptureStream::Stderr => ResourceLimit::CommandStderr,
+        };
+        Self::OutputLimit(crate::resource_limits::ResourceLimitError::new(
+            limit,
+            "output was discarded and the process group was terminated",
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_limit_error_for_test(stream: CaptureStream) -> anyhow::Error {
+        Self::output_limit(stream).into_anyhow()
+    }
+
+    /// Convert into the `anyhow` error the rest of the host carries.
+    ///
+    /// An overflow is *unwrapped* to its [`crate::resource_limits::ResourceLimitError`]
+    /// rather than wrapped in this type. `anyhow::Error::downcast_ref` searches
+    /// its own context chain, not an inner error's `source()` chain, so wrapping
+    /// would hide the typed marker from both the fallback classifier and the
+    /// transport's resource-limit code.
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::OutputLimit(error) => anyhow::Error::new(error),
+            other => anyhow::Error::new(other),
+        }
     }
 }
 
@@ -1146,11 +1173,12 @@ struct GenericCapture {
 /// `limit + 1` is rejected without ever residing in memory. When either bound is
 /// breached the process group is terminated rather than merely abandoned, because
 /// stopping the read while the child runs would leave descendants alive.
-async fn terminate_and_capture_bounded(group: &mut ProcessGroup) -> GenericCapture {
+async fn terminate_and_capture_bounded(
+    group: &mut ProcessGroup,
+    stdin: Option<&[u8]>,
+) -> GenericCapture {
     use crate::resource_limits::{MAX_COMMAND_STDERR_BYTES, MAX_COMMAND_STDOUT_BYTES};
 
-    // Closing stdin first lets a child that reads to EOF finish promptly.
-    drop(group.take_stdin());
     let Some(stdout) = group.take_stdout() else {
         return GenericCapture {
             output: Err(CaptureFailure::MissingPipe),
@@ -1178,6 +1206,36 @@ async fn terminate_and_capture_bounded(group: &mut ProcessGroup) -> GenericCaptu
         CaptureStream::Stderr,
         Arc::clone(&state),
     )));
+
+    // Stdin is written only after both readers exist. A child that writes more
+    // than the pipe buffer before draining stdin would otherwise block on its
+    // own write while the host blocks on `write_all`, deadlocking with no
+    // deadline to break it. The write is bounded for the same reason.
+    if let Some(bytes) = stdin {
+        let Some(mut child_stdin) = group.take_stdin() else {
+            let leader_finished =
+                cleanup_generic_child(group, &mut stdout_task, &mut stderr_task).await;
+            return GenericCapture {
+                output: Err(CaptureFailure::MissingPipe),
+                leader_finished,
+            };
+        };
+        let stdin_deadline =
+            tokio::time::Instant::now() + crate::resource_limits::COMMAND_CLEANUP_GRACE;
+        let written = tokio::time::timeout_at(stdin_deadline, child_stdin.write_all(bytes)).await;
+        if !matches!(written, Ok(Ok(()))) {
+            let leader_finished =
+                cleanup_generic_child(group, &mut stdout_task, &mut stderr_task).await;
+            return GenericCapture {
+                output: Err(CaptureFailure::Io(std::io::Error::other(
+                    "command stdin write failed or timed out",
+                ))),
+                leader_finished,
+            };
+        }
+    }
+    // Closing stdin lets a child that reads to EOF finish promptly.
+    drop(group.take_stdin());
 
     let termination = loop {
         if let Some(stream) = state.overflowed_stream() {
@@ -1349,22 +1407,14 @@ pub(crate) async fn run_unrestricted_inner(
     let mut group = ProcessGroup::spawn(&mut process)
         .context("failed to start unsandboxed command")
         .map_err(|error| RunError::new(error, false, false))?;
-    if let Some(bytes) = stdin
-        && let Some(mut child_stdin) = group.take_stdin()
-    {
-        child_stdin
-            .write_all(bytes)
-            .await
-            .map_err(|error| RunError::new(error.into(), true, false))?;
-    }
-    let capture = terminate_and_capture_bounded(&mut group).await;
+    let capture = terminate_and_capture_bounded(&mut group, stdin).await;
     let output = match capture.output {
         Ok(output) => output,
         Err(failure) => {
             // See `run_tracked_with_path`: an output bound is never evidence that
             // the command did not run.
             return Err(RunError::new(
-                anyhow::Error::new(failure),
+                failure.into_anyhow(),
                 true,
                 capture.leader_finished,
             ));

@@ -43,7 +43,7 @@ than a test.
 | Constant | Value | Derivation |
 | --- | --- | --- |
 | `MAX_MCP_REQUEST_FRAME_BYTES` | 8 MiB | Largest realistic request is a `write_file` (≤256 KiB) plus argv (≤512 KiB) plus a plan proposal (≤256 KiB) plus evidence (≤64 KiB) plus JSON overhead ≈1.1 MiB. 8 MiB is ≈7× margin and still cannot admit an accidental multi-megabyte blob. |
-| `MAX_MCP_RESPONSE_FRAME_BYTES` | 16 MiB | Must exceed the largest single method result after JSON escaping: `read_file` 8 MiB, a command result (4 MiB stdout + 1 MiB stderr), `list_directory` 4 MiB, and base64 image data (8 MiB raw → 10.67 MiB). 16 MiB clears all of them with margin. |
+| `MAX_MCP_RESPONSE_FRAME_BYTES` | 16 MiB | Must exceed the largest method result **after JSON escaping**. See §1.7: a command result is escaped twice, so its frame is up to 7× its raw size. |
 
 The request frame is the outer defense for every input-side bound below. Method
 level bounds are the inner, early rejections that avoid expensive setup.
@@ -52,8 +52,8 @@ level bounds are the inner, early rejections that avoid expensive setup.
 
 | Constant | Value | Derivation |
 | --- | --- | --- |
-| `MAX_COMMAND_STDOUT_BYTES` | 4 MiB | Comfortably above real build/test diagnostics (the full `cargo test` suite for this repository is a few hundred KiB) while remaining bounded. |
-| `MAX_COMMAND_STDERR_BYTES` | 1 MiB | Matches the existing `TRUSTED_GIT_STDERR_LIMIT` precedent for diagnostics. |
+| `MAX_COMMAND_STDOUT_BYTES` | 1536 KiB | Comfortably above real build/test diagnostics (the full `cargo test` suite for this repository is a few hundred KiB) while remaining bounded. |
+| `MAX_COMMAND_STDERR_BYTES` | 256 KiB | Diagnostics. Trusted-Git and model/agent paths keep their own, stricter caps and are unchanged. |
 
 These bound the **generic** path only. Trusted-Git and model/agent paths keep
 their own, stricter, already-enforced caps and are **not** changed.
@@ -62,16 +62,30 @@ their own, stricter, already-enforced caps and are **not** changed.
 
 | Constant | Value | Derivation |
 | --- | --- | --- |
-| `MAX_READ_FILE_BYTES` | 8 MiB | Larger than any ordinary source file; comfortably below the 16 MiB response cap. |
-| `MAX_IMAGE_RAW_BYTES` | 8 MiB | Bounds the **raw** file before base64. base64 expands by 4/3, giving 10.67 MiB < 16 MiB. |
+| `MAX_READ_FILE_BYTES` | 2 MiB | Larger than any ordinary source file; must fit its frame after escaping (§1.7). |
+| `MAX_IMAGE_RAW_BYTES` | 8 MiB | Bounds the **raw** file before base64. base64 expands by 4/3 to 10.67 MiB, and the base64 alphabet needs no JSON escaping, so it stays inside the frame. |
 | `MAX_WRITE_FILE_CONTENT_BYTES` | 256 KiB | Matches the Writer's existing `MAX_WRITE_CONTENT_BYTES`. |
-| `MAX_WRITE_PREIMAGE_BYTES` | 8 MiB | Bounds the existing file read to build a preimage/diff. |
+| `MAX_WRITE_PREIMAGE_BYTES` | 2 MiB | Bounds the existing file read to build a preimage/diff. |
 | `MAX_DIRECTORY_ENTRIES` | 20 000 | Entry-count bound. |
-| `MAX_DIRECTORY_OUTPUT_BYTES` | 4 MiB | Aggregate rendered-listing byte bound. |
+| `MAX_DIRECTORY_OUTPUT_BYTES` | 2 MiB | Aggregate rendered-listing byte bound. |
 
 `MAX_DIRECTORY_ENTRIES` and `MAX_DIRECTORY_OUTPUT_BYTES` are deliberately
 *independent*: 20 000 short names stay under the byte cap, while a smaller number
 of very long names can breach it. Neither is derived from the other.
+
+### 1.7 JSON escape expansion
+
+`serde_json` renders a control byte as ` ```0 ` (6 bytes). A command result is
+serialized **twice** — once by `render_output`, then again when `text_result`
+embeds it as a string value — so the second pass re-escapes each backslash and a
+raw byte costs up to **7**.
+
+This factor is named (`JSON_ESCAPE_WORST_CASE`) and every text-returning bound is
+asserted against it at compile time. A bound derived from raw byte counts alone
+is wrong in a way that matters: `head -c 4194304 /dev/zero` is an ordinary
+command that exits successfully, and its result serializes to a frame several
+times larger than its own byte count. A test measures the real expansion so the
+declared factor cannot drift into optimism.
 
 ### 1.4 Command arguments
 
@@ -137,10 +151,20 @@ On overflow the sequence is fixed:
 3. bounded cleanup waits for leader termination within a cleanup deadline and
    aborts both capture tasks so no reader task leaks;
 4. lifecycle evidence is recorded (`command_started = true`);
-5. a typed `ResourceLimit` failure is returned.
+5. a typed `ResourceLimitError` failure is returned.
 
 Stopping capture alone would leave descendants running and the group alive, so
 termination is not optional.
+
+**stdin is written only after both readers exist**, and under a deadline. A child
+that writes more than the pipe buffer before draining stdin would otherwise block
+on its own write while the host blocks on `write_all`: a deadlock with no deadline
+to break it, since the generic path deliberately has no command timeout.
+
+The overflow failure carries the typed `ResourceLimitError` rather than wrapping
+it, because `anyhow::Error::downcast_ref` searches its own context chain and not
+an inner error's `source()` chain. Wrapping it would hide the marker from both
+the fallback classifier and the transport's resource-limit code.
 
 ## 4. Side-effect semantics on overflow
 
@@ -176,10 +200,19 @@ Three states are distinguished explicitly:
 Entry points: `store_job` (insert), `poll_job` (read + finished removal),
 `stop_job` (remove + abort), and Session shutdown.
 
-Admission is checked **before** a new job is inserted, after GC. If either the
-per-Session or the global ceiling is reached, creating a *new* job fails with a
-deterministic resource-limit error. A running job is never evicted to make room,
-and one Session can never evict another Session's job.
+Admission is decided **under one lock** as `can_admit` followed by `insert`. The
+decision is made by `store_job`, which receives an already-spawned handle: a
+refused job is explicitly terminated before the error is returned, because
+dropping a `JoinHandle` detaches the task rather than stopping the child, which
+would leave a live process with no registry entry and no way to stop it.
+
+`execute` deliberately performs **no** capacity pre-check: a command that finishes
+inside the foreground window never creates a job, and refusing it because the
+registry is full would couple the most-used tool to background-job occupancy.
+
+If either the per-Session or the global ceiling is reached, creating a *new* job
+fails with a deterministic resource-limit error. A running job is never evicted
+to make room, and one Session can never evict another Session's job.
 
 Output bounds apply **at capture time**, so a retained background result already
 obeys `MAX_COMMAND_STDOUT_BYTES` / `MAX_COMMAND_STDERR_BYTES`. Becoming a
@@ -202,16 +235,27 @@ terminates a running process, and it never touches another Session's running job
 Elapsed time uses a monotonic clock (`tokio::time::Instant` in production, an
 injectable source in tests) so wall-clock changes cannot corrupt expiry.
 
-## 7. Session shutdown
+## 7. Job shutdown
 
-`local-mcp stop` and the equivalent Session shutdown path:
+Audit finding, and the reason this section differs from the obvious design:
+**Resource Bounds V1 has no Session-teardown signal.** `local-mcp start` and
+`local-mcp mcp` are separate processes; exiting the start UI does not notify the
+MCP server, and the durable session record is not removed on exit. There is no
+`local-mcp stop` subcommand. Inventing an IPC notification would be a protocol
+change outside this scope.
 
-1. terminate still-running jobs **for that Session only**, using the existing
-   process-group termination;
-2. remove that Session's retained finished results;
-3. never touch another Session's jobs.
+What exists instead:
 
-There is no system-wide process killer.
+* `JobRegistry::release_session` is the scoped teardown operation: it terminates
+  still-running jobs **for that Session only**, removes its retained finished
+  results, and never touches another Session's jobs. It is exercised directly by
+  tests.
+* Explicit **server** shutdown (stdin EOF) terminates and drops every job the
+  server holds. That is the shutdown the process actually has.
+
+Retention in the absence of a Session signal is therefore bounded by the
+per-Session ceiling, the global ceiling and the TTL, rather than by teardown.
+Abnormal parent death is explicitly out of scope (§16 of the task, and below).
 
 ## 8. MCP request framing
 
@@ -237,15 +281,17 @@ adds no new read queue: the read loop remains the single reader.
 
 ## 9. MCP response framing
 
-Method-level bounds (§1.3, §1.2, §1.4) are enforced early enough that a global
-response size is mechanically bounded. As defence in depth, `write_message`
-serializes through a counting writer and asserts the serialized frame is within
-`MAX_MCP_RESPONSE_FRAME_BYTES` **before** any byte is written. If a response would
-exceed the cap it is replaced by a bounded resource-limit error response rather
-than silently truncated — a partially written JSON frame is never emitted.
+Method-level bounds (§1.2, §1.3, §1.4) are enforced early enough that a global
+response size is mechanically guaranteed, with JSON escape expansion accounted
+for (§1.7). As defence in depth, `write_message` asserts the serialized frame is
+within `MAX_MCP_RESPONSE_FRAME_BYTES` **before** any byte is written.
 
-The response channel remains bounded at 64 `Value`s; that is a framing guarantee,
-not a memory guarantee, which is exactly why the per-method bounds above matter.
+When a frame would exceed the cap it is **replaced**, not truncated and not
+propagated: the writer substitutes a bounded resource-limit error frame and
+continues. Failing the writer task instead would drop the response receiver, after
+which every later response is discarded silently while the server keeps running
+the client's commands — one oversized result would wedge the whole session. The
+writer is therefore never allowed to end on a per-frame failure.
 
 ## 10. Error responses
 
