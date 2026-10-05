@@ -348,6 +348,26 @@ mod unix {
     }
 
     #[test]
+    fn a_bounded_blocking_command_terminates_on_output_overflow() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("head -c 67108865 /dev/zero");
+        let output = run_bounded_blocking(&mut command, Duration::from_secs(30))
+            .expect("the bounded blocking command must run");
+        assert!(
+            output.output_overflow,
+            "output beyond the trusted-Git cap must be reported as a resource overflow"
+        );
+        assert!(
+            output.capture_incomplete,
+            "overflow must never be returned as a complete stream"
+        );
+        assert!(
+            output.stdout.len() <= crate::sandbox::TRUSTED_GIT_STDOUT_LIMIT,
+            "the reader must retain no more than the trusted-Git output limit"
+        );
+    }
+
+    #[test]
     fn a_timed_out_blocking_command_leaves_no_descendant_running() {
         // The timeout path must terminate the tree, not merely abandon it. The
         // leader here backgrounds a descendant and then blocks, so a runner that
