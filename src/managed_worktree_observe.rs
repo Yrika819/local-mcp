@@ -14,12 +14,22 @@ use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crate::managed_worktree_discovery::{
     ALL_IN_PROGRESS_OPERATIONS, DiscoveryError, InProgressOperation, PathObservation,
     PrimaryWorkspaceStatus, RepositoryObservation, WorktreeInventory,
     parse_worktree_list_porcelain_z, same_path_identity,
 };
+
+/// Deadline for one read-only Git observation.
+///
+/// Every call on this seam is a short, local, non-networked query, and one
+/// repository observation fans out to roughly a dozen of them in sequence. The
+/// bound is therefore per invocation, not per observation, and is generous
+/// enough for a very large checkout while still refusing to hold a runtime thread
+/// forever on a wedged Git.
+const READ_ONLY_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Git subcommands that have an exact read-only argument form below.
 pub(crate) const READ_ONLY_GIT_SUBCOMMANDS: [&str; 5] = [
@@ -114,15 +124,31 @@ impl ReadOnlyGit for HostGit {
                 command.env_remove(key);
             }
         }
-        let output = command
-            .args(["-c", "core.fsmonitor=false", "--no-optional-locks"])
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .map_err(|error| DiscoveryError::GitCommand {
+        // Bounded and tree-contained rather than a bare blocking `output()`: this
+        // seam runs from a runtime thread, so a wedged Git would otherwise hold
+        // that thread forever with no way to reclaim it. A deadline is terminal
+        // for the attempt and is reported as an unavailable observation, never as
+        // a permission or safety verdict, and never as proof that Git did not run.
+        let output = crate::process_blocking::run_bounded_blocking(
+            command
+                .args(["-c", "core.fsmonitor=false", "--no-optional-locks"])
+                .args(args)
+                .current_dir(cwd),
+            READ_ONLY_GIT_TIMEOUT,
+        )
+        .map_err(|error| DiscoveryError::GitCommand {
+            command: args.join(" "),
+            detail: error.to_string(),
+        })?;
+        if output.timed_out {
+            return Err(DiscoveryError::GitCommand {
                 command: args.join(" "),
-                detail: error.to_string(),
-            })?;
+                detail: format!(
+                    "git did not finish within {}s and its process tree was terminated",
+                    READ_ONLY_GIT_TIMEOUT.as_secs()
+                ),
+            });
+        }
         Ok(GitCommandOutput {
             stdout: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),

@@ -59,6 +59,10 @@ use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use crate::exec_ready::BusyProgramRetry;
+#[cfg(windows)]
+use crate::process_job::Job;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
 
 /// First poll interval used when waiting for a group leader to terminate.
 ///
@@ -85,24 +89,45 @@ pub(crate) struct ProcessGroup {
     child: Child,
     #[cfg(unix)]
     ownership: ProcessGroupOwnership,
+    /// Windows tree containment, when the host allowed a Job to be created.
+    ///
+    /// This is `Option` because job assignment can legitimately be refused. When
+    /// it is absent the lease degrades to direct-child termination, which is what
+    /// this type did on Windows before Job Objects existed and is strictly weaker
+    /// than containment — never stronger, and never claimed as containment.
+    #[cfg(windows)]
+    job: Option<Job>,
 }
 
 impl ProcessGroup {
     /// Spawn `command` as the leader of a new process group owned by this lease.
     ///
-    /// The child is placed in a fresh group whose identifier is the leader's own
-    /// process identifier, so no process outside this tree can be a member.
+    /// On Unix the child is placed in a fresh group whose identifier is the
+    /// leader's own process identifier, so no process outside this tree can be a
+    /// member. On Windows the child is created suspended, put in a Job Object, and
+    /// only then resumed; see [`crate::process_job`] for why.
     pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(unix)]
-        command.process_group(0);
-        let child = spawn_ready_to_exec(command)?;
-        #[cfg(unix)]
-        let ownership = ProcessGroupOwnership::held(child.id().unwrap_or(0) as libc::pid_t);
-        Ok(Self {
-            child,
-            #[cfg(unix)]
-            ownership,
-        })
+        {
+            command.process_group(0);
+            let child = spawn_ready_to_exec(command)?;
+            let ownership = ProcessGroupOwnership::held(child.id().unwrap_or(0) as libc::pid_t);
+            Ok(Self { child, ownership })
+        }
+        #[cfg(windows)]
+        {
+            spawn_contained(command)
+        }
+    }
+
+    /// Whether this lease's whole execution tree is contained on this platform.
+    ///
+    /// Unix always answers `true`: the group is owned outright. Windows answers
+    /// `true` only when the host accepted the Job assignment, so a test can prove
+    /// containment rather than infer it.
+    #[cfg(windows)]
+    pub(crate) fn owns_process_tree(&self) -> bool {
+        self.job.as_ref().is_some_and(Job::is_assigned)
     }
 
     /// The group leader's process identifier, which is also the group identifier.
@@ -136,6 +161,12 @@ impl ProcessGroup {
     pub(crate) fn terminate(&mut self) {
         #[cfg(unix)]
         self.ownership.terminate_group();
+        // Job termination reaches every descendant, not just the leader, so the
+        // direct-child kill below is belt and braces rather than the mechanism.
+        #[cfg(windows)]
+        if let Some(job) = self.job.as_ref() {
+            job.terminate();
+        }
         let _ = self.child.start_kill();
     }
 
@@ -181,6 +212,14 @@ impl Drop for ProcessGroup {
         // leader is reapable and the identifier belongs to the kernel again.
         #[cfg(unix)]
         self.ownership.terminate_group();
+        // Terminating the Job here rather than relying only on the handle close
+        // makes teardown synchronous, so a caller that drops the lease has
+        // requested tree teardown before this frame returns. The handle close that
+        // follows is still the backstop that covers abnormal owner death.
+        #[cfg(windows)]
+        if let Some(job) = self.job.as_ref() {
+            job.terminate();
+        }
         let _ = self.child.start_kill();
     }
 }
@@ -197,6 +236,70 @@ fn spawn_ready_to_exec(command: &mut Command) -> io::Result<Child> {
             result => return result,
         }
     }
+}
+
+/// Spawn a child into a Job Object without ever letting it run uncontained.
+///
+/// The ordering is the whole point, so it is spelled out rather than composed:
+///
+/// 1. Create the Job, so containment exists before any process does.
+/// 2. Spawn with `CREATE_SUSPENDED`, so the child executes no user code at all.
+/// 3. Assign the child to the Job, while it is provably still inert.
+/// 4. Resume it, which is the first instant it may do anything.
+///
+/// If the Job cannot be created the spawn fails closed rather than running an
+/// uncontained child: containment is the guarantee being claimed here, and a
+/// fallback would silently not be it. If only the *assignment* is refused the
+/// child has still run nothing, so it is resumed and the lease degrades to
+/// direct-child termination, which is recorded rather than assumed.
+#[cfg(windows)]
+fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    let mut job = Job::create()?;
+    command.creation_flags(CREATE_SUSPENDED);
+    let child = spawn_ready_to_exec(command)?;
+    match assign_and_resume(&mut job, &child) {
+        Ok(true) => Ok(ProcessGroup {
+            child,
+            job: Some(job),
+        }),
+        // Containment was refused. The child has not run, so resuming it and
+        // continuing with direct-child termination is safe, and the lease records
+        // that the tree is not contained.
+        Ok(false) => Ok(ProcessGroup { child, job: None }),
+        Err(error) => {
+            // The child is suspended and contained, so terminating the Job is both
+            // sufficient and safe: nothing it could spawn exists yet.
+            job.terminate();
+            let _ = child.start_kill();
+            Err(error)
+        }
+    }
+}
+
+/// Resume `child`, reporting whether it ended up contained.
+///
+/// Assignment failure is not an error: the child is still suspended and has run
+/// nothing, so it is resumed either way and the caller records whether the tree
+/// is contained. Only a failure to *resume* is an error, because that leaves a
+/// live process that can never be observed.
+#[cfg(windows)]
+fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("spawned child has no process identifier"))?;
+    // Safety: `raw_handle` is the process handle `spawn` returned and remains valid
+    // while `child` is borrowed.
+    let handle = child
+        .raw_handle()
+        .ok_or_else(|| io::Error::other("spawned child has no process handle"))?;
+    let assigned = job.assign(handle as HANDLE, pid).is_ok();
+    Job::resume(pid)?;
+    Ok(assigned)
 }
 
 /// Bounded output of a terminated process group.

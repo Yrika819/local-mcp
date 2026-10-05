@@ -33,7 +33,10 @@ mod orchestrator_error;
 #[cfg(windows)]
 mod pipe_security;
 mod planner;
+mod process_blocking;
 mod process_group;
+#[cfg(windows)]
+mod process_job;
 mod readonly_worker;
 mod replanner;
 mod resource_limits;

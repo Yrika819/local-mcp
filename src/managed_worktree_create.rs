@@ -26,6 +26,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crate::managed_worktree::{
     ManagedWorktreeCreationIntent, managed_branch_name, managed_lock_reason,
@@ -38,6 +39,14 @@ use crate::managed_worktree_observe::is_git_environment_variable;
 /// Kept as a literal so the runtime self-check below can compare against it
 /// position by position. A future edit that widens this list is a visible diff
 /// *and* a self-check failure.
+/// Deadline for one `git worktree add` invocation.
+///
+/// This is a local, non-networked operation on an already-reconciled repository.
+/// The bound exists so a wedged Git cannot hold a runtime thread forever and
+/// strand the durable creation sequence before reconciliation ever runs; it is
+/// not a statement that the operation is expected to be slow.
+const MANAGED_CREATION_TIMEOUT: Duration = Duration::from_secs(120);
+
 const FROZEN_GIT_OPTION_HEAD: [&str; 5] = [
     "-c",
     "core.fsmonitor=false",
@@ -311,13 +320,30 @@ impl ManagedWorktreeCreator for HostWorktreeCreator {
                 command.env_remove(key);
             }
         }
-        let output = command
-            .args(creation.argv())
-            .current_dir(primary_root)
-            .output()
-            .map_err(|error| ManagedWorktreeCreationError::Spawn {
-                detail: error.to_string(),
-            })?;
+        // Bounded and tree-contained rather than a bare blocking `output()`.
+        //
+        // This is the mutating `git worktree add`, so the deadline must not be
+        // mistaken for evidence about side effects. A timeout means Git was
+        // started and its outcome is **unknown**: the attempt stays consumed and
+        // the sequence blocks for reconciliation, exactly as an ambiguous
+        // observation already does. It never becomes "the mutation did not
+        // happen", and it never replenishes the retry budget.
+        let output = crate::process_blocking::run_bounded_blocking(
+            command.args(creation.argv()).current_dir(primary_root),
+            MANAGED_CREATION_TIMEOUT,
+        )
+        .map_err(|error| ManagedWorktreeCreationError::Spawn {
+            detail: error.to_string(),
+        })?;
+        if output.timed_out {
+            return Err(ManagedWorktreeCreationError::Spawn {
+                detail: format!(
+                    "git worktree add did not finish within {}s; its process tree was \
+                     terminated and the outcome of this attempt is unknown",
+                    MANAGED_CREATION_TIMEOUT.as_secs()
+                ),
+            });
+        }
         Ok(ManagedWorktreeCreationOutcome {
             exit_code: output.status.code(),
             stdout: output.stdout,
