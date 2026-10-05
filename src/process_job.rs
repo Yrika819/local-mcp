@@ -50,8 +50,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
@@ -211,5 +212,33 @@ impl Job {
     /// job assignment shows up as a failed guarantee instead of a silent one.
     pub(crate) fn is_assigned(&self) -> bool {
         self.assigned
+    }
+
+    /// How many processes the kernel currently counts in this Job.
+    ///
+    /// This is the witness the Job Object tests use. The count is reported by the
+    /// kernel itself and covers the *whole* Job, so it observes the entire tree
+    /// rather than a direct child, and it cannot be satisfied by an idle or
+    /// merely unreaped process. Reaching zero means no process in the tree is
+    /// still running.
+    #[cfg(test)]
+    pub(crate) fn active_processes(&self) -> io::Result<u32> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // Safety: the structure is initialized and the length matches the
+        // structure the API is being asked to fill.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle() as HANDLE,
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut accounting).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                    .unwrap_or(u32::MAX),
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(accounting.ActiveProcesses)
     }
 }

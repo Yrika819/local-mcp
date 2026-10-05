@@ -29,14 +29,16 @@
 //!
 //! So this module never signals a remembered identifier after a reap:
 //!
-//! * The identifier is signalled **only** while [`std::process::Child::try_wait`]
-//!   still reports the child as running. That is exactly the window in which the
-//!   leader is unreaped and the identifier provably still belongs to this tree.
-//! * Once the child has been observed to have exited, the result is returned
-//!   without any signal at all.
+//! * The identifier is signalled **only** while the group leader is unreaped.
+//!   While the leader is still running that is automatic; once it has exited, exit
+//!   is observed with `waitid(WNOWAIT)`, which reports termination without
+//!   consuming the status, so the leader stays unreaped and the kernel keeps the
+//!   identifier reserved.
+//! * The reap happens only after the group has been signalled, never before.
 //!
 //! That is the same rule the asynchronous path enforces, expressed for a
-//! blocking caller.
+//! blocking caller, and it is why this seam can terminate a tree on ordinary
+//! completion without reintroducing the recycled-identifier hazard.
 //!
 //! # Why the pipes are drained on their own threads
 //!
@@ -153,32 +155,60 @@ fn join_reader(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
     handle.join().unwrap_or_default()
 }
 
-/// Wait for `child`, terminating its tree if `timeout` expires.
+/// Wait for `child`, terminating its tree when the leader exits or the deadline
+/// expires.
 ///
-/// Returns the exit status and whether the deadline expired. The group signal is
-/// issued only while `try_wait` still reports the child as running, which is
-/// precisely the window in which the identifier still belongs to this tree.
+/// Returns the exit status and whether the deadline expired.
+///
+/// # Why the group is signalled even on ordinary completion
+///
+/// A command may background a descendant and exit immediately. Leaving that
+/// descendant running would make this seam weaker than the asynchronous path,
+/// which terminates the group once the leader is gone. So the group is signalled
+/// on **both** paths.
+///
+/// # Why that is still safe
+///
+/// The group identifier is only signalled while the leader is **unreaped**, which
+/// is exactly the window in which the kernel cannot have recycled the identifier
+/// to an unrelated process group. On the timeout path the child is still running,
+/// so it is trivially unreaped. On the completion path the leader has exited but
+/// has deliberately *not* been reaped: exit is observed with
+/// `waitid(WNOWAIT)`, which reports a child's termination without consuming its
+/// status. The identifier is therefore still reserved when the group is signalled,
+/// and the reap happens only afterwards.
+///
+/// Reaping first and then signalling a remembered identifier is precisely the
+/// V2.1.1 hazard, and it is why this module observes exit without consuming it.
 #[cfg(unix)]
 fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
     use std::os::unix::process::ExitStatusExt;
 
     let deadline = Instant::now() + timeout;
     let mut interval = POLL_START;
-    let status = loop {
-        // Safety: `try_wait` only observes. A `Some` result means the child has
-        // exited and been reaped, and the loop returns there without ever
-        // signalling the identifier afterwards.
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            // The child can no longer be observed. Treat the deadline as expired
-            // and terminate the tree rather than leaving it unowned.
+    loop {
+        match has_exited_unreaped(child.id()) {
+            // The leader is gone but unreaped, so the group identifier is still
+            // reserved and the group may be signalled.
+            Ok(true) => {
+                terminate_tree(child);
+                return match child.wait() {
+                    Ok(status) => (status, false),
+                    Err(_) => (ExitStatus::from_raw(0), false),
+                };
+            }
+            Ok(false) => {}
+            // The child can no longer be observed. Terminate the tree rather than
+            // leaving it unowned, and report the deadline as expired so the caller
+            // keeps the outcome unknown.
             Err(_) => {
                 terminate_tree(child);
+                let _ = child.wait();
                 return (ExitStatus::from_raw(0), true);
             }
         }
         if Instant::now() >= deadline {
+            // Still running, therefore still unreaped: the identifier is ours.
             terminate_tree(child);
             return match child.wait() {
                 Ok(status) => (status, true),
@@ -187,8 +217,50 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
         }
         std::thread::sleep(interval);
         interval = std::cmp::min(interval * 2, POLL_MAX);
+    }
+}
+
+/// Report whether `pid` has terminated **without reaping it**.
+///
+/// `WNOWAIT` leaves the exit status uncollected, so the kernel keeps the process
+/// identifier reserved and it cannot be handed to another process. That is the
+/// ownership proof the group signal depends on.
+#[cfg(unix)]
+fn has_exited_unreaped(pid: u32) -> io::Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // Safety: `waitid` only writes into the `siginfo_t` it is handed, and `P_PID`
+    // restricts the query to a single direct child of this process.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
     };
-    (status, false)
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // `libc` exposes the same union as plain fields on Apple and as accessors
+    // elsewhere, so the report is read through a helper rather than directly.
+    let reported = reported_child(&info);
+    Ok(reported != 0)
+}
+
+/// The child a termination report refers to, or `0` when nothing was reported.
+#[cfg(target_os = "macos")]
+fn reported_child(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
+}
+
+/// The child a termination report refers to, or `0` when nothing was reported.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn reported_child(info: &libc::siginfo_t) -> libc::pid_t {
+    // Safety: reading a field of a `siginfo_t` that `waitid` has just filled in.
+    unsafe { info.si_pid() }
 }
 
 /// Wait for `child`, terminating it if `timeout` expires.
@@ -226,9 +298,9 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
 
 /// Terminate the child's whole process group.
 ///
-/// Called only while the child is known to still be running, so the group
-/// identifier is still reserved by an unreaped leader and cannot have been
-/// recycled to another process group.
+/// Called only while the group leader is unreaped — either still running, or
+/// exited but observed with `WNOWAIT` — so the group identifier is still reserved
+/// by that leader and cannot have been recycled to another process group.
 #[cfg(unix)]
 fn terminate_tree(child: &mut Child) {
     let pid = child.id();

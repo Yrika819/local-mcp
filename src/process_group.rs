@@ -130,6 +130,19 @@ impl ProcessGroup {
         self.job.as_ref().is_some_and(Job::is_assigned)
     }
 
+    /// Kernel-reported count of processes still running in this lease's tree.
+    ///
+    /// Test-only witness. It observes the whole Job rather than a direct child,
+    /// and the kernel is the one deciding the count, so it cannot be satisfied by
+    /// an idle, suspended, or merely unreaped process.
+    #[cfg(all(test, windows))]
+    pub(crate) fn active_processes_for_test(&self) -> io::Result<u32> {
+        self.job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("this lease has no Job containment"))?
+            .active_processes()
+    }
+
     /// The group leader's process identifier, which is also the group identifier.
     #[cfg(all(test, unix))]
     pub(crate) fn leader_id(&self) -> u32 {

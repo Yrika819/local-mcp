@@ -79,6 +79,8 @@ mod phase0_fallback_tests;
 mod phase0_tests;
 #[cfg(test)]
 mod phase11_goal_run_tests;
+#[cfg(test)]
+mod platform_runtime_tests;
 #[cfg(all(test, unix))]
 mod process_group_ownership_tests;
 #[cfg(all(test, unix))]
