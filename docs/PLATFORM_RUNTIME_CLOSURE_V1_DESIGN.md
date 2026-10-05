@@ -49,8 +49,8 @@ Every production child spawn in the repository, after this design is applied:
 | 2 | `sandbox::run_unrestricted_inner` (host-native) | `ProcessGroup::spawn` | yes (Unix) / Job (Windows) | none by design |
 | 3 | `sandbox::run_unrestricted_clean_raw_with_limits` (trusted Git) | `ProcessGroup::spawn` | yes (Unix) / Job (Windows) | caller-supplied |
 | 4 | `agent::run_bounded_process_async` (model/agent) | `ProcessGroup::spawn` | yes (Unix) / Job (Windows) | caller-supplied |
-| 5 | `managed_worktree_observe::HostGit::run` | `std::process::Command::output()` | group (Unix) / direct child (Windows) | **30 s** |
-| 6 | `managed_worktree_create::HostWorktreeCreator::create` | `std::process::Command::output()` | group (Unix) / direct child (Windows) | **120 s** |
+| 5 | `managed_worktree_observe::HostGit::run` | bounded blocking runner | group (Unix) / Job (Windows) | **30 s** |
+| 6 | `managed_worktree_create::HostWorktreeCreator::create` | bounded blocking runner | group (Unix) / Job (Windows) | **120 s** |
 | 7 | `bubblewrap_support::probe` (Linux) | `std::process::Command::output()` | no | **none** |
 
 Sites 5 and 6 are bounded and contained after this design; site 7 is deliberately
@@ -113,11 +113,10 @@ that has not deliberately escaped containment.
 | **Host process graceful exit** | tree terminated | tree terminated | tree terminated |
 | **Host process abnormal death** | **residual gap, §6** | **residual gap, §6** | **tree terminated, §6** |
 
-Sites 1–4 are the four `ProcessGroup` paths and carry every row above. Sites 5 and
-6 are the blocking Managed Worktrees Git seams: they carry the same rows on Unix
-(their own process group, signalled on completion and on timeout), and on Windows
-they are bounded and direct-child terminated rather than Job-contained — a
-narrower guarantee, recorded here rather than glossed over. See §10.
+Sites 1–6 carry every lifecycle row above. Sites 5 and 6 use the blocking
+runner: Unix process groups are signalled on completion and timeout, and Windows
+Jobs are assigned before resume and terminated on both paths. Output is drained
+under the trusted-Git caps; incomplete captures fail closed.
 
 "Leader reaped; group terminated" on Unix is deliberate and pre-existing: after the
 leader finishes, the group is still signalled so no descendant survives the command.
@@ -246,25 +245,19 @@ Windows gets from the kernel. It is deliberately **not** introduced here:
   Next phase, subject to: ships in release archives, structured host-owned
   arguments only, no repository-selected code, no TaskScope widening, bounded IPC
   with bounded frames and bounded waits, deterministic shutdown.
-- **Windows Job Objects are not used by the blocking Git seams (5, 6).** They are
-  bounded and direct-child terminated on Windows, where `ProcessGroup`'s Job
-  covers sites 1–4. `git worktree add` can run a `post-checkout` hook and so can
-  spawn a descendant. Next phase: give the blocking runner a Job too.
-- **No output byte cap on the blocking Git seams.** The previous
-  `Command::output()` was equally unbounded, so this is not a regression, but
-  unlike the generic path these two seams do not enforce
-  `MAX_COMMAND_STDOUT_BYTES` / `MAX_COMMAND_STDERR_BYTES`. Next phase.
-- **`HostGit` resolves `git` through a bare `PATH` lookup** while the mutating
-  seam uses the validated `execution::host_git_path()` identity. Pre-existing and
-  unchanged by this branch; on Windows `CreateProcessW` searches the current
-  directory before `PATH`, so this is a real (P3) hardening item.
+- **The `bubblewrap_support::probe` remains uncontained and has no timeout.** It
+  runs before anything is spawned, argv is fixed to `--version`, and it feeds a
+  fail-closed gate, so this remains low severity and is deferred.
+- **Blocking Git output has trusted-Git caps, not generic command caps.** The
+  64 MiB stdout / 1 MiB stderr ceilings intentionally match the stricter existing
+  trusted-Git policy. An over-limit or incomplete capture is rejected; callers do
+  not parse a truncated prefix as a complete result.
+
 - **The blocking Git seams still block a runtime worker.** They are synchronous by
   construction, so a dropped future cannot detach a child (an improvement), but a
   120 s stall is still possible. Next phase: move them to `spawn_blocking`.
 - **Windows approval reply is unbounded** (§8). Product decision on consent.
-- **`bubblewrap_support::probe` has no timeout.** It runs before anything is
-  spawned, argv is fixed to `--version`, and it feeds a fail-closed gate, so it is
-  low severity. Left for a later phase.
+
 
 **Explicitly out of scope for this branch and its follow-ups:** Managed Worktrees
 Phase 5, `Goal::validate` complexity, `goal_status`/`goal_result` pagination,
@@ -278,8 +271,10 @@ changes are intentional:
 
 - on Windows, descendants of a timed-out, stopped, cancelled, or shut-down
   `ProcessGroup` execution are now terminated (previously they survived);
-- on every platform, the Managed Worktrees Git seams are now bounded, and on Unix
-  they are tree-contained on completion and on timeout as well;
+- on every platform, the Managed Worktrees Git seams are now bounded, tree-contained
+  on completion and timeout, and use the cached validated Git executable identity;
+- incomplete or over-limit Git output is refused rather than parsed as a complete
+  result.
 - the Unix process-group ownership proof is unchanged.
 
 The public project brand, compatibility identifiers, and historical release notes

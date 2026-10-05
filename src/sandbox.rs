@@ -1460,7 +1460,7 @@ fn safe_environment_with_path(path: Option<&std::ffi::OsStr>) -> HashMap<String,
     environment
 }
 
-fn clean_git_environment() -> HashMap<String, String> {
+pub(crate) fn clean_git_environment() -> HashMap<String, String> {
     let mut environment = safe_environment();
     environment.insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
     environment.insert("GIT_CONFIG_GLOBAL".to_owned(), null_device_path());

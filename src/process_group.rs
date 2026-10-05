@@ -89,12 +89,8 @@ pub(crate) struct ProcessGroup {
     child: Child,
     #[cfg(unix)]
     ownership: ProcessGroupOwnership,
-    /// Windows tree containment, when the host allowed a Job to be created.
-    ///
-    /// This is `Option` because job assignment can legitimately be refused. When
-    /// it is absent the lease degrades to direct-child termination, which is what
-    /// this type did on Windows before Job Objects existed and is strictly weaker
-    /// than containment — never stronger, and never claimed as containment.
+    /// Windows tree containment. A ProcessGroup is constructed only if the Job
+    /// assignment succeeded, so this is always `Some` on a live Windows lease.
     #[cfg(windows)]
     job: Option<Job>,
 }
@@ -260,11 +256,10 @@ fn spawn_ready_to_exec(command: &mut Command) -> io::Result<Child> {
 /// 3. Assign the child to the Job, while it is provably still inert.
 /// 4. Resume it, which is the first instant it may do anything.
 ///
-/// If the Job cannot be created the spawn fails closed rather than running an
-/// uncontained child: containment is the guarantee being claimed here, and a
-/// fallback would silently not be it. If only the *assignment* is refused the
-/// child has still run nothing, so it is resumed and the lease degrades to
-/// direct-child termination, which is recorded rather than assumed.
+/// If creating the Job, assigning the child, or resuming it fails, spawn fails
+/// closed. Assignment failure is especially safe to handle: the child has not run
+/// a single instruction, so the known suspended child is killed without ever
+/// resuming an uncontained process.
 #[cfg(windows)]
 fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
     use std::os::windows::process::CommandExt;
@@ -274,17 +269,14 @@ fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
     command.creation_flags(CREATE_SUSPENDED);
     let child = spawn_ready_to_exec(command)?;
     match assign_and_resume(&mut job, &child) {
-        Ok(true) => Ok(ProcessGroup {
+        Ok(()) => Ok(ProcessGroup {
             child,
             job: Some(job),
         }),
-        // Containment was refused. The child has not run, so resuming it and
-        // continuing with direct-child termination is safe, and the lease records
-        // that the tree is not contained.
-        Ok(false) => Ok(ProcessGroup { child, job: None }),
         Err(error) => {
-            // The child is suspended and contained, so terminating the Job is both
-            // sufficient and safe: nothing it could spawn exists yet.
+            // A failed assignment or resume is terminal. The child has not run
+            // user code, so killing its direct process handle is sufficient and
+            // safe; never resume an uncontained child as a fallback.
             job.terminate();
             let _ = child.start_kill();
             Err(error)
@@ -292,14 +284,9 @@ fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
     }
 }
 
-/// Resume `child`, reporting whether it ended up contained.
-///
-/// Assignment failure is not an error: the child is still suspended and has run
-/// nothing, so it is resumed either way and the caller records whether the tree
-/// is contained. Only a failure to *resume* is an error, because that leaves a
-/// live process that can never be observed.
+/// Assign and resume `child`, failing closed if either step fails.
 #[cfg(windows)]
-fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result<bool> {
+fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
     let pid = child
@@ -310,9 +297,8 @@ fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result
     let handle = child
         .raw_handle()
         .ok_or_else(|| io::Error::other("spawned child has no process handle"))?;
-    let assigned = job.assign(handle as HANDLE, pid).is_ok();
-    Job::resume(pid)?;
-    Ok(assigned)
+    job.assign(handle as HANDLE, pid)?;
+    Job::resume(pid)
 }
 
 /// Bounded output of a terminated process group.

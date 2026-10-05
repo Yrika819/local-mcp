@@ -51,6 +51,10 @@
 
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -71,6 +75,17 @@ const POLL_MAX: Duration = Duration::from_millis(5);
 /// leak is the thread's, not a hang of the caller.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// Maximum time spent observing reaping after SIGKILL/Job termination.
+///
+/// Kernel teardown is normally immediate, but a host must never block forever
+/// waiting for an uninterruptible process or a broken OS wait implementation.
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Blocking trusted-Git output limits. Match the stricter trusted-Git capture
+/// contract rather than borrowing the larger generic execute budgets.
+const STDOUT_LIMIT: usize = crate::sandbox::TRUSTED_GIT_STDOUT_LIMIT;
+const STDERR_LIMIT: usize = crate::sandbox::TRUSTED_GIT_STDERR_LIMIT;
+
 /// Exit status used when the child's own status could not be observed.
 ///
 /// Deliberately **not** zero. A status of zero reads as `success()`, which would
@@ -79,6 +94,8 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// construct by accident, which is the whole point of keeping the outcome unknown.
 #[cfg(unix)]
 const UNOBSERVED_RAW: i32 = 1 << 8;
+#[cfg(windows)]
+const UNOBSERVED_RAW: u32 = u32::MAX;
 
 /// Bounded output of a host-owned blocking command.
 pub(crate) struct BlockingOutput {
@@ -91,12 +108,18 @@ pub(crate) struct BlockingOutput {
     /// command was started and may have performed side effects before the
     /// deadline. Callers keep their existing fail-closed classification.
     pub(crate) timed_out: bool,
+    /// A stream exceeded its trusted-Git cap or did not reach EOF before the
+    /// bounded drain grace. Callers must reject the result rather than parse a
+    /// truncated prefix as a complete observation.
+    pub(crate) capture_incomplete: bool,
+    /// Output exceeded the trusted-Git bound and the process tree was terminated.
+    pub(crate) output_overflow: bool,
 }
 
 /// Run a host-owned command to completion under a deadline, containing its tree.
 ///
-/// The command is spawned into its own process group on Unix so a descendant
-/// cannot survive it, and the whole group is terminated if the deadline expires.
+/// The command is spawned into its own process group on Unix, or a Job Object on
+/// Windows, so descendants cannot survive ordinary completion or the deadline.
 /// Both pipes are drained concurrently so a result larger than a pipe buffer
 /// completes instead of deadlocking.
 pub(crate) fn run_bounded_blocking(
@@ -107,6 +130,14 @@ pub(crate) fn run_bounded_blocking(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    #[cfg(windows)]
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+    #[cfg(windows)]
+    let mut job = crate::process_job::Job::create()?;
+    #[cfg(windows)]
+    command.creation_flags(CREATE_SUSPENDED);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -116,12 +147,40 @@ pub(crate) fn run_bounded_blocking(
     }
 
     let mut child = spawn_ready(command)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let pid = child.id();
+        if let Err(error) = job.assign(
+            child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            pid,
+        ) {
+            // The child has not run because it is still suspended. Assignment
+            // failure is terminal; kill the one known child and never resume it
+            // uncontained.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = crate::process_job::Job::resume(pid) {
+            job.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_reader = spawn_reader(stdout);
-    let stderr_reader = spawn_reader(stderr);
+    let output_overflow = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_reader(stdout, STDOUT_LIMIT, Arc::clone(&output_overflow));
+    let stderr_reader = spawn_reader(stderr, STDERR_LIMIT, Arc::clone(&output_overflow));
 
-    let (status, timed_out) = wait_bounded(&mut child, timeout);
+    #[cfg(windows)]
+    let (status, timed_out, output_overflowed) =
+        wait_bounded(&mut child, timeout, &job, &output_overflow);
+    #[cfg(unix)]
+    let (status, timed_out, output_overflowed) =
+        wait_bounded(&mut child, timeout, &output_overflow);
 
     // A reader only ends at EOF, which requires **every** holder of the write end
     // to be gone — not merely the leader. A descendant that inherited the pipe and
@@ -130,14 +189,16 @@ pub(crate) fn run_bounded_blocking(
     // exists to prevent. `wait_bounded` has already terminated the tree, so the
     // only remaining possibility is a descendant that escaped containment; the
     // join is given a bounded grace and then abandoned rather than waited on.
-    let stdout = join_reader_bounded(stdout_reader, DRAIN_GRACE);
-    let stderr = join_reader_bounded(stderr_reader, DRAIN_GRACE);
+    let (stdout, stdout_incomplete) = join_reader_bounded(stdout_reader, DRAIN_GRACE);
+    let (stderr, stderr_incomplete) = join_reader_bounded(stderr_reader, DRAIN_GRACE);
 
     Ok(BlockingOutput {
         status,
         stdout,
         stderr,
         timed_out,
+        capture_incomplete: stdout_incomplete || stderr_incomplete,
+        output_overflow: output_overflowed,
     })
 }
 
@@ -155,19 +216,32 @@ fn spawn_ready(command: &mut Command) -> io::Result<Child> {
 }
 
 /// Drain one pipe on its own thread so the child never blocks on a full pipe.
-fn spawn_reader<R>(reader: Option<R>) -> JoinHandle<Vec<u8>>
+fn spawn_reader<R>(
+    reader: Option<R>,
+    limit: usize,
+    output_overflow: Arc<AtomicBool>,
+) -> JoinHandle<(Vec<u8>, bool)>
 where
     R: Read + Send + 'static,
 {
     std::thread::spawn(move || {
         let Some(mut reader) = reader else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
-        let mut buffer = Vec::new();
-        // A read failure ends this stream only. The exit status and the other
-        // stream still decide the outcome, so it is not an execution failure.
-        let _ = reader.read_to_end(&mut buffer);
-        buffer
+        let mut buffer = Vec::with_capacity(limit.min(8192));
+        // Read at most limit + 1 so over-limit output is detected without ever
+        // retaining more than one byte beyond the configured cap.
+        let read_result = reader
+            .by_ref()
+            .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+            .read_to_end(&mut buffer);
+        let over_limit = buffer.len() > limit;
+        if over_limit {
+            output_overflow.store(true, Ordering::Release);
+        }
+        let incomplete = read_result.is_err() || over_limit;
+        buffer.truncate(limit);
+        (buffer, incomplete)
     })
 }
 
@@ -175,7 +249,7 @@ where
 ///
 /// A panicking reader yields an empty stream rather than taking down the caller,
 /// matching the tolerance the reader itself applies to a failed read.
-fn join_reader_bounded(handle: JoinHandle<Vec<u8>>, grace: Duration) -> Vec<u8> {
+fn join_reader_bounded(handle: JoinHandle<(Vec<u8>, bool)>, grace: Duration) -> (Vec<u8>, bool) {
     let deadline = Instant::now() + grace;
     let handle = Some(handle);
     while Instant::now() < deadline && !handle.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -187,7 +261,7 @@ fn join_reader_bounded(handle: JoinHandle<Vec<u8>>, grace: Duration) -> Vec<u8> 
         // Still holding the pipe: detach rather than block the caller forever.
         // `JoinHandle`'s `Drop` already detaches, and the OS reclaims the thread
         // and its buffers when the pipe finally closes.
-        _ => Vec::new(),
+        _ => (Vec::new(), true),
     }
 }
 
@@ -217,21 +291,38 @@ fn join_reader_bounded(handle: JoinHandle<Vec<u8>>, grace: Duration) -> Vec<u8> 
 /// Reaping first and then signalling a remembered identifier is precisely the
 /// V2.1.1 hazard, and it is why this module observes exit without consuming it.
 #[cfg(unix)]
-fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
+fn wait_bounded(
+    child: &mut Child,
+    timeout: Duration,
+    output_overflow: &AtomicBool,
+) -> (ExitStatus, bool, bool) {
     use std::os::unix::process::ExitStatusExt;
 
     let deadline = Instant::now() + timeout;
     let mut interval = POLL_START;
     loop {
+        if output_overflow.load(Ordering::Acquire) {
+            match has_exited_unreaped(child.id()) {
+                Ok(_) => {
+                    terminate_tree(child);
+                    return (wait_after_termination(child), false, true);
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    return (ExitStatus::from_raw(UNOBSERVED_RAW), true, true);
+                }
+            }
+        }
         match has_exited_unreaped(child.id()) {
             // The leader is gone but unreaped, so the group identifier is still
             // reserved and the group may be signalled.
             Ok(true) => {
                 terminate_tree(child);
-                return match child.wait() {
-                    Ok(status) => (status, false),
-                    Err(_) => (ExitStatus::from_raw(UNOBSERVED_RAW), false),
-                };
+                return (wait_after_termination(child), false, false);
+            }
+            Ok(false) if output_overflow.load(Ordering::Acquire) => {
+                terminate_tree(child);
+                return (wait_after_termination(child), false, true);
             }
             Ok(false) => {}
             // The child can no longer be observed, so there is **no** ownership
@@ -242,20 +333,36 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
             // the deadline is reported as expired so the outcome stays unknown.
             Err(_) => {
                 let _ = child.kill();
-                let _ = child.wait();
-                return (ExitStatus::from_raw(UNOBSERVED_RAW), true);
+                let _ = wait_after_termination(child);
+                return (ExitStatus::from_raw(UNOBSERVED_RAW), true, false);
             }
         }
         if Instant::now() >= deadline {
             // Still running, therefore still unreaped: the identifier is ours.
             terminate_tree(child);
-            return match child.wait() {
-                Ok(status) => (status, true),
-                Err(_) => (ExitStatus::from_raw(UNOBSERVED_RAW), true),
-            };
+            return (wait_after_termination(child), true, false);
         }
         std::thread::sleep(interval);
         interval = std::cmp::min(interval * 2, POLL_MAX);
+    }
+}
+
+/// Wait boundedly for a child after its group has already been terminated.
+///
+/// At this point the group signal has already been sent while the ownership proof
+/// held. Reaping is safe, but waiting is bounded so an uninterruptible kernel task
+/// cannot hang the server forever.
+#[cfg(unix)]
+fn wait_after_termination(child: &mut Child) -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+
+    let deadline = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_MAX),
+            Ok(None) | Err(_) => return ExitStatus::from_raw(UNOBSERVED_RAW),
+        }
     }
 }
 
@@ -315,34 +422,63 @@ fn reported_child(info: &libc::siginfo_t) -> libc::pid_t {
 
 /// Wait for `child`, terminating it if `timeout` expires.
 ///
-/// Windows has no process group. Containment for the asynchronous paths comes
-/// from the Job Object in [`crate::process_job`]; these blocking seams are
-/// host-owned, argv-allowlisted Git with no descendant-bearing argv, so a bounded
-/// direct termination is the whole guarantee here.
+/// Windows has no process group. Containment comes from the Job Object assigned
+/// before the suspended child is resumed. The Job is terminated on both normal
+/// completion and timeout, so a Git descendant cannot survive either path.
 #[cfg(windows)]
-fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
+fn wait_bounded(
+    child: &mut Child,
+    timeout: Duration,
+    job: &crate::process_job::Job,
+    output_overflow: &AtomicBool,
+) -> (ExitStatus, bool, bool) {
     use std::os::windows::process::ExitStatusExt;
 
     let deadline = Instant::now() + timeout;
     let mut interval = POLL_START;
     loop {
+        if output_overflow.load(Ordering::Acquire) {
+            job.terminate();
+            let _ = child.kill();
+            return (wait_after_termination(child), false, true);
+        }
         match child.try_wait() {
-            Ok(Some(status)) => return (status, false),
+            Ok(Some(status)) => {
+                // A command leader can exit while a descendant still runs. Kill
+                // the Job on normal completion too, before the parent begins
+                // joining output readers.
+                job.terminate();
+                return (status, false, false);
+            }
             Ok(None) => {}
             Err(_) => {
+                job.terminate();
                 let _ = child.kill();
-                return (ExitStatus::from_raw(0), true);
+                return (wait_after_termination(child), true, false);
             }
         }
         if Instant::now() >= deadline {
+            job.terminate();
             let _ = child.kill();
-            return match child.wait() {
-                Ok(status) => (status, true),
-                Err(_) => (ExitStatus::from_raw(0), true),
-            };
+            return (wait_after_termination(child), true, false);
         }
         std::thread::sleep(interval);
         interval = std::cmp::min(interval * 2, POLL_MAX);
+    }
+}
+
+/// Wait boundedly for a Windows child after its Job has already been terminated.
+#[cfg(windows)]
+fn wait_after_termination(child: &mut Child) -> ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+
+    let deadline = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_MAX),
+            Ok(None) | Err(_) => return ExitStatus::from_raw(UNOBSERVED_RAW),
+        }
     }
 }
 

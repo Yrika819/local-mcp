@@ -335,11 +335,10 @@ impl ManagedWorktreeCreator for HostWorktreeCreator {
         .map_err(|error| ManagedWorktreeCreationError::Spawn {
             detail: error.to_string(),
         })?;
-        if output.timed_out {
+        if output.timed_out || output.capture_incomplete || output.output_overflow {
             return Err(ManagedWorktreeCreationError::Spawn {
                 detail: format!(
-                    "git worktree add did not finish within {}s; its process tree was \
-                     terminated and the outcome of this attempt is unknown",
+                    "git worktree add did not produce a complete result within {}s or exceeded its output bound; its process tree was terminated and the outcome of this attempt is unknown",
                     MANAGED_CREATION_TIMEOUT.as_secs()
                 ),
             });

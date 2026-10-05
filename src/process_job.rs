@@ -32,19 +32,18 @@
 //! resumed. The child is therefore never allowed to run before containment is
 //! established, which is a structural property rather than a timing assumption.
 //!
-//! # Degradation
+//! # Failure
 //!
-//! Job assignment can legitimately fail on a host that forbids it. When it does,
-//! the child is still suspended and has run nothing, so it is resumed and the
-//! lease proceeds with direct-child termination only — strictly weaker, never
-//! stronger, and never a silent claim of tree containment. [`Job::is_assigned`]
-//! reports the difference so tests can assert containment is genuinely in effect
-//! rather than merely compiled.
+//! Job assignment can legitimately fail on a host that forbids it (for example,
+//! a nested Job configuration the OS refuses). When it does, the child is still
+//! suspended and has run nothing, so the host kills that one known child and
+//! returns an error. It never resumes an uncontained child as a fallback, and it
+//! never silently weakens the guarantee.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
@@ -167,7 +166,7 @@ impl Job {
         // whose `dwSize` this function has just set to its own size.
         let mut more = unsafe { Thread32First(snapshot.as_raw_handle() as HANDLE, &mut entry) };
         while more != 0 {
-            if entry.dwth32OwnerProcessID == pid {
+            if entry.th32OwnerProcessID == pid {
                 // Safety: the thread identifier comes from the kernel's own
                 // snapshot and is opened for resume only.
                 let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };

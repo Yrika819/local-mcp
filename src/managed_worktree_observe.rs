@@ -118,12 +118,15 @@ impl Default for HostGit {
 impl ReadOnlyGit for HostGit {
     fn run(&self, args: &[&str], cwd: &Path) -> Result<GitCommandOutput, DiscoveryError> {
         assert_read_only(args)?;
-        let mut command = Command::new(&self.executable);
-        for (key, _) in std::env::vars_os() {
-            if is_git_environment_variable(&key) {
-                command.env_remove(key);
-            }
-        }
+        let executable =
+            crate::execution::host_git_path().map_err(|error| DiscoveryError::GitCommand {
+                command: args.join(" "),
+                detail: format!("host Git identity is unavailable: {error:#}"),
+            })?;
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .envs(crate::sandbox::clean_git_environment());
         // Bounded and tree-contained rather than a bare blocking `output()`: this
         // seam runs from a runtime thread, so a wedged Git would otherwise hold
         // that thread forever with no way to reclaim it. A deadline is terminal
@@ -140,11 +143,11 @@ impl ReadOnlyGit for HostGit {
             command: args.join(" "),
             detail: error.to_string(),
         })?;
-        if output.timed_out {
+        if output.timed_out || output.capture_incomplete || output.output_overflow {
             return Err(DiscoveryError::GitCommand {
                 command: args.join(" "),
                 detail: format!(
-                    "git did not finish within {}s and its process tree was terminated",
+                    "git did not produce a complete result within {}s or exceeded its output bound; its process tree was terminated",
                     READ_ONLY_GIT_TIMEOUT.as_secs()
                 ),
             });
