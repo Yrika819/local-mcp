@@ -65,6 +65,9 @@ use windows_sys::Win32::System::Threading::{
 /// `sandbox` already records.
 const JOB_TERMINATION_EXIT_CODE: u32 = 1;
 
+/// `ResumeThread` returns this when the resume failed.
+const RESUME_FAILED: u32 = u32::MAX;
+
 /// A Windows Job Object owning one execution tree.
 ///
 /// Dropping this closes the Job handle. Because the Job carries
@@ -175,7 +178,14 @@ impl Job {
                 let thread = unsafe { OwnedHandle::from_raw_handle(thread as RawHandle) };
                 // Safety: the handle is open for `THREAD_SUSPEND_RESUME` and the
                 // process was created suspended, so the count is at least one.
-                unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+                let previous = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+                // A failed resume must not be reported as success. The process
+                // would stay suspended forever while the Job — which *was*
+                // assigned — kept answering "contained", so containment would be
+                // claimed for a process that never executes a single instruction.
+                if previous == RESUME_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
                 return Ok(());
             }
             // Safety: the entry carries the size the kernel reported on the

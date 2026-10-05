@@ -63,6 +63,23 @@ const POLL_START: Duration = Duration::from_micros(200);
 /// Upper bound on the blocking poll interval.
 const POLL_MAX: Duration = Duration::from_millis(5);
 
+/// How long a reader thread is given to reach EOF after the tree is terminated.
+///
+/// Bounds the one part of this function that could otherwise wait on a process
+/// outside this process's control: a descendant that inherited a pipe and did not
+/// die. When the grace expires the bytes read so far are still returned, and the
+/// leak is the thread's, not a hang of the caller.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Exit status used when the child's own status could not be observed.
+///
+/// Deliberately **not** zero. A status of zero reads as `success()`, which would
+/// let a mutating caller pair "timed out" with "succeeded" and infer that the side
+/// effect did not happen. A non-zero status makes that combination impossible to
+/// construct by accident, which is the whole point of keeping the outcome unknown.
+#[cfg(unix)]
+const UNOBSERVED_RAW: i32 = 1 << 8;
+
 /// Bounded output of a host-owned blocking command.
 pub(crate) struct BlockingOutput {
     pub(crate) status: ExitStatus,
@@ -105,10 +122,16 @@ pub(crate) fn run_bounded_blocking(
     let stderr_reader = spawn_reader(stderr);
 
     let (status, timed_out) = wait_bounded(&mut child, timeout);
-    // The readers own the pipe ends, so they only end at EOF. After a terminated
-    // or exited child that is immediate; joining cannot hang indefinitely.
-    let stdout = join_reader(stdout_reader);
-    let stderr = join_reader(stderr_reader);
+
+    // A reader only ends at EOF, which requires **every** holder of the write end
+    // to be gone — not merely the leader. A descendant that inherited the pipe and
+    // outlived the leader would therefore keep the join blocked forever, which is
+    // the very "a hung Git holds a runtime thread indefinitely" failure this seam
+    // exists to prevent. `wait_bounded` has already terminated the tree, so the
+    // only remaining possibility is a descendant that escaped containment; the
+    // join is given a bounded grace and then abandoned rather than waited on.
+    let stdout = join_reader_bounded(stdout_reader, DRAIN_GRACE);
+    let stderr = join_reader_bounded(stderr_reader, DRAIN_GRACE);
 
     Ok(BlockingOutput {
         status,
@@ -136,7 +159,7 @@ fn spawn_reader<R>(reader: Option<R>) -> JoinHandle<Vec<u8>>
 where
     R: Read + Send + 'static,
 {
-    let handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let Some(mut reader) = reader else {
             return Vec::new();
         };
@@ -145,14 +168,27 @@ where
         // stream still decide the outcome, so it is not an execution failure.
         let _ = reader.read_to_end(&mut buffer);
         buffer
-    });
-    handle
+    })
 }
 
-/// Collect a reader's bytes. A panicking reader yields an empty stream rather
-/// than taking down the caller, matching the tolerance above.
-fn join_reader(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
+/// Collect a reader's bytes, giving up after `grace`.
+///
+/// A panicking reader yields an empty stream rather than taking down the caller,
+/// matching the tolerance the reader itself applies to a failed read.
+fn join_reader_bounded(handle: JoinHandle<Vec<u8>>, grace: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + grace;
+    let handle = Some(handle);
+    while Instant::now() < deadline && !handle.as_ref().is_some_and(JoinHandle::is_finished) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    match handle {
+        // The thread finished, so joining is immediate and cannot block.
+        Some(handle) if handle.is_finished() => handle.join().unwrap_or_default(),
+        // Still holding the pipe: detach rather than block the caller forever.
+        // `JoinHandle`'s `Drop` already detaches, and the OS reclaims the thread
+        // and its buffers when the pipe finally closes.
+        _ => Vec::new(),
+    }
 }
 
 /// Wait for `child`, terminating its tree when the leader exits or the deadline
@@ -194,17 +230,20 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
                 terminate_tree(child);
                 return match child.wait() {
                     Ok(status) => (status, false),
-                    Err(_) => (ExitStatus::from_raw(0), false),
+                    Err(_) => (ExitStatus::from_raw(UNOBSERVED_RAW), false),
                 };
             }
             Ok(false) => {}
-            // The child can no longer be observed. Terminate the tree rather than
-            // leaving it unowned, and report the deadline as expired so the caller
-            // keeps the outcome unknown.
+            // The child can no longer be observed, so there is **no** ownership
+            // proof for the group identifier and it must not be signalled: an
+            // auto-reaping host (SIGCHLD ignored, SA_NOCLDWAIT, or a `waitpid(-1)`
+            // sweep elsewhere) can already have recycled it. Only the direct child
+            // is stopped, which needs no proof because it is our own child, and
+            // the deadline is reported as expired so the outcome stays unknown.
             Err(_) => {
-                terminate_tree(child);
+                let _ = child.kill();
                 let _ = child.wait();
-                return (ExitStatus::from_raw(0), true);
+                return (ExitStatus::from_raw(UNOBSERVED_RAW), true);
             }
         }
         if Instant::now() >= deadline {
@@ -212,7 +251,7 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
             terminate_tree(child);
             return match child.wait() {
                 Ok(status) => (status, true),
-                Err(_) => (ExitStatus::from_raw(0), true),
+                Err(_) => (ExitStatus::from_raw(UNOBSERVED_RAW), true),
             };
         }
         std::thread::sleep(interval);
@@ -225,29 +264,40 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> (ExitStatus, bool) {
 /// `WNOWAIT` leaves the exit status uncollected, so the kernel keeps the process
 /// identifier reserved and it cannot be handed to another process. That is the
 /// ownership proof the group signal depends on.
+///
+/// `EINTR` is retried rather than reported: an interrupted query says nothing
+/// about the child, and treating it as "unobservable" would stop a perfectly
+/// healthy command and report it as a timeout.
 #[cfg(unix)]
 fn has_exited_unreaped(pid: u32) -> io::Result<bool> {
+    use std::io::ErrorKind;
+
     if pid == 0 {
         return Ok(false);
     }
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // Safety: `waitid` only writes into the `siginfo_t` it is handed, and `P_PID`
-    // restricts the query to a single direct child of this process.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &raw mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Safety: `waitid` only writes into the `siginfo_t` it is handed, and
+        // `P_PID` restricts the query to a single direct child of this process.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result != -1 {
+            // `libc` exposes the same union as plain fields on Apple and as
+            // accessors elsewhere, so the report is read through a helper.
+            return Ok(reported_child(&info) != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
     }
-    // `libc` exposes the same union as plain fields on Apple and as accessors
-    // elsewhere, so the report is read through a helper rather than directly.
-    let reported = reported_child(&info);
-    Ok(reported != 0)
 }
 
 /// The child a termination report refers to, or `0` when nothing was reported.

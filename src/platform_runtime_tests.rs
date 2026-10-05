@@ -32,7 +32,7 @@ mod unix {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
@@ -303,6 +303,48 @@ mod unix {
             1024 * 1024,
             "the whole stream must be retained"
         );
+    }
+
+    #[test]
+    fn a_descendant_that_escapes_containment_cannot_hang_the_caller() {
+        // A reader thread only ends at EOF, which needs *every* holder of the pipe
+        // to be gone. A descendant that escapes the process group and inherits the
+        // pipe would therefore keep an unbounded join blocked forever — the exact
+        // "a hung Git holds a runtime thread" failure this seam exists to prevent.
+        // `setsid` is that escape: it puts the descendant in a new session, outside
+        // the group, so the group signal cannot reach it.
+        let (read_end, write_end) = witness_pipe().expect("the witness pipe must be creatable");
+        let write_raw = write_end.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("setsid sleep 300 & exit 0");
+        // Safety: `dup2` is async-signal-safe and is the only call made here.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(write_raw, libc::STDOUT_FILENO) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        // If the join were unbounded this call would never return.
+        let output = run_bounded_blocking(&mut command, Duration::from_secs(2))
+            .expect("the bounded blocking command must run");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "SECURITY REGRESSION: an escaping descendant hung the caller for {elapsed:?}"
+        );
+        assert!(
+            !output.timed_out,
+            "a leader that exits at once must not be reported as a timeout"
+        );
+        // Reap the escaped descendant so the test leaves nothing behind.
+        drop(write_end);
+        drop(read_end);
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "setsid sleep 300"])
+            .status();
     }
 
     #[test]
