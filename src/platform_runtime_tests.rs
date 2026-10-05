@@ -316,7 +316,11 @@ mod unix {
         let (read_end, write_end) = witness_pipe().expect("the witness pipe must be creatable");
         let write_raw = write_end.as_raw_fd();
         let mut command = std::process::Command::new("/bin/sh");
-        command.arg("-c").arg("setsid sleep 300 & exit 0");
+        // Keep the escaped descendant short-lived so the test leaves no
+        // background process to clean up with a global scanner or a remembered
+        // PID. Its eight-second lifetime exceeds the runner's five-second drain
+        // grace, which is all this test needs to prove the caller is bounded.
+        command.arg("-c").arg("setsid sleep 8 & exit 0");
         // Safety: `dup2` is async-signal-safe and is the only call made here.
         unsafe {
             command.pre_exec(move || {
@@ -339,12 +343,10 @@ mod unix {
             !output.timed_out,
             "a leader that exits at once must not be reported as a timeout"
         );
-        // Reap the escaped descendant so the test leaves nothing behind.
+        // The descendant has a bounded eight-second lifetime and self-terminates;
+        // no global scanner or remembered PID is used to clean it up.
         drop(write_end);
         drop(read_end);
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "setsid sleep 300"])
-            .status();
     }
 
     #[test]
@@ -448,6 +450,71 @@ mod windows {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         command
+    }
+
+    #[tokio::test]
+    async fn abnormal_owner_death_closes_the_job_and_terminates_its_descendant() {
+        // Run a fresh copy of this test executable as the Local MCP owner. It
+        // creates a real ProcessGroup, proves a descendant entered its Job, and
+        // then aborts itself so no Rust destructor can close the Job. Windows must
+        // close that handle as part of process termination, which must kill the
+        // descendant. The descendant inherits stdout; pipe EOF is the witness.
+        let executable = std::env::current_exe().expect("test executable path");
+        let mut owner = tokio::process::Command::new(executable);
+        owner
+            .args([
+                "--exact",
+                "platform_runtime_tests::windows::abnormal_owner_child",
+                "--nocapture",
+            ])
+            .env("GOALLATCH_ABNORMAL_OWNER_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = owner.spawn().expect("owner helper must spawn");
+        let mut witness = child.stdout.take().expect("stdout witness pipe");
+        let status = tokio::time::timeout(Duration::from_secs(15), child.wait())
+            .await
+            .expect("abnormal owner must terminate within the bound")
+            .expect("owner process must be waitable");
+        assert!(
+            !status.success(),
+            "the helper must terminate abnormally rather than dropping its lease"
+        );
+        let mut bytes = Vec::new();
+        tokio::time::timeout(TEARDOWN, witness.read_to_end(&mut bytes))
+            .await
+            .expect("SECURITY REGRESSION: descendant held the owner pipe after abnormal death")
+            .expect("stdout witness must read");
+    }
+
+    /// Child-process helper for `abnormal_owner_death_closes_the_job_and_terminates_its_descendant`.
+    ///
+    /// Invoked in a fresh test-harness process. The test is a no-op when run by
+    /// the normal suite; the parent test sets the marker environment variable.
+    #[test]
+    fn abnormal_owner_child() {
+        if std::env::var_os("GOALLATCH_ABNORMAL_OWNER_HELPER").is_none() {
+            return;
+        }
+        let mut command = Command::new("cmd.exe");
+        command
+            .arg("/C")
+            .arg("start /b ping -n 300 127.0.0.1 & exit /b 0");
+        // Inherit stdout from the helper test process: the descendant holding
+        // this handle is the parent's kernel EOF witness after owner death.
+        let lease = ProcessGroup::spawn(&mut command).expect("the owned tree must spawn");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if lease.active_processes_for_test().unwrap_or(0) >= 2 {
+                // Deliberately bypass all Rust destructors. If kill-on-close is
+                // missing, the descendant keeps stdout open and the parent test
+                // observes the witness timeout.
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("fixture did not produce a descendant in the Job");
     }
 
     #[tokio::test]

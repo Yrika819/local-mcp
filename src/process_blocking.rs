@@ -317,8 +317,9 @@ fn wait_bounded(
             // The leader is gone but unreaped, so the group identifier is still
             // reserved and the group may be signalled.
             Ok(true) => {
+                let overflowed = output_overflow.load(Ordering::Acquire);
                 terminate_tree(child);
-                return (wait_after_termination(child), false, false);
+                return (wait_after_termination(child), false, overflowed);
             }
             Ok(false) if output_overflow.load(Ordering::Acquire) => {
                 terminate_tree(child);
