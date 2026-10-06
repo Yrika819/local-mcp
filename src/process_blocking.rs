@@ -83,8 +83,8 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// Blocking trusted-Git output limits. Match the stricter trusted-Git capture
 /// contract rather than borrowing the larger generic execute budgets.
-const STDOUT_LIMIT: usize = crate::sandbox::TRUSTED_GIT_STDOUT_LIMIT;
-const STDERR_LIMIT: usize = crate::sandbox::TRUSTED_GIT_STDERR_LIMIT;
+const STDOUT_LIMIT: usize = crate::resource_limits::TRUSTED_GIT_STDOUT_LIMIT;
+const STDERR_LIMIT: usize = crate::resource_limits::TRUSTED_GIT_STDERR_LIMIT;
 
 /// Exit status used when the child's own status could not be observed.
 ///
@@ -126,6 +126,15 @@ pub(crate) fn run_bounded_blocking(
     command: &mut Command,
     timeout: Duration,
 ) -> io::Result<BlockingOutput> {
+    run_bounded_blocking_with_limits(command, timeout, STDOUT_LIMIT, STDERR_LIMIT)
+}
+
+pub(crate) fn run_bounded_blocking_with_limits(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> io::Result<BlockingOutput> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -159,27 +168,60 @@ pub(crate) fn run_bounded_blocking(
             // failure is terminal; kill the one known child and never resume it
             // uncontained.
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = wait_after_termination(&mut child);
             return Err(error);
         }
         if let Err(error) = crate::process_job::Job::resume(pid) {
             job.terminate();
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = wait_after_termination(&mut child);
             return Err(error);
         }
     }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let output_overflow = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_reader(stdout, STDOUT_LIMIT, Arc::clone(&output_overflow));
-    let stderr_reader = spawn_reader(stderr, STDERR_LIMIT, Arc::clone(&output_overflow));
+    let stdout_reader = match spawn_reader(stdout, stdout_limit, Arc::clone(&output_overflow)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            #[cfg(unix)]
+            {
+                terminate_tree(&mut child);
+                let _ = wait_after_termination(&mut child);
+            }
+            #[cfg(windows)]
+            {
+                job.terminate();
+                let _ = child.kill();
+                let _ = wait_after_termination(&mut child);
+            }
+            return Err(error);
+        }
+    };
+    let stderr_reader = match spawn_reader(stderr, stderr_limit, Arc::clone(&output_overflow)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            #[cfg(unix)]
+            {
+                terminate_tree(&mut child);
+                let _ = wait_after_termination(&mut child);
+            }
+            #[cfg(windows)]
+            {
+                job.terminate();
+                let _ = child.kill();
+                let _ = wait_after_termination(&mut child);
+            }
+            let _ = join_reader_bounded(stdout_reader, DRAIN_GRACE);
+            return Err(error);
+        }
+    };
 
     #[cfg(windows)]
-    let (status, timed_out, output_overflowed) =
+    let (status, timed_out, _wait_reported_overflow) =
         wait_bounded(&mut child, timeout, &job, &output_overflow);
     #[cfg(unix)]
-    let (status, timed_out, output_overflowed) =
+    let (status, timed_out, _wait_reported_overflow) =
         wait_bounded(&mut child, timeout, &output_overflow);
 
     // A reader only ends at EOF, which requires **every** holder of the write end
@@ -191,6 +233,11 @@ pub(crate) fn run_bounded_blocking(
     // join is given a bounded grace and then abandoned rather than waited on.
     let (stdout, stdout_incomplete) = join_reader_bounded(stdout_reader, DRAIN_GRACE);
     let (stderr, stderr_incomplete) = join_reader_bounded(stderr_reader, DRAIN_GRACE);
+    // A fast leader may exit before the reader thread consumes the final byte
+    // beyond the cap. The wait loop's snapshot can therefore be stale even though
+    // the bounded readers have now completed. Read the flag only after joining
+    // them so output overflow cannot be accepted as a complete observation.
+    let output_overflowed = output_overflow.load(Ordering::Acquire);
 
     Ok(BlockingOutput {
         status,
@@ -220,11 +267,11 @@ fn spawn_reader<R>(
     reader: Option<R>,
     limit: usize,
     output_overflow: Arc<AtomicBool>,
-) -> JoinHandle<(Vec<u8>, bool)>
+) -> io::Result<JoinHandle<(Vec<u8>, bool)>>
 where
     R: Read + Send + 'static,
 {
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let Some(mut reader) = reader else {
             return (Vec::new(), true);
         };
@@ -247,8 +294,8 @@ where
 
 /// Collect a reader's bytes, giving up after `grace`.
 ///
-/// A panicking reader yields an empty stream rather than taking down the caller,
-/// matching the tolerance the reader itself applies to a failed read.
+/// A panicking reader yields an incomplete empty stream rather than taking down
+/// the caller or letting a missing capture be accepted as a complete observation.
 fn join_reader_bounded(handle: JoinHandle<(Vec<u8>, bool)>, grace: Duration) -> (Vec<u8>, bool) {
     let deadline = Instant::now() + grace;
     let handle = Some(handle);
@@ -257,7 +304,7 @@ fn join_reader_bounded(handle: JoinHandle<(Vec<u8>, bool)>, grace: Duration) -> 
     }
     match handle {
         // The thread finished, so joining is immediate and cannot block.
-        Some(handle) if handle.is_finished() => handle.join().unwrap_or_default(),
+        Some(handle) if handle.is_finished() => handle.join().unwrap_or((Vec::new(), true)),
         // Still holding the pipe: detach rather than block the caller forever.
         // `JoinHandle`'s `Drop` already detaches, and the OS reclaims the thread
         // and its buffers when the pipe finally closes.
@@ -308,7 +355,9 @@ fn wait_bounded(
                     return (wait_after_termination(child), false, true);
                 }
                 Err(_) => {
-                    let _ = child.kill();
+                    // The leader may already have been reaped by an external
+                    // SIGCHLD handler. Its remembered PID is no longer a safe
+                    // signal target, so fail closed without signalling it.
                     return (ExitStatus::from_raw(UNOBSERVED_RAW), true, true);
                 }
             }
@@ -327,16 +376,12 @@ fn wait_bounded(
             }
             Ok(false) => {}
             // The child can no longer be observed, so there is **no** ownership
-            // proof for the group identifier and it must not be signalled: an
-            // auto-reaping host (SIGCHLD ignored, SA_NOCLDWAIT, or a `waitpid(-1)`
-            // sweep elsewhere) can already have recycled it. Only the direct child
-            // is stopped, which needs no proof because it is our own child, and
-            // the deadline is reported as expired so the outcome stays unknown.
-            Err(_) => {
-                let _ = child.kill();
-                let _ = wait_after_termination(child);
-                return (ExitStatus::from_raw(UNOBSERVED_RAW), true, false);
-            }
+            // proof for either the group identifier or the remembered direct-child
+            // PID: an auto-reaping host (SIGCHLD ignored, SA_NOCLDWAIT, or a
+            // `waitpid(-1)` sweep elsewhere) may already have recycled them. Do
+            // not signal either identifier; return an unknown outcome and preserve
+            // fail-closed retry semantics.
+            Err(_) => return (ExitStatus::from_raw(UNOBSERVED_RAW), true, false),
         }
         if Instant::now() >= deadline {
             // Still running, therefore still unreaped: the identifier is ours.
@@ -499,5 +544,19 @@ fn terminate_tree(child: &mut Child) {
     // and the group provably contains only this tree.
     unsafe {
         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_reader_bounded;
+
+    #[test]
+    fn panicking_reader_is_marked_incomplete() {
+        let reader = std::thread::spawn(|| -> (Vec<u8>, bool) { panic!("reader failure") });
+        assert_eq!(
+            join_reader_bounded(reader, std::time::Duration::from_secs(1)),
+            (Vec::new(), true)
+        );
     }
 }

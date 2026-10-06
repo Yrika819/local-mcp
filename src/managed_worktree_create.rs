@@ -32,7 +32,6 @@ use crate::managed_worktree::{
     ManagedWorktreeCreationIntent, managed_branch_name, managed_lock_reason,
 };
 use crate::managed_worktree_discovery::same_path_identity;
-use crate::managed_worktree_observe::is_git_environment_variable;
 
 /// The exact frozen global-option head.
 ///
@@ -46,6 +45,7 @@ use crate::managed_worktree_observe::is_git_environment_variable;
 /// strand the durable creation sequence before reconciliation ever runs; it is
 /// not a statement that the operation is expected to be slow.
 const MANAGED_CREATION_TIMEOUT: Duration = Duration::from_secs(120);
+const MANAGED_FILTER_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 const FROZEN_GIT_OPTION_HEAD: [&str; 5] = [
     "-c",
@@ -249,31 +249,54 @@ fn resolve_host_git() -> Result<PathBuf, ManagedWorktreeCreationError> {
         .map_err(|error| ManagedWorktreeCreationError::ExecutableIdentity(format!("{error:#}")))
 }
 
-/// Environment variables removed before the mutating command runs.
-///
-/// `GIT_*` is Git's own configuration surface, and
-/// [`is_git_environment_variable`] already matches every `GIT_` variable
-/// case-insensitively (which is why the explicit `GIT_CONFIG*` entries below are
-/// redundant and kept only to document intent). The rest are the ambient
-/// channels that could otherwise redirect the process: `LD_*` and `DYLD_*`
-/// substitute loaded code, and `XDG_CONFIG_HOME`/`HOME`/`APPDATA` relocate Git's
-/// configuration discovery away from the operator's own.
-const SANITIZED_ENVIRONMENT: [&str; 8] = [
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "XDG_CONFIG_HOME",
-    "HOME",
-    "APPDATA",
-];
-
-fn is_sanitized_environment_variable(key: &std::ffi::OsStr) -> bool {
-    is_git_environment_variable(key)
-        || SANITIZED_ENVIRONMENT
-            .iter()
-            .any(|name| std::ffi::OsStr::new(name) == key)
+fn reject_repository_filter_drivers(
+    executable: &Path,
+    primary_root: &Path,
+) -> Result<(), ManagedWorktreeCreationError> {
+    for scope in ["--local", "--worktree"] {
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .envs(crate::sandbox::clean_git_environment())
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=",
+                "--no-optional-locks",
+                "config",
+                scope,
+                "--get-regexp",
+                "^filter\\.",
+            ])
+            .current_dir(primary_root);
+        let output = crate::process_blocking::run_bounded_blocking(
+            &mut command,
+            MANAGED_FILTER_QUERY_TIMEOUT,
+        )
+        .map_err(|error| ManagedWorktreeCreationError::Spawn {
+            detail: format!("Git filter configuration query failed: {error}"),
+        })?;
+        if output.timed_out || output.capture_incomplete || output.output_overflow {
+            return Err(ManagedWorktreeCreationError::Spawn {
+                detail: "Git filter configuration query was incomplete".to_owned(),
+            });
+        }
+        match output.status.code() {
+            Some(0) if !output.stdout.is_empty() => {
+                return Err(ManagedWorktreeCreationError::Spawn {
+                    detail: "repository has configured Git filter drivers; refusing host checkout execution".to_owned(),
+                });
+            }
+            Some(1) => {}
+            status => {
+                return Err(ManagedWorktreeCreationError::Spawn {
+                    detail: format!("Git filter configuration query returned status {status:?}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A creator backed by the host Git executable.
@@ -314,12 +337,12 @@ impl ManagedWorktreeCreator for HostWorktreeCreator {
             trusted
         };
 
+        reject_repository_filter_drivers(&executable, primary_root)?;
+
         let mut command = Command::new(&executable);
-        for (key, _) in std::env::vars_os() {
-            if is_sanitized_environment_variable(&key) {
-                command.env_remove(key);
-            }
-        }
+        command
+            .env_clear()
+            .envs(crate::sandbox::clean_git_environment());
         // Bounded and tree-contained rather than a bare blocking `output()`.
         //
         // This is the mutating `git worktree add`, so the deadline must not be

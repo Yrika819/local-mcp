@@ -72,6 +72,15 @@ pub(crate) const MAX_COMMAND_STDOUT_BYTES: usize = 1536 * 1024;
 /// bound by these.
 pub(crate) const MAX_COMMAND_STDERR_BYTES: usize = 256 * 1024;
 
+/// Largest captured stdout for a host-owned trusted Git process.
+///
+/// Managed-worktree observation can list a large repository, so this bound is
+/// intentionally independent of the much smaller interactive command budget.
+pub(crate) const TRUSTED_GIT_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Largest captured stderr for a host-owned trusted Git process.
+pub(crate) const TRUSTED_GIT_STDERR_LIMIT: usize = 1024 * 1024;
+
 /// Bytes retained for activity-timeline diagnostics.
 ///
 /// The start UI echoes command output, so the summary itself needs a bound

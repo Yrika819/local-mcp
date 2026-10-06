@@ -2452,6 +2452,48 @@ fn creation_produces_the_exact_locked_worktree_branch_and_head() {
 
 #[cfg(unix)]
 #[test]
+fn creation_refuses_repository_filter_drivers_before_checkout() {
+    let mut fixture = Fixture::new("filters");
+    let marker = fixture.root.join("filter-ran");
+    std::fs::write(
+        fixture.primary.join(".gitattributes"),
+        "tracked.txt filter=hostile\n",
+    )
+    .unwrap();
+    git(&fixture.primary, &["add", ".gitattributes"]);
+    git(
+        &fixture.primary,
+        &["commit", "-q", "-m", "configure test filter"],
+    );
+    let filter = format!("sh -c 'touch {}; cat'", marker.display());
+    let configured = Command::new("git")
+        .args(["config", "--local", "filter.hostile.smudge"])
+        .arg(filter)
+        .current_dir(&fixture.primary)
+        .status()
+        .expect("filter config command starts");
+    assert!(configured.success(), "filter config is written");
+
+    fixture.authorize_managed_root();
+    let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+    let result = fixture.prepare_real(&goal_id);
+
+    assert!(
+        !result.is_active(),
+        "filter configuration must block creation"
+    );
+    assert!(
+        !marker.exists(),
+        "host checkout must not execute the filter"
+    );
+    assert!(
+        !fixture.managed_target(&goal_id).exists(),
+        "a rejected filter driver must not create a managed worktree"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn creation_does_not_execute_repository_hooks() {
     use std::os::unix::fs::PermissionsExt;
 

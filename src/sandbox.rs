@@ -22,8 +22,7 @@ use crate::process_group::ProcessGroup;
 pub(crate) const TRUSTED_GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const TRUSTED_GIT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const TRUSTED_GIT_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const TRUSTED_GIT_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
-pub(crate) const TRUSTED_GIT_STDERR_LIMIT: usize = 1024 * 1024;
+pub(crate) use crate::resource_limits::{TRUSTED_GIT_STDERR_LIMIT, TRUSTED_GIT_STDOUT_LIMIT};
 pub(crate) const TRUSTED_GIT_CLEANUP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]

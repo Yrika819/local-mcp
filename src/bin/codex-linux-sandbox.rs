@@ -5,6 +5,19 @@
 mod exec_ready;
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../resource_limits.rs"]
+mod resource_limits;
+
+#[cfg(target_os = "linux")]
+#[path = "../process_group.rs"]
+mod process_group;
+
+#[cfg(target_os = "linux")]
+#[path = "../process_blocking.rs"]
+mod process_blocking;
+
+#[cfg(target_os = "linux")]
 #[path = "../bubblewrap_support.rs"]
 mod bubblewrap_support;
 
@@ -14,6 +27,10 @@ use bubblewrap_support::{BubblewrapSupport, check as check_bubblewrap};
 fn main() -> ! {
     #[cfg(target_os = "linux")]
     {
+        if let Err(error) = process_group::normalize_child_signal_policy() {
+            eprintln!("Linux sandbox could not establish child ownership policy: {error}");
+            std::process::exit(126);
+        }
         // The trusted parent already refuses to spawn this helper when the
         // ambient Bubblewrap is unusable, and it owns the sandbox lifecycle
         // decision. This gate is deliberately retained: the helper must not

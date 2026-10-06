@@ -47,20 +47,33 @@ impl BubblewrapSupport {
         // instead of the version it is actually refusing. Only a momentary busy
         // refusal is retried, so a missing, non-executable or failing runtime is
         // still `Unavailable` and the gate still fails closed.
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const PROBE_OUTPUT_LIMIT: usize = 4 * 1024;
         let retry = crate::exec_ready::BusyProgramRetry::new();
         let output = loop {
-            match std::process::Command::new(path).arg("--version").output() {
+            let mut command = std::process::Command::new(path);
+            command.arg("--version");
+            match crate::process_blocking::run_bounded_blocking_with_limits(
+                &mut command,
+                PROBE_TIMEOUT,
+                PROBE_OUTPUT_LIMIT,
+                PROBE_OUTPUT_LIMIT,
+            ) {
                 Err(error) if retry.retry(&error) => {}
                 result => break result,
             }
         };
         let output = match output {
-            Ok(output) => output,
-            Err(_) => return (BubblewrapSupport::Unavailable, None),
+            Ok(output)
+                if output.status.success()
+                    && !output.timed_out
+                    && !output.capture_incomplete
+                    && !output.output_overflow =>
+            {
+                output
+            }
+            _ => return (BubblewrapSupport::Unavailable, None),
         };
-        if !output.status.success() {
-            return (BubblewrapSupport::Unavailable, None);
-        }
         let text = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -219,6 +232,24 @@ mod tests {
         let support = check(Path::new(&bin).as_os_str());
         release.join().expect("the writer must be released");
         assert_eq!(support, BubblewrapSupport::UnsupportedVersion);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stalled_runtime_probe_is_bounded_and_unavailable() {
+        let root = std::env::temp_dir().join(format!("local-mcp-bwrap-stall-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = write_fake_bwrap(&root, "0.12.0");
+        let bwrap = Path::new(&bin).join("bwrap");
+        std::fs::write(&bwrap, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        let mut permissions = std::fs::metadata(&bwrap).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&bwrap, permissions).unwrap();
+
+        assert_eq!(
+            check(Path::new(&bin).as_os_str()),
+            BubblewrapSupport::Unavailable
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
