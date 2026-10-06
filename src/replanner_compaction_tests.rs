@@ -529,7 +529,7 @@ fn build(label: &str, shape: Shape) -> Fixture {
         assert!(!anchors.is_empty(), "edge top-up needs at least one anchor");
         // A `READY` Task may gain a hard dependency on an already-`COMPLETED`
         // Task, so anchors are legal targets from either state.
-        let pendings = goal
+        let mut pendings = goal
             .tasks()
             .iter()
             .filter(|(_, task)| {
@@ -539,6 +539,9 @@ fn build(label: &str, shape: Shape) -> Fixture {
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        // The edge-ceiling replacement regression must reclaim enough budget
+        // from its reserved trigger regardless of random UUID ordering.
+        pendings.sort_by_key(|id| (id != &trigger_leaf_id, id.clone()));
         // `add_dependencies` must group once per target Task, so collect the
         // per-Task sets first and only then build the mutation.
         let mut planned = BTreeMap::<TaskId, Vec<TaskId>>::new();
@@ -2061,6 +2064,10 @@ fn a_replacement_at_the_exact_edge_ceiling_is_admitted_because_the_dead_task_rel
         planner::MAX_PLAN_DEPENDENCY_EDGES
     );
     assert!(before.active_dependency_edges > 0);
+    assert!(
+        fixture.goal.tasks()[&fixture.trigger].dependencies().len() >= 3,
+        "the reserved trigger must own enough edges for the decomposed replacement"
+    );
 
     let proposal = decomposed_replacement(&fixture, "synthetic-trigger-request");
     let result = apply(&fixture, &proposal).expect(

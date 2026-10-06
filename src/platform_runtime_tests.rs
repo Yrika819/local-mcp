@@ -611,6 +611,10 @@ mod windows {
             !status.success(),
             "the helper must terminate abnormally rather than dropping its lease"
         );
+        assert!(
+            ready.exists(),
+            "the descendant must signal readiness before owner death"
+        );
         let mut bytes = Vec::new();
         tokio::time::timeout(TEARDOWN, witness.read_to_end(&mut bytes))
             .await

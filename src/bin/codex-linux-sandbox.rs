@@ -5,7 +5,7 @@
 mod exec_ready;
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
+#[allow(dead_code, unfulfilled_lint_expectations)]
 #[path = "../resource_limits.rs"]
 mod resource_limits;
 
