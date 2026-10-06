@@ -15,6 +15,7 @@ mod resource_limits;
 mod process_group;
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "../process_blocking.rs"]
 mod process_blocking;
 

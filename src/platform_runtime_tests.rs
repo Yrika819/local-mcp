@@ -481,6 +481,7 @@ mod unix {
 /// a timer or a process identifier that may have been recycled.
 #[cfg(windows)]
 mod windows {
+    use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -492,20 +493,91 @@ mod windows {
     /// How long a terminated Job is given to drain its accounting.
     const TEARDOWN: Duration = Duration::from_secs(10);
 
-    /// A command that starts a descendant and then exits, leaving the descendant
-    /// running. The descendant is what a direct-child-only check would miss.
-    fn leader_then_descendant() -> Command {
-        let mut command = Command::new("cmd.exe");
-        // `start /b` backgrounds `ping` without a new window, and `ping -n 300`
-        // runs for roughly five minutes, comfortably past every deadline here.
+    const TREE_HELPER_ENV: &str = "GOALLATCH_WINDOWS_TREE_HELPER";
+    const TREE_LEAF_ENV: &str = "GOALLATCH_WINDOWS_TREE_LEAF";
+    const TREE_MODE_ENV: &str = "GOALLATCH_WINDOWS_TREE_MODE";
+    const TREE_READY_ENV: &str = "GOALLATCH_WINDOWS_TREE_READY";
+
+    fn new_tree_ready_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "local-mcp-windows-tree-ready-{}.marker",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn windows_tree_leader(mode: &str, ready: &std::path::Path) -> std::process::Command {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"));
         command
-            .arg("/C")
-            .arg("start /b ping -n 300 127.0.0.1 & exit /b 0");
-        command
+            .args([
+                "--exact",
+                "platform_runtime_tests::windows::windows_tree_leader_helper",
+                "--nocapture",
+            ])
+            .env(TREE_HELPER_ENV, "1")
+            .env(TREE_MODE_ENV, mode)
+            .env(TREE_READY_ENV, ready)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         command
+    }
+
+    fn leader_then_descendant(mode: &str, ready: &std::path::Path) -> Command {
+        Command::from(windows_tree_leader(mode, ready))
+    }
+
+    fn wait_for_tree_ready(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "descendant helper never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn windows_tree_leader_helper() {
+        if std::env::var_os(TREE_HELPER_ENV).is_none() {
+            return;
+        }
+        let ready = PathBuf::from(
+            std::env::var_os(TREE_READY_ENV)
+                .expect("the ready-marker path is passed by the parent"),
+        );
+        let mut leaf =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"));
+        leaf.args([
+            "--exact",
+            "platform_runtime_tests::windows::windows_tree_leaf_helper",
+            "--nocapture",
+        ])
+        .env(TREE_LEAF_ENV, "1")
+        .env(TREE_READY_ENV, &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::null());
+        let child = leaf.spawn().expect("the descendant helper must spawn");
+        wait_for_tree_ready(&ready);
+        drop(child);
+        if std::env::var(TREE_MODE_ENV).is_ok_and(|mode| mode == "hold") {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn windows_tree_leaf_helper() {
+        if std::env::var_os(TREE_LEAF_ENV).is_none() {
+            return;
+        }
+        let ready = PathBuf::from(
+            std::env::var_os(TREE_READY_ENV)
+                .expect("the ready-marker path is passed by the parent"),
+        );
+        std::fs::write(ready, b"ready").expect("the leaf signals its start");
+        std::thread::sleep(Duration::from_secs(60));
     }
 
     #[tokio::test]
@@ -516,6 +588,7 @@ mod windows {
         // close that handle as part of process termination, which must kill the
         // descendant. The descendant inherits stdout; pipe EOF is the witness.
         let executable = std::env::current_exe().expect("test executable path");
+        let ready = new_tree_ready_path();
         let mut owner = tokio::process::Command::new(executable);
         owner
             .args([
@@ -524,6 +597,7 @@ mod windows {
                 "--nocapture",
             ])
             .env("GOALLATCH_ABNORMAL_OWNER_HELPER", "1")
+            .env(TREE_READY_ENV, &ready)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -542,6 +616,7 @@ mod windows {
             .await
             .expect("SECURITY REGRESSION: descendant held the owner pipe after abnormal death")
             .expect("stdout witness must read");
+        let _ = std::fs::remove_file(ready);
     }
 
     /// Child-process helper for `abnormal_owner_death_closes_the_job_and_terminates_its_descendant`.
@@ -553,32 +628,26 @@ mod windows {
         if std::env::var_os("GOALLATCH_ABNORMAL_OWNER_HELPER").is_none() {
             return;
         }
-        let mut command = Command::new("cmd.exe");
-        command
-            .arg("/C")
-            .arg("start /b ping -n 300 127.0.0.1 & exit /b 0");
-        // Inherit stdout from the helper test process: the descendant holding
-        // this handle is the parent's kernel EOF witness after owner death.
+        let ready = PathBuf::from(
+            std::env::var_os(TREE_READY_ENV).expect("the parent provides the witness marker"),
+        );
+        let mut command = leader_then_descendant("hold", &ready);
+        command.as_std_mut().stdout(Stdio::inherit());
         let lease = ProcessGroup::spawn(&mut command).expect("the owned tree must spawn");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if lease.active_processes_for_test().unwrap_or(0) >= 2 {
-                // Deliberately bypass all Rust destructors. If kill-on-close is
-                // missing, the descendant keeps stdout open and the parent test
-                // observes the witness timeout.
-                std::process::abort();
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("fixture did not produce a descendant in the Job");
+        wait_for_tree_ready(&ready);
+        assert!(
+            lease.active_processes_for_test().unwrap_or(0) >= 2,
+            "the Job must include both leader and descendant before owner death"
+        );
+        // Deliberately bypass all Rust destructors. If kill-on-close is missing,
+        // the descendant keeps the inherited owner pipe open.
+        std::process::abort();
     }
 
     #[test]
     fn blocking_git_runner_terminates_descendants_on_ordinary_completion() {
-        let mut command = std::process::Command::new("cmd.exe");
-        command
-            .arg("/C")
-            .arg("start /b ping -n 300 127.0.0.1 & exit /b 0");
+        let ready = new_tree_ready_path();
+        let mut command = windows_tree_leader("exit", &ready);
         let output = run_bounded_blocking(&mut command, Duration::from_secs(30))
             .expect("blocking Git command must run");
         assert!(
@@ -589,14 +658,17 @@ mod windows {
             !output.capture_incomplete,
             "the Job must terminate a descendant that inherited the output pipe"
         );
+        assert!(
+            ready.exists(),
+            "the descendant must have started before completion"
+        );
+        let _ = std::fs::remove_file(ready);
     }
 
     #[test]
     fn blocking_git_runner_timeout_terminates_the_descendant_tree() {
-        let mut command = std::process::Command::new("cmd.exe");
-        command
-            .arg("/C")
-            .arg("start /b ping -n 300 127.0.0.1 & ping -n 300 127.0.0.1");
+        let ready = new_tree_ready_path();
+        let mut command = windows_tree_leader("hold", &ready);
         let output = run_bounded_blocking(&mut command, Duration::from_secs(2))
             .expect("blocking Git command must run");
         assert!(
@@ -607,41 +679,44 @@ mod windows {
             !output.capture_incomplete,
             "the Job must close descendant-held output after timeout"
         );
+        assert!(
+            ready.exists(),
+            "the descendant must have started before timeout"
+        );
+        let _ = std::fs::remove_file(ready);
     }
 
     #[tokio::test]
     async fn a_windows_lease_reports_real_tree_containment() {
-        let mut command = leader_then_descendant();
+        let ready = new_tree_ready_path();
+        let mut command = leader_then_descendant("hold", &ready);
         let lease = ProcessGroup::spawn(&mut command).expect("the tree must spawn");
+        wait_for_tree_ready(&ready);
         // A real assertion rather than a compile-time one: a host that refuses job
         // assignment must fail here instead of the suite claiming a guarantee the
         // platform did not provide.
         assert!(
-            lease.owns_process_tree(),
-            "SECURITY REGRESSION: Windows reported containment it does not have"
+            lease.owns_process_tree() && lease.active_processes_for_test().unwrap_or(0) >= 2,
+            "SECURITY REGRESSION: the descendant did not enter the assigned Job"
         );
+        drop(lease);
+        let _ = std::fs::remove_file(ready);
     }
 
     #[tokio::test]
     async fn termination_empties_the_whole_tree_not_just_the_leader() {
-        let mut command = leader_then_descendant();
+        let ready = new_tree_ready_path();
+        let mut command = leader_then_descendant("exit", &ready);
         let mut lease = ProcessGroup::spawn(&mut command).expect("the tree must spawn");
-
-        // Let the leader spawn its descendant, then confirm the Job really does
-        // contain more than the leader. Without this, an empty count afterwards
-        // would prove nothing.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut saw_descendant = false;
-        while Instant::now() < deadline {
-            if lease.active_processes_for_test().unwrap_or(0) >= 2 {
-                saw_descendant = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_tree_ready(&ready);
+        let status = lease
+            .wait_termination()
+            .await
+            .expect("the leader exits normally");
+        assert!(status.success());
         assert!(
-            saw_descendant,
-            "the fixture never produced a descendant to witness"
+            lease.active_processes_for_test().unwrap_or(0) >= 1,
+            "the descendant must outlive the leader before tree termination"
         );
 
         lease.terminate();
@@ -657,30 +732,26 @@ mod windows {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let _ = std::fs::remove_file(ready);
     }
 
     #[tokio::test]
     async fn dropping_the_lease_empties_the_whole_tree() {
-        let mut command = leader_then_descendant();
+        let ready = new_tree_ready_path();
+        let mut command = leader_then_descendant("exit", &ready);
         let mut lease = ProcessGroup::spawn(&mut command).expect("the tree must spawn");
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut saw_descendant = false;
-        while Instant::now() < deadline {
-            if lease.active_processes_for_test().unwrap_or(0) >= 2 {
-                saw_descendant = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_tree_ready(&ready);
+        let status = lease
+            .wait_termination()
+            .await
+            .expect("the leader exits normally");
+        assert!(status.success());
         assert!(
-            saw_descendant,
-            "the fixture never produced a descendant to witness"
+            lease.active_processes_for_test().unwrap_or(0) >= 1,
+            "the descendant must outlive the leader before lease drop"
         );
 
-        // The descendant inherits stdout, so EOF proves it is gone even if its
-        // direct-child leader exited earlier. This checks the KILL_ON_JOB_CLOSE
-        // drop path without relying on a process identifier that could be reused.
+        // The descendant inherits stdout, so EOF proves it is gone after Job close.
         let mut witness = lease.take_stdout().expect("stdout witness pipe");
         drop(lease);
         let mut output = Vec::new();
@@ -688,6 +759,7 @@ mod windows {
             .await
             .expect("SECURITY REGRESSION: descendant survived lease drop")
             .expect("stdout witness must read");
+        let _ = std::fs::remove_file(ready);
     }
 
     #[tokio::test]
