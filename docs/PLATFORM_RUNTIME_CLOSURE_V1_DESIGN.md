@@ -51,16 +51,19 @@ Every production child spawn in the repository, after this design is applied:
 | 4 | `agent::run_bounded_process_async` (model/agent) | `ProcessGroup::spawn` | yes (Unix) / Job (Windows) | caller-supplied |
 | 5 | `managed_worktree_observe::HostGit::run` | bounded blocking runner | group (Unix) / Job (Windows) | **30 s** |
 | 6 | `managed_worktree_create::HostWorktreeCreator::create` | bounded blocking runner | group (Unix) / Job (Windows) | **120 s** |
-| 7 | `bubblewrap_support::probe` (Linux) | `std::process::Command::output()` | no | **none** |
+| 7 | `bubblewrap_support::probe` (Linux; parent and sandbox helper) | bounded blocking runner | group (Unix) | **5 s / 4 KiB per stream** |
 
-Sites 5 and 6 are bounded and contained after this design; site 7 is deliberately
-not (see §10). Sites 1–4 keep their existing structure and gain Windows containment.
+Sites 5–7 are bounded and contained after this design. Sites 5 and 6 use the
+trusted-Git capture ceilings; site 7 uses a tighter 4 KiB per-stream cap and a
+5-second deadline. Sites 1–4 keep their existing structure and gain Windows
+containment.
 
 Sites 5 and 6 matter more than their size suggests. `HostWorktreeCreator::create`
 performs `git worktree add`, a **mutating** operation, on the **Managed Worktrees**
-authority path, and it blocks a runtime thread with no deadline: a hung Git holds
-that thread forever and the durable creation sequence never reconciles. `HostGit`
-fans out to roughly a dozen sequential blocking Git children per observation.
+authority path. Its 120-second deadline prevents a hung Git from holding a runtime
+thread forever; a timeout remains an unknown mutation that must be reconciled, not
+proof that creation did not happen. `HostGit` fans out to roughly a dozen sequential
+bounded Git children per observation.
 
 ## 2. The Windows defect this design exists to fix
 
@@ -113,10 +116,12 @@ that has not deliberately escaped containment.
 | **Host process graceful exit** | tree terminated | tree terminated | tree terminated |
 | **Host process abnormal death** | **residual gap, §6** | **residual gap, §6** | **tree terminated, §6** |
 
-Sites 1–6 carry every lifecycle row above. Sites 5 and 6 use the blocking
-runner: Unix process groups are signalled on completion and timeout, and Windows
-Jobs are assigned before resume and terminated on both paths. Output is drained
-under the trusted-Git caps; incomplete captures fail closed.
+Sites 1–7 carry every lifecycle row above. Sites 5–7 use the blocking runner:
+Unix process groups are signalled on completion and timeout, and Windows Jobs are
+assigned before resume and terminated on both paths. Trusted Git output uses its
+named caps; the Bubblewrap version probe uses a tighter 4 KiB cap per stream.
+Incomplete captures fail closed. The probe is read-only, so timeout does not imply
+or classify a repository side effect.
 
 "Leader reaped; group terminated" on Unix is deliberate and pre-existing: after the
 leader finishes, the group is still signalled so no descendant survives the command.
@@ -129,9 +134,15 @@ The invariant below is unchanged and remains the load-bearing security property:
 > a host-owned proof that the group identifier belongs to the process tree it
 > launched.
 
+The standalone executable resets `SIGCHLD` to the default disposition and clears
+`SA_NOCLDWAIT` before starting its Tokio runtime or spawning children. The host owns
+this process signal policy and does not install a competing child reaper; these are
+necessary conditions for its unreaped-child proof.
+
 Specifically this design does **not**:
 
 - issue `kill(-pgid, …)` because an integer PGID was remembered;
+- allow inherited auto-reaping SIGCHLD policy to invalidate the unreaped-leader proof;
 - reap the group leader while the lease needs its identifier;
 - reintroduce a PID/PGID reuse race;
 - use a global process scanner as cleanup authority.
@@ -245,9 +256,11 @@ Windows gets from the kernel. It is deliberately **not** introduced here:
   Next phase, subject to: ships in release archives, structured host-owned
   arguments only, no repository-selected code, no TaskScope widening, bounded IPC
   with bounded frames and bounded waits, deterministic shutdown.
-- **The `bubblewrap_support::probe` remains uncontained and has no timeout.** It
-  runs before anything is spawned, argv is fixed to `--version`, and it feeds a
-  fail-closed gate, so this remains low severity and is deferred.
+- **Same-user concurrent repository-config changes remain a check/use race** for
+  managed Git filter configuration, as documented in `SECURITY.md`: Git offers no
+  shared atomic snapshot spanning the local/worktree config query and checkout.
+  Creation rejects filters present at query time and fails closed on incomplete
+  queries, but does not claim serialization against another same-user process.
 - **Blocking Git output has trusted-Git caps, not generic command caps.** The
   64 MiB stdout / 1 MiB stderr ceilings intentionally match the stricter existing
   trusted-Git policy. An over-limit or incomplete capture is rejected; callers do
