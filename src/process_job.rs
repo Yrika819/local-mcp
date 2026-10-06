@@ -53,9 +53,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-};
+use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
 /// Exit code reported to every process the Job terminates.
 ///

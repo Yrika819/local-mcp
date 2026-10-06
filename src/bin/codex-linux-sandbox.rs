@@ -10,6 +10,7 @@ mod exec_ready;
 mod resource_limits;
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "../process_group.rs"]
 mod process_group;
 

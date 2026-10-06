@@ -285,12 +285,11 @@ fn spawn_ready_to_exec(command: &mut Command) -> io::Result<Child> {
 /// resuming an uncontained process.
 #[cfg(windows)]
 fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
-    use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
     let mut job = Job::create()?;
     command.creation_flags(CREATE_SUSPENDED);
-    let child = spawn_ready_to_exec(command)?;
+    let mut child = spawn_ready_to_exec(command)?;
     match assign_and_resume(&mut job, &child) {
         Ok(()) => Ok(ProcessGroup {
             child,
@@ -310,8 +309,6 @@ fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
 /// Assign and resume `child`, failing closed if either step fails.
 #[cfg(windows)]
 fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("spawned child has no process identifier"))?;

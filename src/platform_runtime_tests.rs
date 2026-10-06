@@ -662,7 +662,7 @@ mod windows {
     #[tokio::test]
     async fn dropping_the_lease_empties_the_whole_tree() {
         let mut command = leader_then_descendant();
-        let lease = ProcessGroup::spawn(&mut command).expect("the tree must spawn");
+        let mut lease = ProcessGroup::spawn(&mut command).expect("the tree must spawn");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_descendant = false;
@@ -696,7 +696,7 @@ mod windows {
         // No descendant: the Job must drain from a single-process tree too, which
         // is the ordinary completion path.
         command.arg("/C").arg("exit /b 0");
-        let mut lease = ProcessGroup::spawn(&mut command).expect("the command must spawn");
+        let lease = ProcessGroup::spawn(&mut command).expect("the command must spawn");
 
         let deadline = Instant::now() + TEARDOWN;
         loop {
@@ -717,7 +717,7 @@ mod windows {
         // forever. A short deadline that must *not* fire is the direct regression.
         let mut command = Command::new("cmd.exe");
         command.arg("/C").arg("exit /b 0");
-        let lease = ProcessGroup::spawn(&mut command).expect("the command must spawn");
+        let mut lease = ProcessGroup::spawn(&mut command).expect("the command must spawn");
         let result = tokio::time::timeout(Duration::from_secs(20), lease.wait_termination()).await;
         assert!(
             result.is_ok(),

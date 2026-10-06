@@ -478,8 +478,6 @@ fn wait_bounded(
     job: &crate::process_job::Job,
     output_overflow: &AtomicBool,
 ) -> (ExitStatus, bool, bool) {
-    use std::os::windows::process::ExitStatusExt;
-
     let deadline = Instant::now() + timeout;
     let mut interval = POLL_START;
     loop {
