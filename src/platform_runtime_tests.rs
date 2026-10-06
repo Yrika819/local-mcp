@@ -10,10 +10,11 @@
 //!   exactly the "direct-child-only false proof" that a parent-death fix must not
 //!   rely on.
 //!
-//! The Unix witness is a pipe whose write end is inherited **only** by the
-//! descendant that must die. The kernel closes a process's descriptors when it
-//! terminates, even while it remains an unreaped zombie, so the read end reaching
-//! EOF is a decision the kernel made — not a timer, and not an inference.
+//! The Unix witness is a FIFO whose writer is opened by the intended child in its
+//! `pre_exec` hook, not held open in the parent and inherited by concurrent forks.
+//! The kernel closes a process's descriptors when it terminates, even while it
+//! remains an unreaped zombie, so the read end reaching EOF is a decision the
+//! kernel made — not a timer, and not an inference.
 //!
 //! What is proven here, and what is not:
 //!
@@ -28,8 +29,10 @@
 
 #[cfg(unix)]
 mod unix {
+    use std::ffi::CString;
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -37,6 +40,7 @@ mod unix {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
+    use crate::execution::AbortOnDropJoinHandle;
     use crate::process_blocking::run_bounded_blocking;
     use crate::process_group::ProcessGroup;
 
@@ -52,41 +56,82 @@ mod unix {
     /// a scheduling delay.
     const NEGATIVE_SETTLE: Duration = Duration::from_millis(500);
 
-    /// A pipe whose descriptors stay out of every unrelated process this binary
-    /// spawns, and whose write end is handed to exactly one descendant.
-    ///
-    /// `pipe2(O_CLOEXEC)` would be the obvious spelling but is Linux-only;
-    /// Darwin's libc has no `pipe2`, so a harness written against it would not
-    /// even compile for macOS. `pipe` plus an explicit `FD_CLOEXEC` is the
-    /// portable spelling. The residual two-syscall window is accepted for the
-    /// same reason the existing ownership harness accepts it.
-    fn witness_pipe() -> io::Result<(tokio::fs::File, OwnedFd)> {
-        let mut fds = [0 as libc::c_int; 2];
-        // Safety: `pipe` only writes the two descriptors into the array given.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+    /// A FIFO witness whose writer is opened by the intended child in `pre_exec`.
+    /// No writer descriptor exists in the parent, so unrelated fork/exec activity
+    /// cannot temporarily inherit a false witness holder during the spawn race.
+    struct WitnessPipe {
+        read_end: tokio::fs::File,
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for WitnessPipe {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn witness_pipe() -> io::Result<WitnessPipe> {
+        let path = std::env::temp_dir().join(format!(
+            "local-mcp-runtime-witness-{}.fifo",
+            uuid::Uuid::new_v4()
+        ));
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        // Safety: `c_path` is NUL-terminated and the mode is a valid permission mask.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        let [read_end, write_end] = fds;
-        for descriptor in [read_end, write_end] {
-            // Safety: both descriptors are open and owned by this function.
-            if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                let error = io::Error::last_os_error();
-                // Safety: this function owns both descriptors and has transferred
-                // neither, so a partial failure closes each exactly once.
-                unsafe {
-                    libc::close(read_end);
-                    libc::close(write_end);
-                }
-                return Err(error);
-            }
-        }
-        // Safety: ownership of both open descriptors transfers to these values.
-        Ok(unsafe {
-            (
-                tokio::fs::File::from_std(std::fs::File::from_raw_fd(read_end)),
-                OwnedFd::from_raw_fd(write_end),
+        let read_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
-        })
+        };
+        if read_fd == -1 {
+            let error = io::Error::last_os_error();
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1
+        {
+            let error = io::Error::last_os_error();
+            unsafe { libc::close(read_fd) };
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        // Safety: ownership of the fresh descriptor transfers to the returned file.
+        let read_end = unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_fd(read_fd)) };
+        Ok(WitnessPipe { read_end, path })
+    }
+
+    fn redirect_stdout_to_witness(
+        command: &mut std::process::Command,
+        witness: &WitnessPipe,
+    ) -> io::Result<()> {
+        let path = CString::new(witness.path.as_os_str().as_bytes())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: the closure uses only async-signal-safe open/dup2/close calls
+        // and captures an owned, NUL-terminated path.
+        unsafe {
+            command.pre_exec(move || {
+                let writer = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if writer == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::dup2(writer, libc::STDOUT_FILENO) == -1 {
+                    let error = io::Error::last_os_error();
+                    libc::close(writer);
+                    return Err(error);
+                }
+                if libc::close(writer) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
     }
 
     /// Observes whether a witnessed descendant is still alive.
@@ -96,7 +141,7 @@ mod unix {
     /// descriptors closed by the kernel, so this distinguishes a terminated
     /// process from a merely unreaped one.
     struct DescendantWitness {
-        read_end: tokio::fs::File,
+        pipe: WitnessPipe,
     }
 
     impl DescendantWitness {
@@ -104,7 +149,7 @@ mod unix {
             let mut byte = [0_u8; 1];
             tokio::time::timeout(settle, async {
                 loop {
-                    match self.read_end.read(&mut byte).await {
+                    match self.pipe.read_end.read(&mut byte).await {
                         Ok(0) => return true,
                         Ok(_) => continue,
                         Err(_) => return false,
@@ -130,32 +175,17 @@ mod unix {
         }
     }
 
-    /// A command whose leader spawns a long-lived descendant holding `write_end`.
+    /// A command whose leader spawns a long-lived descendant holding the FIFO writer.
     ///
     /// The descendant outlives its leader by construction: the leader exits
     /// immediately and only the descendant keeps running. That is the shape which
     /// makes a direct-child-only check worthless, so it is the shape every test
     /// here uses.
-    fn leader_then_descendant(write_end: &OwnedFd) -> Command {
-        let write_raw = write_end.as_raw_fd();
+    fn leader_then_descendant(witness: &WitnessPipe) -> Command {
         let mut command = std::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            // Backgrounded so it inherits the witness descriptor as stdout, then
-            // the leader exits immediately. Only the descendant holds the end.
-            .arg("sleep 300 & exit 0");
-        // Installed after fork, immediately before exec: `dup2` clears FD_CLOEXEC
-        // on the new descriptor, so the exec'd process inherits the write end.
-        //
-        // Safety: `dup2` is async-signal-safe and is the only call made here.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(write_raw, libc::STDOUT_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.arg("-c").arg("sleep 300 & exit 0");
+        redirect_stdout_to_witness(&mut command, witness)
+            .expect("the descendant witness path is valid");
         let mut command = Command::from(command);
         command
             .stdin(Stdio::null())
@@ -166,15 +196,14 @@ mod unix {
 
     /// Spawn a witnessed tree and hand back the lease plus its witness.
     ///
-    /// The parent's copies of both the runtime's stdout pipe and the witness write
-    /// end are closed here, so the only holder of the write end is the descendant.
+    /// The witness writer is opened only by the intended child after fork, so no
+    /// other concurrently spawned test process can hold the FIFO open.
     async fn witnessed_tree() -> (ProcessGroup, DescendantWitness) {
-        let (read_end, write_end) = witness_pipe().expect("the witness pipe must be creatable");
-        let mut command = leader_then_descendant(&write_end);
+        let pipe = witness_pipe().expect("the witness pipe must be creatable");
+        let mut command = leader_then_descendant(&pipe);
         let mut lease = ProcessGroup::spawn(&mut command).expect("the tree must spawn");
         drop(lease.take_stdout());
-        drop(write_end);
-        (lease, DescendantWitness { read_end })
+        (lease, DescendantWitness { pipe })
     }
 
     #[tokio::test]
@@ -188,6 +217,20 @@ mod unix {
         // Dropping the lease is the cancellation path: a future dropped while an
         // owned execution is in flight must not detach the tree.
         drop(lease);
+
+        witness.assert_terminated().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_foreground_task_owner_terminates_its_descendant() {
+        let (lease, mut witness) = witnessed_tree().await;
+        witness.assert_alive().await;
+
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        drop(AbortOnDropJoinHandle::new(task));
 
         witness.assert_terminated().await;
     }
@@ -218,19 +261,10 @@ mod unix {
 
     #[test]
     fn a_bounded_blocking_command_kills_a_descendant_that_outlives_its_leader() {
-        let (read_end, write_end) = witness_pipe().expect("the witness pipe must be creatable");
-        let write_raw = write_end.as_raw_fd();
+        let mut witness = witness_pipe().expect("the witness pipe must be creatable");
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg("sleep 300 & exit 0");
-        // Safety: `dup2` is async-signal-safe and is the only call made here.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(write_raw, libc::STDOUT_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        redirect_stdout_to_witness(&mut command, &witness).expect("witness path is valid");
 
         // The leader exits at once, so the command completes well inside the
         // deadline; the descendant is what must not survive it.
@@ -241,9 +275,8 @@ mod unix {
             !output.timed_out,
             "a fast leader must not be reported as a timeout"
         );
-        drop(write_end);
 
-        let mut read_end = read_end;
+        let read_end = &mut witness.read_end;
         let mut byte = [0_u8; 1];
         let released = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -311,42 +344,74 @@ mod unix {
         // to be gone. A descendant that escapes the process group and inherits the
         // pipe would therefore keep an unbounded join blocked forever — the exact
         // "a hung Git holds a runtime thread" failure this seam exists to prevent.
-        // `setsid` is that escape: it puts the descendant in a new session, outside
-        // the group, so the group signal cannot reach it.
-        let (read_end, write_end) = witness_pipe().expect("the witness pipe must be creatable");
-        let write_raw = write_end.as_raw_fd();
-        let mut command = std::process::Command::new("/bin/sh");
-        // Keep the escaped descendant short-lived so the test leaves no
-        // background process to clean up with a global scanner or a remembered
-        // PID. Its eight-second lifetime exceeds the runner's five-second drain
-        // grace, which is all this test needs to prove the caller is bounded.
-        command.arg("-c").arg("setsid sleep 8 & exit 0");
-        // Safety: `dup2` is async-signal-safe and is the only call made here.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(write_raw, libc::STDOUT_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // The helper below starts its own process group rather than relying on the
+        // non-portable `setsid` command (which is absent on macOS).
+        let mut witness = witness_pipe().expect("the witness pipe must be creatable");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"));
+        command
+            .args([
+                "--exact",
+                "platform_runtime_tests::unix::escaped_descendant_helper",
+                "--nocapture",
+            ])
+            .env("GOALLATCH_ESCAPED_DESCENDANT_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        redirect_stdout_to_witness(&mut command, &witness).expect("witness path is valid");
         let started = Instant::now();
         // If the join were unbounded this call would never return.
-        let output = run_bounded_blocking(&mut command, Duration::from_secs(2))
+        let _output = run_bounded_blocking(&mut command, Duration::from_secs(2))
             .expect("the bounded blocking command must run");
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(60),
             "SECURITY REGRESSION: an escaping descendant hung the caller for {elapsed:?}"
         );
+        // The command's reader pipe is not the independent descendant witness:
+        // pre_exec deliberately redirects stdout to the witness pipe. Verify that
+        // the escaped process still holds that pipe after the bounded runner returns.
+        let read_end = &mut witness.read_end;
+        let witness_still_open = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime must build")
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(200), async {
+                    let mut byte = [0_u8; 1];
+                    loop {
+                        match read_end.read(&mut byte).await {
+                            Ok(0) | Err(_) => return false,
+                            Ok(_) => continue,
+                        }
+                    }
+                })
+                .await
+                .is_err()
+            });
         assert!(
-            !output.timed_out,
-            "a leader that exits at once must not be reported as a timeout"
+            witness_still_open,
+            "the escaped descendant must retain its independent witness pipe"
         );
         // The descendant has a bounded eight-second lifetime and self-terminates;
         // no global scanner or remembered PID is used to clean it up.
-        drop(write_end);
-        drop(read_end);
+    }
+
+    #[test]
+    fn escaped_descendant_helper() {
+        if std::env::var_os("GOALLATCH_ESCAPED_DESCENDANT_HELPER").is_none() {
+            return;
+        }
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("8")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null());
+        // Give the witness process a different group so the runner cannot signal it.
+        command.process_group(0);
+        let child = command.spawn().expect("escaped witness must spawn");
+        drop(child);
     }
 
     #[test]
@@ -374,25 +439,15 @@ mod unix {
         // The timeout path must terminate the tree, not merely abandon it. The
         // leader here backgrounds a descendant and then blocks, so a runner that
         // only killed the leader would leave the descendant alive.
-        let (read_end, write_end) = witness_pipe().expect("the witness pipe must be creatable");
-        let write_raw = write_end.as_raw_fd();
+        let mut witness = witness_pipe().expect("the witness pipe must be creatable");
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg("sleep 300 & sleep 300");
-        // Safety: `dup2` is async-signal-safe and is the only call made here.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(write_raw, libc::STDOUT_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        redirect_stdout_to_witness(&mut command, &witness).expect("witness path is valid");
         let output = run_bounded_blocking(&mut command, Duration::from_millis(250))
             .expect("the bounded blocking command must run");
         assert!(output.timed_out, "the deadline must have expired");
-        drop(write_end);
 
-        let mut read_end = read_end;
+        let read_end = &mut witness.read_end;
         let mut byte = [0_u8; 1];
         let released = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -429,8 +484,9 @@ mod windows {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    use tokio::process::Command;
+    use tokio::{io::AsyncReadExt, process::Command};
 
+    use crate::process_blocking::run_bounded_blocking;
     use crate::process_group::ProcessGroup;
 
     /// How long a terminated Job is given to drain its accounting.
@@ -444,7 +500,7 @@ mod windows {
         // runs for roughly five minutes, comfortably past every deadline here.
         command
             .arg("/C")
-            .arg("start /b ping -n 300 127.0.0.1 > NUL & exit /b 0");
+            .arg("start /b ping -n 300 127.0.0.1 & exit /b 0");
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -517,6 +573,42 @@ mod windows {
         panic!("fixture did not produce a descendant in the Job");
     }
 
+    #[test]
+    fn blocking_git_runner_terminates_descendants_on_ordinary_completion() {
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .arg("/C")
+            .arg("start /b ping -n 300 127.0.0.1 & exit /b 0");
+        let output = run_bounded_blocking(&mut command, Duration::from_secs(30))
+            .expect("blocking Git command must run");
+        assert!(
+            !output.timed_out,
+            "the leader should complete before deadline"
+        );
+        assert!(
+            !output.capture_incomplete,
+            "the Job must terminate a descendant that inherited the output pipe"
+        );
+    }
+
+    #[test]
+    fn blocking_git_runner_timeout_terminates_the_descendant_tree() {
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .arg("/C")
+            .arg("start /b ping -n 300 127.0.0.1 & ping -n 300 127.0.0.1");
+        let output = run_bounded_blocking(&mut command, Duration::from_secs(2))
+            .expect("blocking Git command must run");
+        assert!(
+            output.timed_out,
+            "the foreground leader must exceed the deadline"
+        );
+        assert!(
+            !output.capture_incomplete,
+            "the Job must close descendant-held output after timeout"
+        );
+    }
+
     #[tokio::test]
     async fn a_windows_lease_reports_real_tree_containment() {
         let mut command = leader_then_descendant();
@@ -586,11 +678,16 @@ mod windows {
             "the fixture never produced a descendant to witness"
         );
 
-        // Dropping is the cancellation path: a dropped future must not detach a
-        // tree it owned. Closing the Job handle carries `KILL_ON_JOB_CLOSE`, so the
-        // kernel terminates the tree rather than this code signalling a process
-        // identifier.
+        // The descendant inherits stdout, so EOF proves it is gone even if its
+        // direct-child leader exited earlier. This checks the KILL_ON_JOB_CLOSE
+        // drop path without relying on a process identifier that could be reused.
+        let mut witness = lease.take_stdout().expect("stdout witness pipe");
         drop(lease);
+        let mut output = Vec::new();
+        tokio::time::timeout(TEARDOWN, witness.read_to_end(&mut output))
+            .await
+            .expect("SECURITY REGRESSION: descendant survived lease drop")
+            .expect("stdout witness must read");
     }
 
     #[tokio::test]
