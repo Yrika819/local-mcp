@@ -94,13 +94,21 @@ impl Job {
         &self.command
     }
 
+    /// Request task cancellation without awaiting it.
+    ///
+    /// Shutdown uses this for every retained job before its first await, so
+    /// cancellation of the shutdown future cannot detach jobs later in the batch.
+    pub(crate) fn request_termination(&self) {
+        self.handle.abort();
+    }
+
     /// Stop the job's task and wait for it to unwind.
     ///
     /// Dropping the spawned task is what tears the child down: the process-group
     /// guard inside it signals the whole group on drop. This is the same
     /// mechanism `stop_job` always used; no broader process authority is added.
     pub(crate) async fn terminate(self) {
-        self.handle.abort();
+        self.request_termination();
         let _ = self.handle.await;
     }
 

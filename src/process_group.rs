@@ -95,6 +95,29 @@ pub(crate) struct ProcessGroup {
     job: Option<Job>,
 }
 
+#[cfg(unix)]
+pub(crate) fn normalize_child_signal_policy() -> io::Result<()> {
+    // A remembered PGID is safe to signal only while its direct-child leader is
+    // still an unreaped child. An inherited SIGCHLD=SIG_IGN disposition (or
+    // SA_NOCLDWAIT) silently auto-reaps leaders and invalidates that proof. This
+    // standalone server owns its process signal policy, so restore the POSIX
+    // default before the async runtime or any child process is started.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_DFL;
+    action.sa_flags = 0;
+    // SAFETY: `action` is initialized as a default disposition with an empty
+    // signal mask before it is installed for SIGCHLD.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `action` is valid for the duration of this call and no old action
+    // needs to be retained by the standalone executable.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl ProcessGroup {
     /// Spawn `command` as the leader of a new process group owned by this lease.
     ///

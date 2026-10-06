@@ -275,12 +275,27 @@ where
 /// process killer, and it does not reach jobs owned by another MCP server
 /// process. Abnormal parent death (a kill rather than a clean EOF) is a separate,
 /// later concern and is deliberately not handled here.
-async fn release_all_jobs() {
-    // Collect first: the registry lock must not be held across an await.
-    let released = job_registry::registry().release_all();
+fn request_job_batch_termination(jobs: &[job_registry::Job]) {
+    for job in jobs {
+        job.request_termination();
+    }
+}
+
+async fn terminate_jobs(released: Vec<job_registry::Job>) {
+    // Request cancellation for the entire drained batch before awaiting any one
+    // task. If shutdown itself is cancelled while joining, every job has already
+    // been told to stop and dropping the remaining JoinHandles cannot detach live
+    // execution trees.
+    request_job_batch_termination(&released);
     for job in released {
         job.terminate().await;
     }
+}
+
+async fn release_all_jobs() {
+    // Collect first: the registry lock must not be held across an await.
+    let released = job_registry::registry().release_all();
+    terminate_jobs(released).await;
 }
 
 /// Write one response, replacing it with a bounded error frame if it does not fit.
@@ -1617,7 +1632,60 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 // includes this file and would otherwise compile the module a second time.
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
+
+    use tokio::sync::oneshot;
+
     use super::*;
+
+    struct DropNotice(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            if let Some(notice) = self.0.take() {
+                let _ = notice.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_requests_cancellation_for_every_drained_job_before_joining() {
+        let mut jobs = Vec::new();
+        let mut started = Vec::new();
+        let mut stopped = Vec::new();
+        for index in 0..2 {
+            let (started_tx, started_rx) = oneshot::channel();
+            let (stopped_tx, stopped_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _notice = DropNotice(Some(stopped_tx));
+                let _ = started_tx.send(());
+                pending::<()>().await;
+                Ok(String::new())
+            });
+            jobs.push(job_registry::Job::new(
+                format!("shutdown-test-{index}"),
+                "sleep".to_owned(),
+                handle,
+            ));
+            started.push(started_rx);
+            stopped.push(stopped_rx);
+        }
+        for notice in started {
+            notice.await.expect("job task started");
+        }
+
+        // This synchronous batch operation is the cancellation boundary used by
+        // release_all_jobs. The JoinHandles may subsequently be dropped if the
+        // shutdown future is cancelled, but every task must already be aborted.
+        request_job_batch_termination(&jobs);
+        drop(jobs);
+        for notice in stopped {
+            tokio::time::timeout(Duration::from_secs(5), notice)
+                .await
+                .expect("aborted job task did not unwind")
+                .expect("job drop notification was sent");
+        }
+    }
 
     /// A session rooted at a scratch directory, for exercising the write_file
     /// preimage contract without touching a real project.

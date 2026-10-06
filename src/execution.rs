@@ -19,6 +19,32 @@ pub(crate) struct BackgroundExecution {
     pub(crate) activity: &'static str,
 }
 
+/// Keeps a foreground command task attached to the caller until ownership is
+/// explicitly transferred to the background-job registry.
+pub(crate) struct AbortOnDropJoinHandle<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDropJoinHandle<T> {
+    pub(crate) fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn as_mut(&mut self) -> &mut JoinHandle<T> {
+        self.0.as_mut().expect("guard always owns its task")
+    }
+
+    fn into_inner(mut self) -> JoinHandle<T> {
+        self.0.take().expect("guard always owns its task")
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 pub(crate) enum ExecutionOutcome {
     Completed(String),
     Background(BackgroundExecution),
@@ -129,15 +155,16 @@ fn encode_publish_frame(request: &crate::writer::WriterWriteRequest<'_>) -> Resu
     ))
 }
 pub(crate) async fn execute(args: &Value, session: &config::Session) -> Result<ExecutionOutcome> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
+    let (rendered_command, handle) = spawn_sandboxed_command("execute", args, session).await?;
+    let mut handle = AbortOnDropJoinHandle::new(handle);
 
-    match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
+    match tokio::time::timeout(FOREGROUND_TIMEOUT, handle.as_mut()).await {
         Ok(joined) => Ok(ExecutionOutcome::Completed(
             joined.context("command task failed")??,
         )),
         Err(_) => Ok(ExecutionOutcome::Background(BackgroundExecution {
             rendered_command,
-            handle,
+            handle: handle.into_inner(),
             activity: "Backgrounded",
         })),
     }
@@ -1657,14 +1684,14 @@ pub(crate) async fn without_sandbox(
         result
     });
 
-    let mut handle = handle;
-    match tokio::time::timeout(HOST_FOREGROUND_TIMEOUT, &mut handle).await {
+    let mut handle = AbortOnDropJoinHandle::new(handle);
+    match tokio::time::timeout(HOST_FOREGROUND_TIMEOUT, handle.as_mut()).await {
         Ok(joined) => Ok(ExecutionOutcome::Completed(
             joined.context("command task failed")??,
         )),
         Err(_) => Ok(ExecutionOutcome::Background(BackgroundExecution {
             rendered_command,
-            handle,
+            handle: handle.into_inner(),
             activity: "Backgrounded host command",
         })),
     }
@@ -1754,6 +1781,7 @@ mod tests {
     use super::*;
 
     const TEST_APPROVAL_TIMEOUT: Duration = Duration::from_secs(15);
+    const TEST_LONG_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 
     struct FakeGit {
         root: PathBuf,
@@ -2328,8 +2356,12 @@ mod tests {
             "--".to_owned(),
             "staged.txt".to_owned(),
         ];
+        // This path performs multiple trusted Git subprocesses plus a Codex
+        // preflight. Keep a bounded test deadline, but leave room for process
+        // contention in the default-parallel suite; 15 seconds proved too tight
+        // while sibling process-runtime tests were active.
         let execution = tokio::time::timeout(
-            TEST_APPROVAL_TIMEOUT,
+            TEST_LONG_EXECUTION_TIMEOUT,
             process_sandboxed_attempt_with_test_codex(
                 &fixture.session.id,
                 &command,

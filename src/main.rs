@@ -125,8 +125,17 @@ enum Command {
     Mcp,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    #[cfg(unix)]
+    process_group::normalize_child_signal_policy()?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Start { session_id: None }) {
         Command::Start { session_id } => approvals::start(session_id.as_deref()).await,

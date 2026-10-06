@@ -34,6 +34,8 @@ use tokio::process::Command;
 
 use crate::process_group::{ProcessGroup, ProcessGroupOwnership};
 
+const SIGCHLD_NORMALIZATION_CHILD: &str = "LOCAL_MCP_SIGCHLD_NORMALIZATION_CHILD";
+
 /// How long a group is given to show that it is still populated.
 ///
 /// Group kills are issued synchronously, so this only has to outlast scheduling
@@ -265,6 +267,43 @@ async fn assert_collected(pid: libc::pid_t) {
     assert_eq!(
         second, -1,
         "the group leader must not be left as an unreaped zombie"
+    );
+}
+
+#[test]
+fn inherited_sigchld_auto_reap_is_disabled_before_owned_children() {
+    const TEST_NAME: &str = "process_group_ownership_tests::inherited_sigchld_auto_reap_is_disabled_before_owned_children";
+    if std::env::var_os(SIGCHLD_NORMALIZATION_CHILD).is_some() {
+        let mut ignored: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignored.sa_sigaction = libc::SIG_IGN;
+        ignored.sa_flags = libc::SA_NOCLDWAIT;
+        assert_eq!(unsafe { libc::sigemptyset(&mut ignored.sa_mask) }, 0);
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, &ignored, std::ptr::null_mut()) },
+            0
+        );
+
+        crate::process_group::normalize_child_signal_policy()
+            .expect("the owner must restore a reapable-child policy");
+        let mut actual: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut actual) },
+            0
+        );
+        assert_eq!(actual.sa_sigaction, libc::SIG_DFL);
+        assert_eq!(actual.sa_flags & libc::SA_NOCLDWAIT, 0);
+        return;
+    }
+
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST_NAME])
+        .env(SIGCHLD_NORMALIZATION_CHILD, "1")
+        .output()
+        .expect("the isolated signal-policy test process starts");
+    assert!(
+        result.status.success(),
+        "child process did not normalize SIGCHLD: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
 }
 
