@@ -58,6 +58,63 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, unix))]
+#[derive(Debug, Default)]
+pub(crate) struct ProcessTreeTestEvidence {
+    pub(crate) leader_pid: Option<u32>,
+    pub(crate) group_id: Option<i32>,
+    pub(crate) ownership_observation: Option<String>,
+    pub(crate) group_signal_result: Option<i32>,
+    pub(crate) group_signal_errno: Option<i32>,
+}
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static PROCESS_TREE_TEST_EVIDENCE: std::cell::RefCell<ProcessTreeTestEvidence> =
+        std::cell::RefCell::new(ProcessTreeTestEvidence::default());
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn take_process_tree_test_evidence() -> ProcessTreeTestEvidence {
+    PROCESS_TREE_TEST_EVIDENCE.with(|evidence| std::mem::take(&mut *evidence.borrow_mut()))
+}
+
+#[cfg(all(test, unix))]
+fn reset_process_tree_test_evidence() {
+    PROCESS_TREE_TEST_EVIDENCE
+        .with(|evidence| *evidence.borrow_mut() = ProcessTreeTestEvidence::default());
+}
+
+#[cfg(all(test, unix))]
+fn record_process_tree_leader(pid: u32) {
+    PROCESS_TREE_TEST_EVIDENCE.with(|evidence| {
+        let mut evidence = evidence.borrow_mut();
+        evidence.leader_pid = Some(pid);
+        evidence.group_id = Some(pid as i32);
+    });
+}
+
+#[cfg(all(test, unix))]
+fn record_ownership_observation(observation: &io::Result<bool>) {
+    let value = match observation {
+        Ok(false) => "leader-running-and-unreaped".to_owned(),
+        Ok(true) => "leader-exited-but-unreaped".to_owned(),
+        Err(error) => format!("unproven: {error} (errno {:?})", error.raw_os_error()),
+    };
+    PROCESS_TREE_TEST_EVIDENCE.with(|evidence| {
+        evidence.borrow_mut().ownership_observation = Some(value);
+    });
+}
+
+#[cfg(all(test, unix))]
+fn record_group_signal(result: i32, errno: Option<i32>) {
+    PROCESS_TREE_TEST_EVIDENCE.with(|evidence| {
+        let mut evidence = evidence.borrow_mut();
+        evidence.group_signal_result = Some(result);
+        evidence.group_signal_errno = errno;
+    });
+}
+
 /// First poll interval while waiting for a bounded blocking child.
 ///
 /// Short, because most host-owned Git children finish in milliseconds and the
@@ -135,6 +192,8 @@ pub(crate) fn run_bounded_blocking_with_limits(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> io::Result<BlockingOutput> {
+    #[cfg(all(test, unix))]
+    reset_process_tree_test_evidence();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -156,6 +215,8 @@ pub(crate) fn run_bounded_blocking_with_limits(
     }
 
     let mut child = spawn_ready(command)?;
+    #[cfg(all(test, unix))]
+    record_process_tree_leader(child.id());
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
@@ -349,7 +410,10 @@ fn wait_bounded(
     let mut interval = POLL_START;
     loop {
         if output_overflow.load(Ordering::Acquire) {
-            match has_exited_unreaped(child.id()) {
+            let observation = has_exited_unreaped(child.id());
+            #[cfg(test)]
+            record_ownership_observation(&observation);
+            match observation {
                 Ok(_) => {
                     terminate_tree(child);
                     return (wait_after_termination(child), false, true);
@@ -362,7 +426,10 @@ fn wait_bounded(
                 }
             }
         }
-        match has_exited_unreaped(child.id()) {
+        let observation = has_exited_unreaped(child.id());
+        #[cfg(test)]
+        record_ownership_observation(&observation);
+        match observation {
             // The leader is gone but unreaped, so the group identifier is still
             // reserved and the group may be signalled.
             Ok(true) => {
@@ -540,9 +607,18 @@ fn terminate_tree(child: &mut Child) {
     // Safety: the leader is unreaped and still running, so its process identifier
     // — which is also the group identifier — has not been returned to the kernel,
     // and the group provably contains only this tree.
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-    }
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    #[cfg(test)]
+    record_group_signal(
+        result,
+        (result == -1).then(|| {
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default()
+        }),
+    );
+    #[cfg(not(test))]
+    let _ = result;
 }
 
 #[cfg(test)]

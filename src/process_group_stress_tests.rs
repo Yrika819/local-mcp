@@ -33,6 +33,14 @@
 //! has been reaped. Nothing here needs `/proc`, `ps`, process names, sleeps or a
 //! group identifier, so it behaves identically on Linux and on macOS.
 //!
+//! The guards clean up on ordinary return, panic unwind, and task cancellation
+//! while the owner process is still running. They cannot run after the test
+//! executable is externally killed (for example by a harness timeout or machine
+//! failure), so this is not a zero-residue guarantee for those events. The
+//! fixtures' long-lived commands are bounded, but external termination can leave
+//! them until their own command lifetime expires; residue must be audited and
+//! cleaned by the harness/operator using the recorded test-owned group identity.
+//!
 //! Because a FIFO is a filesystem rendezvous rather than an inherited
 //! descriptor, the test can install a witness into a group it does not spawn:
 //! the production launcher owns the child's stdin, stdout and stderr, and every
@@ -180,8 +188,8 @@ impl FixtureRoot {
 
 impl Drop for FixtureRoot {
     fn drop(&mut self) {
-        // Runs on the normal path and while a failing assertion unwinds, so a red
-        // test cannot accumulate temporary directories for the next run.
+        // Runs on ordinary return and panic unwind only. External SIGKILL of the
+        // test executable bypasses Drop and is not covered by this guard.
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }

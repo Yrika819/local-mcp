@@ -116,7 +116,10 @@ mod unix {
         // and captures an owned, NUL-terminated path.
         unsafe {
             command.pre_exec(move || {
-                let writer = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                let writer = libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                );
                 if writer == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -434,41 +437,186 @@ mod unix {
         );
     }
 
+    fn install_descendant_readiness_handshake(command: &mut std::process::Command) {
+        let shell = CString::new("/bin/sh").unwrap();
+        let option = CString::new("-c").unwrap();
+        let script = CString::new("printf R; printf S >&9; exec sleep 30").unwrap();
+        unsafe {
+            command.pre_exec(move || {
+                let mut descriptors = [0; 2];
+                if libc::pipe(descriptors.as_mut_ptr()) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let descendant = libc::fork();
+                if descendant == -1 {
+                    let error = io::Error::last_os_error();
+                    libc::close(descriptors[0]);
+                    libc::close(descriptors[1]);
+                    return Err(error);
+                }
+                if descendant == 0 {
+                    libc::close(descriptors[0]);
+                    const READY_FD: libc::c_int = 9;
+                    if libc::dup2(descriptors[1], READY_FD) == -1 {
+                        libc::_exit(126);
+                    }
+                    if descriptors[1] != READY_FD && libc::close(descriptors[1]) == -1 {
+                        libc::_exit(126);
+                    }
+                    let arguments = [
+                        shell.as_ptr(),
+                        option.as_ptr(),
+                        script.as_ptr(),
+                        std::ptr::null(),
+                    ];
+                    libc::execv(shell.as_ptr(), arguments.as_ptr());
+                    libc::_exit(127);
+                }
+
+                libc::close(descriptors[1]);
+                let mut poll_descriptor = libc::pollfd {
+                    fd: descriptors[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let poll_result = libc::poll(&mut poll_descriptor, 1, 5_000);
+                let mut ready = 0_u8;
+                let mut read_result = -1;
+                if poll_result > 0 {
+                    read_result = libc::read(
+                        descriptors[0],
+                        &mut ready as *mut u8 as *mut libc::c_void,
+                        1,
+                    );
+                }
+                libc::close(descriptors[0]);
+                if poll_result <= 0 || read_result != 1 || ready != b'S' {
+                    libc::kill(descendant, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(descendant, &mut status, 0);
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "descendant readiness handshake did not arrive before command exec",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn failure_process_evidence(group_id: Option<i32>, witness_path: &std::path::Path) -> String {
+        let Some(group_id) = group_id else {
+            return "process inspection unavailable: process-group id was not recorded".to_owned();
+        };
+        let processes = std::process::Command::new("ps")
+            .args(["-axo", "pid,ppid,pgid,stat,command"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace()
+                            .nth(2)
+                            .and_then(|value| value.parse::<i32>().ok())
+                            == Some(group_id)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|error| format!("ps unavailable: {error}"));
+        let holders = std::process::Command::new("lsof")
+            .args(["-n", &witness_path.to_string_lossy()])
+            .output()
+            .map(|output| {
+                format!(
+                    "status={} stdout={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })
+            .unwrap_or_else(|error| format!("lsof unavailable: {error}"));
+        format!("process_group={group_id} members={processes:?}; fifo_holders={holders}")
+    }
+
     #[test]
     fn a_timed_out_blocking_command_leaves_no_descendant_running() {
-        // The timeout path must terminate the tree, not merely abandon it. The
-        // leader here backgrounds a descendant and then blocks, so a runner that
-        // only killed the leader would leave the descendant alive.
+        // `spawn_ready` returns only after exec succeeds, and `wait_bounded` starts
+        // its deadline afterwards. The child-side pre_exec has therefore opened
+        // the witness before this 250 ms run deadline begins. The descendant emits
+        // its own marker before exec, proving cleanup is not judged vacuously.
         let mut witness = witness_pipe().expect("the witness pipe must be creatable");
         let mut command = std::process::Command::new("/bin/sh");
-        command.arg("-c").arg("sleep 300 & sleep 300");
+        command.arg("-c").arg("sleep 30");
         redirect_stdout_to_witness(&mut command, &witness).expect("witness path is valid");
+        install_descendant_readiness_handshake(&mut command);
         let output = run_bounded_blocking(&mut command, Duration::from_millis(250))
             .expect("the bounded blocking command must run");
-        assert!(output.timed_out, "the deadline must have expired");
+        let process_evidence = crate::process_blocking::take_process_tree_test_evidence();
 
         let read_end = &mut witness.read_end;
-        let mut byte = [0_u8; 1];
-        let released = tokio::runtime::Builder::new_current_thread()
+        let mut byte = [0_u8; 64];
+        let (descendant_ready, released) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("a current-thread runtime must build")
             .block_on(async {
                 tokio::time::timeout(TEARDOWN, async {
+                    let mut descendant_ready = false;
                     loop {
                         match read_end.read(&mut byte).await {
-                            Ok(0) => return true,
-                            Ok(_) => continue,
-                            Err(_) => return false,
+                            Ok(0) => return (descendant_ready, true),
+                            Ok(count) => {
+                                descendant_ready |= byte[..count].contains(&b'R');
+                            }
+                            Err(_) => return (descendant_ready, false),
                         }
                     }
                 })
                 .await
-                .unwrap_or(false)
+                .unwrap_or((false, false))
             });
+        let failure_evidence = if descendant_ready && released && output.timed_out {
+            String::new()
+        } else {
+            failure_process_evidence(process_evidence.group_id, &witness.path)
+        };
+        assert!(
+            output.timed_out,
+            "deadline did not expire; leader_pid={:?} pgid={:?} ownership={:?} \
+             group_signal={:?}/errno={:?} descendant_ready={descendant_ready} eof={released} \
+             process_evidence={failure_evidence}",
+            process_evidence.leader_pid,
+            process_evidence.group_id,
+            process_evidence.ownership_observation,
+            process_evidence.group_signal_result,
+            process_evidence.group_signal_errno,
+        );
+        assert!(
+            descendant_ready,
+            "fixture did not prove a descendant held the writer before timeout cleanup; \
+             leader_pid={:?} pgid={:?} timeout={} ownership={:?} group_signal={:?}/errno={:?} \
+             fifo={} eof={released} process_evidence={failure_evidence}",
+            process_evidence.leader_pid,
+            process_evidence.group_id,
+            output.timed_out,
+            process_evidence.ownership_observation,
+            process_evidence.group_signal_result,
+            process_evidence.group_signal_errno,
+            witness.path.display(),
+        );
         assert!(
             released,
-            "SECURITY REGRESSION: a timed-out execution left a descendant running"
+            "SECURITY REGRESSION: timed-out tree retained the FIFO writer; \
+             leader_pid={:?} pgid={:?} timeout={} ownership={:?} group_signal={:?}/errno={:?} \
+             fifo={} process_evidence={failure_evidence}",
+            process_evidence.leader_pid,
+            process_evidence.group_id,
+            output.timed_out,
+            process_evidence.ownership_observation,
+            process_evidence.group_signal_result,
+            process_evidence.group_signal_errno,
+            witness.path.display(),
         );
     }
 }

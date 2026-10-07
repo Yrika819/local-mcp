@@ -8,6 +8,12 @@ use uuid::Uuid;
 use crate::sandbox;
 
 #[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
@@ -23,6 +29,93 @@ fn executable_script(root: &Path, name: &str, body: &str) -> PathBuf {
 #[cfg(unix)]
 fn script_command(path: &Path) -> Vec<String> {
     vec![path.to_string_lossy().into_owned()]
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+struct TempRoot(PathBuf);
+
+#[cfg(unix)]
+impl TempRoot {
+    fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+const WITNESS_READY: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+const WITNESS_TEARDOWN: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+struct LifetimeWitness {
+    path: PathBuf,
+    ready_path: PathBuf,
+    read_end: tokio::fs::File,
+}
+
+#[cfg(unix)]
+impl LifetimeWitness {
+    fn new(root: &Path) -> Self {
+        let path = root.join("descendant.witness");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let read_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        assert!(read_fd >= 0, "witness FIFO read end must open");
+        let file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        Self {
+            ready_path: root.join("descendant.ready"),
+            path,
+            read_end: tokio::fs::File::from_std(file),
+        }
+    }
+
+    async fn wait_until_ready(&self) -> bool {
+        loop {
+            if tokio::fs::try_exists(&self.ready_path)
+                .await
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn observe_until_eof(&mut self) -> bool {
+        use tokio::io::AsyncReadExt;
+
+        let mut buffer = [0_u8; 64];
+        loop {
+            match self.read_end.read(&mut buffer).await {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -129,49 +222,114 @@ async fn bounded_clean_runner_kills_hanging_child_promptly() {
 }
 
 #[cfg(unix)]
+#[test]
+fn descendant_lifetime_helper() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let Some(path) = std::env::var_os("LOCAL_MCP_DESCENDANT_WITNESS") else {
+        return;
+    };
+    let ready_path = std::env::var_os("LOCAL_MCP_DESCENDANT_READY")
+        .expect("the readiness marker path must be configured");
+    let path = CString::new(path.as_os_str().as_bytes()).expect("witness path must be NUL-free");
+    let writer = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if writer == -1 {
+        return;
+    }
+    let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+    let writer_fd = writer.as_raw_fd();
+    let mut child = Command::new("/bin/sleep");
+    child.arg("30");
+    unsafe {
+        child.pre_exec(move || {
+            const WITNESS_FD: libc::c_int = 9;
+            if libc::dup2(writer_fd, WITNESS_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(WITNESS_FD, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(WITNESS_FD, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if writer_fd != WITNESS_FD && libc::close(writer_fd) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let ready = b"R";
+            if libc::write(WITNESS_FD, ready.as_ptr().cast(), ready.len()) != ready.len() as isize {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = child.spawn().expect("the witnessed descendant must spawn");
+    std::fs::write(ready_path, b"ready").expect("the descendant readiness marker must persist");
+    // The runner owns cleanup of this process group; dropping detaches the child
+    // handle so the helper can exit while the witnessed descendant stays alive.
+    drop(child);
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn bounded_clean_runner_kills_descendant_retaining_pipes() {
-    let root =
-        std::env::temp_dir().join(format!("local-mcp-bounded-descendant-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let pid_path = root.join("descendant.pid");
+    let root = TempRoot::new("local-mcp-bounded-descendant");
+    let mut witness = LifetimeWitness::new(&root.0);
+    let executable = std::env::current_exe().expect("test executable path");
     let script = executable_script(
-        &root,
+        &root.0,
         "descendant.sh",
         &format!(
-            "#!/bin/sh\n/bin/sleep 4 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
-            pid_path.display()
+            "#!/bin/sh\nLOCAL_MCP_DESCENDANT_WITNESS={} LOCAL_MCP_DESCENDANT_READY={} exec {} --exact phase0_tests::sandbox_contract::descendant_lifetime_helper --nocapture\n",
+            shell_quote(&witness.path.display().to_string()),
+            shell_quote(&witness.ready_path.display().to_string()),
+            shell_quote(&executable.display().to_string())
         ),
     );
-    let timeout = Duration::from_secs(1);
+    // The nested test harness startup competed with the bounded runner's original
+    // one-second deadline. Under parallel load the runner could finish before the
+    // helper had a chance to fork its witnessed descendant. Give fixture startup a
+    // separately observed readiness phase before judging the cleanup result.
+    let timeout = Duration::from_secs(3);
+    let witness_path = witness.path.clone();
     let started = Instant::now();
-    let result = sandbox::run_unrestricted_clean_with_limits(
-        &script_command(&script),
-        &root,
-        None,
-        timeout,
-        1024,
-        1024,
-    )
-    .await;
-    let error = result.expect_err("retained descendant pipes must time out");
+    let command = script_command(&script);
+    let cwd = root.0.clone();
+    let runner = tokio::spawn(async move {
+        sandbox::run_unrestricted_clean_with_limits(&command, &cwd, None, timeout, 1024, 1024).await
+    });
+    let ready = tokio::time::timeout(WITNESS_READY, witness.wait_until_ready())
+        .await
+        .unwrap_or(false);
+    let result = runner
+        .await
+        .expect("the bounded runner task must not panic");
+    let run_finished_at = Instant::now();
+    let eof = tokio::time::timeout(WITNESS_TEARDOWN, witness.observe_until_eof())
+        .await
+        .expect("the kernel lifetime witness must reach EOF after bounded cleanup");
+    assert!(
+        ready,
+        "the writer handshake was not observed before cleanup; this is a fixture-startup \
+         failure, not descendant-cleanup evidence (run finished in {:?}, witness {})",
+        run_finished_at.duration_since(started),
+        witness_path.display()
+    );
+    let error = result.expect_err("the ready descendant must retain stdout/stderr until deadline");
     assert!(error.command_started);
     assert!(error.command_finished);
     assert!(
-        started.elapsed()
+        run_finished_at.duration_since(started)
             < timeout + sandbox::TRUSTED_GIT_CLEANUP_GRACE + Duration::from_millis(250)
     );
-    let pid = wait_for_pid(&pid_path).await;
-    let mut alive = true;
-    for _ in 0..50 {
-        if unsafe { libc::kill(pid, 0) } == -1 {
-            alive = false;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(!alive);
-    let _ = std::fs::remove_dir_all(root);
+    assert!(eof, "the FIFO observer must report kernel EOF");
 }
 
 #[cfg(unix)]
