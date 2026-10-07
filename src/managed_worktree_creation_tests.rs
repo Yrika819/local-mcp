@@ -12,6 +12,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -555,6 +556,116 @@ impl ReadOnlyGit for AmbiguousGit {
 
     fn ref_exists(&self, ref_name: &str, cwd: &Path) -> Result<bool, DiscoveryError> {
         self.0.ref_exists(ref_name, cwd)
+    }
+}
+
+/// A Git observer that becomes unavailable only after the mutation seam reports
+/// an ambiguous result. This composes a sent mutation with mandatory
+/// reconciliation without relying on a slow or timing-sensitive Git process.
+struct UnknownAfterAttemptGit {
+    inner: HostGit,
+    attempt_may_have_been_sent: Arc<AtomicBool>,
+}
+
+impl ReadOnlyGit for UnknownAfterAttemptGit {
+    fn run(&self, args: &[&str], cwd: &Path) -> Result<GitCommandOutput, DiscoveryError> {
+        if self.attempt_may_have_been_sent.load(Ordering::SeqCst)
+            && matches!(args, ["worktree", "list", "--porcelain", "-z"])
+        {
+            return Err(DiscoveryError::ObservationUnavailable(
+                "scripted post-timeout worktree observation is unknown".to_owned(),
+            ));
+        }
+        self.inner.run(args, cwd)
+    }
+
+    fn ref_exists(&self, ref_name: &str, cwd: &Path) -> Result<bool, DiscoveryError> {
+        self.inner.ref_exists(ref_name, cwd)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InjectedCaptureFault {
+    Timeout,
+    Incomplete,
+    Overflow,
+}
+
+struct BoundedRunnerFaultCreator<'a> {
+    store: &'a TaskStore,
+    session_id: &'a str,
+    goal_id: &'a GoalId,
+    attempt_may_have_been_sent: Arc<AtomicBool>,
+    calls: Arc<Mutex<usize>>,
+    fault: InjectedCaptureFault,
+}
+
+impl ManagedWorktreeCreator for BoundedRunnerFaultCreator<'_> {
+    fn create(
+        &self,
+        creation: &ManagedWorktreeCreation,
+        primary_root: &Path,
+    ) -> Result<ManagedWorktreeCreationOutcome, ManagedWorktreeCreationError> {
+        *self.calls.lock().unwrap() += 1;
+        let durable = self
+            .store
+            .load_goal(self.session_id, self.goal_id)
+            .expect("attempt state loads before the creator runs");
+        assert_eq!(
+            durable
+                .managed_worktree()
+                .expect("managed record is durable")
+                .creation_attempts_consumed(),
+            1,
+            "attempt budget must be persisted before the bounded runner is invoked"
+        );
+        let attempt_may_have_been_sent = Arc::clone(&self.attempt_may_have_been_sent);
+        let fault = self.fault;
+        let primary_root = primary_root.to_path_buf();
+        let runner_root = primary_root.clone();
+        let result = HostWorktreeCreator::new().create_with_runner(
+            creation,
+            &primary_root,
+            move |command, timeout| {
+                let argv: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                assert!(argv.windows(2).any(|pair| pair == ["worktree", "add"]));
+                // Exercise HostWorktreeCreator's real result classifier without
+                // running a Git mutation. Retain the trusted executable and clean
+                // Git environment, but run only its harmless version query.
+                attempt_may_have_been_sent.store(true, Ordering::SeqCst);
+                let mut safe_query = Command::new(command.get_program());
+                safe_query
+                    .env_clear()
+                    .envs(crate::sandbox::clean_git_environment())
+                    .arg("--version")
+                    .current_dir(&runner_root);
+                let mut output =
+                    crate::process_blocking::run_bounded_blocking(&mut safe_query, timeout)?;
+                assert!(
+                    !output.timed_out && !output.capture_incomplete && !output.output_overflow,
+                    "the harmless baseline query must be complete before fault injection"
+                );
+                match fault {
+                    InjectedCaptureFault::Timeout => output.timed_out = true,
+                    InjectedCaptureFault::Incomplete => output.capture_incomplete = true,
+                    InjectedCaptureFault::Overflow => output.output_overflow = true,
+                }
+                Ok(output)
+            },
+        );
+        let error = result
+            .as_ref()
+            .expect_err("each injected bounded-runner flag must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("outcome of this attempt is unknown"),
+            "the bounded-runner failure must remain ambiguous: {error}"
+        );
+        result
     }
 }
 
@@ -2865,6 +2976,82 @@ fn a_common_dir_mismatch_blocks_before_any_creation() {
     );
     assert!(!fixture.managed_target(&goal_id).exists());
     assert!(!fixture.ref_exists(&Fixture::branch_ref(&goal_id)));
+}
+
+#[test]
+fn a_bounded_capture_failure_consumes_budget_and_requires_reconciliation() {
+    fn assert_capture_fault(fault: InjectedCaptureFault, label: &str) {
+        let mut fixture = Fixture::new(label);
+        fixture.authorize_managed_root();
+        let goal_id = fixture.start(WorkspaceMode::ManagedWorktree);
+        let attempt_may_have_been_sent = Arc::new(AtomicBool::new(false));
+        let creator = BoundedRunnerFaultCreator {
+            store: &fixture.store,
+            session_id: &fixture.session.id,
+            goal_id: &goal_id,
+            attempt_may_have_been_sent: Arc::clone(&attempt_may_have_been_sent),
+            calls: Arc::new(Mutex::new(0)),
+            fault,
+        };
+        let observer = UnknownAfterAttemptGit {
+            inner: HostGit::new(),
+            attempt_may_have_been_sent,
+        };
+
+        let blocked = fixture
+            .prepare(&goal_id, &observer, &creator)
+            .expect("an ambiguous mutation is represented as a durable block");
+        let block = blocked
+            .block_detail()
+            .expect("unknown post-attempt state requires recovery");
+        assert_eq!(block.code, "MANAGED_OBSERVATION_UNAVAILABLE");
+        assert!(block.detail.contains("post-timeout"), "{}", block.detail);
+        let goal_after_attempt = fixture.goal(&goal_id);
+        let record = goal_after_attempt
+            .managed_worktree()
+            .expect("the durable worktree record remains");
+        assert_eq!(record.creation_attempts_consumed(), 1);
+        assert_eq!(*creator.calls.lock().unwrap(), 1);
+        assert!(!fixture.managed_target(&goal_id).exists());
+        assert!(!fixture.ref_exists(&Fixture::branch_ref(&goal_id)));
+
+        // Retrying while the observation is still unknown stops at reconciliation;
+        // it cannot send a duplicate mutation or restore the consumed attempt.
+        let retry = fixture
+            .prepare(&goal_id, &observer, &creator)
+            .expect("unknown state remains a host-visible block");
+        assert_eq!(
+            retry.block_detail().expect("unknown must block").code,
+            "MANAGED_OBSERVATION_UNAVAILABLE"
+        );
+        assert_eq!(
+            *creator.calls.lock().unwrap(),
+            1,
+            "unknown state must never automatically issue a duplicate mutation"
+        );
+        assert_eq!(
+            fixture
+                .goal(&goal_id)
+                .managed_worktree()
+                .unwrap()
+                .creation_attempts_consumed(),
+            1,
+            "an ambiguous bounded-runner failure never returns attempt budget"
+        );
+    }
+
+    assert_capture_fault(
+        InjectedCaptureFault::Timeout,
+        "timeout-reconciliation-composition",
+    );
+    assert_capture_fault(
+        InjectedCaptureFault::Incomplete,
+        "incomplete-reconciliation-composition",
+    );
+    assert_capture_fault(
+        InjectedCaptureFault::Overflow,
+        "overflow-reconciliation-composition",
+    );
 }
 
 #[test]

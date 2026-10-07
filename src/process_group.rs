@@ -285,12 +285,22 @@ fn spawn_ready_to_exec(command: &mut Command) -> io::Result<Child> {
 /// resuming an uncontained process.
 #[cfg(windows)]
 fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
+    spawn_contained_with(command, assign_and_resume)
+}
+
+/// Test seam for deterministically exercising setup failures with a real
+/// suspended child and the production cleanup path.
+#[cfg(windows)]
+fn spawn_contained_with(
+    command: &mut Command,
+    setup: impl FnOnce(&mut Job, &Child) -> io::Result<()>,
+) -> io::Result<ProcessGroup> {
     use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
     let mut job = Job::create()?;
     command.creation_flags(CREATE_SUSPENDED);
     let mut child = spawn_ready_to_exec(command)?;
-    match assign_and_resume(&mut job, &child) {
+    match setup(&mut job, &child) {
         Ok(()) => Ok(ProcessGroup {
             child,
             job: Some(job),
@@ -309,6 +319,19 @@ fn spawn_contained(command: &mut Command) -> io::Result<ProcessGroup> {
 /// Assign and resume `child`, failing closed if either step fails.
 #[cfg(windows)]
 fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result<()> {
+    assign_and_resume_with(job, child, Job::assign, Job::resume)
+}
+
+/// Shared ordering/error-propagation path used by production and fault-injection
+/// tests. The injected operations model a kernel-call result; child ownership and
+/// the outer fail-closed cleanup branch remain production code.
+#[cfg(windows)]
+fn assign_and_resume_with(
+    job: &mut Job,
+    child: &tokio::process::Child,
+    assign: impl FnOnce(&mut Job, HANDLE, u32) -> io::Result<()>,
+    resume: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<()> {
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("spawned child has no process identifier"))?;
@@ -317,8 +340,8 @@ fn assign_and_resume(job: &mut Job, child: &tokio::process::Child) -> io::Result
     let handle = child
         .raw_handle()
         .ok_or_else(|| io::Error::other("spawned child has no process handle"))?;
-    job.assign(handle as HANDLE, pid)?;
-    Job::resume(pid)
+    assign(job, handle as HANDLE, pid)?;
+    resume(pid)
 }
 
 /// Bounded output of a terminated process group.
@@ -478,4 +501,201 @@ fn reported_status(info: &libc::siginfo_t) -> libc::c_int {
 fn reported_status(info: &libc::siginfo_t) -> libc::c_int {
     // Safety: reading a field of a `siginfo_t` that `waitid` has just filled in.
     unsafe { info.si_status() }
+}
+
+#[cfg(all(test, windows))]
+mod windows_setup_failure_tests {
+
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tokio::process::Command;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    use super::{assign_and_resume_with, spawn_contained_with};
+
+    const WORKLOAD_ENV: &str = "GOALLATCH_WINDOWS_SETUP_FAILURE_WORKLOAD";
+
+    fn marker_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "local-mcp-windows-setup-failure-{}.marker",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn helper_command(marker: &std::path::Path) -> std::process::Command {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"));
+        command
+            .args([
+                "--exact",
+                "process_group::windows_setup_failure_tests::fault_injection_workload_helper",
+                "--nocapture",
+            ])
+            .env(WORKLOAD_ENV, marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    struct KillOnDrop(Option<std::process::Child>);
+
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    impl KillOnDrop {
+        fn stop(&mut self) -> std::io::Result<()> {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                child.wait()?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.stop();
+        }
+    }
+
+    fn assert_workload_helper_is_a_real_witness() {
+        let marker = marker_path();
+        let _marker_cleanup = RemoveOnDrop(marker.clone());
+        let helper = helper_command(&marker)
+            .spawn()
+            .expect("workload helper starts");
+        let mut helper = KillOnDrop(Some(helper));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workload helper did not produce its readiness marker"
+            );
+            assert!(
+                helper
+                    .0
+                    .as_mut()
+                    .expect("helper remains owned until stopped")
+                    .try_wait()
+                    .expect("helper status is observable")
+                    .is_none(),
+                "helper exited without running the workload"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        helper.stop().expect("positive-control helper is reaped");
+        std::fs::remove_file(marker).expect("positive-control marker is cleaned up");
+    }
+
+    fn assert_fault_fails_closed(fail_during_resume: bool) {
+        assert_workload_helper_is_a_real_witness();
+        let marker = marker_path();
+        let _marker_cleanup = RemoveOnDrop(marker.clone());
+        let mut command = Command::from(helper_command(&marker));
+        let observed_pid = Arc::new(AtomicU32::new(0));
+        let observed_handle = Arc::new(Mutex::new(None::<OwnedHandle>));
+        let pid_for_setup = Arc::clone(&observed_pid);
+        let handle_for_setup = Arc::clone(&observed_handle);
+        let resume_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resume_called_by_setup = Arc::clone(&resume_called);
+        let result = spawn_contained_with(&mut command, move |job, child| {
+            let pid = child
+                .id()
+                .ok_or_else(|| std::io::Error::other("spawned child has no PID"))?;
+            pid_for_setup.store(pid, Ordering::SeqCst);
+            let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if process.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let process = unsafe { OwnedHandle::from_raw_handle(process as RawHandle) };
+            *handle_for_setup.lock().unwrap() = Some(process);
+            if fail_during_resume {
+                assign_and_resume_with(
+                    job,
+                    child,
+                    |job, process, pid| job.assign(process, pid),
+                    |_| {
+                        resume_called_by_setup.store(true, Ordering::SeqCst);
+                        Err(std::io::Error::other("injected ResumeThread failure"))
+                    },
+                )
+            } else {
+                assign_and_resume_with(
+                    job,
+                    child,
+                    |_, _, _| {
+                        Err(std::io::Error::other(
+                            "injected AssignProcessToJobObject failure",
+                        ))
+                    },
+                    |_| {
+                        resume_called_by_setup.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            }
+        });
+        let error = result
+            .err()
+            .expect("injected setup failure must fail the spawn");
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(
+            resume_called.load(Ordering::SeqCst),
+            fail_during_resume,
+            "assignment failure must stop before resume; the resume failure must be invoked"
+        );
+
+        let pid = observed_pid.load(Ordering::SeqCst);
+        assert_ne!(pid, 0, "the setup seam must have observed the child");
+        // Keep a kernel process handle until termination is observed. This proves
+        // cleanup completed, rather than relying on a delay or a PID liveness probe.
+        let process = observed_handle
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the process handle was retained at failure");
+        let exited = unsafe { WaitForSingleObject(process.as_raw_handle() as _, 10_000) };
+        drop(process);
+        assert_eq!(
+            exited, WAIT_OBJECT_0,
+            "the suspended child was not cleaned up"
+        );
+        assert!(
+            !marker.exists(),
+            "the workload executed despite a failed containment setup"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn assignment_failure_kills_the_suspended_child_without_running_workload() {
+        assert_fault_fails_closed(false);
+    }
+
+    #[test]
+    fn resume_failure_kills_the_assigned_child_without_running_workload() {
+        assert_fault_fails_closed(true);
+    }
+
+    #[test]
+    fn fault_injection_workload_helper() {
+        let Some(marker) = std::env::var_os(WORKLOAD_ENV) else {
+            return;
+        };
+        std::fs::write(marker, b"executed").expect("workload marker is writable");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }

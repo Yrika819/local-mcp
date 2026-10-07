@@ -310,19 +310,15 @@ impl HostWorktreeCreator {
             executable: PathBuf::from("git"),
         }
     }
-}
 
-impl Default for HostWorktreeCreator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ManagedWorktreeCreator for HostWorktreeCreator {
-    fn create(
+    pub(crate) fn create_with_runner(
         &self,
         creation: &ManagedWorktreeCreation,
         primary_root: &Path,
+        runner: impl FnOnce(
+            &mut Command,
+            Duration,
+        ) -> std::io::Result<crate::process_blocking::BlockingOutput>,
     ) -> Result<ManagedWorktreeCreationOutcome, ManagedWorktreeCreationError> {
         // A configured absolute executable is honored only when it resolves to
         // the established host Git identity; anything else falls back to that
@@ -344,14 +340,8 @@ impl ManagedWorktreeCreator for HostWorktreeCreator {
             .env_clear()
             .envs(crate::sandbox::clean_git_environment());
         // Bounded and tree-contained rather than a bare blocking `output()`.
-        //
-        // This is the mutating `git worktree add`, so the deadline must not be
-        // mistaken for evidence about side effects. A timeout means Git was
-        // started and its outcome is **unknown**: the attempt stays consumed and
-        // the sequence blocks for reconciliation, exactly as an ambiguous
-        // observation already does. It never becomes "the mutation did not
-        // happen", and it never replenishes the retry budget.
-        let output = crate::process_blocking::run_bounded_blocking(
+        // A timeout is unknown mutation evidence, never proof that Git did not run.
+        let output = runner(
             command.args(creation.argv()).current_dir(primary_root),
             MANAGED_CREATION_TIMEOUT,
         )
@@ -371,5 +361,25 @@ impl ManagedWorktreeCreator for HostWorktreeCreator {
             stdout: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+}
+
+impl Default for HostWorktreeCreator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedWorktreeCreator for HostWorktreeCreator {
+    fn create(
+        &self,
+        creation: &ManagedWorktreeCreation,
+        primary_root: &Path,
+    ) -> Result<ManagedWorktreeCreationOutcome, ManagedWorktreeCreationError> {
+        self.create_with_runner(
+            creation,
+            primary_root,
+            crate::process_blocking::run_bounded_blocking,
+        )
     }
 }
