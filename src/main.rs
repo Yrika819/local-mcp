@@ -49,6 +49,7 @@ mod verifier;
 mod verifier_git_observation;
 mod worker_capability;
 mod workspace_publish;
+mod workspace_snapshot;
 mod writer;
 
 #[cfg(test)]
@@ -101,6 +102,8 @@ mod resource_bounds_transport_tests;
 mod secure_fs_tests;
 #[cfg(test)]
 mod verifier_tests;
+#[cfg(test)]
+mod workspace_snapshot_tests;
 #[cfg(test)]
 mod writer_stress_tests;
 

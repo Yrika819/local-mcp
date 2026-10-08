@@ -812,7 +812,7 @@ fn validate_bounded_text(value: &str, field: &str) -> Result<(), OrchestratorErr
 ///
 /// Design section 10 forbids an unvalidated commit-ish; freezing full-length
 /// lowercase hex removes abbreviated and ref-ambiguous base commits.
-fn validate_object_id(value: &str, field: &str) -> Result<(), OrchestratorError> {
+pub(crate) fn validate_object_id(value: &str, field: &str) -> Result<(), OrchestratorError> {
     let plausible = matches!(value.len(), 40 | 64)
         && value
             .bytes()
