@@ -689,6 +689,61 @@ fn git_may_fail(repo: &Path, args: &[&str]) -> std::process::Output {
         .expect("git runs")
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn marker_writer(root: &Path, marker: &Path, label: &str) -> String {
+    #[cfg(windows)]
+    {
+        // Git for Windows executes fsmonitor commands and hooks through its
+        // bundled POSIX shell. Delegate marker creation to Windows PowerShell
+        // rather than relying on a Unix utility such as `touch`.
+        let script = root.join(format!("{label}.ps1"));
+        let marker = shell_path(marker).replace('\'', "''");
+        std::fs::write(
+            &script,
+            format!("[System.IO.File]::WriteAllText('{marker}', 'ran')\nexit 0\n"),
+        )
+        .unwrap();
+        format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
+            shell_quote(&shell_path(&script))
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let script = root.join(label);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' ran > {}\n",
+                shell_quote(&shell_path(marker))
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        shell_quote(&shell_path(&script))
+    }
+}
+
+fn assert_process_success(label: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn init_repo(root: &Path) -> PathBuf {
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -1246,24 +1301,20 @@ fn real_git_fsmonitor_marker_positive_control() {
     let base = temp_dir("fsmonpc");
     let repo = init_repo(&base);
     let marker = base.join("fsmonitor-ran");
-    git(
-        &repo,
-        &[
-            "config",
-            "core.fsmonitor",
-            &format!("touch {}", marker.display()),
-        ],
-    );
-    // Positive control: a plain `git status` fires the repository-chosen
-    // monitor command before the observer does.
+    let command = marker_writer(&base, &marker, "write-fsmonitor-marker");
+    git(&repo, &["config", "core.fsmonitor", &command]);
+
+    // Positive control: plain Git must execute the configured helper before
+    // the observer runs. The helper is platform-specific, not `touch`.
     let output = std::process::Command::new(host_git())
         .args(["status", "--porcelain"])
         .current_dir(&repo)
         .output()
         .expect("git runs");
-    assert!(output.status.success());
+    assert_process_success("git status positive control", &output);
     assert!(marker.exists(), "fsmonitor fixture must be live");
-    let _ = std::fs::remove_file(&marker);
+    std::fs::remove_file(&marker).unwrap();
+
     let metadata = observe_snapshot_metadata(&real_git(), &repo).unwrap();
     assert!(metadata.head.len() == 40 || metadata.head.len() == 64);
     assert!(
@@ -1280,37 +1331,33 @@ fn real_git_hooks_marker_positive_control() {
     let hooks = repo.join(".git").join("attacker-hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     let marker = base.join("hook-ran");
-    for hook in ["post-index-change", "post-checkout"] {
-        let script = hooks.join(hook);
-        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&script, permissions).unwrap();
-        }
+    let writer = marker_writer(&base, &marker, "write-hook-marker");
+    let hook = hooks.join("post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\n{writer}\nexit $?\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
     }
-    git(
-        &repo,
-        &["config", "core.hooksPath", &hooks.to_string_lossy()],
-    );
-    // Positive control: plain `git read-tree` fires post-index-change and
-    // `git checkout HEAD` fires post-checkout.
-    let read_tree = std::process::Command::new(host_git())
-        .args(["read-tree", "HEAD"])
-        .current_dir(&repo)
-        .output()
-        .expect("git runs");
-    assert!(read_tree.status.success());
+    git(&repo, &["config", "core.hooksPath", &shell_path(&hooks)]);
+
+    // Make a real branch transition with a changed tracked file so Git
+    // deterministically invokes post-checkout (unlike checking out HEAD).
+    git(&repo, &["checkout", "-q", "-b", "other"]);
+    std::fs::write(repo.join("base.txt"), b"other branch\n").unwrap();
+    git(&repo, &["add", "base.txt"]);
+    git(&repo, &["commit", "-q", "-m", "other branch"]);
     let checkout = std::process::Command::new(host_git())
-        .args(["checkout", "HEAD"])
+        .args(["checkout", "main"])
         .current_dir(&repo)
         .output()
         .expect("git runs");
-    assert!(checkout.status.success());
+    assert_process_success("git checkout main positive control", &checkout);
     assert!(marker.exists(), "hooks fixture must be live");
-    let _ = std::fs::remove_file(&marker);
+    std::fs::remove_file(&marker).unwrap();
+
     let metadata = observe_snapshot_metadata(&real_git(), &repo).unwrap();
     assert!(metadata.head.len() == 40 || metadata.head.len() == 64);
     assert!(!marker.exists(), "observer ran a repository-chosen hook");
