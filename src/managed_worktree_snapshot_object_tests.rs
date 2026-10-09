@@ -177,6 +177,28 @@ fn absent_paths_and_symlinked_parent_components_are_distinct() {
         .unwrap(),
         CandidateObjectIdentity::Absent
     );
+    assert_eq!(
+        observe(
+            &root,
+            "missing-parent/file.txt",
+            None,
+            GitFileModePolicy::TrustExecutableBit,
+            &mut budget
+        )
+        .unwrap(),
+        CandidateObjectIdentity::Absent
+    );
+    std::fs::write(root.join("not-a-directory"), b"file").unwrap();
+    assert!(matches!(
+        observe(
+            &root,
+            "not-a-directory/file.txt",
+            None,
+            GitFileModePolicy::TrustExecutableBit,
+            &mut budget
+        ),
+        Err(SnapshotObjectError::Unsupported(_))
+    ));
     assert!(
         observe(
             &root,

@@ -3,8 +3,17 @@
 //! Git configuration is supplied by the already-completed Slice 2A observer;
 //! this layer never runs Git. Unix traversal is descriptor-relative from an
 //! opened root, refuses symlinked parents/final opens, and hashes streams with
-//! a fixed reusable buffer. Windows uses handle-relative opens and fails
+//! fixed reusable buffer. Windows uses handle-relative opens and fails
 //! closed for reparse objects and unreliable executable metadata.
+//!
+//! Regular-file content observation is bounded by the fixed streaming buffer,
+//! the aggregate byte budget, and bounded candidate/evidence sizes; special
+//! objects such as FIFOs and devices are never streamed. Synchronous regular-
+//! file syscall latency remains host/kernel controlled, so no hard syscall
+//! wall-clock guarantee is claimed. An observation either returns a complete
+//! identity or an error; it never returns a partial `CandidateObjectIdentity`.
+//! Cancellation or timeout is not evidence of successful observation, and V1
+//! does not automatically retry an observation.
 
 #![expect(
     dead_code,
@@ -195,7 +204,7 @@ mod unix {
         Ok(file)
     }
 
-    fn open_parent(parent: &File, name: &str) -> Result<File, SnapshotObjectError> {
+    fn open_parent(parent: &File, name: &str) -> Result<Option<File>, SnapshotObjectError> {
         let name = c_name(name)?;
         // SAFETY: parent is a live directory descriptor and name is a single
         // NUL-free normalized component. O_NOFOLLOW prevents parent symlinks.
@@ -207,7 +216,16 @@ mod unix {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if error.raw_os_error() == Some(libc::ENOTDIR) {
+                return Err(SnapshotObjectError::Unsupported(
+                    "parent component is not a directory",
+                ));
+            }
+            return Err(error.into());
         }
         // SAFETY: openat returned a new owned descriptor.
         let file = unsafe { File::from_raw_fd(fd) };
@@ -216,20 +234,23 @@ mod unix {
                 "parent component is not a directory",
             ));
         }
-        Ok(file)
+        Ok(Some(file))
     }
 
     fn parent_and_leaf(
         root: &Path,
         path: &NormalizedWorkspacePath,
-    ) -> Result<(File, String), SnapshotObjectError> {
+    ) -> Result<Option<(File, String)>, SnapshotObjectError> {
         let mut components = path.as_str().split('/').peekable();
         let mut directory = root_directory(root)?;
         while let Some(component) = components.next() {
             if components.peek().is_none() {
-                return Ok((directory, component.to_owned()));
+                return Ok(Some((directory, component.to_owned())));
             }
-            directory = open_parent(&directory, component)?;
+            let Some(next_directory) = open_parent(&directory, component)? else {
+                return Ok(None);
+            };
+            directory = next_directory;
         }
         Err(SnapshotObjectError::Unsupported("empty normalized path"))
     }
@@ -413,7 +434,9 @@ mod unix {
         budget: &mut SnapshotHashBudget,
         before_read: &mut dyn FnMut(),
     ) -> Result<CandidateObjectIdentity, SnapshotObjectError> {
-        let (parent, leaf_name) = parent_and_leaf(root, path)?;
+        let Some((parent, leaf_name)) = parent_and_leaf(root, path)? else {
+            return Ok(CandidateObjectIdentity::Absent);
+        };
         let leaf = c_name(&leaf_name)?;
         let initial = match stat_at(&parent, &leaf)? {
             Some(stat) => stat,
