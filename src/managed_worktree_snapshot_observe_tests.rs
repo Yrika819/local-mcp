@@ -1324,6 +1324,11 @@ fn real_git_fsmonitor_marker_positive_control() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+// Git for Windows attempts to execute the extensionless hook path directly;
+// its runner reports `Exec format error` for POSIX hook scripts. Keep runtime
+// positive-control evidence on Unix and retain the Windows observer-negative
+// and exact-argv coverage without claiming a Windows hook positive control.
+#[cfg(unix)]
 #[test]
 fn real_git_hooks_marker_positive_control() {
     let base = temp_dir("hookspc");
