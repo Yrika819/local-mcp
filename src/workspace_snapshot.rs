@@ -93,6 +93,10 @@ impl NormalizedWorkspacePath {
         }
         Ok(Self(value))
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Stable Git candidate object identity. Regular files bind Git's 100644/100755
