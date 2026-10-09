@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::managed_worktree_snapshot_observe::{
-    ALL_SNAPSHOT_QUERIES, SnapshotCommandOutput, SnapshotGit, SnapshotGitQuery, SnapshotIndexEntry,
-    SnapshotIndexMode, SnapshotMetadataError, check_index_flags, enforce_complete_process_output,
-    observe_snapshot_metadata, parse_head, parse_index_stage, parse_nul_name_set, parse_status,
-    snapshot_argv,
+    ALL_SNAPSHOT_QUERIES, GitFileModePolicy, SnapshotCommandOutput, SnapshotGit, SnapshotGitQuery,
+    SnapshotIndexEntry, SnapshotIndexMode, SnapshotMetadataError, check_index_flags,
+    enforce_complete_process_output, observe_snapshot_metadata, parse_file_mode_policy, parse_head,
+    parse_index_stage, parse_nul_name_set, parse_status, snapshot_argv,
 };
 use crate::workspace_snapshot::NormalizedWorkspacePath;
 
@@ -55,6 +55,7 @@ impl FakeSnapshotGit {
                 SnapshotGitQuery::Head,
                 ok_output(format!("{head}\n").into_bytes()),
             )
+            .with(SnapshotGitQuery::FileMode, ok_output(b"true\n".to_vec()))
             .with(SnapshotGitQuery::Status, ok_output(Vec::new()))
             .with(SnapshotGitQuery::IndexStage, ok_output(Vec::new()))
             .with(SnapshotGitQuery::IndexFlags, ok_output(Vec::new()))
@@ -95,11 +96,50 @@ fn stage_record(mode: &str, oid: &str, stage: &str, path: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_snapshot_queries_cover_six_closed_variants() {
-    assert_eq!(ALL_SNAPSHOT_QUERIES.len(), 6);
+fn all_snapshot_queries_cover_seven_closed_variants() {
+    assert_eq!(ALL_SNAPSHOT_QUERIES.len(), 7);
+    assert!(ALL_SNAPSHOT_QUERIES.contains(&SnapshotGitQuery::FileMode));
     for query in ALL_SNAPSHOT_QUERIES {
         assert!(!query.tail().is_empty());
         assert!(!query.label().is_empty());
+    }
+}
+
+#[test]
+fn file_mode_parser_accepts_only_canonical_git_boolean_and_unset_default() {
+    assert_eq!(
+        parse_file_mode_policy(&ok_output(b"true\n".to_vec())).unwrap(),
+        GitFileModePolicy::TrustExecutableBit
+    );
+    assert_eq!(
+        parse_file_mode_policy(&ok_output(b"false\n".to_vec())).unwrap(),
+        GitFileModePolicy::IgnoreExecutableBit
+    );
+    assert_eq!(
+        parse_file_mode_policy(&failed_output(1, "")).unwrap(),
+        GitFileModePolicy::TrustExecutableBit
+    );
+    for stdout in [
+        b"yes\n".as_slice(),
+        b"true",
+        b"true\nfalse\n",
+        b"true\n\n",
+        b"TRUE\n",
+    ] {
+        assert!(
+            parse_file_mode_policy(&ok_output(stdout.to_vec())).is_err(),
+            "{stdout:?}"
+        );
+    }
+    for output in [
+        failed_output(2, "fatal"),
+        SnapshotCommandOutput {
+            stdout: b"false\n".to_vec(),
+            stderr: String::new(),
+            exit_code: 1,
+        },
+    ] {
+        assert!(parse_file_mode_policy(&output).is_err());
     }
 }
 
@@ -790,6 +830,88 @@ fn real_git_clean_repo_has_empty_sets_and_valid_head() {
     // `base.txt` as mode 100644 (covered by the stage parser tests).
     assert!(metadata.index_entries.is_empty());
     let _ = std::fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_mode_policy_matches_git_status_and_effective_included_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (setting, expected_policy, expects_mode_change) in [
+        (Some("true"), GitFileModePolicy::TrustExecutableBit, true),
+        (Some("false"), GitFileModePolicy::IgnoreExecutableBit, false),
+        (None, GitFileModePolicy::TrustExecutableBit, true),
+    ] {
+        let base = temp_dir("filemode");
+        let repo = init_repo(&base);
+        if let Some(setting) = setting {
+            git(&repo, &["config", "core.fileMode", setting]);
+        } else {
+            let _ = git_may_fail(&repo, &["config", "--unset", "core.fileMode"]);
+        }
+        let before = std::fs::metadata(repo.join("base.txt"))
+            .unwrap()
+            .permissions();
+        std::fs::set_permissions(
+            repo.join("base.txt"),
+            std::fs::Permissions::from_mode(before.mode() | 0o100),
+        )
+        .unwrap();
+        let status = git_may_fail(&repo, &["status", "--porcelain"]);
+        assert_process_success("git status", &status);
+        assert_eq!(
+            String::from_utf8(status.stdout)
+                .unwrap()
+                .contains(" M base.txt"),
+            expects_mode_change
+        );
+        let observed = observe_snapshot_metadata(&real_git(), &repo).unwrap();
+        assert_eq!(observed.file_mode_policy, expected_policy);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    let base = temp_dir("filemode-include");
+    let repo = init_repo(&base);
+    let included = base.join("included.gitconfig");
+    std::fs::write(&included, b"[core]\n\tfileMode = false\n").unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "include.path",
+            included.to_str().unwrap(),
+        ],
+    );
+    let observed = observe_snapshot_metadata(&real_git(), &repo).unwrap();
+    assert_eq!(
+        observed.file_mode_policy,
+        GitFileModePolicy::IgnoreExecutableBit
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn file_mode_query_uses_fixed_key_and_existing_hardened_envelope() {
+    assert_eq!(
+        SnapshotGitQuery::FileMode.tail(),
+        &["config", "--bool", "--get", "core.fileMode"]
+    );
+    let argv = snapshot_argv(SnapshotGitQuery::FileMode).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1].starts_with("core.hooksPath="))
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "core.fsmonitor=false")
+    );
+    assert!(argv.contains(&"--no-optional-locks".to_owned()));
+    assert!(
+        !argv
+            .iter()
+            .any(|arg| arg == "--local" || arg.starts_with("--file"))
+    );
 }
 
 #[test]

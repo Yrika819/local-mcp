@@ -89,6 +89,8 @@ pub(crate) const EMPTY_BLOB_SHA1: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c53
 pub(crate) enum SnapshotGitQuery {
     /// `rev-parse HEAD` — the observed worktree HEAD (must resolve).
     Head,
+    /// Effective repository `core.fileMode` after Git config precedence.
+    FileMode,
     /// Machine-readable status with renames disabled and submodules ignored.
     Status,
     /// Full index entries: mode, OID, stage, path.
@@ -109,6 +111,7 @@ impl SnapshotGitQuery {
     pub(crate) fn tail(self) -> &'static [&'static str] {
         match self {
             Self::Head => &["rev-parse", "HEAD"],
+            Self::FileMode => &["config", "--bool", "--get", "core.fileMode"],
             Self::Status => &[
                 "status",
                 "--porcelain=v1",
@@ -147,6 +150,7 @@ impl SnapshotGitQuery {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Head => "rev-parse HEAD",
+            Self::FileMode => "config --bool --get core.fileMode",
             Self::Status => "status --porcelain=v1 -z",
             Self::IndexStage => "ls-files --stage -z",
             Self::IndexFlags => "ls-files -v -z",
@@ -157,8 +161,9 @@ impl SnapshotGitQuery {
 }
 
 /// All queries Slice 2A may run, in a fixed order.
-pub(crate) const ALL_SNAPSHOT_QUERIES: [SnapshotGitQuery; 6] = [
+pub(crate) const ALL_SNAPSHOT_QUERIES: [SnapshotGitQuery; 7] = [
     SnapshotGitQuery::Head,
+    SnapshotGitQuery::FileMode,
     SnapshotGitQuery::Status,
     SnapshotGitQuery::IndexStage,
     SnapshotGitQuery::IndexFlags,
@@ -358,10 +363,39 @@ pub(crate) struct SnapshotIndexEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotGitMetadata {
     pub(crate) head: String,
+    pub(crate) file_mode_policy: GitFileModePolicy,
     pub(crate) changed_paths: Vec<NormalizedWorkspacePath>,
     pub(crate) staged_paths: Vec<NormalizedWorkspacePath>,
     pub(crate) untracked_paths: Vec<NormalizedWorkspacePath>,
     pub(crate) index_entries: Vec<SnapshotIndexEntry>,
+}
+
+/// Whether Git treats working-tree executable bits as authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitFileModePolicy {
+    TrustExecutableBit,
+    IgnoreExecutableBit,
+}
+
+/// Parse Git's normalized `config --bool --get core.fileMode` result.
+/// Exit 1 with no output means unset; Git's documented default is true.
+pub(crate) fn parse_file_mode_policy(
+    output: &SnapshotCommandOutput,
+) -> Result<GitFileModePolicy, SnapshotMetadataError> {
+    match output.exit_code {
+        0 => match output.stdout.as_slice() {
+            b"true\n" => Ok(GitFileModePolicy::TrustExecutableBit),
+            b"false\n" => Ok(GitFileModePolicy::IgnoreExecutableBit),
+            _ => Err(SnapshotMetadataError::GitObservationUnavailable(
+                "core.fileMode query returned malformed or non-canonical boolean output".to_owned(),
+            )),
+        },
+        1 if output.stdout.is_empty() => Ok(GitFileModePolicy::TrustExecutableBit),
+        _ => Err(SnapshotMetadataError::GitObservationUnavailable(format!(
+            "core.fileMode query exited {} with unexpected output",
+            output.exit_code
+        ))),
+    }
 }
 
 /// Observe closed Git candidate metadata with `cwd`.
@@ -378,6 +412,9 @@ pub(crate) fn observe_snapshot_metadata(
     let head_output = git.run(SnapshotGitQuery::Head, cwd)?;
     require_success(SnapshotGitQuery::Head, &head_output)?;
     let head = parse_head(&head_output.stdout)?;
+
+    let file_mode_output = git.run(SnapshotGitQuery::FileMode, cwd)?;
+    let file_mode_policy = parse_file_mode_policy(&file_mode_output)?;
 
     let status_output = git.run(SnapshotGitQuery::Status, cwd)?;
     require_success(SnapshotGitQuery::Status, &status_output)?;
@@ -421,6 +458,7 @@ pub(crate) fn observe_snapshot_metadata(
 
     Ok(SnapshotGitMetadata {
         head,
+        file_mode_policy,
         changed_paths: status_sets.changed,
         staged_paths: status_sets.staged,
         untracked_paths: status_sets.untracked,
