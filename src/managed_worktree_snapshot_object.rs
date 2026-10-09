@@ -266,7 +266,7 @@ mod unix {
             libc::S_IFDIR => metadata_kind.is_dir(),
             _ => false,
         };
-        u64::try_from(stat.st_dev).ok() == Some(metadata.dev())
+        stat_device_number(stat) == Some(metadata.dev())
             && stat.st_ino == metadata.ino()
             && u64::try_from(stat.st_size).ok() == Some(metadata.size())
             && same_kind
@@ -274,6 +274,16 @@ mod unix {
             && stat.st_ctime == metadata.ctime()
             && stat_mtime_nsec(stat) == metadata.mtime_nsec()
             && stat_ctime_nsec(stat) == metadata.ctime_nsec()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stat_device_number(stat: &libc::stat) -> Option<u64> {
+        Some(stat.st_dev)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn stat_device_number(stat: &libc::stat) -> Option<u64> {
+        u64::try_from(stat.st_dev).ok()
     }
 
     fn stat_mtime_nsec(stat: &libc::stat) -> i64 {

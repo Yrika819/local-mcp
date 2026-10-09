@@ -523,7 +523,7 @@ fn aggregate_budget_overflow_is_checked_before_digest_growth() {
             &root,
             "file",
             None,
-            GitFileModePolicy::TrustExecutableBit,
+            GitFileModePolicy::IgnoreExecutableBit,
             &mut budget
         ),
         Err(SnapshotObjectError::LimitExceeded(_))
