@@ -888,6 +888,37 @@ fn file_mode_policy_matches_git_status_and_effective_included_config() {
         observed.file_mode_policy,
         GitFileModePolicy::IgnoreExecutableBit
     );
+    let before = std::fs::metadata(repo.join("base.txt"))
+        .unwrap()
+        .permissions();
+    std::fs::set_permissions(
+        repo.join("base.txt"),
+        std::fs::Permissions::from_mode(before.mode() | 0o100),
+    )
+    .unwrap();
+    let status = git_may_fail(&repo, &["status", "--porcelain"]);
+    assert_process_success("git status with included core.fileMode", &status);
+    assert!(
+        !String::from_utf8(status.stdout)
+            .unwrap()
+            .contains(" M base.txt")
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_mode_duplicate_config_values_follow_git_last_value_precedence() {
+    let base = temp_dir("filemode-duplicates");
+    let repo = init_repo(&base);
+    git(&repo, &["config", "--unset-all", "core.fileMode"]);
+    git(&repo, &["config", "--add", "core.fileMode", "false"]);
+    git(&repo, &["config", "--add", "core.fileMode", "true"]);
+    let observed = observe_snapshot_metadata(&real_git(), &repo).unwrap();
+    assert_eq!(
+        observed.file_mode_policy,
+        GitFileModePolicy::TrustExecutableBit
+    );
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -1324,6 +1355,21 @@ fn observe_retains_only_candidate_index_entries() {
 fn snapshot_observation_environment_drops_pager_overrides() {
     let environment = crate::sandbox::clean_git_environment();
     for key in ["GIT_PAGER", "PAGER", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS"] {
+        assert!(!environment.contains_key(key), "{key}");
+    }
+    assert_eq!(
+        environment.get("GIT_CONFIG_NOSYSTEM").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        environment.get("GIT_CONFIG_GLOBAL").map(String::as_str),
+        Some(crate::sandbox::null_device_path().as_str())
+    );
+    for key in [
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
         assert!(!environment.contains_key(key), "{key}");
     }
 }
