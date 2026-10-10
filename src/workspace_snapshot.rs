@@ -23,7 +23,13 @@ pub(crate) const MAX_WRITER_MUTATED_PATHS: usize = 20_000;
 pub(crate) const MAX_GIT_VISIBLE_PATHS: usize = 60_000;
 pub(crate) const MAX_NORMALIZED_PATH_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_CANONICAL_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
-/// Maximum combined bytes the observer may hash for Git-visible and writer-mutated files.
+/// Maximum combined **semantic content evidence** bytes represented by one
+/// manifest, summed exactly as the constructor below sums it (per Git-visible
+/// `index_object + worktree_object`, per writer-mutated `Present` object, with
+/// logical duplication counted). This is a semantic bound, not a lifetime
+/// physical read count: the Slice 2D coherence recheck performs two physical
+/// passes, each independently capped at this value, and validates against this
+/// single semantic bound. See `docs/MANAGED_WORKTREES_PHASE5_SNAPSHOT_EVIDENCE.md`.
 pub(crate) const MAX_SNAPSHOT_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,7 +148,7 @@ impl CandidateObjectIdentity {
         Ok(())
     }
 
-    fn size_bytes(&self) -> u64 {
+    pub(crate) fn size_bytes(&self) -> u64 {
         match self {
             Self::Absent => 0,
             Self::RegularFile { size_bytes, .. } => *size_bytes,
