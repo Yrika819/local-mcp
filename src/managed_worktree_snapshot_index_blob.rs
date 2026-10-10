@@ -156,22 +156,35 @@ impl SnapshotIndexBlobSession {
         budget: &mut SnapshotHashBudget,
         response_timeout: Duration,
     ) -> Result<(Self, CandidateObjectIdentity), IndexBlobError> {
-        if self.request_count >= MAX_GIT_VISIBLE_PATHS {
-            return Err(IndexBlobError::LimitExceeded("request count"));
+        let preflight_error = if self.request_count >= MAX_GIT_VISIBLE_PATHS {
+            Some(IndexBlobError::LimitExceeded("request count"))
+        } else if let Err(error) = validate_oid(&entry.oid) {
+            Some(error)
+        } else if Instant::now() >= self.started + SESSION_TIMEOUT {
+            Some(IndexBlobError::Timeout)
+        } else {
+            None
+        };
+        if let Some(error) = preflight_error {
+            self.terminate_and_wait().await;
+            return Err(error);
         }
-        validate_oid(&entry.oid)?;
         let session_deadline = self.started + SESSION_TIMEOUT;
-        if Instant::now() >= session_deadline {
-            return Err(IndexBlobError::Timeout);
-        }
         let response_deadline = (Instant::now() + response_timeout).min(session_deadline);
         let outcome = timeout_at(
             response_deadline,
             self.read_entry_response(&entry.oid, entry.mode, budget),
         )
         .await
-        .map_err(|_| IndexBlobError::Timeout)?;
-        let identity = outcome?;
+        .map_err(|_| IndexBlobError::Timeout)
+        .and_then(|result| result);
+        let identity = match outcome {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.terminate_and_wait().await;
+                return Err(error);
+            }
+        };
         self.request_count += 1;
         Ok((self, identity))
     }
@@ -271,6 +284,14 @@ impl SnapshotIndexBlobSession {
 
     /// Close stdin, require no unsolicited stdout, and reap the cleanly exited child.
     pub(crate) async fn finish(mut self) -> Result<(), IndexBlobError> {
+        let result = self.finish_inner().await;
+        if result.is_err() {
+            self.terminate_and_wait().await;
+        }
+        result
+    }
+
+    async fn finish_inner(&mut self) -> Result<(), IndexBlobError> {
         self.stdin.take();
         let mut trailing = [0_u8; 1];
         let overall = self.started + SESSION_TIMEOUT;
@@ -298,6 +319,13 @@ impl SnapshotIndexBlobSession {
             )));
         }
         Ok(())
+    }
+
+    async fn terminate_and_wait(&mut self) {
+        self.stdin.take();
+        self.group.terminate();
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let _ = timeout_at(cleanup_deadline, self.group.wait_termination()).await;
     }
 
     async fn wait_for_exit(&mut self) -> Result<std::process::ExitStatus, IndexBlobError> {
