@@ -81,7 +81,7 @@ impl SnapshotHashBudget {
         self.hashed_bytes
     }
 
-    fn remaining(&self) -> u64 {
+    pub(crate) fn remaining(&self) -> u64 {
         MAX_SNAPSHOT_CONTENT_BYTES - self.hashed_bytes
     }
 
@@ -90,7 +90,7 @@ impl SnapshotHashBudget {
         Self { hashed_bytes }
     }
 
-    fn charge(&mut self, bytes: usize) -> Result<(), SnapshotObjectError> {
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), SnapshotObjectError> {
         let bytes = u64::try_from(bytes)
             .map_err(|_| SnapshotObjectError::LimitExceeded("content bytes"))?;
         self.hashed_bytes = self
