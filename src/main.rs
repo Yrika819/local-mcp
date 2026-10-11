@@ -28,6 +28,7 @@ mod managed_worktree_observe;
 mod managed_worktree_prepare;
 mod managed_worktree_snapshot_coherence;
 mod managed_worktree_snapshot_index_blob;
+mod managed_worktree_snapshot_manifest;
 mod managed_worktree_snapshot_object;
 mod managed_worktree_snapshot_observe;
 mod mcp;
@@ -76,6 +77,8 @@ mod managed_worktree_creation_tests;
 mod managed_worktree_discovery_tests;
 #[cfg(test)]
 mod managed_worktree_snapshot_coherence_tests;
+#[cfg(test)]
+mod managed_worktree_snapshot_manifest_tests;
 #[cfg(test)]
 mod managed_worktree_snapshot_object_tests;
 #[cfg(test)]

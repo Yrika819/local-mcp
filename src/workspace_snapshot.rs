@@ -221,6 +221,30 @@ impl WriterMutatedPathIdentity {
         Self::Absent { path }
     }
 
+    /// Build a `Present` writer identity from an already-observed
+    /// [`CandidateObjectIdentity`], preserving its exact kind: the executable bit
+    /// of a regular file and the raw target bytes of a symlink.
+    ///
+    /// Digest and size validation is routed through the same
+    /// [`CandidateObjectIdentity::validate`] the manifest constructor uses, so an
+    /// executable regular file or a symlink is never flattened into the
+    /// non-executable convenience shape
+    /// ([`Self::present`](Self::present) builds that shape and is kept for callers
+    /// that genuinely mean "regular file, non-executable").
+    ///
+    /// [`CandidateObjectIdentity::Absent`] is not representable here: an observer
+    /// that found no object records [`Self::absent`] instead.
+    pub(crate) fn present_with_object(
+        path: NormalizedWorkspacePath,
+        object: CandidateObjectIdentity,
+    ) -> Result<Self, WorkspaceSnapshotError> {
+        object.validate()?;
+        if object == CandidateObjectIdentity::Absent {
+            return Err(WorkspaceSnapshotError::InvalidCandidateIdentityCoverage);
+        }
+        Ok(Self::Present { path, object })
+    }
+
     fn path(&self) -> &NormalizedWorkspacePath {
         match self {
             Self::Present { path, .. } | Self::Absent { path } => path,
