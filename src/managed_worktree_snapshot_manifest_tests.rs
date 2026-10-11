@@ -70,24 +70,47 @@ fn worktree_id() -> WorktreeId {
     WorktreeId::parse("00000000-0000-4000-8000-000000000001").unwrap()
 }
 
-/// An `ACTIVE` durable record reached through the real pure lifecycle path.
-fn active_record() -> ManagedWorktreeRecord {
+/// Durable root paths. `ManagedWorktreeRecord::validate` requires canonical
+/// absolute paths, which on Windows means a drive prefix, so the shapes are
+/// platform-specific exactly as `managed_worktree_tests` does.
+#[cfg(not(windows))]
+const PRIMARY_ROOT: &str = "/managed/primary";
+#[cfg(windows)]
+const PRIMARY_ROOT: &str = r"C:\managed\primary";
+#[cfg(not(windows))]
+const COMMON_DIR: &str = "/managed/repo-common";
+#[cfg(windows)]
+const COMMON_DIR: &str = r"C:\managed\repo-common";
+#[cfg(not(windows))]
+const WORKTREE_ROOT: &str = "/managed/worktree";
+#[cfg(windows)]
+const WORKTREE_ROOT: &str = r"C:\managed\worktree";
+const NOW: &str = "2026-10-11T00:00:00Z";
+
+/// A `REQUESTED` durable record. Exposed so tests can observe the lifecycle gate
+/// without reaching `ACTIVE`.
+fn requested_record() -> ManagedWorktreeRecord {
     ManagedWorktreeRecord::requested(
         &goal_id(),
         worktree_id(),
-        PathBuf::from("/managed/primary"),
-        PathBuf::from("/managed/repo-common"),
-        PathBuf::from("/managed/worktree"),
+        PathBuf::from(PRIMARY_ROOT),
+        PathBuf::from(COMMON_DIR),
+        PathBuf::from(WORKTREE_ROOT),
         BASE_OID.to_owned(),
         None,
         1,
         0,
     )
     .unwrap()
-    .to_prepared()
-    .unwrap()
-    .to_active(OBSERVED_OID, "2026-10-11T00:00:00Z")
-    .unwrap()
+}
+
+/// An `ACTIVE` durable record reached through the real pure lifecycle path.
+fn active_record() -> ManagedWorktreeRecord {
+    requested_record()
+        .to_prepared()
+        .unwrap()
+        .to_active(OBSERVED_OID, NOW)
+        .unwrap()
 }
 
 type GitVisibleSpec<'a> = (&'a str, CandidateObjectIdentity, CandidateObjectIdentity);
@@ -676,18 +699,7 @@ fn existing_golden_digest_is_unchanged() {
 
 #[test]
 fn a_non_active_lifecycle_cannot_hold_stable_evidence() {
-    let requested = ManagedWorktreeRecord::requested(
-        &goal_id(),
-        worktree_id(),
-        PathBuf::from("/managed/primary"),
-        PathBuf::from("/managed/repo-common"),
-        PathBuf::from("/managed/worktree"),
-        BASE_OID.to_owned(),
-        None,
-        1,
-        0,
-    )
-    .unwrap();
+    let requested = requested_record();
     let observed = consistent(OBSERVED_OID, &[], &[], &[], &[]);
     let error = assemble_workspace_snapshot_manifest(&requested, &observed).unwrap_err();
     assert!(matches!(
@@ -868,19 +880,7 @@ fn git_visible_identity_construction_validates_both_objects() {
 fn assembly_error_display_is_human_readable() {
     let observed = build_observation(OBSERVED_OID, &[], &[], &[], &[], &[]);
     assert!(assemble(&observed).digest().len() == 64);
-    let requested = ManagedWorktreeRecord::requested(
-        &goal_id(),
-        worktree_id(),
-        PathBuf::from("/managed/primary"),
-        PathBuf::from("/managed/repo-common"),
-        PathBuf::from("/managed/worktree"),
-        BASE_OID.to_owned(),
-        None,
-        1,
-        0,
-    )
-    .unwrap();
-    let error = assemble_workspace_snapshot_manifest(&requested, &observed).unwrap_err();
+    let error = assemble_workspace_snapshot_manifest(&requested_record(), &observed).unwrap_err();
     let rendered = error.to_string();
     assert!(rendered.contains("lifecycle"));
     assert!(rendered.contains("stable workspace snapshot"));
