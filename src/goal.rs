@@ -736,6 +736,16 @@ fn validate_snapshot_digest(digest: &str) -> Result<(), OrchestratorError> {
 /// re-validation path: the frozen bound, one identity per Task, and
 /// UUID-shaped identities (orchestrator design section 5.1). Cross-checking
 /// the identities against live Tasks is Slice 3C work; Slice 3A proves shape.
+///
+/// The repeat is decided on the *parsed* identity, never on the stored
+/// spelling. `TaskId::parse` and `VerificationId::parse` accept every UUID
+/// spelling and normalize it to the canonical lowercase hyphenated form, so a
+/// deserialized list may hold several spellings of one Task, and a stored
+/// spelling never equals the one the Goal's own `BTreeMap<TaskId, Task>` uses.
+/// Enforcing the canonical spelling here — the same contract `goal_id`,
+/// `worktree_id`, and the criterion ids already prove through their `validate`
+/// — both keeps the durable record comparable by identity and refuses an
+/// alternate spelling of a Task that is already listed.
 fn validate_task_verification_identities(
     identities: &[(TaskId, VerificationId)],
 ) -> Result<(), OrchestratorError> {
@@ -746,9 +756,17 @@ fn validate_task_verification_identities(
     }
     let mut seen_tasks = BTreeSet::new();
     for (task_id, verification_id) in identities {
-        TaskId::parse(task_id.as_str())?;
-        VerificationId::parse(verification_id.as_str())?;
-        if !seen_tasks.insert(task_id.clone()) {
+        let parsed_task_id = TaskId::parse(task_id.as_str())?;
+        if parsed_task_id.as_str() != task_id.as_str() {
+            return Err(OrchestratorError::UnsafeIdentifier("TaskId".to_owned()));
+        }
+        let parsed_verification_id = VerificationId::parse(verification_id.as_str())?;
+        if parsed_verification_id.as_str() != verification_id.as_str() {
+            return Err(OrchestratorError::UnsafeIdentifier(
+                "VerificationId".to_owned(),
+            ));
+        }
+        if !seen_tasks.insert(parsed_task_id) {
             return Err(OrchestratorError::CorruptGoal(
                 "workspace verification evidence repeats a task verification identity".to_owned(),
             ));

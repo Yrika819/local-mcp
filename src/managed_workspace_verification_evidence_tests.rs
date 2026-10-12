@@ -1108,3 +1108,114 @@ fn task_store_loads_a_bound_goal_carrying_valid_evidence() {
     assert_eq!(stored.goal_revision(), goal.revision());
     assert_eq!(persisted, serde_json::to_vec_pretty(&document).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Alternate UUID spellings of one logical Task
+// ---------------------------------------------------------------------------
+
+/// A Task UUID that carries hex letters, so its accepted spellings differ from
+/// the canonical form by more than case: a digits-only fixture uppercases to
+/// itself and would only re-test the plain repeat.
+const ALIAS_TASK_UUID: &str = "00000000-0000-4000-8000-00000000abcd";
+
+/// Every spelling of [`ALIAS_TASK_UUID`] that `Uuid::parse_str` accepts and
+/// `to_string` normalizes back to the canonical value: uppercase, brace
+/// wrapped, URN prefixed, unhyphenated, and mixed case. Each is therefore a
+/// genuine alias of the same logical Task, never a different identity.
+fn task_id_spellings() -> Vec<String> {
+    let spellings = vec![
+        ALIAS_TASK_UUID.to_uppercase(),
+        format!("{{{ALIAS_TASK_UUID}}}"),
+        format!("urn:uuid:{ALIAS_TASK_UUID}"),
+        ALIAS_TASK_UUID.replace('-', ""),
+        "00000000-0000-4000-8000-00000000aBcD".to_owned(),
+    ];
+    for spelling in &spellings {
+        assert_eq!(
+            TaskId::parse(spelling)
+                .expect("spelling is parsed")
+                .as_str(),
+            ALIAS_TASK_UUID,
+            "{spelling} does not normalize to the canonical task id"
+        );
+    }
+    spellings
+}
+
+/// The durable canonical spelling of [`ALIAS_TASK_UUID`].
+fn alias_task_id() -> TaskId {
+    TaskId::parse(ALIAS_TASK_UUID).unwrap()
+}
+
+/// Build evidence through the constructor with the given identity list.
+///
+/// A `TaskId` can only carry an alternate spelling if some other decode
+/// produced it, because `new()` and `parse()` both mint canonical values and
+/// the inner string is private; that is exactly what a durable document does,
+/// which is why this path needs a spelling case of its own.
+fn evidence_with_task_identities(
+    identities: Vec<(TaskId, VerificationId)>,
+) -> Result<ManagedWorkspaceVerificationEvidenceV1, OrchestratorError> {
+    ManagedWorkspaceVerificationEvidenceV1::new(
+        goal_id(),
+        7,
+        1,
+        worktree_id(),
+        BASE_OID.to_owned(),
+        OBSERVED_OID.to_owned(),
+        SNAPSHOT_DIGEST.to_owned(),
+        verification_id(),
+        identities,
+        None,
+        NOW.to_owned(),
+    )
+}
+
+#[test]
+fn new_refuses_a_task_identity_repeated_in_another_uuid_spelling() {
+    // Positive control: one canonical identity still builds, so any refusal
+    // below is about the alternate spelling or the repeat, not the list.
+    assert!(
+        evidence_with_task_identities(vec![(alias_task_id(), verification_id())]).is_ok(),
+        "the canonical spelling the constructor receives was refused"
+    );
+    // The same logical Task must not appear twice, no matter which accepted
+    // spelling each entry carries.
+    for spelling in task_id_spellings() {
+        let repeated: TaskId = serde_json::from_value(json!(spelling)).expect("decoded task id");
+        let result = evidence_with_task_identities(vec![
+            (alias_task_id(), verification_id()),
+            (repeated, verification_id()),
+        ]);
+        assert!(
+            result.is_err(),
+            "accepted a repeated task identity spelled {spelling}"
+        );
+    }
+}
+
+#[test]
+fn a_bound_goal_rejects_a_task_identity_repeated_in_another_uuid_spelling() {
+    // The durable path, where the alternate spelling actually originates:
+    // deserialization builds `TaskId` straight from the stored string, so the
+    // repeat has to be decided on the parsed identity rather than on the
+    // spelling the record happens to store.
+    reload_bound_goal_with_evidence(bound_evidence_value(&bound_goal()))
+        .expect("the canonical spelling the minter emits still validates");
+    let verification = verification_id().as_str().to_owned();
+    for spelling in task_id_spellings() {
+        let mut record = bound_evidence_value(&bound_goal());
+        record["task_verification_identities"] = json!([
+            [ALIAS_TASK_UUID, verification.clone()],
+            [spelling.clone(), verification.clone()],
+        ]);
+        let error = match reload_bound_goal_with_evidence(record) {
+            Ok(_) => panic!("accepted a repeated task identity spelled {spelling}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unsafe TaskId identifier"),
+            "unexpected error for spelling {spelling}: {error}"
+        );
+    }
+}
