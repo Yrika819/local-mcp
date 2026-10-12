@@ -624,6 +624,13 @@ static HOST_GIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 ///
 /// Exposed so the Managed Worktrees creation seam runs the same host Git
 /// identity as the staging mutation instead of re-deriving a weaker one.
+///
+/// The cache intentionally preserves the first result — including a failure —
+/// for the process lifetime. The ambient `PATH` does not change after server
+/// startup, so retrying with a broader untrusted environment would weaken the
+/// identity invariant. A malformed `PATH` must be repaired by the host owner
+/// (launcher/host configuration) and the process restarted; the resolver
+/// reports the failing entry index so that repair is actionable.
 pub(crate) fn host_git_path() -> Result<PathBuf> {
     HOST_GIT
         .get_or_init(|| resolve_host_git_path().map_err(|error| format!("{error:#}")))
@@ -639,13 +646,29 @@ fn resolve_host_git_path() -> Result<PathBuf> {
 fn resolve_git_from_path(path: &std::ffi::OsStr) -> Result<PathBuf> {
     anyhow::ensure!(!path.is_empty(), "PATH is empty");
     let entries = std::env::split_paths(path).collect::<Vec<_>>();
-    for entry in &entries {
+    // Security boundary: an empty component must never resolve as the current
+    // working directory, and a relative component must never become a trusted
+    // executable location. Both are rejected here, before any filesystem
+    // probe, and the error names the failing index so a host owner can repair
+    // their own PATH. The resolver never strips or rewrites entries: silent
+    // repair would change executable-search authority and hide a hijack. PATH
+    // repair belongs to the launcher/host configuration, not to this resolver.
+    for (index, entry) in entries.iter().enumerate() {
         anyhow::ensure!(
             !entry.as_os_str().is_empty(),
-            "PATH contains an empty entry"
+            "PATH contains an empty entry at index {index} of {} entries",
+            entries.len()
         );
-        anyhow::ensure!(entry.is_absolute(), "PATH contains a relative entry");
-        anyhow::ensure!(entry.to_str().is_some(), "PATH entry is not valid UTF-8");
+        anyhow::ensure!(
+            entry.is_absolute(),
+            "PATH contains a relative entry at index {index} of {} entries",
+            entries.len()
+        );
+        anyhow::ensure!(
+            entry.to_str().is_some(),
+            "PATH entry at index {index} of {} entries is not valid UTF-8",
+            entries.len()
+        );
     }
     for entry in entries {
         for name in git_file_names() {
@@ -3632,6 +3655,193 @@ mod tests {
     async fn relative_fake_git_is_not_run_for_authorized_pre_approval_snapshot() {
         let fixture = FakeGit::new();
         assert_pre_approval_git_is_not_run(&fixture, "./git".to_owned(), true).await;
+    }
+}
+
+#[cfg(test)]
+mod windows_path_parity_tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn fixture_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("local-mcp-git-parity-{tag}-{}", Uuid::new_v4()))
+    }
+
+    fn git_candidate_name() -> &'static str {
+        #[cfg(windows)]
+        {
+            "git.exe"
+        }
+        #[cfg(not(windows))]
+        {
+            "git"
+        }
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
+    fn path_with_entries(entries: &[String]) -> std::ffi::OsString {
+        #[cfg(windows)]
+        let separator = ";";
+        #[cfg(not(windows))]
+        let separator = ":";
+        std::ffi::OsString::from(entries.join(separator))
+    }
+
+    #[test]
+    fn valid_absolute_path_locates_expected_git() {
+        let root = fixture_dir("valid");
+        let entry = root.join("entry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let candidate = entry.join(git_candidate_name());
+        std::fs::write(&candidate, "fixture git").unwrap();
+        make_executable(&candidate);
+        let path = std::env::join_paths([&entry]).unwrap();
+        let resolved = resolve_git_from_path(path.as_os_str()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&candidate).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_path_entry_is_rejected_with_actionable_index() {
+        let root = fixture_dir("empty");
+        let entry = root.join("entry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let valid = entry.to_str().unwrap().to_owned();
+        // Trailing separator produces a trailing empty component on both
+        // Windows (`;`) and POSIX (`:`), matching the host failure observed
+        // with a trailing `;` in the ambient PATH.
+        let path = path_with_entries(&[valid.clone(), String::new()]);
+        let error = resolve_git_from_path(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("empty entry at index 1 of 2"),
+            "unexpected message: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_path_entry_is_rejected_with_actionable_index() {
+        let root = fixture_dir("relative");
+        let entry = root.join("entry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let valid = entry.to_str().unwrap().to_owned();
+        let path = path_with_entries(&[valid, "relative".to_owned()]);
+        let error = resolve_git_from_path(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("relative entry at index 1 of 2"),
+            "unexpected message: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_git_produces_a_clear_failure() {
+        let root = fixture_dir("missing");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = std::env::join_paths([&root]).unwrap();
+        let error = resolve_git_from_path(path.as_os_str()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not found"),
+            "unexpected message: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_path_cannot_broaden_authority_to_cwd() {
+        assert!(resolve_git_from_path(std::ffi::OsStr::new("")).is_err());
+        // An empty-only PATH must fail, never resolve `./git` from the CWD.
+        #[cfg(windows)]
+        let empty_like: std::ffi::OsString = std::ffi::OsString::from(";");
+        #[cfg(not(windows))]
+        let empty_like: std::ffi::OsString = std::ffi::OsString::from(":");
+        assert!(resolve_git_from_path(&empty_like).is_err());
+        assert!(resolve_git_from_path(std::ffi::OsStr::new("relative/path")).is_err());
+    }
+
+    #[test]
+    fn explicit_validated_path_is_deterministic() {
+        let root = fixture_dir("deterministic");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_git = first.join(git_candidate_name());
+        let second_git = second.join(git_candidate_name());
+        std::fs::write(&first_git, "first").unwrap();
+        std::fs::write(&second_git, "second").unwrap();
+        make_executable(&first_git);
+        make_executable(&second_git);
+        // The explicit PATH is the authority: launcher and direct execution
+        // with the same explicit value must locate the same executable.
+        let first_path = std::env::join_paths([&first]).unwrap();
+        let second_path = std::env::join_paths([&second]).unwrap();
+        assert_eq!(
+            resolve_git_from_path(first_path.as_os_str()).unwrap(),
+            std::fs::canonicalize(&first_git).unwrap()
+        );
+        assert_eq!(
+            resolve_git_from_path(second_path.as_os_str()).unwrap(),
+            std::fs::canonicalize(&second_git).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cached_host_identity_is_stable_within_the_process() {
+        // The cache preserves the first result for the process lifetime; this
+        // only asserts the stability invariant, never the ambient outcome.
+        // A malformed ambient PATH fails here rather than resolving elsewhere.
+        let ambient = std::env::var_os("PATH");
+        let Some(ambient) = ambient else {
+            assert!(resolve_host_git_path().is_err());
+            return;
+        };
+        let direct = resolve_git_from_path(&ambient);
+        match direct {
+            Ok(expected) => {
+                // A healthy host resolves once and keeps that identity.
+                let first = host_git_path().unwrap();
+                let second = host_git_path().unwrap();
+                assert_eq!(first, second);
+                assert_eq!(first, expected);
+            }
+            Err(error) => {
+                // A malformed host PATH fails deterministically with the
+                // failing index, and the cached failure matches it.
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("index")
+                        || message.contains("empty")
+                        || message.contains("not found")
+                        || message.contains("PATH"),
+                    "unexpected message: {message}"
+                );
+                assert!(host_git_path().is_err());
+                assert_eq!(
+                    format!("{:#}", host_git_path().unwrap_err()),
+                    format!("{:#}", host_git_path().unwrap_err()),
+                    "cached failure must be stable"
+                );
+            }
+        }
     }
 }
 

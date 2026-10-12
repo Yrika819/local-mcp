@@ -1453,10 +1453,106 @@ fn safe_environment_with_path(path: Option<&std::ffi::OsStr>) -> HashMap<String,
             .map(|value| (name.to_owned(), value))
     })
     .collect();
+    #[cfg(windows)]
+    {
+        for (name, value) in windows_system_environment() {
+            environment.insert(name, value);
+        }
+    }
     if let Some(path) = path {
         environment.insert("PATH".to_owned(), path.to_string_lossy().into_owned());
     }
     environment
+}
+
+/// Windows-only system environment forwarded to restricted children.
+///
+/// The base allowlist above is deliberately small and platform-independent.
+/// On Windows that leaves standard programs without values they expect
+/// (`SystemDrive`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`,
+/// `ComSpec`). Only these six explicit names are forwarded, only on Windows,
+/// and only when each value passes the strict shape check in
+/// [`checked_windows_env`]. Anything else — credentials, tokens, proxy
+/// secrets, `GIT_*` overrides — is still dropped by `env_clear()`.
+///
+/// `std::env::var` on Windows is case-insensitive, so the canonical lookup
+/// below finds the ambient value regardless of the case the host stored.
+#[cfg(windows)]
+fn windows_system_environment() -> HashMap<String, String> {
+    [
+        "SystemDrive",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ComSpec",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| checked_windows_env(name, &value))
+    })
+    .collect()
+}
+
+/// Validate one Windows system value before forwarding.
+///
+/// Fail-closed: empty values, embedded NULs, relative paths, and a `ComSpec`
+/// that does not name `cmd.exe` are dropped rather than forwarded. Path-like
+/// values must be Windows-absolute (`C:\...` or `\\...`) so a relative value
+/// can never redirect a child to the current working directory.
+fn checked_windows_env(name: &str, value: &str) -> Option<(String, String)> {
+    if value.is_empty() || value.contains('\0') {
+        return None;
+    }
+    match name {
+        "SystemDrive" => {
+            let bytes = value.as_bytes();
+            if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                Some((name.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        }
+        "ComSpec" => {
+            if !is_windows_absolute_path(value) {
+                return None;
+            }
+            let file_name = value.rsplit(['/', '\\']).next().unwrap_or_default();
+            if file_name.eq_ignore_ascii_case("cmd.exe") {
+                Some((name.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        }
+        "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "ProgramData" => {
+            if is_windows_absolute_path(value) {
+                Some((name.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `value` is an absolute Windows path, independent of host platform.
+///
+/// `Path::is_absolute` follows the host (so `C:\...` is not absolute on
+/// Linux CI). The child runs on Windows, so the check must use Windows
+/// semantics everywhere: a drive-letter root (`C:\`, `C:/`) or a UNC prefix
+/// (`\\server\share`).
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    value.starts_with(r"\\")
 }
 
 pub(crate) fn clean_git_environment() -> HashMap<String, String> {
@@ -1522,6 +1618,190 @@ mod unrestricted_tests {
         assert_eq!(output.stdout, "stdout");
         assert_eq!(output.stderr, "stderr");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod windows_environment_parity_tests {
+    use super::*;
+
+    #[test]
+    fn windows_absolute_path_validator_accepts_roots_and_rejects_relative() {
+        for valid in [
+            r"C:\Windows",
+            r"C:/Windows",
+            r"D:\Users\fixture",
+            r"\\server\share",
+        ] {
+            assert!(is_windows_absolute_path(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "relative",
+            r"C:relative",
+            "C:",
+            r"C:foo",
+            "/unix/absolute",
+        ] {
+            assert!(!is_windows_absolute_path(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn checked_windows_env_accepts_minimum_system_environment() {
+        let cases = [
+            ("SystemDrive", "C:"),
+            ("USERPROFILE", r"C:\Users\fixture"),
+            ("APPDATA", r"C:\Users\fixture\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\fixture\AppData\Local"),
+            ("ProgramData", r"C:\ProgramData"),
+            ("ComSpec", r"C:\Windows\System32\cmd.exe"),
+        ];
+        for (name, value) in cases {
+            assert_eq!(
+                checked_windows_env(name, value),
+                Some((name.to_owned(), value.to_owned())),
+                "{name}"
+            );
+        }
+        // `ComSpec` matching is case-insensitive, as on Windows.
+        assert!(checked_windows_env("ComSpec", r"C:\Windows\System32\CMD.EXE").is_some());
+    }
+
+    #[test]
+    fn checked_windows_env_rejects_empty_malformed_and_injection() {
+        assert!(checked_windows_env("SystemDrive", "").is_none());
+        assert!(checked_windows_env("USERPROFILE", "").is_none());
+        assert!(checked_windows_env("USERPROFILE", "relative\\path").is_none());
+        assert!(checked_windows_env("USERPROFILE", "C:").is_none());
+        assert!(checked_windows_env("USERPROFILE", "C:relative").is_none());
+        assert!(checked_windows_env("SystemDrive", "C").is_none());
+        assert!(checked_windows_env("SystemDrive", r"C:\").is_none());
+        assert!(checked_windows_env("SystemDrive", "CC:").is_none());
+        assert!(checked_windows_env("ComSpec", r"C:\Windows\System32\evil.exe").is_none());
+        assert!(checked_windows_env("ComSpec", "cmd.exe").is_none());
+        assert!(checked_windows_env("ComSpec", "C:\\Windows\\System32\\cmd.exe\0").is_none());
+        assert!(checked_windows_env("APPDATA", "C:\0injected").is_none());
+        assert!(checked_windows_env("UNKNOWN", r"C:\Windows").is_none());
+    }
+
+    #[test]
+    fn clean_git_environment_isolates_git_overrides_and_secrets() {
+        let environment = clean_git_environment();
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_PAGER",
+            "GIT_EXTERNAL_DIFF",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "OPENAI_API_KEY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+        ] {
+            assert!(!environment.contains_key(name), "{name}");
+        }
+        assert_eq!(
+            environment.get("GIT_CONFIG_NOSYSTEM"),
+            Some(&"1".to_owned())
+        );
+    }
+
+    #[test]
+    fn safe_environment_never_forwards_arbitrary_variables() {
+        let environment = safe_environment();
+        let mut allowed: std::collections::HashSet<&str> = [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "SystemRoot",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_ATTR_NOSYSTEM",
+        ]
+        .into_iter()
+        .collect();
+        #[cfg(windows)]
+        for name in [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ComSpec",
+        ] {
+            allowed.insert(name);
+        }
+        for key in environment.keys() {
+            assert!(allowed.contains(key.as_str()), "unexpected {key}");
+        }
+    }
+
+    #[test]
+    fn safe_environment_with_explicit_path_is_deterministic() {
+        let first = safe_environment_with_path(Some(std::ffi::OsStr::new("first")));
+        let second = safe_environment_with_path(Some(std::ffi::OsStr::new("second")));
+        assert_eq!(first.get("PATH"), Some(&"first".to_owned()));
+        assert_eq!(second.get("PATH"), Some(&"second".to_owned()));
+        // The explicit PATH is the search authority; ambient PATH never leaks in.
+        assert_ne!(first.get("PATH"), second.get("PATH"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_environment_behavior_is_unchanged() {
+        let environment = safe_environment();
+        for unexpected in [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ComSpec",
+            "HOME",
+        ] {
+            assert!(!environment.contains_key(unexpected), "{unexpected}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_receives_minimum_system_environment() {
+        // Fail-closed per variable: only well-formed ambient values appear.
+        // The host running this test provides the standard six; a missing or
+        // malformed host value is dropped rather than forwarded.
+        let environment = safe_environment();
+        for name in [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ComSpec",
+        ] {
+            if let Ok(ambient) = std::env::var(name) {
+                let expected = checked_windows_env(name, &ambient);
+                assert_eq!(
+                    environment
+                        .get(name)
+                        .cloned()
+                        .map(|value| (name.to_owned(), value)),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
     }
 }
 
