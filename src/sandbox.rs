@@ -1502,6 +1502,11 @@ fn windows_system_environment() -> HashMap<String, String> {
 /// that does not name `cmd.exe` are dropped rather than forwarded. Path-like
 /// values must be Windows-absolute (`C:\...` or `\\...`) so a relative value
 /// can never redirect a child to the current working directory.
+///
+/// Compiled on Windows and in every test build: Linux production has no
+/// Windows child to forward to, so without the `test` gate this would be
+/// dead code under `cargo clippy -- -D warnings`.
+#[cfg(any(windows, test))]
 fn checked_windows_env(name: &str, value: &str) -> Option<(String, String)> {
     if value.is_empty() || value.contains('\0') {
         return None;
@@ -1543,6 +1548,10 @@ fn checked_windows_env(name: &str, value: &str) -> Option<(String, String)> {
 /// Linux CI). The child runs on Windows, so the check must use Windows
 /// semantics everywhere: a drive-letter root (`C:\`, `C:/`) or a UNC prefix
 /// (`\\server\share`).
+///
+/// See [`checked_windows_env`]: needed on Windows and in tests, dead code in
+/// Linux production.
+#[cfg(any(windows, test))]
 fn is_windows_absolute_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() >= 3
