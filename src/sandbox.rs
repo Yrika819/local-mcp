@@ -1726,7 +1726,18 @@ mod windows_environment_parity_tests {
     #[test]
     fn safe_environment_never_forwards_arbitrary_variables() {
         let environment = safe_environment();
-        let mut allowed: std::collections::HashSet<&str> = [
+        #[cfg(windows)]
+        let extra = [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ComSpec",
+        ];
+        #[cfg(not(windows))]
+        let extra: [&str; 0] = [];
+        let allowed: std::collections::HashSet<&str> = [
             "PATH",
             "LANG",
             "LC_ALL",
@@ -1740,18 +1751,8 @@ mod windows_environment_parity_tests {
             "GIT_ATTR_NOSYSTEM",
         ]
         .into_iter()
+        .chain(extra)
         .collect();
-        #[cfg(windows)]
-        for name in [
-            "SystemDrive",
-            "USERPROFILE",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "ProgramData",
-            "ComSpec",
-        ] {
-            allowed.insert(name);
-        }
         for key in environment.keys() {
             assert!(allowed.contains(key.as_str()), "unexpected {key}");
         }
