@@ -1714,6 +1714,9 @@ fn schema_four_document(goal: &Goal) -> Value {
     let mut value = serde_json::to_value(goal).unwrap();
     let object = value.as_object_mut().unwrap();
     object.insert("schema_version".to_owned(), json!(4));
+    // A schema-4 document has no managed-workspace verification evidence field,
+    // so removing it is what makes the stored bytes faithful to that schema.
+    object.remove("managed_workspace_verification_evidence");
     if let Some(record) = goal.managed_worktree() {
         let mut record_value = serde_json::to_value(record).unwrap();
         // A schema-4 record has no attempt counter at all.

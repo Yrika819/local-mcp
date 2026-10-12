@@ -23,12 +23,18 @@ const SCHEMA_BEFORE_MANAGED_WORKTREES: u64 = 3;
 /// the last version without that budget, so it is the origin of this step.
 const SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET: u64 = 4;
 
+/// Schema 5 is the last version without the durable managed-workspace
+/// verification evidence field (Phase 5 Slice 3A). A stored schema-5 Goal has
+/// no evidence at all, so the migration must establish the field without
+/// inventing evidence for a Goal that never assembled one.
+const SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION: u64 = 5;
+
 /// The migration chain above is written against a specific current schema. If a
 /// future change advances `GOAL_SCHEMA_VERSION` without extending the chain,
 /// refuse to compile rather than silently routing a newer durable document
 /// through an older migration step.
 const _: () = assert!(
-    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET + 1,
+    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION + 1,
     "goal schema migration chain must be extended when GOAL_SCHEMA_VERSION advances"
 );
 
@@ -369,6 +375,21 @@ impl TaskStore {
             legacy_object.insert("legacy_final_verification".to_owned(), old_final);
             legacy_object.insert("final_verifications".to_owned(), Value::Array(Vec::new()));
             legacy_object.insert("final_verification_spec".to_owned(), Value::Null);
+            // The current Goal shape states managed-workspace verification
+            // evidence explicitly, and a legacy Goal never assembled any. A
+            // legacy document that already carries the field is not a legacy
+            // document, so it is refused rather than overwritten.
+            if legacy_object.contains_key("managed_workspace_verification_evidence") {
+                return Err(OrchestratorError::CorruptGoal(
+                    "legacy schema-1 durable Goal must not carry managed-workspace verification \
+                     evidence"
+                        .to_owned(),
+                ));
+            }
+            legacy_object.insert(
+                "managed_workspace_verification_evidence".to_owned(),
+                Value::Null,
+            );
             let goal: Goal = serde_json::from_value(legacy).map_err(|error| {
                 OrchestratorError::CorruptGoal(format!(
                     "legacy durable Goal shape is invalid: {error}"
@@ -400,8 +421,24 @@ impl TaskStore {
         if schema_version == SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET {
             return Self::decode_pre_durable_attempt_budget(value);
         }
+        if schema_version == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION {
+            return Self::decode_pre_managed_workspace_verification(value);
+        }
         if schema_version != GOAL_SCHEMA_VERSION as u64 {
             return Err(OrchestratorError::UnsupportedSchema(schema_version));
+        }
+        // The authority-bearing managed-workspace verification evidence field
+        // carries no serde default, and serde cannot distinguish a missing
+        // `Option` from an explicit `null`. The store is the single durable
+        // decode path, so it is where the boundary is enforced: a current-schema
+        // document that does not state the field is not a current-schema
+        // document. Older documents reach here only through the migration chain
+        // above, which states the value explicitly.
+        if !object.contains_key("managed_workspace_verification_evidence") {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{GOAL_SCHEMA_VERSION} durable Goal must state managed-workspace \
+                 verification evidence"
+            )));
         }
         let goal: Goal = serde_json::from_value(value).map_err(|error| {
             OrchestratorError::CorruptGoal(format!("durable Goal shape is invalid: {error}"))
@@ -478,18 +515,62 @@ impl TaskStore {
         }
         object.insert(
             "schema_version".to_owned(),
+            Value::from(SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION),
+        );
+        // The document is now schema 5. Continue through the shared
+        // managed-workspace-verification step so a stored schema-4 Goal is
+        // normalized by exactly the same code as a stored schema-5 Goal, rather
+        // than relying on a serde default to coincide with the intended value.
+        Self::decode_pre_managed_workspace_verification(migrated)
+    }
+
+    /// Migrate a schema-5 durable Goal to schema 6 by stating that it has no
+    /// managed-workspace verification evidence.
+    ///
+    /// Schema 6 introduces the Phase 5 Slice 3A evidence record. A schema-5 Goal
+    /// predates it, so the only honest migration is an explicit "no evidence":
+    /// the field is written as `null` and never inferred. Evidence is minted by
+    /// the finalization path after a real deterministic final verification, never
+    /// by a migration, so a migrated Goal keeps whatever every pre-6 release
+    /// actually had plus nothing.
+    ///
+    /// The field carries no `#[serde(default)]`, so this insertion is what makes
+    /// the older document decodable at all: the Goal shape itself enforces that
+    /// no other route can produce a schema-6 Goal.
+    fn decode_pre_managed_workspace_verification(value: Value) -> Result<Goal, OrchestratorError> {
+        let mut migrated = value;
+        let object = migrated.as_object_mut().expect("validated object");
+        // A schema-5 document cannot carry this field: it did not exist at that
+        // version. Honouring one would let a document hand itself
+        // post-verification evidence authority and defeat the explicit "no
+        // evidence" decision below, which is exactly what this migration exists
+        // to make. Reject it, matching the sibling migrations that refuse
+        // carried managed state.
+        if object.contains_key("managed_workspace_verification_evidence") {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION} durable Goal must not carry \
+                 managed-workspace verification evidence"
+            )));
+        }
+        object.insert(
+            "managed_workspace_verification_evidence".to_owned(),
+            Value::Null,
+        );
+        object.insert(
+            "schema_version".to_owned(),
             Value::from(GOAL_SCHEMA_VERSION),
         );
         let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
             OrchestratorError::CorruptGoal(format!(
-                "schema-{SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET} durable Goal shape is invalid: {error}"
+                "schema-{SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION} durable Goal shape is \
+                 invalid: {error}"
             ))
         })?;
         goal.validate()?;
         Ok(goal)
     }
 
-    /// Migrate a pre-managed-worktree durable Goal (schema 3) to the current schema.
+    /// Migrate a pre-managed-worktree durable Goal (schema 3) to schema 4.
     ///
     /// Schema 4 introduces explicit Managed Worktrees V1 workspace identity. A
     /// schema-3 Goal has no such state, so migration is strictly additive: it
@@ -498,36 +579,28 @@ impl TaskStore {
     /// a directory name, a branch name, or any repository observation, so no
     /// stored Goal is silently converted into managed mode
     /// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` sections 3 and 9).
+    ///
+    /// The refusal of carried managed state stays here, where the field is
+    /// introduced, and the chain then continues through the shared schema-4 step
+    /// so a stored schema-3 Goal is normalized by exactly the same code as a
+    /// stored schema-4 Goal.
     fn decode_pre_managed_schema(value: Value) -> Result<Goal, OrchestratorError> {
         let mut migrated = value;
         let migrated_object = migrated.as_object_mut().expect("validated object");
-        migrated_object.insert("workspace_mode".to_owned(), Value::from("PRIMARY"));
-        Self::decode_migrated_goal(migrated, SCHEMA_BEFORE_MANAGED_WORKTREES)
-    }
-
-    /// Finish a migration by stamping the current schema version, decoding, and
-    /// validating. `origin` is the stored version the migration started from and
-    /// is used only for the corruption message.
-    fn decode_migrated_goal(mut migrated: Value, origin: u64) -> Result<Goal, OrchestratorError> {
-        let object = migrated.as_object_mut().expect("validated object");
-        if object.contains_key("managed_worktree")
-            || object.contains_key("managed_worktree_creation_intent")
+        if migrated_object.contains_key("managed_worktree")
+            || migrated_object.contains_key("managed_worktree_creation_intent")
         {
             return Err(OrchestratorError::CorruptGoal(format!(
-                "schema-{origin} durable Goal must not carry managed-worktree state"
+                "schema-{SCHEMA_BEFORE_MANAGED_WORKTREES} durable Goal must not carry \
+                 managed-worktree state"
             )));
         }
-        object.insert(
+        migrated_object.insert("workspace_mode".to_owned(), Value::from("PRIMARY"));
+        migrated_object.insert(
             "schema_version".to_owned(),
-            Value::from(GOAL_SCHEMA_VERSION),
+            Value::from(SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET),
         );
-        let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
-            OrchestratorError::CorruptGoal(format!(
-                "schema-{origin} durable Goal shape is invalid: {error}"
-            ))
-        })?;
-        goal.validate()?;
-        Ok(goal)
+        Self::decode_pre_durable_attempt_budget(migrated)
     }
 
     fn commit_goal_unlocked(&self, goal: &Goal) -> Result<(), OrchestratorError> {
@@ -758,6 +831,19 @@ mod tests {
             NOW,
         )
         .unwrap()
+    }
+
+    /// A durable document as it would have been stored at `version`: a current
+    /// Goal with the schema-6 evidence field removed and the older
+    /// `schema_version` stamped. Removing the field is what makes the document
+    /// faithful to the older schema rather than a newer document with a
+    /// rewritten version.
+    fn document_at_version(goal: &Goal, version: u64) -> Value {
+        let mut value = serde_json::to_value(goal).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("managed_workspace_verification_evidence");
+        object.insert("schema_version".to_owned(), Value::from(version));
+        value
     }
 
     fn read_only_scope() -> TaskScope {
@@ -1069,8 +1155,7 @@ mod tests {
         let goal = goal("schema-two-migration");
         let path = store.goal_path("schema-two-migration", goal.id()).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut value = serde_json::to_value(&goal).unwrap();
-        value["schema_version"] = Value::from(2_u64);
+        let mut value = document_at_version(&goal, 2);
         value
             .as_object_mut()
             .unwrap()
@@ -1116,8 +1201,7 @@ mod tests {
         let goal = goal(session);
         let path = store.goal_path(session, goal.id()).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut value = serde_json::to_value(&goal).unwrap();
-        value["schema_version"] = Value::from(3_u64);
+        let value = document_at_version(&goal, 3);
         let bytes = serde_json::to_vec_pretty(&value).unwrap();
         std::fs::write(&path, &bytes).unwrap();
 
@@ -1146,8 +1230,7 @@ mod tests {
         let goal = goal(session);
         let path = store.goal_path(session, goal.id()).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut value = serde_json::to_value(&goal).unwrap();
-        value["schema_version"] = Value::from(2_u64);
+        let mut value = document_at_version(&goal, 2);
         value
             .as_object_mut()
             .unwrap()
@@ -1218,8 +1301,7 @@ mod tests {
         .unwrap();
         let path = store.goal_path(session, managed_looking.id()).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut value = serde_json::to_value(&managed_looking).unwrap();
-        value["schema_version"] = Value::from(3_u64);
+        let value = document_at_version(&managed_looking, 3);
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
         let loaded = store.load_goal(session, managed_looking.id()).unwrap();

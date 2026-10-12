@@ -11,7 +11,7 @@ use crate::config;
 use crate::failure_class::FailureClass;
 use crate::fallback::SideEffectState;
 use crate::managed_worktree::{
-    ManagedWorktreeCreationIntent, ManagedWorktreeRecord, WorkspaceMode,
+    ManagedWorktreeCreationIntent, ManagedWorktreeRecord, WorkspaceMode, WorktreeId,
 };
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
@@ -36,7 +36,13 @@ pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
 /// advance because the new field changes durable retry authority: a schema-4
 /// managed record has no attempt count, and the migration must decide one
 /// without inventing permission to mutate Git again.
-pub(crate) const GOAL_SCHEMA_VERSION: u32 = 5;
+///
+/// Schema 6 adds the durable managed-workspace verification evidence
+/// (`managed_workspace_verification_evidence`), the Phase 5 Slice 3A record.
+/// It is an explicit advance because the field is authority-bearing state: a
+/// schema-5 Goal has no evidence, and the migration must say so explicitly
+/// instead of letting a serde default stand in for a decision.
+pub(crate) const GOAL_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -364,6 +370,459 @@ impl GoalFinalVerificationRecord {
     }
     pub(crate) fn finished_at(&self) -> &str {
         &self.finished_at
+    }
+}
+
+/// Durable schema version of [`ManagedWorkspaceVerificationEvidenceV1`].
+///
+/// Fail-closed: an evidence record carrying any other version is corrupt and is
+/// never reinterpreted, because the record binds finalization authority.
+pub(crate) const MANAGED_WORKSPACE_VERIFICATION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound on the durable `(TaskId, VerificationId)` list in one evidence
+/// record.
+///
+/// A durable storage bound, not a semantic claim about which Tasks are
+/// verified: it is sized above the planner's per-plan task bound
+/// (`crate::planner::MAX_PLAN_TASKS`) so accumulated replacement chains still
+/// fit, while the stored list itself stays finite.
+pub(crate) const MAX_TASK_VERIFICATION_IDENTITIES: usize = 1_024;
+
+/// Informational `BASE_ADVANCED` review evidence (freeze note J6/J7).
+///
+/// The primary `base_commit` advanced while the candidate stayed frozen. It is
+/// review evidence only: it never blocks completion, and promotion out of the
+/// candidate remains a separate explicit host/user action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedWorkspaceBaseAdvanced {
+    old_base: String,
+    current_primary_head: String,
+}
+
+/// Durable post-verification managed-workspace snapshot evidence (freeze note
+/// J7, adopted option B: a separate record referenced by `VerificationId`).
+///
+/// The record is assembled after deterministic Goal final verification passes
+/// and before final completion. It holds no filesystem or Git authority of its
+/// own: worktree identity and `base_commit` are copied from the durable managed
+/// record, and the digest comes from one pure snapshot observation, so the
+/// finalizer's fresh re-observation can be compared against it by digest alone.
+///
+/// Authority-bearing fields are deliberately **not** `#[serde(default)]` (the
+/// `creation_attempts_consumed` precedent): a record that omits one is corrupt
+/// rather than a weaker-but-valid record. Absence of the whole record means
+/// "no evidence" and is expressed at the `Goal` level instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedWorkspaceVerificationEvidenceV1 {
+    schema_version: u32,
+    goal_id: GoalId,
+    goal_revision: u64,
+    plan_revision: u32,
+    worktree_id: WorktreeId,
+    base_commit: String,
+    observed_head: String,
+    workspace_snapshot_digest: String,
+    final_verification_id: VerificationId,
+    task_verification_identities: Vec<(TaskId, VerificationId)>,
+    base_advanced: Option<ManagedWorkspaceBaseAdvanced>,
+    verified_at: String,
+}
+
+#[expect(
+    dead_code,
+    reason = "Slice 3A freezes the BASE_ADVANCED contract before 3E reports it to the operator."
+)]
+impl ManagedWorkspaceBaseAdvanced {
+    pub(crate) fn new(
+        old_base: String,
+        current_primary_head: String,
+    ) -> Result<Self, OrchestratorError> {
+        let candidate = Self {
+            old_base,
+            current_primary_head,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn old_base(&self) -> &str {
+        &self.old_base
+    }
+
+    pub(crate) fn current_primary_head(&self) -> &str {
+        &self.current_primary_head
+    }
+}
+
+/// Live structural validation for [`ManagedWorkspaceBaseAdvanced`], shared by
+/// the constructor above and the durable re-validation path.
+///
+/// Deserialization never runs `new()`: a persisted nested object carries
+/// unchecked strings, so the object-ID shapes and the advance inequality must
+/// be re-proven before any Goal binding trusts them.
+impl ManagedWorkspaceBaseAdvanced {
+    fn validate(&self) -> Result<(), OrchestratorError> {
+        crate::managed_worktree::validate_object_id(&self.old_base, "base_advanced old_base")?;
+        crate::managed_worktree::validate_object_id(
+            &self.current_primary_head,
+            "base_advanced current_primary_head",
+        )?;
+        // `BASE_ADVANCED` reports that the primary moved *away* from the frozen
+        // base. An identical pair is not an advance and would read as
+        // informational evidence for a movement that never happened.
+        if self.old_base == self.current_primary_head {
+            return Err(OrchestratorError::CorruptGoal(
+                "BASE_ADVANCED requires the primary HEAD to differ from the frozen base commit"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Every freezed J7 field is an independent authority binding; bundling them would hide a required identity."
+)]
+#[expect(
+    dead_code,
+    reason = "Slice 3A freezes the pure durable evidence contract before 3C/3D bind it into finalization."
+)]
+impl ManagedWorkspaceVerificationEvidenceV1 {
+    pub(crate) fn new(
+        goal_id: GoalId,
+        goal_revision: u64,
+        plan_revision: u32,
+        worktree_id: WorktreeId,
+        base_commit: String,
+        observed_head: String,
+        workspace_snapshot_digest: String,
+        final_verification_id: VerificationId,
+        task_verification_identities: Vec<(TaskId, VerificationId)>,
+        base_advanced: Option<ManagedWorkspaceBaseAdvanced>,
+        verified_at: String,
+    ) -> Result<Self, OrchestratorError> {
+        // One shared structural validator covers both this constructor and
+        // deserialized records (`validate_against_goal` runs it after the
+        // bindings), so a persisted record can never bypass an invariant
+        // enforced here.
+        let candidate = Self {
+            schema_version: MANAGED_WORKSPACE_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+            goal_id,
+            goal_revision,
+            plan_revision,
+            worktree_id,
+            base_commit,
+            observed_head,
+            workspace_snapshot_digest,
+            final_verification_id,
+            task_verification_identities,
+            base_advanced,
+            verified_at,
+        };
+        candidate.validate_structure()?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub(crate) fn goal_id(&self) -> &GoalId {
+        &self.goal_id
+    }
+
+    pub(crate) fn goal_revision(&self) -> u64 {
+        self.goal_revision
+    }
+
+    pub(crate) fn plan_revision(&self) -> u32 {
+        self.plan_revision
+    }
+
+    pub(crate) fn worktree_id(&self) -> &WorktreeId {
+        &self.worktree_id
+    }
+
+    pub(crate) fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    pub(crate) fn observed_head(&self) -> &str {
+        &self.observed_head
+    }
+
+    pub(crate) fn workspace_snapshot_digest(&self) -> &str {
+        &self.workspace_snapshot_digest
+    }
+
+    pub(crate) fn final_verification_id(&self) -> &VerificationId {
+        &self.final_verification_id
+    }
+
+    pub(crate) fn task_verification_identities(&self) -> &[(TaskId, VerificationId)] {
+        &self.task_verification_identities
+    }
+
+    pub(crate) fn base_advanced(&self) -> Option<&ManagedWorkspaceBaseAdvanced> {
+        self.base_advanced.as_ref()
+    }
+
+    pub(crate) fn verified_at(&self) -> &str {
+        &self.verified_at
+    }
+}
+
+/// Self-contained validation of an evidence record, plus its binding to one
+/// durable Goal.
+///
+/// Only durable comparisons are performed: no filesystem access, no Git
+/// execution, no TaskStore query (freeze note J4 step 5).
+///
+/// The Goal bindings run first so a record that names the wrong Goal,
+/// worktree, base, revision, or verification keeps reporting the exact
+/// binding it violates; the structural re-check runs last so a persisted
+/// record must still re-prove every constructor-level invariant
+/// (deserialization never runs the constructor). Either layer fails closed.
+impl ManagedWorkspaceVerificationEvidenceV1 {
+    /// Structural validation shared by the constructor (`new()`) and the
+    /// durable re-validation path below.
+    ///
+    /// The ID newtypes are transparent strings on the wire and every other
+    /// shape is a plain string or Vec on the wire, so without this step a
+    /// persisted record would bypass every constructor check. The binding
+    /// checks below transitively cover `goal_id`, `worktree_id`,
+    /// `base_commit`, `final_verification_id`, and the `BASE_ADVANCED`
+    /// `old_base` through equality against already-validated durable state;
+    /// `observed_head`, the snapshot digest, the identity list, the nested
+    /// advance head and inequality, and `verified_at` have no such counterpart
+    /// and are re-proven here with the constructor's errors. The transitively
+    /// covered shapes are still re-checked so the constructor and the durable
+    /// path obey literally the same invariants.
+    fn validate_structure(&self) -> Result<(), OrchestratorError> {
+        if self.schema_version != MANAGED_WORKSPACE_VERIFICATION_EVIDENCE_SCHEMA_VERSION {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence schema version is unsupported".to_owned(),
+            ));
+        }
+        self.goal_id.validate()?;
+        self.worktree_id.validate()?;
+        if self.goal_revision == 0 || self.plan_revision == 0 {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence revisions must be non-zero".to_owned(),
+            ));
+        }
+        crate::managed_worktree::validate_object_id(&self.base_commit, "evidence base_commit")?;
+        crate::managed_worktree::validate_object_id(&self.observed_head, "evidence observed_head")?;
+        validate_snapshot_digest(&self.workspace_snapshot_digest)?;
+        VerificationId::parse(self.final_verification_id.as_str())?;
+        validate_task_verification_identities(&self.task_verification_identities)?;
+        if let Some(advanced) = &self.base_advanced {
+            advanced.validate()?;
+        }
+        if !is_rfc3339_utc(&self.verified_at) {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence verified_at must be RFC3339 UTC".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_against_goal(&self, goal: &Goal) -> Result<(), OrchestratorError> {
+        if self.schema_version != MANAGED_WORKSPACE_VERIFICATION_EVIDENCE_SCHEMA_VERSION {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence schema version is unsupported".to_owned(),
+            ));
+        }
+        if self.goal_id != goal.id {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence goal_id does not match the durable Goal"
+                    .to_owned(),
+            ));
+        }
+        if goal.workspace_mode.is_primary() {
+            return Err(OrchestratorError::CorruptGoal(
+                "PRIMARY Goal must not carry managed-workspace verification evidence".to_owned(),
+            ));
+        }
+        let record = goal.managed_worktree.as_ref().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "managed-workspace verification evidence requires a durable worktree record"
+                    .to_owned(),
+            )
+        })?;
+        if self.worktree_id != *record.worktree_id() {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence worktree_id does not match the durable record"
+                    .to_owned(),
+            ));
+        }
+        if self.base_commit != record.base_commit() {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence base_commit does not match the durable record"
+                    .to_owned(),
+            ));
+        }
+        // `BASE_ADVANCED` reports the same base advancing, never a substituted
+        // one, so its old value must be the durable managed base commit exactly.
+        if let Some(advanced) = &self.base_advanced
+            && advanced.old_base() != record.base_commit()
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "BASE_ADVANCED old_base does not match the durable managed base commit".to_owned(),
+            ));
+        }
+        if self.goal_revision == 0
+            || self.goal_revision > goal.revision
+            || self.plan_revision == 0
+            || self.plan_revision > goal.plan_revision
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence revisions are inconsistent with the Goal"
+                    .to_owned(),
+            ));
+        }
+        let referenced = goal
+            .final_verifications
+            .iter()
+            .find(|verification| verification.id == self.final_verification_id)
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "workspace verification evidence references a missing final verification"
+                        .to_owned(),
+                )
+            })?;
+        if referenced.source != VerificationOrigin::HostDeterministicGoalVerifier
+            || referenced.goal_id != goal.id
+            || referenced.committed_goal_revision != self.goal_revision
+            || referenced.plan_revision != self.plan_revision
+            || referenced.outcome() != VerificationOutcome::Passed
+        {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence is not bound to the passing final verification"
+                    .to_owned(),
+            ));
+        }
+        // Deserialization never runs the constructor, so a persisted record
+        // re-proves every constructor-level structural invariant here, after
+        // the bindings above have named their exact counterpart. Records that
+        // violate both report the binding first; either layer fails closed.
+        self.validate_structure()?;
+        Ok(())
+    }
+}
+
+/// Snapshot-digest shape shared by the evidence constructor and the durable
+/// re-validation path: exactly the 64 lowercase hex characters the frozen
+/// Slice 1 digest spelling produces. The digest algorithm and its domain
+/// separator are untouched; only the spelling is re-proven here, because a
+/// deserialized record never passes through the constructor.
+fn validate_snapshot_digest(digest: &str) -> Result<(), OrchestratorError> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(OrchestratorError::CorruptGoal(
+            "workspace snapshot digest must be 64 lowercase hex characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Task-identity-list shape shared by the evidence constructor and the durable
+/// re-validation path: the frozen bound, one identity per Task, and
+/// UUID-shaped identities (orchestrator design section 5.1). Cross-checking
+/// the identities against live Tasks is Slice 3C work; Slice 3A proves shape.
+fn validate_task_verification_identities(
+    identities: &[(TaskId, VerificationId)],
+) -> Result<(), OrchestratorError> {
+    if identities.len() > MAX_TASK_VERIFICATION_IDENTITIES {
+        return Err(OrchestratorError::CorruptGoal(
+            "workspace verification evidence task identity list is too large".to_owned(),
+        ));
+    }
+    let mut seen_tasks = BTreeSet::new();
+    for (task_id, verification_id) in identities {
+        TaskId::parse(task_id.as_str())?;
+        VerificationId::parse(verification_id.as_str())?;
+        if !seen_tasks.insert(task_id.clone()) {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace verification evidence repeats a task verification identity".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Structural check for the exact `YYYY-MM-DDTHH:MM:SSZ` spelling produced by
+/// [`crate::task_store::utc_now_rfc3339`]. Durable evidence fails closed on any
+/// other timestamp spelling rather than accepting an arbitrary string.
+///
+/// Beyond the spelling, the frozen contract is RFC 3339 UTC (orchestrator
+/// design section 5.1, freeze note J7), so calendar ranges are enforced as
+/// well: the minter computes real civil dates and never emits a leap second,
+/// an offset, or fractional seconds, and a record claiming month 13 or
+/// February 30 is not a timestamp any host clock produced.
+fn is_rfc3339_utc(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20 || bytes[19] != b'Z' {
+        return false;
+    }
+    let digit_at = |index: usize| bytes[index].is_ascii_digit();
+    let separator_at = |index: usize, expected: u8| bytes[index] == expected;
+    if !(digit_at(0)
+        && digit_at(1)
+        && digit_at(2)
+        && digit_at(3)
+        && separator_at(4, b'-')
+        && digit_at(5)
+        && digit_at(6)
+        && separator_at(7, b'-')
+        && digit_at(8)
+        && digit_at(9)
+        && separator_at(10, b'T')
+        && digit_at(11)
+        && digit_at(12)
+        && separator_at(13, b':')
+        && digit_at(14)
+        && digit_at(15)
+        && separator_at(16, b':')
+        && digit_at(17)
+        && digit_at(18))
+    {
+        return false;
+    }
+    let number = |from: usize, to: usize| {
+        bytes[from..to].iter().fold(0_u32, |accumulator, byte| {
+            accumulator * 10 + u32::from(byte - b'0')
+        })
+    };
+    let year = number(0, 4);
+    let month = number(5, 7);
+    let day = number(8, 10);
+    let hour = number(11, 13);
+    let minute = number(14, 16);
+    let second = number(17, 19);
+    if month == 0 || month > 12 || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    day != 0 && day <= days_in_month(year, month)
+}
+
+/// Proleptic Gregorian month length, matching the civil calendar
+/// [`crate::task_store::utc_now_rfc3339`] mints timestamps from.
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
     }
 }
 
@@ -891,6 +1350,20 @@ pub(crate) struct Goal {
     managed_worktree: Option<ManagedWorktreeRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_worktree_creation_intent: Option<ManagedWorktreeCreationIntent>,
+    /// Post-verification managed-workspace snapshot evidence (freeze note J7).
+    ///
+    /// Absent means "no evidence has been assembled yet", which is the correct
+    /// reading of every Goal written before the field existed. When present, the
+    /// record itself has no `#[serde(default)]` fields, so a partially written
+    /// evidence fails closed instead of decoding as a weaker-but-valid record.
+    ///
+    /// The field is authority-bearing state, so it carries **no**
+    /// `#[serde(default)]` and **no** `skip_serializing_if`: every schema-6
+    /// document states it explicitly, and a document that does not state it is
+    /// not a schema-6 document. Schema 2-5 documents reach schema 6 only through
+    /// the explicit `TaskStore` migration chain, which inserts the value rather
+    /// than letting serde assume it.
+    managed_workspace_verification_evidence: Option<ManagedWorkspaceVerificationEvidenceV1>,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -1049,6 +1522,7 @@ impl Goal {
             },
             managed_worktree,
             managed_worktree_creation_intent: None,
+            managed_workspace_verification_evidence: None,
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -1082,6 +1556,12 @@ impl Goal {
     /// from a path name, a branch name, or a Git convention.
     pub(crate) fn managed_worktree(&self) -> Option<&ManagedWorktreeRecord> {
         self.managed_worktree.as_ref()
+    }
+
+    pub(crate) fn managed_workspace_verification_evidence(
+        &self,
+    ) -> Option<&ManagedWorkspaceVerificationEvidenceV1> {
+        self.managed_workspace_verification_evidence.as_ref()
     }
 
     /// Outstanding creation intent, if managed-worktree creation is in flight.
@@ -3657,6 +4137,9 @@ impl Goal {
                 ));
             }
         }
+        if let Some(evidence) = &self.managed_workspace_verification_evidence {
+            evidence.validate_against_goal(self)?;
+        }
         let mut rejection_request_ids = BTreeSet::new();
         for rejection in &self.pre_execution_plan_rejections {
             if rejection.request_id.trim().is_empty()
@@ -4059,6 +4542,12 @@ impl Goal {
         // A legacy terminal Goal has no managed-workspace history to preserve, so
         // durable managed state on one is corruption rather than compatibility.
         self.validate_managed_workspace_state()?;
+        if self.managed_workspace_verification_evidence.is_some() {
+            return Err(OrchestratorError::CorruptGoal(
+                "legacy terminal Goal must not carry managed-workspace verification evidence"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 

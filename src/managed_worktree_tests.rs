@@ -121,14 +121,21 @@ fn primary_goal_serializes_without_managed_fields_for_byte_compatibility() {
 
 #[test]
 fn legacy_goal_json_without_workspace_fields_deserializes_as_primary() {
-    // A schema-3 durable payload read directly through serde must not acquire
-    // managed ownership merely because the field is absent.
+    // A schema-3 durable payload must not acquire managed ownership merely
+    // because the managed fields are absent. The authority-bearing
+    // managed-workspace verification evidence field (schema 6) is stated
+    // explicitly by the durable store, so a payload without it never decodes as
+    // a current Goal through the store; here the directly decoded document is
+    // stamped with the current schema and is still `PRIMARY` with no managed
+    // state and no evidence.
     let goal = managed_goal();
     let mut value = serde_json::to_value(&goal).unwrap();
-    value["schema_version"] = Value::from(3_u64);
+    value["managed_workspace_verification_evidence"] = Value::Null;
+    value["schema_version"] = Value::from(GOAL_SCHEMA_VERSION);
     let decoded: Goal = serde_json::from_value(value).unwrap();
     assert_eq!(decoded.workspace_mode(), WorkspaceMode::Primary);
     assert!(decoded.managed_worktree().is_none());
+    assert!(decoded.managed_workspace_verification_evidence().is_none());
 }
 
 #[test]
