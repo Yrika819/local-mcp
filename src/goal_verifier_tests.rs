@@ -384,6 +384,11 @@ fn write_schema1_fixture(f: &Fixture, status: &str) -> (crate::goal::GoalId, Vec
         .unwrap()
         .remove("final_verification_spec");
     value.as_object_mut().unwrap().remove("final_verifications");
+    // A schema-1 document carries no managed-workspace verification evidence.
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("managed_workspace_verification_evidence");
     value["final_verification"] = Value::Null;
     let bytes = serde_json::to_vec_pretty(&value).unwrap();
     fs::write(&path, &bytes).unwrap();
