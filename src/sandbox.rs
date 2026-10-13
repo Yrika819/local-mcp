@@ -1649,15 +1649,30 @@ fn checked_windows_env(name: &str, value: &str) -> Option<(String, String)> {
 /// Whether a Windows-absolute value carries a body beyond its root.
 ///
 /// Bare drive roots (`C:\`) are absolute spellings but never legitimate
-/// profile homes. Complete UNC paths always carry server + share by
-/// construction (see [`windows_unc_parts`]), which counts as a body.
+/// profile homes. Repeating a separator (`C:\\`) does not launder a root into
+/// a body: only a real component — a non-empty run between separators — past
+/// the root counts, so what survives is the path of an actual directory.
+/// Complete UNC paths always carry server + share by construction (see
+/// [`windows_unc_parts`]), which counts as a body, provided the server name
+/// is itself a benign component.
 #[cfg(any(windows, test))]
 fn windows_profile_has_body(value: &str) -> bool {
     if let Some(remainder) = windows_drive_remainder(value) {
-        !remainder.is_empty()
-    } else {
-        true
+        return windows_has_regular_component(remainder);
     }
+    if let Some((server, share_rest)) = windows_unc_parts(value) {
+        return windows_component_is_safe(server) && windows_has_regular_component(share_rest);
+    }
+    // Not a drive-absolute and not a complete UNC spelling: nothing to accept.
+    false
+}
+
+/// Whether a root remainder holds at least one real (non-empty) component.
+#[cfg(any(windows, test))]
+fn windows_has_regular_component(remainder: &str) -> bool {
+    remainder
+        .split(['\\', '/'])
+        .any(|component| !component.is_empty())
 }
 
 /// Whether `value` is an absolute Windows path, independent of host platform.
@@ -1671,7 +1686,9 @@ fn windows_profile_has_body(value: &str) -> bool {
 /// This answers only "is this spelled like a usable absolute path", never
 /// "is the destination trusted". Device/verbatim namespaces, incomplete UNC
 /// forms, traversal, ADS-like components, and other malformed components are
-/// rejected without being rewritten into a different path authority.
+/// rejected without being rewritten into a different path authority. The UNC
+/// server component is validated exactly like the share and the components
+/// after it, because it is a path component too.
 ///
 /// See [`checked_windows_env`]: needed on Windows and in tests, dead code in
 /// Linux production.
@@ -1683,8 +1700,8 @@ fn is_windows_absolute_path(value: &str) -> bool {
     if let Some(remainder) = windows_drive_remainder(value) {
         return windows_components_are_safe(remainder);
     }
-    if let Some((_server, share_rest)) = windows_unc_parts(value) {
-        return windows_components_are_safe(share_rest);
+    if let Some((server, share_rest)) = windows_unc_parts(value) {
+        return windows_component_is_safe(server) && windows_components_are_safe(share_rest);
     }
     false
 }
@@ -1737,9 +1754,9 @@ fn windows_unc_parts(value: &str) -> Option<(&str, &str)> {
 /// Whether every component of a path remainder (after its root) is benign.
 ///
 /// Components are split on both separators with a single trailing separator
-/// tolerated. An empty remainder (bare drive root) is vacuously safe here;
-/// suitability (body) is decided by callers such as
-/// [`windows_profile_has_body`].
+/// tolerated. An empty remainder (bare drive root, or nothing but repeated
+/// separators) is vacuously safe here; suitability (body) is decided by
+/// callers such as [`windows_profile_has_body`].
 #[cfg(any(windows, test))]
 fn windows_components_are_safe(remainder: &str) -> bool {
     let trimmed = remainder
@@ -1933,6 +1950,47 @@ mod windows_environment_parity_tests {
         }
     }
 
+    /// The UNC server component is a path component like any other, so it
+    /// must pass the same [`windows_component_is_safe`] bar as the share and
+    /// everything after it. `\\..\share` names the parent namespace rather
+    /// than a host; `\\NUL\share` names a device; `\\bad*server\share` is not
+    /// a resolvable host name. Legitimate hosts — NetBIOS names and DNS names
+    /// alike — still pass.
+    #[test]
+    fn windows_unc_server_name_is_validated_like_share_components() {
+        for invalid in [
+            r"\\..\share\profile",
+            r"\\NUL\share\profile",
+            r"\\bad*server\share\profile",
+        ] {
+            assert!(!is_windows_absolute_path(invalid), "{invalid}");
+        }
+        for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "ProgramData"] {
+            for invalid in [
+                r"\\..\share\profile",
+                r"\\NUL\share\profile",
+                r"\\bad*server\share\profile",
+            ] {
+                assert!(
+                    checked_windows_env(name, invalid).is_none(),
+                    "{name}={invalid}"
+                );
+            }
+        }
+        for valid in [
+            r"\\server\share\profile",
+            r"\\server\share",
+            r"\\server\share\Users\fixture",
+            r"\\corp.example.com\share\profile",
+        ] {
+            assert!(is_windows_absolute_path(valid), "{valid}");
+            assert!(
+                checked_windows_env("USERPROFILE", valid).is_some(),
+                "{valid}"
+            );
+        }
+    }
+
     #[test]
     fn profile_values_require_a_body_beyond_the_root() {
         assert!(checked_windows_env("USERPROFILE", r"C:\").is_none());
@@ -1940,6 +1998,48 @@ mod windows_environment_parity_tests {
         assert!(checked_windows_env("USERPROFILE", r"\\server\share").is_some());
         assert!(checked_windows_env("USERPROFILE", r"\\").is_none());
         assert!(checked_windows_env("APPDATA", r"C:\foo\..\evil").is_none());
+    }
+
+    /// A bare drive root is never a legitimate profile home, and repeating a
+    /// separator does not launder a root into a body: only a real path
+    /// component after the root counts. A trailing separator on a genuine
+    /// component still keeps its body.
+    #[test]
+    fn profile_values_reject_root_only_spellings_with_repeated_separators() {
+        for invalid in [
+            r"C:\",
+            r"C:/",
+            r"C:\\",
+            r"C://",
+            r"C:\\\",
+            r"D:\",
+            r"D:\\",
+            r"\\",
+            r"\\server\",
+            r"\\server\\",
+        ] {
+            assert!(
+                checked_windows_env("USERPROFILE", invalid).is_none(),
+                "{invalid}"
+            );
+            assert!(
+                checked_windows_env("ProgramData", invalid).is_none(),
+                "{invalid}"
+            );
+        }
+        for valid in [
+            r"C:\Users\fixture",
+            r"C:\Users\fixture\",
+            r"C:/Users/fixture",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\server\share\Users\fixture",
+        ] {
+            assert!(
+                checked_windows_env("USERPROFILE", valid).is_some(),
+                "{valid}"
+            );
+        }
     }
 
     #[test]
