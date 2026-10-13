@@ -1,6 +1,4 @@
 use std::collections::VecDeque;
-#[cfg(windows)]
-use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]

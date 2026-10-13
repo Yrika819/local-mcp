@@ -23,10 +23,15 @@ use crate::managed_worktree_discovery::{
     same_path_identity,
 };
 use crate::managed_worktree_observe::{
-    GitCommandOutput, HostGit, READ_ONLY_GIT_SUBCOMMANDS, READ_ONLY_WORKTREE_VERBS, ReadOnlyGit,
+    GitCommandOutput, READ_ONLY_GIT_SUBCOMMANDS, READ_ONLY_WORKTREE_VERBS, ReadOnlyGit,
     assert_read_only, is_git_environment_variable,
     observe_repository as observe_repository_with_paths,
 };
+// Every caller of `HostGit` below is `#[cfg(unix)]` or `#[cfg(not(windows))]`
+// gated: hosting a real Git repository is not part of the Windows read-only
+// observation contract.
+#[cfg(not(windows))]
+use crate::managed_worktree_observe::HostGit;
 
 const NOW: &str = "2026-01-01T00:00:00Z";
 #[cfg(not(windows))]

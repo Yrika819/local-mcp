@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use sha2::Digest as _;
 use std::path::Path;
 
@@ -22,6 +23,11 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap()
 }
 
+/// Drive the real host Git inside a temporary repository.
+///
+/// Only the `#[cfg(unix)]` filemode-policy mapping needs a real repository; the
+/// platform-independent identity tests build their fixtures directly.
+#[cfg(unix)]
 fn git(repo: &Path, args: &[&str]) {
     let output = std::process::Command::new(crate::execution::host_git_path().unwrap())
         .args(args)
