@@ -31,6 +31,7 @@ mod managed_worktree_snapshot_index_blob;
 mod managed_worktree_snapshot_manifest;
 mod managed_worktree_snapshot_object;
 mod managed_worktree_snapshot_observe;
+mod managed_worktree_writer_paths;
 mod mcp;
 mod mutation;
 mod mutation_recovery;
