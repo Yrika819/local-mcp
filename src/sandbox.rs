@@ -1128,7 +1128,9 @@ impl CaptureFailure {
         ))
     }
 
-    #[cfg(test)]
+    /// Build the typed output-limit error for the `resource_bounds_process_tests`
+    /// unit, which is the only place a synthetic (non-overflow) instance is needed.
+    #[cfg(all(test, unix))]
     pub(crate) fn output_limit_error_for_test(stream: CaptureStream) -> anyhow::Error {
         Self::output_limit(stream).into_anyhow()
     }

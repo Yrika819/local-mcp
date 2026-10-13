@@ -144,7 +144,7 @@ impl ProcessGroup {
     /// Unix always answers `true`: the group is owned outright. Windows answers
     /// `true` only when the host accepted the Job assignment, so a test can prove
     /// containment rather than infer it.
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     pub(crate) fn owns_process_tree(&self) -> bool {
         self.job.as_ref().is_some_and(Job::is_assigned)
     }

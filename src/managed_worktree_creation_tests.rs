@@ -3781,7 +3781,10 @@ fn verifier_git_path_spelling_matches_managed_scope_and_primary_root_mode() {
     let escaped =
         crate::verifier::resolve_git_path_for_test("junction-escape/secret.txt", candidate)
             .unwrap();
-    assert!(escaped.starts_with(&crate::config::canonical_path(&outside).unwrap()));
+    assert!(
+        escaped.starts_with(crate::config::canonical_path(&outside).unwrap()),
+        "the junction escape must resolve outside the managed root"
+    );
     assert!(!escaped.starts_with(candidate));
     assert!(
         !crate::verifier::task_scope_allows_git_changes(&scope, &[escaped]),
