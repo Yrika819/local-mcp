@@ -1453,10 +1453,373 @@ fn safe_environment_with_path(path: Option<&std::ffi::OsStr>) -> HashMap<String,
             .map(|value| (name.to_owned(), value))
     })
     .collect();
+    #[cfg(windows)]
+    {
+        for (name, value) in windows_system_environment() {
+            environment.insert(name, value);
+        }
+    }
     if let Some(path) = path {
         environment.insert("PATH".to_owned(), path.to_string_lossy().into_owned());
     }
     environment
+}
+
+/// Windows-only system environment forwarded to restricted children.
+///
+/// The base allowlist above is deliberately small and platform-independent.
+/// On Windows that leaves standard programs without values they expect
+/// (`SystemDrive`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`,
+/// `ComSpec`). Only these six explicit names are forwarded, only on Windows,
+/// and only when each value passes its strict check: the five profile values
+/// through [`checked_windows_env`], and `ComSpec` additionally through
+/// [`checked_comspec_env`] against the OS-provided system directory (a bare
+/// `cmd.exe` file-name match is never sufficient). Anything else —
+/// credentials, tokens, proxy secrets, `GIT_*` overrides — is still dropped
+/// by `env_clear()`.
+///
+/// `std::env::var` on Windows is case-insensitive, so the canonical lookup
+/// below finds the ambient value regardless of the case the host stored.
+#[cfg(windows)]
+fn windows_system_environment() -> HashMap<String, String> {
+    windows_system_environment_with(
+        |name| std::env::var(name).ok(),
+        trusted_system_directory().as_deref(),
+    )
+}
+
+/// Build the forwarded Windows system environment from injected sources.
+///
+/// `get` reads one variable (`None` = missing) and `trusted_system32` is the
+/// OS-provided system directory (`None` = unavailable). Both injections keep
+/// the policy unit-testable on any platform without touching process-global
+/// state: missing values are dropped, malformed values are dropped, and an
+/// unavailable or unusable OS reference drops `ComSpec` only — fail-closed,
+/// with no fallback to an arbitrary `cmd.exe`.
+#[cfg(any(windows, test))]
+fn windows_system_environment_with(
+    get: impl Fn(&str) -> Option<String>,
+    trusted_system32: Option<&str>,
+) -> HashMap<String, String> {
+    let mut environment = HashMap::new();
+    for name in [
+        "SystemDrive",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+    ] {
+        if let Some(value) = get(name)
+            && let Some((key, validated)) = checked_windows_env(name, &value)
+        {
+            environment.insert(key, validated);
+        }
+    }
+    if let (Some(value), Some(trusted)) = (get("ComSpec"), trusted_system32)
+        && let Some((key, validated)) = checked_comspec_env(&value, trusted)
+    {
+        environment.insert(key, validated);
+    }
+    environment
+}
+
+/// Validate `ComSpec` against the OS-provided system directory.
+///
+/// `trusted_system32` must be the operating system's own answer (production:
+/// [`trusted_system_directory`], i.e. `GetSystemDirectoryW`), never an
+/// ambient variable. Acceptance is an exact, separator-normalized,
+/// case-insensitive match against `{trusted}\cmd.exe` or its `SysWOW64`
+/// sibling — so UNC paths, device namespaces, traversal spellings,
+/// `Sysnative` aliases, sibling directories, and wrong executables can never
+/// smuggle through, and no fallback to an arbitrary `cmd.exe` exists.
+///
+/// Precise trust guarantee: acceptance proves the spelling names the command
+/// processor inside the OS-reported system directory. It does NOT prove the
+/// file exists, is unmodified, or was not replaced afterwards (no TOCTOU
+/// claim is made); existence and integrity remain the OS and host's
+/// responsibility, and spawning still fails closed when the file is absent.
+#[cfg(any(windows, test))]
+fn checked_comspec_env(value: &str, trusted_system32: &str) -> Option<(String, String)> {
+    if value.is_empty() || value.contains('\0') {
+        return None;
+    }
+    // Lexical bar first (absolute spelling, `cmd.exe` file name, no
+    // traversal/ADS/device forms). Necessary, not sufficient.
+    checked_windows_env("ComSpec", value)?;
+    // The reference itself must be a sane, non-root drive-absolute directory.
+    // An unusable reference fails closed.
+    let trusted = trusted_system32
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\");
+    let trusted_remainder = windows_drive_remainder(&trusted)?;
+    if trusted_remainder.is_empty() || !windows_components_are_safe(trusted_remainder) {
+        return None;
+    }
+    let candidate = value.replace('/', "\\");
+    if candidate.eq_ignore_ascii_case(&format!("{trusted}\\cmd.exe")) {
+        return Some(("ComSpec".to_owned(), value.to_owned()));
+    }
+    // `SysWOW64` sibling of the trusted `System32`, whatever its case.
+    // Anything else named `cmd.exe` — including `Sysnative` — is rejected.
+    let (parent, leaf) = trusted.rsplit_once('\\')?;
+    if !leaf.eq_ignore_ascii_case("system32") {
+        return None;
+    }
+    if candidate.eq_ignore_ascii_case(&format!("{parent}\\SysWOW64\\cmd.exe")) {
+        return Some(("ComSpec".to_owned(), value.to_owned()));
+    }
+    None
+}
+
+/// Authoritative system-directory reference from the OS, never ambient env.
+///
+/// `GetSystemDirectoryW` (kernel32, via the already-depended `windows-sys`
+/// crate — no new dependency) reports the system directory independently of
+/// `SystemRoot`, `windir`, or the registry, so a tampered ambient
+/// `SystemRoot` cannot launder an arbitrary `ComSpec` through the check.
+/// `None` on any failure: callers forward no `ComSpec` at all rather than
+/// falling back to ambient comparison.
+#[cfg(windows)]
+fn trusted_system_directory() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    // The system directory is a short fixed path; 1024 UTF-16 units leaves
+    // ample room while keeping the stack buffer small.
+    let mut buffer = vec![0u16; 1024];
+    // SAFETY: `buffer` is a live, correctly sized UTF-16 buffer for the call
+    // duration; the API writes at most `uSize` units and returns the count
+    // excluding the terminator.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 || length as usize >= buffer.len() {
+        return None;
+    }
+    String::from_utf16(&buffer[..length as usize]).ok()
+}
+
+/// Validate one Windows system value before forwarding.
+///
+/// Fail-closed: empty values, embedded NULs, relative paths, incomplete UNC
+/// forms, device/verbatim namespaces, traversal, ADS-like components, and
+/// other malformed components are dropped rather than forwarded. Path-like
+/// values must be strictly Windows-absolute with a body beyond their root.
+/// The `ComSpec` arm below is a lexical gate only (absolute spelling ending
+/// in `cmd.exe`); it is necessary but NOT sufficient proof of trust.
+/// Production additionally requires [`checked_comspec_env`] against the
+/// OS-provided system directory.
+///
+/// Compiled on Windows and in every test build: Linux production has no
+/// Windows child to forward to, so without the `test` gate this would be
+/// dead code under `cargo clippy -- -D warnings`.
+#[cfg(any(windows, test))]
+fn checked_windows_env(name: &str, value: &str) -> Option<(String, String)> {
+    if value.is_empty() || value.contains('\0') {
+        return None;
+    }
+    match name {
+        "SystemDrive" => {
+            let bytes = value.as_bytes();
+            if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                Some((name.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        }
+        "ComSpec" => {
+            if !is_windows_absolute_path(value) {
+                return None;
+            }
+            let file_name = value.rsplit(['/', '\\']).next().unwrap_or_default();
+            if file_name.eq_ignore_ascii_case("cmd.exe") {
+                Some((name.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        }
+        "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "ProgramData" => {
+            if is_windows_absolute_path(value) && windows_profile_has_body(value) {
+                Some((name.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a Windows-absolute value carries a body beyond its root.
+///
+/// Bare drive roots (`C:\`) are absolute spellings but never legitimate
+/// profile homes. Repeating a separator (`C:\\`) does not launder a root into
+/// a body: only a real component — a non-empty run between separators — past
+/// the root counts, so what survives is the path of an actual directory.
+/// Complete UNC paths always carry server + share by construction (see
+/// [`windows_unc_parts`]), which counts as a body, provided the server name
+/// is itself a benign component.
+#[cfg(any(windows, test))]
+fn windows_profile_has_body(value: &str) -> bool {
+    if let Some(remainder) = windows_drive_remainder(value) {
+        return windows_has_regular_component(remainder);
+    }
+    if let Some((server, share_rest)) = windows_unc_parts(value) {
+        return windows_component_is_safe(server) && windows_has_regular_component(share_rest);
+    }
+    // Not a drive-absolute and not a complete UNC spelling: nothing to accept.
+    false
+}
+
+/// Whether a root remainder holds at least one real (non-empty) component.
+#[cfg(any(windows, test))]
+fn windows_has_regular_component(remainder: &str) -> bool {
+    remainder
+        .split(['\\', '/'])
+        .any(|component| !component.is_empty())
+}
+
+/// Whether `value` is an absolute Windows path, independent of host platform.
+///
+/// `Path::is_absolute` follows the host (so `C:\...` is not absolute on
+/// Linux CI). The child runs on Windows, so the check must use Windows
+/// semantics everywhere: a drive-letter root (`C:\`, `C:/`) with benign
+/// components, or a complete UNC path (`\\server\share[...]`) with benign
+/// components.
+///
+/// This answers only "is this spelled like a usable absolute path", never
+/// "is the destination trusted". Device/verbatim namespaces, incomplete UNC
+/// forms, traversal, ADS-like components, and other malformed components are
+/// rejected without being rewritten into a different path authority. The UNC
+/// server component is validated exactly like the share and the components
+/// after it, because it is a path component too.
+///
+/// See [`checked_windows_env`]: needed on Windows and in tests, dead code in
+/// Linux production.
+#[cfg(any(windows, test))]
+fn is_windows_absolute_path(value: &str) -> bool {
+    if value.is_empty() || value.contains('\0') {
+        return false;
+    }
+    if let Some(remainder) = windows_drive_remainder(value) {
+        return windows_components_are_safe(remainder);
+    }
+    if let Some((server, share_rest)) = windows_unc_parts(value) {
+        return windows_component_is_safe(server) && windows_components_are_safe(share_rest);
+    }
+    false
+}
+
+/// Remainder after a drive-absolute root (`X:\` or `X:/`), or `None`.
+///
+/// Only these two ASCII spellings count. Drive-relative forms (`C:foo`,
+/// `C:`) and every other prefix are not drive-absolute. Byte indices 0..3
+/// are ASCII by construction, so the slice always sits on a char boundary.
+#[cfg(any(windows, test))]
+fn windows_drive_remainder(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        Some(&value[3..])
+    } else {
+        None
+    }
+}
+
+/// Split a strict UNC path into `(server, share_and_rest)`.
+///
+/// Accepts only `\\server\share[...]` with non-empty server and share.
+/// Device/verbatim namespaces (`\\.\`, `\\?\`, `\\??\`) are rejected, NT
+/// single-backslash forms (`\??\...`, `\Device\...`) never match the `\\`
+/// prefix, and forward-slash `//` UNC is conservatively rejected
+/// (legitimate system values use backslashes; rejection is fail-closed).
+#[cfg(any(windows, test))]
+fn windows_unc_parts(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix(r"\\")?;
+    for namespace in [r".\", r"?\", r"??\"] {
+        if rest.starts_with(namespace) {
+            return None;
+        }
+    }
+    let (server, after_server) = rest.split_once(['\\', '/'])?;
+    if server.is_empty() {
+        return None;
+    }
+    let share = after_server.split(['\\', '/']).next().unwrap_or_default();
+    if share.is_empty() {
+        return None;
+    }
+    Some((server, after_server))
+}
+
+/// Whether every component of a path remainder (after its root) is benign.
+///
+/// Components are split on both separators with a single trailing separator
+/// tolerated. An empty remainder (bare drive root, or nothing but repeated
+/// separators) is vacuously safe here; suitability (body) is decided by
+/// callers such as [`windows_profile_has_body`].
+#[cfg(any(windows, test))]
+fn windows_components_are_safe(remainder: &str) -> bool {
+    let trimmed = remainder
+        .strip_suffix('\\')
+        .or_else(|| remainder.strip_suffix('/'))
+        .unwrap_or(remainder);
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed.split(['\\', '/']).all(windows_component_is_safe)
+}
+
+/// Whether one Windows path component is benign.
+///
+/// Rejects empty components, `.`/`..`, ADS colons, trailing dots/spaces
+/// (which Windows silently strips, inviting confusion), illegal characters,
+/// and reserved DOS device names (with or without extension).
+#[cfg(any(windows, test))]
+fn windows_component_is_safe(component: &str) -> bool {
+    if component.is_empty() {
+        return false;
+    }
+    if component == "." || component == ".." {
+        return false;
+    }
+    // ADS stream separator (`file:stream`).
+    if component.contains(':') {
+        return false;
+    }
+    // Windows strips trailing dots/spaces, so `foo.` and `foo ` never name
+    // what they spell.
+    if component
+        .as_bytes()
+        .last()
+        .is_some_and(|last| *last == b'.' || *last == b' ')
+    {
+        return false;
+    }
+    if component.contains(['*', '?', '"', '<', '>', '|']) {
+        return false;
+    }
+    // Reserved DOS device names (`NUL`, `COM1.txt`, ...) can never be real
+    // directories; accepting one invites null-device-style confusion.
+    let base = component.split('.').next().unwrap_or_default();
+    if base.eq_ignore_ascii_case("CON")
+        || base.eq_ignore_ascii_case("PRN")
+        || base.eq_ignore_ascii_case("AUX")
+        || base.eq_ignore_ascii_case("NUL")
+    {
+        return false;
+    }
+    if base.len() == 4 && base.is_ascii() {
+        let (head, tail) = base.split_at(3);
+        if (head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT"))
+            && tail
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn clean_git_environment() -> HashMap<String, String> {
@@ -1522,6 +1885,549 @@ mod unrestricted_tests {
         assert_eq!(output.stdout, "stdout");
         assert_eq!(output.stderr, "stderr");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod windows_environment_parity_tests {
+    use super::*;
+
+    #[test]
+    fn windows_absolute_path_validator_accepts_roots_and_rejects_relative() {
+        for valid in [
+            r"C:\Windows",
+            r"C:/Windows",
+            r"D:\Users\fixture",
+            r"\\server\share",
+        ] {
+            assert!(is_windows_absolute_path(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "relative",
+            r"C:relative",
+            "C:",
+            r"C:foo",
+            "/unix/absolute",
+        ] {
+            assert!(!is_windows_absolute_path(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn windows_absolute_paths_distinguish_drive_unc_device_and_nt_forms() {
+        for valid in [
+            r"C:\Windows",
+            r"C:\Windows\System32\cmd.exe",
+            r"C:/Windows/System32",
+            r"D:\",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\server\share\Users\fixture",
+        ] {
+            assert!(is_windows_absolute_path(valid), "{valid}");
+        }
+        for invalid in [
+            r"\\",
+            r"\\server",
+            r"\\server\",
+            r"\\.\C:\evil",
+            r"\\?\C:\Windows",
+            r"\\??\C:\evil",
+            r"\??\C:\evil",
+            r"\Device\HarddiskVolume1\Windows",
+            r"C:\foo\..\evil",
+            r"C:\.\evil",
+            r"C:\foo:bar",
+            r"C:\NUL",
+            r"C:\COM1.txt",
+            r"C:\trailing.\x",
+            r"C:\trailing \x",
+            r"C:\bad*char",
+            r"C:\bad?char",
+        ] {
+            assert!(!is_windows_absolute_path(invalid), "{invalid}");
+        }
+    }
+
+    /// The UNC server component is a path component like any other, so it
+    /// must pass the same [`windows_component_is_safe`] bar as the share and
+    /// everything after it. `\\..\share` names the parent namespace rather
+    /// than a host; `\\NUL\share` names a device; `\\bad*server\share` is not
+    /// a resolvable host name. Legitimate hosts — NetBIOS names and DNS names
+    /// alike — still pass.
+    #[test]
+    fn windows_unc_server_name_is_validated_like_share_components() {
+        for invalid in [
+            r"\\..\share\profile",
+            r"\\NUL\share\profile",
+            r"\\bad*server\share\profile",
+        ] {
+            assert!(!is_windows_absolute_path(invalid), "{invalid}");
+        }
+        for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "ProgramData"] {
+            for invalid in [
+                r"\\..\share\profile",
+                r"\\NUL\share\profile",
+                r"\\bad*server\share\profile",
+            ] {
+                assert!(
+                    checked_windows_env(name, invalid).is_none(),
+                    "{name}={invalid}"
+                );
+            }
+        }
+        for valid in [
+            r"\\server\share\profile",
+            r"\\server\share",
+            r"\\server\share\Users\fixture",
+            r"\\corp.example.com\share\profile",
+        ] {
+            assert!(is_windows_absolute_path(valid), "{valid}");
+            assert!(
+                checked_windows_env("USERPROFILE", valid).is_some(),
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_values_require_a_body_beyond_the_root() {
+        assert!(checked_windows_env("USERPROFILE", r"C:\").is_none());
+        assert!(checked_windows_env("USERPROFILE", r"C:\Users\fixture").is_some());
+        assert!(checked_windows_env("USERPROFILE", r"\\server\share").is_some());
+        assert!(checked_windows_env("USERPROFILE", r"\\").is_none());
+        assert!(checked_windows_env("APPDATA", r"C:\foo\..\evil").is_none());
+    }
+
+    /// A bare drive root is never a legitimate profile home, and repeating a
+    /// separator does not launder a root into a body: only a real path
+    /// component after the root counts. A trailing separator on a genuine
+    /// component still keeps its body.
+    #[test]
+    fn profile_values_reject_root_only_spellings_with_repeated_separators() {
+        for invalid in [
+            r"C:\",
+            r"C:/",
+            r"C:\\",
+            r"C://",
+            r"C:\\\",
+            r"D:\",
+            r"D:\\",
+            r"\\",
+            r"\\server\",
+            r"\\server\\",
+        ] {
+            assert!(
+                checked_windows_env("USERPROFILE", invalid).is_none(),
+                "{invalid}"
+            );
+            assert!(
+                checked_windows_env("ProgramData", invalid).is_none(),
+                "{invalid}"
+            );
+        }
+        for valid in [
+            r"C:\Users\fixture",
+            r"C:\Users\fixture\",
+            r"C:/Users/fixture",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\server\share\Users\fixture",
+        ] {
+            assert!(
+                checked_windows_env("USERPROFILE", valid).is_some(),
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn comspec_authority_accepts_only_trusted_system_locations() {
+        let trusted = r"C:\Windows\System32";
+        for valid in [
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\WINDOWS\SYSTEM32\CMD.EXE",
+            r"C:/Windows/System32/cmd.exe",
+            r"C:\Windows\SysWOW64\cmd.exe",
+        ] {
+            assert!(
+                checked_comspec_env(valid, trusted).is_some(),
+                "{valid} under {trusted}"
+            );
+        }
+        for invalid in [
+            r"D:\writable\cmd.exe",
+            r"\\server\share\cmd.exe",
+            r"\\?\C:\evil\cmd.exe",
+            r"\\.\C:\evil\cmd.exe",
+            r"C:\Windows\System32\..\System32\cmd.exe",
+            r"C:\Windows\cmd.exe",
+            r"C:\Windows\System32\evil.exe",
+            r"C:\Windows\Sysnative\cmd.exe",
+            r"C:\Windows\System32\cmd.exe ",
+            "cmd.exe",
+        ] {
+            assert!(
+                checked_comspec_env(invalid, trusted).is_none(),
+                "{invalid} under {trusted}"
+            );
+        }
+        // Reference combinations: empty, relative, UNC, and mismatched-drive
+        // references all fail closed; only the matching drive binds.
+        assert!(checked_comspec_env(r"C:\Windows\System32\cmd.exe", "").is_none());
+        assert!(checked_comspec_env(r"C:\Windows\System32\cmd.exe", "relative").is_none());
+        assert!(checked_comspec_env(r"C:\Windows\System32\cmd.exe", r"\\evil\share").is_none());
+        assert!(
+            checked_comspec_env(r"C:\Windows\System32\cmd.exe", r"D:\Windows\System32").is_none()
+        );
+        // A differently cased trusted spelling still binds the same directory.
+        assert!(
+            checked_comspec_env(r"C:\Windows\System32\cmd.exe", r"c:\windows\system32").is_some()
+        );
+    }
+
+    #[test]
+    fn windows_system_environment_with_is_deterministic_and_fail_closed() {
+        let valid = |name: &str| match name {
+            "SystemDrive" => Some("C:".to_owned()),
+            "USERPROFILE" => Some(r"C:\Users\fixture".to_owned()),
+            "APPDATA" => Some(r"C:\Users\fixture\AppData\Roaming".to_owned()),
+            "LOCALAPPDATA" => Some(r"C:\Users\fixture\AppData\Local".to_owned()),
+            "ProgramData" => Some(r"C:\ProgramData".to_owned()),
+            "ComSpec" => Some(r"C:\Windows\System32\cmd.exe".to_owned()),
+            _ => None,
+        };
+        let trusted = Some(r"C:\Windows\System32");
+        let environment = windows_system_environment_with(valid, trusted);
+        for (name, expected) in [
+            ("SystemDrive", "C:"),
+            ("USERPROFILE", r"C:\Users\fixture"),
+            ("APPDATA", r"C:\Users\fixture\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\fixture\AppData\Local"),
+            ("ProgramData", r"C:\ProgramData"),
+            ("ComSpec", r"C:\Windows\System32\cmd.exe"),
+        ] {
+            assert_eq!(environment.get(name), Some(&expected.to_owned()), "{name}");
+        }
+        // Missing ambient values are dropped, never invented.
+        let missing = |_: &str| None::<String>;
+        assert!(windows_system_environment_with(missing, trusted).is_empty());
+        // Malformed values are dropped while valid survivors remain.
+        let mixed = |name: &str| match name {
+            "USERPROFILE" => Some(r"\\".to_owned()),
+            "ComSpec" => Some(r"D:\writable\cmd.exe".to_owned()),
+            "SystemDrive" => Some("C:".to_owned()),
+            _ => None,
+        };
+        let environment = windows_system_environment_with(mixed, trusted);
+        assert!(!environment.contains_key("USERPROFILE"));
+        assert!(!environment.contains_key("ComSpec"));
+        assert_eq!(environment.get("SystemDrive"), Some(&"C:".to_owned()));
+        // An unavailable or unusable OS reference drops `ComSpec` only.
+        let environment = windows_system_environment_with(valid, None);
+        assert!(!environment.contains_key("ComSpec"));
+        assert_eq!(environment.len(), 5);
+        let environment = windows_system_environment_with(valid, Some("relative"));
+        assert!(!environment.contains_key("ComSpec"));
+        assert_eq!(environment.len(), 5);
+    }
+
+    #[test]
+    fn checked_windows_env_accepts_minimum_system_environment() {
+        let cases = [
+            ("SystemDrive", "C:"),
+            ("USERPROFILE", r"C:\Users\fixture"),
+            ("APPDATA", r"C:\Users\fixture\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\fixture\AppData\Local"),
+            ("ProgramData", r"C:\ProgramData"),
+            ("ComSpec", r"C:\Windows\System32\cmd.exe"),
+        ];
+        for (name, value) in cases {
+            assert_eq!(
+                checked_windows_env(name, value),
+                Some((name.to_owned(), value.to_owned())),
+                "{name}"
+            );
+        }
+        // `ComSpec` matching is case-insensitive, as on Windows.
+        assert!(checked_windows_env("ComSpec", r"C:\Windows\System32\CMD.EXE").is_some());
+    }
+
+    #[test]
+    fn checked_windows_env_rejects_empty_malformed_and_injection() {
+        assert!(checked_windows_env("SystemDrive", "").is_none());
+        assert!(checked_windows_env("USERPROFILE", "").is_none());
+        assert!(checked_windows_env("USERPROFILE", "relative\\path").is_none());
+        assert!(checked_windows_env("USERPROFILE", "C:").is_none());
+        assert!(checked_windows_env("USERPROFILE", "C:relative").is_none());
+        assert!(checked_windows_env("SystemDrive", "C").is_none());
+        assert!(checked_windows_env("SystemDrive", r"C:\").is_none());
+        assert!(checked_windows_env("SystemDrive", "CC:").is_none());
+        assert!(checked_windows_env("ComSpec", r"C:\Windows\System32\evil.exe").is_none());
+        assert!(checked_windows_env("ComSpec", "cmd.exe").is_none());
+        assert!(checked_windows_env("ComSpec", "C:\\Windows\\System32\\cmd.exe\0").is_none());
+        assert!(checked_windows_env("APPDATA", "C:\0injected").is_none());
+        assert!(checked_windows_env("UNKNOWN", r"C:\Windows").is_none());
+    }
+
+    #[test]
+    fn clean_git_environment_isolates_git_overrides_and_secrets() {
+        let environment = clean_git_environment();
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_PAGER",
+            "GIT_EXTERNAL_DIFF",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "OPENAI_API_KEY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+        ] {
+            assert!(!environment.contains_key(name), "{name}");
+        }
+        assert_eq!(
+            environment.get("GIT_CONFIG_NOSYSTEM"),
+            Some(&"1".to_owned())
+        );
+    }
+
+    #[test]
+    fn safe_environment_never_forwards_arbitrary_variables() {
+        let environment = safe_environment();
+        #[cfg(windows)]
+        let extra = [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ComSpec",
+        ];
+        #[cfg(not(windows))]
+        let extra: [&str; 0] = [];
+        let allowed: std::collections::HashSet<&str> = [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "SystemRoot",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_ATTR_NOSYSTEM",
+        ]
+        .into_iter()
+        .chain(extra)
+        .collect();
+        for key in environment.keys() {
+            assert!(allowed.contains(key.as_str()), "unexpected {key}");
+        }
+    }
+
+    #[test]
+    fn safe_environment_with_explicit_path_is_deterministic() {
+        let first = safe_environment_with_path(Some(std::ffi::OsStr::new("first")));
+        let second = safe_environment_with_path(Some(std::ffi::OsStr::new("second")));
+        assert_eq!(first.get("PATH"), Some(&"first".to_owned()));
+        assert_eq!(second.get("PATH"), Some(&"second".to_owned()));
+        // The explicit PATH is the search authority; ambient PATH never leaks in.
+        assert_ne!(first.get("PATH"), second.get("PATH"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_environment_behavior_is_unchanged() {
+        let environment = safe_environment();
+        for unexpected in [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ComSpec",
+            "HOME",
+        ] {
+            assert!(!environment.contains_key(unexpected), "{unexpected}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_receives_minimum_system_environment() {
+        // Consistency between the ambient-derived map and the validators.
+        // Limited role: vacuous when the host lacks a variable. Deterministic
+        // coverage (including missing ambient values) lives in
+        // `windows_system_environment_with_is_deterministic_and_fail_closed`,
+        // and real transmission in
+        // `restricted_child_environment_is_observable_end_to_end`.
+        let environment = safe_environment();
+        for name in [
+            "SystemDrive",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+        ] {
+            if let Ok(ambient) = std::env::var(name) {
+                let expected = checked_windows_env(name, &ambient);
+                assert_eq!(
+                    environment
+                        .get(name)
+                        .cloned()
+                        .map(|value| (name.to_owned(), value)),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+        if let Ok(ambient) = std::env::var("ComSpec") {
+            let expected = trusted_system_directory()
+                .as_deref()
+                .and_then(|trusted| checked_comspec_env(&ambient, trusted));
+            assert_eq!(
+                environment
+                    .get("ComSpec")
+                    .cloned()
+                    .map(|value| ("ComSpec".to_owned(), value)),
+                expected,
+                "ComSpec"
+            );
+        }
+    }
+
+    /// Real child-process proof that the approved environment reaches Windows.
+    ///
+    /// Deterministic: every value is synthetic and fixture-local (no ambient
+    /// dependence, no real username, no global Git identity), and ambient is
+    /// never mutated. A spawn/parse failure reports `environmental:`
+    /// (missing OS facility) while a value mismatch reports `defect:`
+    /// (application bug); an unexecuted transmission is never reported as
+    /// PASS.
+    #[cfg(windows)]
+    #[test]
+    fn restricted_child_environment_is_observable_end_to_end() {
+        let fixture =
+            std::env::temp_dir().join(format!("local-mcp-child-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let profile = fixture.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let profile = profile
+            .to_str()
+            .expect("environmental: fixture path is not UTF-8")
+            .to_owned();
+        assert!(
+            profile.is_ascii(),
+            "environmental: fixture path is not ASCII; child codepage round-trip would be lossy"
+        );
+        let trusted =
+            trusted_system_directory().expect("environmental: OS system directory unavailable");
+        let trimmed = trusted.trim_end_matches(['\\', '/']).to_owned();
+        let system_root = trimmed
+            .rsplit_once('\\')
+            .map(|(parent, _)| parent.to_owned())
+            .expect("environmental: OS system directory has no parent");
+        let appdata = format!("{profile}\\AppData\\Roaming");
+        let localappdata = format!("{profile}\\AppData\\Local");
+        let program_data = format!(
+            "{}\\ProgramData",
+            fixture
+                .to_str()
+                .expect("environmental: fixture path is not UTF-8")
+        );
+        let comspec = format!("{trimmed}\\cmd.exe");
+        let get = |name: &str| match name {
+            "SystemDrive" => Some("C:".to_owned()),
+            "USERPROFILE" => Some(profile.clone()),
+            "APPDATA" => Some(appdata.clone()),
+            "LOCALAPPDATA" => Some(localappdata.clone()),
+            "ProgramData" => Some(program_data.clone()),
+            "ComSpec" => Some(comspec.clone()),
+            _ => None,
+        };
+        let mut child_env = windows_system_environment_with(get, Some(trimmed.as_str()));
+        assert_eq!(
+            child_env.len(),
+            6,
+            "defect: production builder dropped a valid synthetic value: {child_env:?}"
+        );
+        // Hostile values through the same builder stay out of the map.
+        let hostile = windows_system_environment_with(
+            |name: &str| match name {
+                "ComSpec" => Some(r"D:\writable\cmd.exe".to_owned()),
+                "USERPROFILE" => Some(r"\\".to_owned()),
+                _ => None,
+            },
+            Some(trimmed.as_str()),
+        );
+        assert!(
+            hostile.is_empty(),
+            "defect: hostile values were forwarded: {hostile:?}"
+        );
+        // Git isolation and a deterministic PATH, exactly as production adds.
+        child_env.insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
+        child_env.insert("GIT_CONFIG_GLOBAL".to_owned(), null_device_path());
+        child_env.insert("GIT_ATTR_NOSYSTEM".to_owned(), "1".to_owned());
+        child_env.insert("PATH".to_owned(), trimmed.clone());
+        child_env.insert("SystemRoot".to_owned(), system_root);
+        let shell = format!("{trimmed}\\cmd.exe");
+        assert!(
+            std::path::Path::new(&shell).is_file(),
+            "environmental: trusted shell is absent: {shell}"
+        );
+        // The shell is addressed by absolute OS-derived path, so neither PATH
+        // nor ambient ComSpec takes part in resolving it.
+        let output = std::process::Command::new(&shell)
+            .arg("/c")
+            .arg("set")
+            .env_clear()
+            .envs(&child_env)
+            .output()
+            .expect("environmental: cannot spawn trusted system shell");
+        assert!(
+            output.status.success(),
+            "environmental: system shell did not run: {}",
+            output.status
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut observed = std::collections::HashMap::new();
+        for line in text.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if let Some((key, val)) = line.split_once('=') {
+                observed.insert(key.to_uppercase(), val.to_owned());
+            }
+        }
+        for (key, expected) in &child_env {
+            assert_eq!(
+                observed.get(&key.to_uppercase()).map(String::as_str),
+                Some(expected.as_str()),
+                "defect: child-visible {key} mismatch"
+            );
+        }
+        // Names that must never cross the boundary, even when present in the
+        // parent process. Only names are asserted here, never secret values.
+        for secret in [
+            "GOALLATCH_P0_PROBE_SECRET",
+            "GITHUB_TOKEN",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+        ] {
+            assert!(
+                !observed.contains_key(secret),
+                "defect: child exposes {secret}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&fixture);
     }
 }
 
