@@ -10,6 +10,7 @@ use crate::goal::Goal;
 use crate::managed_worktree::ManagedWorktreeLifecycle;
 use crate::mutation::MutationIntentState;
 use crate::orchestrator_error::OrchestratorError;
+use crate::task::Task;
 use crate::workspace_snapshot::{MAX_WRITER_MUTATED_PATHS, NormalizedWorkspacePath};
 
 /// Derive the deterministic, bounded path set from every Task and every
@@ -32,8 +33,17 @@ pub(crate) fn derive_writer_mutated_paths(
         ));
     }
 
+    derive_paths_from_tasks(goal.tasks().values(), record.worktree_root())
+}
+
+/// Derive over every supplied Task. Callers must pass the complete durable Goal
+/// task collection; task status is deliberately not an authority filter here.
+fn derive_paths_from_tasks<'a>(
+    tasks: impl IntoIterator<Item = &'a Task>,
+    worktree_root: &Path,
+) -> Result<Vec<NormalizedWorkspacePath>, OrchestratorError> {
     let mut paths = BTreeSet::new();
-    for task in goal.tasks().values() {
+    for task in tasks {
         for attempt in task.attempts() {
             let Some(intent) = attempt.mutation_intent() else {
                 continue;
@@ -42,10 +52,7 @@ pub(crate) fn derive_writer_mutated_paths(
             match intent.state() {
                 MutationIntentState::Applied | MutationIntentState::ReconciledPerformed => {
                     for operation in intent.operations() {
-                        let path = normalize_durable_writer_path(
-                            operation.path(),
-                            record.worktree_root(),
-                        )?;
+                        let path = normalize_durable_writer_path(operation.path(), worktree_root)?;
                         if paths.insert(path) && paths.len() > MAX_WRITER_MUTATED_PATHS {
                             return Err(corrupt("writer-mutated path limit exceeded"));
                         }
@@ -171,6 +178,7 @@ mod tests {
         VerificationCheckResult, VerificationOutcome, VerificationResult, VerificationSpec,
         WorkerKind,
     };
+    use std::collections::BTreeMap;
 
     const NOW: &str = "2026-10-13T00:00:00Z";
     const BASE_OID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -326,6 +334,53 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn superseded_writer_task(path: PathBuf) -> Task {
+        let mut task = Task::new(
+            "historical writer",
+            "perform a mutation before replacement",
+            true,
+            WorkerKind::CodexWriter,
+            TaskScope::new(
+                vec![root()],
+                Vec::new(),
+                TaskOperationKind::LocalMutation,
+                ReplaySafety::VerifyBeforeRetry,
+            ),
+            vec![VerificationSpec::StructuredEvidence {
+                requirement_id: "historical-writer-proof".to_owned(),
+            }],
+            3,
+            1,
+            NOW,
+        )
+        .unwrap();
+        let context = TaskTransitionContext {
+            active_worker_stopped: true,
+            side_effect_reconciled: true,
+        };
+        task.transition_to(TaskStatus::Ready, true, context, NOW)
+            .unwrap();
+        task.transition_to(TaskStatus::Running, true, context, NOW)
+            .unwrap();
+        task.prepare_latest_mutation_intent(intent(path)).unwrap();
+        task.advance_latest_mutation_intent(
+            "operation-1",
+            MutationIntentUpdate::BeginOperation { index: 0 },
+        )
+        .unwrap();
+        task.advance_latest_mutation_intent(
+            "operation-1",
+            MutationIntentUpdate::CompleteOperation { index: 0 },
+        )
+        .unwrap();
+        task.transition_to(TaskStatus::Verifying, true, context, NOW)
+            .unwrap();
+        task.transition_to(TaskStatus::Retryable, true, context, NOW)
+            .unwrap();
+        task.supersede_for_host(NOW).unwrap();
+        task
     }
 
     #[test]
@@ -516,8 +571,9 @@ mod tests {
             NOW,
         )
         .unwrap();
+        let reloaded: Goal = serde_json::from_slice(&serde_json::to_vec(&goal).unwrap()).unwrap();
         assert_eq!(
-            derive_writer_mutated_paths(&goal).unwrap()[0].as_str(),
+            derive_writer_mutated_paths(&reloaded).unwrap()[0].as_str(),
             "src/recovered.rs"
         );
     }
@@ -563,6 +619,28 @@ mod tests {
                 .map(|path| path.as_str().to_owned())
                 .collect::<Vec<_>>(),
             vec!["new.rs", "old.rs"]
+        );
+        let reloaded: Goal = serde_json::from_slice(&serde_json::to_vec(&goal).unwrap()).unwrap();
+        assert_eq!(
+            derive_writer_mutated_paths(&reloaded)
+                .unwrap()
+                .into_iter()
+                .map(|path| path.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["new.rs", "old.rs"]
+        );
+    }
+
+    #[test]
+    fn superseded_task_mutation_history_contributes_after_reload() {
+        let task = superseded_writer_task(root().join("superseded.rs"));
+        assert_eq!(task.status(), TaskStatus::Superseded);
+        let reloaded: Task = serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        reloaded.validate_local().unwrap();
+        let tasks = BTreeMap::from([(reloaded.id().clone(), reloaded)]);
+        assert_eq!(
+            derive_paths_from_tasks(tasks.values(), &root()).unwrap()[0].as_str(),
+            "superseded.rs"
         );
     }
 
