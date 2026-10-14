@@ -107,6 +107,13 @@ states. It does **not** prove that no transient mutation occurred at any instant
 between samples; a `A → B → A` sequence falling entirely between samples may be
 invisible. 2D does not claim temporal-history integrity.
 
+The finalizer's fresh re-observation and Goal revision CAS are also not one
+transaction with the external filesystem. A mutation after the final stable
+sample but before the durable `COMPLETED` CAS can therefore escape detection.
+The CAS protects Goal state and evidence identity only; it does not lock or
+serialize external Git/filesystem changes. This observation-to-commit window is
+part of `NON_TRANSACTIONAL_ABA_RESIDUAL`, not a guarantee of temporal integrity.
+
 ## 4. What 2D deliberately does not do
 
 - 2D does not assemble `WorkspaceSnapshotManifestV1` (a later slice does).
