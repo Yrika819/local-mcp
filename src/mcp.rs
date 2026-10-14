@@ -1165,7 +1165,9 @@ async fn goal_run(args: &Value, session: &config::Session) -> Result<Value> {
             .enable_all()
             .build()
             .context("failed to build goal_run runtime")?;
-        let result = runtime.block_on(goal_runner::run_goal_foreground(
+        // Keep the generic orchestration future off the blocking worker's
+        // fixed-size stack; managed runs include the async snapshot observer.
+        let runner = Box::pin(goal_runner::run_goal_foreground(
             &store,
             &session,
             &goal_id,
@@ -1176,6 +1178,7 @@ async fn goal_run(args: &Value, session: &config::Session) -> Result<Value> {
             backends.reviewer(),
             backends.replanner(),
         ));
+        let result = runtime.block_on(runner);
         text_result(serialize_goal_run_result(&result))
     })
     .await

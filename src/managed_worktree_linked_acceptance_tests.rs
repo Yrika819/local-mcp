@@ -28,10 +28,10 @@ use crate::task::{
 };
 use crate::task_store::TaskStore;
 use crate::{
+    goal_runner::{GoalRunLimits, GoalRunStopReason, run_goal_foreground},
     planner::{PlannerBackend, PlannerError, PlannerRequest},
     readonly_worker::{ReadonlyBackend, ReadonlyError, ReadonlyRequest},
     replanner::{ReplannerBackend, ReplannerError, ReplannerRequest},
-    scheduler::SchedulerStepOutcome,
     writer::{ReviewerBackend, ReviewerRequest, WriterBackend, WriterError, WriterRequest},
 };
 
@@ -713,47 +713,28 @@ async fn real_managed_goal_runs_writer_verifier_snapshot_and_finalizer_end_to_en
         .load_goal(&fixture.session.id, &fixture.goal_id)
         .unwrap();
 
-    let mut current = initial.clone();
-    let mut scheduler_steps = 0;
-    while current.status() != crate::goal::GoalStatus::Verifying && scheduler_steps < 10 {
-        let step = crate::scheduler::scheduler_step(
-            &fixture.store,
-            &fixture.session,
-            &fixture.goal_id,
-            current.revision(),
-            &FullRunPlanner,
-            &FullRunReadonly,
-            &FullRunWriter,
-            &FullRunReviewer,
-            &FullRunReplanner,
-        )
-        .await
-        .unwrap();
-        assert_eq!(step.outcome, SchedulerStepOutcome::Applied);
-        scheduler_steps += 1;
-        current = fixture
-            .store
-            .load_goal(&fixture.session.id, &fixture.goal_id)
-            .unwrap();
-    }
-    assert_eq!(current.status(), crate::goal::GoalStatus::Verifying);
-    let finalization = finalize_goal_at_revision_with_session(
+    let runner = Box::pin(run_goal_foreground(
         &fixture.store,
         &fixture.session,
         &fixture.goal_id,
-        current.revision(),
-    )
-    .await
-    .unwrap();
+        GoalRunLimits::new(16).unwrap(),
+        &FullRunPlanner,
+        &FullRunReadonly,
+        &FullRunWriter,
+        &FullRunReviewer,
+        &FullRunReplanner,
+    ));
+    let result = runner.await;
+    assert_eq!(result.stop_reason, GoalRunStopReason::Completed);
     assert_eq!(
-        finalization.decision().outcome(),
-        GoalFinalizationOutcome::ReadyToComplete
+        result.terminal_status,
+        Some(crate::goal::GoalStatus::Completed)
     );
+    assert!(result.steps_applied >= 4);
     let completed = fixture
         .store
         .load_goal(&fixture.session.id, &fixture.goal_id)
         .unwrap();
-    assert!(scheduler_steps >= 4);
     assert_eq!(completed.status(), crate::goal::GoalStatus::Completed);
     assert_ne!(initial.revision(), completed.revision());
     assert_eq!(
