@@ -17,15 +17,18 @@ use uuid::Uuid;
 
 use crate::goal::{
     GOAL_SCHEMA_VERSION, Goal, GoalCriterionBinding, GoalFinalVerificationRecord,
-    GoalFinalVerificationSpec, GoalId, GoalVerificationRequirement,
+    GoalFinalVerificationSpec, GoalId, GoalStatus, GoalVerificationRequirement,
     MANAGED_WORKSPACE_VERIFICATION_EVIDENCE_SCHEMA_VERSION, MAX_TASK_VERIFICATION_IDENTITIES,
     ManagedWorkspaceBaseAdvanced, ManagedWorkspaceVerificationEvidenceV1,
+};
+use crate::goal_finalizer::{
+    GoalFinalizationOutcome, evaluate_goal_finalization, prepare_goal_finalization,
 };
 use crate::managed_worktree::{ManagedWorktreeRecord, WorktreeId};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
-    ReplaySafety, Task, TaskId, TaskOperationKind, TaskScope, VerificationId, VerificationOutcome,
-    WorkerKind,
+    ReplaySafety, Task, TaskId, TaskOperationKind, TaskScope, TaskStatus, TaskTransitionContext,
+    VerificationId, VerificationOutcome, VerificationResult, WorkerKind,
 };
 use crate::task_store::TaskStore;
 
@@ -794,6 +797,9 @@ fn bound_goal() -> Goal {
         NOW,
     )
     .unwrap();
+    let mut task_value = serde_json::to_value(task).unwrap();
+    task_value["id"] = json!(alias_task_id());
+    let task: Task = serde_json::from_value(task_value).unwrap();
     let criterion = goal.completion_criteria()[0].id().clone();
     let binding = GoalCriterionBinding::new(
         criterion,
@@ -801,12 +807,36 @@ fn bound_goal() -> Goal {
             task_id: task.id().clone(),
         }],
     );
+    let task_id = task.id().clone();
     goal.materialize_initial_plan_with_contract(
         vec![task],
         GoalFinalVerificationSpec::new(1, vec![binding]),
         NOW,
     )
     .unwrap();
+    let settled = TaskTransitionContext {
+        active_worker_stopped: true,
+        side_effect_reconciled: true,
+    };
+    goal.transition_task(&task_id, TaskStatus::Running, settled, NOW)
+        .unwrap();
+    goal.transition_task(&task_id, TaskStatus::Verifying, settled, NOW)
+        .unwrap();
+    let mut task_verification = serde_json::to_value(VerificationResult::new(
+        VerificationOutcome::Passed,
+        Vec::new(),
+        NOW,
+        NOW,
+    ))
+    .unwrap();
+    task_verification["id"] = json!(verification_id());
+    goal.task_record_verification_result(
+        &task_id,
+        serde_json::from_value(task_verification).unwrap(),
+    )
+    .unwrap();
+    goal.transition_task(&task_id, TaskStatus::Completed, settled, NOW)
+        .unwrap();
     let mut value = serde_json::to_value(&goal).unwrap();
     let revision = value["revision"].as_u64().unwrap();
     let mut record = serde_json::to_value(GoalFinalVerificationRecord::new(
@@ -838,6 +868,25 @@ fn bound_evidence_value(goal: &Goal) -> Value {
     let mut record = serde_json::to_value(evidence()).unwrap();
     record["goal_revision"] = json!(goal.revision());
     record["plan_revision"] = json!(1);
+    let task_verification_identities = goal
+        .final_verification_spec()
+        .into_iter()
+        .flat_map(|spec| spec.criterion_bindings())
+        .flat_map(|binding| binding.requirements())
+        .map(crate::goal::GoalVerificationRequirement::task_id)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|task_id| {
+            let verification = goal
+                .tasks()
+                .get(&task_id)
+                .and_then(|task| task.verification_results().last())
+                .unwrap();
+            (task_id, verification.id().clone())
+        })
+        .collect::<Vec<_>>();
+    record["task_verification_identities"] = json!(task_verification_identities);
     record
 }
 
@@ -854,6 +903,50 @@ fn reload_bound_goal_with_evidence(evidence: Value) -> Result<Goal, Orchestrator
         .map_err(|error| OrchestratorError::CorruptGoal(format!("evidence decode: {error}")))?;
     decoded.validate()?;
     Ok(decoded)
+}
+
+#[test]
+fn evidence_binding_is_idempotent_and_refuses_replacement() {
+    let mut goal = bound_goal();
+    let serialized = bound_evidence_value(&goal);
+    let evidence: ManagedWorkspaceVerificationEvidenceV1 =
+        serde_json::from_value(serialized.clone()).unwrap();
+    goal.bind_managed_workspace_verification_evidence(evidence.clone())
+        .unwrap();
+    let committed = goal.clone();
+    goal.bind_managed_workspace_verification_evidence(evidence)
+        .unwrap();
+    assert_eq!(goal, committed, "same evidence must be a no-op");
+
+    let mut different = serialized;
+    different["workspace_snapshot_digest"] = json!("c".repeat(64));
+    let different = serde_json::from_value(different).unwrap();
+    assert!(
+        goal.bind_managed_workspace_verification_evidence(different)
+            .is_err()
+    );
+    assert_eq!(goal, committed, "different evidence must not overwrite");
+}
+
+#[test]
+fn managed_goal_without_snapshot_evidence_cannot_finalize() {
+    let mut value = serde_json::to_value(bound_goal()).unwrap();
+    value["status"] = serde_json::to_value(GoalStatus::Verifying).unwrap();
+    let goal: Goal = serde_json::from_value(value).unwrap();
+    let root = std::env::temp_dir().join(format!("local-mcp-slice-3c-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = TaskStore::with_state_root(root.clone());
+    store.create_goal(&goal).unwrap();
+    let snapshot = prepare_goal_finalization(&store, goal.session_id(), goal.id()).unwrap();
+    let decision = evaluate_goal_finalization(&snapshot).unwrap();
+    assert_eq!(decision.outcome(), GoalFinalizationOutcome::Blocked);
+    assert!(
+        decision
+            .blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISSING")
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn evidence_at(

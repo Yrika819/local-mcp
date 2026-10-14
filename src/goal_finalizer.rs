@@ -376,6 +376,34 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
             "indeterminate never completes",
         )),
     }
+    if !goal.workspace_mode().is_primary() {
+        let latest_id = goal
+            .latest_applicable_final_verification()
+            .map(|record| record.id());
+        match goal.managed_workspace_verification_evidence() {
+            None => blockers.push(GoalFinalizationBlocker::new(
+                "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISSING",
+                None,
+                "managed Goal cannot complete without durable snapshot evidence",
+            )),
+            Some(evidence)
+                if Some(evidence.final_verification_id()) != latest_id
+                    || evidence.goal_revision()
+                        != goal
+                            .latest_applicable_final_verification()
+                            .map(|record| record.committed_goal_revision())
+                            .unwrap_or_default()
+                    || evidence.plan_revision() != goal.plan_revision() =>
+            {
+                blockers.push(GoalFinalizationBlocker::new(
+                    "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISMATCH",
+                    None,
+                    "managed snapshot evidence does not match the applicable final verification",
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     let outcome = if blockers.is_empty() {
         GoalFinalizationOutcome::ReadyToComplete
     } else if blockers
@@ -390,6 +418,8 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
                 | "UNRESOLVED_TASK_BLOCKER"
                 | "UNKNOWN_SIDE_EFFECT"
                 | "FINAL_VERIFICATION_INDETERMINATE"
+                | "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISSING"
+                | "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISMATCH"
         )
     }) {
         GoalFinalizationOutcome::Blocked
