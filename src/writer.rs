@@ -2077,6 +2077,294 @@ mod tests {
     /// production commit path rather than a stand-in.
     struct RealWriteBoundary;
 
+    /// Slice 3B: the real Writer materialization feeds managed-Goal derivation.
+    ///
+    /// A real Git repository with a real locked linked worktree backs a managed
+    /// Goal, so `validated_execution_root` passes exactly as in production.
+    /// The actual private `materialize_operations()` resolves an existing file
+    /// and a new file inside an existing parent directory; those resolved
+    /// absolute paths (verbatim `\\?\C:\...` on Windows) become the durable
+    /// `MutationIntent`, which is Applied through the canonical Goal API,
+    /// persisted, reloaded, and derived to workspace-relative paths. No
+    /// production API, Writer authority, or persistence schema is widened.
+    #[test]
+    fn real_writer_materialization_feeds_managed_goal_derivation() {
+        use std::process::Command;
+
+        const NOW: &str = "2026-10-13T00:00:00Z";
+
+        fn git(cwd: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap_or_else(|error| panic!("could not run git {args:?}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?} failed in {}: {}",
+                cwd.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn git_output(cwd: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap_or_else(|error| panic!("could not run git {args:?}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?} failed in {}: {}",
+                cwd.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_owned()
+        }
+
+        let raw_base =
+            std::env::temp_dir().join(format!("local-mcp-slice3b-real-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(raw_base.join("primary")).unwrap();
+        let base = std::fs::canonicalize(&raw_base).unwrap();
+        let primary_unclean = base.join("primary");
+        git(&primary_unclean, &["init", "-q", "."]);
+        git(&primary_unclean, &["config", "core.autocrlf", "false"]);
+        git(
+            &primary_unclean,
+            &["config", "user.email", "slice3b@example.invalid"],
+        );
+        git(&primary_unclean, &["config", "user.name", "Slice 3B"]);
+        git(&primary_unclean, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(primary_unclean.join("src")).unwrap();
+        let existing_bytes = b"existing\n";
+        std::fs::write(
+            primary_unclean.join("src").join("existing.txt"),
+            existing_bytes,
+        )
+        .unwrap();
+        git(&primary_unclean, &["add", "src/existing.txt"]);
+        git(&primary_unclean, &["commit", "-q", "-m", "add existing"]);
+        let base_commit = git_output(&primary_unclean, &["rev-parse", "HEAD"]);
+        let common_raw = git_output(
+            &primary_unclean,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let common_dir = std::fs::canonicalize(Path::new(&common_raw)).unwrap();
+        let primary = std::fs::canonicalize(&primary_unclean).unwrap();
+
+        let candidate_raw = raw_base.join("candidate");
+        let goal_id =
+            GoalId::parse("00000000-0000-4000-8000-000000000003").expect("goal id parses");
+        let branch_ref = crate::managed_worktree::managed_branch_ref(&goal_id);
+        let branch_name = crate::managed_worktree::managed_branch_name(&branch_ref)
+            .expect("managed branch name derives");
+        let lock_reason = crate::managed_worktree::managed_lock_reason(&goal_id);
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                candidate_raw.to_str().expect("candidate path is UTF-8"),
+                &base_commit,
+            ],
+        );
+        git(
+            &primary,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                &lock_reason,
+                candidate_raw.to_str().expect("candidate path is UTF-8"),
+            ],
+        );
+        let candidate =
+            crate::config::canonical_path(&candidate_raw).expect("managed candidate is canonical");
+
+        let session = crate::config::Session {
+            id: format!("slice3b-{}", uuid::Uuid::new_v4().simple()),
+            cwd: primary.clone(),
+            permitted_directories: vec![primary.clone(), candidate.clone()],
+        };
+        let record = crate::managed_worktree::ManagedWorktreeRecord::requested(
+            &goal_id,
+            crate::managed_worktree::WorktreeId::new(),
+            primary.clone(),
+            common_dir,
+            candidate.clone(),
+            base_commit.clone(),
+            None,
+            1,
+            0,
+        )
+        .expect("managed record requests")
+        .to_prepared()
+        .expect("managed record prepares")
+        .consume_creation_attempt()
+        .expect("managed record consumes one creation attempt")
+        .to_active(&base_commit, NOW)
+        .expect("managed record activates");
+
+        let mut goal = Goal::new_managed_with_id(
+            goal_id,
+            session.id.clone(),
+            primary.clone(),
+            "slice 3b real writer integration",
+            None,
+            Vec::new(),
+            vec!["writer paths are durable".to_owned()],
+            NOW,
+            record,
+        )
+        .expect("managed goal builds");
+        let task = crate::task::Task::new(
+            "writer",
+            "write an existing and a new file",
+            true,
+            WorkerKind::CodexWriter,
+            crate::task::TaskScope::new(
+                vec![candidate.clone()],
+                Vec::new(),
+                crate::task::TaskOperationKind::LocalMutation,
+                crate::task::ReplaySafety::VerifyBeforeRetry,
+            ),
+            vec![VerificationSpec::StructuredEvidence {
+                requirement_id: "writer-proof".to_owned(),
+            }],
+            3,
+            1,
+            NOW,
+        )
+        .expect("writer task builds");
+        let task_id = task.id().clone();
+        goal.materialize_initial_plan(vec![task], NOW)
+            .expect("initial plan materializes");
+        goal.transition_task(
+            &task_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .expect("writer task runs");
+
+        let operations = vec![
+            WriterOperation::WriteUtf8 {
+                path: "src/existing.txt".to_owned(),
+                expected_preimage: PreimageExpectation::Sha256 {
+                    sha256: sha256_hex(existing_bytes),
+                },
+                content: "existing changed\n".to_owned(),
+            },
+            WriterOperation::WriteUtf8 {
+                path: "src/new.txt".to_owned(),
+                expected_preimage: PreimageExpectation::Absent,
+                content: "new file\n".to_owned(),
+            },
+        ];
+        let materialized = materialize_operations(&goal, &session, &task_id, &operations)
+            .expect("real writer materialization resolves");
+        assert_eq!(materialized.len(), 2);
+        #[cfg(windows)]
+        for write in &materialized {
+            assert!(
+                write.path.to_string_lossy().starts_with(r"\\?\"),
+                "writer-resolved path keeps the verbatim spelling: {}",
+                write.path.display()
+            );
+        }
+
+        let operation_id = "slice-3b-real-1".to_owned();
+        let scope_identity = crate::workspace_publish::scope_identity(
+            &materialized
+                .iter()
+                .map(|write| (write.path.clone(), sha256_hex(write.content.as_bytes())))
+                .collect::<Vec<_>>(),
+        );
+        let intent = MutationIntent::new(
+            operation_id.clone(),
+            scope_identity,
+            materialized
+                .iter()
+                .enumerate()
+                .map(|(index, write)| {
+                    MutationOperationIntent::new(
+                        index as u32,
+                        write.path.clone(),
+                        mutation_preimage(&write.expected_preimage),
+                        mutation_observation(&write.before),
+                        sha256_hex(write.content.as_bytes()),
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                })
+                .collect(),
+        )
+        .expect("mutation intent builds from writer-resolved paths");
+        goal.task_prepare_latest_mutation_intent(&task_id, intent)
+            .expect("intent prepares");
+        for index in 0..materialized.len() {
+            goal.task_advance_latest_mutation_intent(
+                &task_id,
+                &operation_id,
+                crate::mutation::MutationIntentUpdate::BeginOperation {
+                    index: index as u32,
+                },
+            )
+            .expect("operation begins");
+            goal.task_advance_latest_mutation_intent(
+                &task_id,
+                &operation_id,
+                crate::mutation::MutationIntentUpdate::CompleteOperation {
+                    index: index as u32,
+                },
+            )
+            .expect("operation completes");
+        }
+
+        let derived = crate::managed_worktree_writer_paths::derive_writer_mutated_paths(&goal)
+            .expect("writer paths derive");
+        let rendered = derived
+            .iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, vec!["src/existing.txt", "src/new.txt"]);
+        let reloaded: Goal =
+            serde_json::from_slice(&serde_json::to_vec(&goal).expect("goal serializes"))
+                .expect("goal reloads");
+        reloaded.validate().expect("reloaded goal validates");
+        let rederived =
+            crate::managed_worktree_writer_paths::derive_writer_mutated_paths(&reloaded)
+                .expect("writer paths derive after reload");
+        let rerendered = rederived
+            .iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(rerendered, vec!["src/existing.txt", "src/new.txt"]);
+
+        git(
+            &primary,
+            &[
+                "worktree",
+                "unlock",
+                candidate.to_str().expect("candidate path is UTF-8"),
+            ],
+        );
+        git(
+            &primary,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                candidate.to_str().expect("candidate path is UTF-8"),
+            ],
+        );
+        git(&primary, &["worktree", "prune"]);
+        std::fs::remove_dir_all(&raw_base).unwrap();
+    }
+
     impl WriteBoundary for RealWriteBoundary {
         fn write<'a>(
             &'a self,
