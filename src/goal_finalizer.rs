@@ -13,6 +13,16 @@ impl GoalFinalizationAuthority {
     }
 }
 
+struct FreshWorkspaceReobservationAuthority {
+    _private: (),
+}
+
+impl FreshWorkspaceReobservationAuthority {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GoalFinalizationOutcome {
     ReadyToComplete,
@@ -401,11 +411,7 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
                     "managed snapshot evidence does not match the applicable final verification",
                 ));
             }
-            Some(_) => blockers.push(GoalFinalizationBlocker::new(
-                "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED",
-                None,
-                "managed Goal remains fail-closed until the fresh finalizer re-observation gate is installed",
-            )),
+            Some(_) => {}
         }
     }
     let outcome = if blockers.is_empty() {
@@ -424,7 +430,6 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
                 | "FINAL_VERIFICATION_INDETERMINATE"
                 | "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISSING"
                 | "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISMATCH"
-                | "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED"
         )
     }) {
         GoalFinalizationOutcome::Blocked
@@ -453,17 +458,49 @@ pub(crate) fn commit_goal_finalization(
     snapshot: &GoalFinalizationSnapshot,
     decision: &GoalFinalizationDecision,
 ) -> Result<Goal, GoalFinalizerError> {
+    commit_goal_finalization_inner(store, snapshot, decision, None)
+}
+
+fn commit_managed_goal_finalization(
+    store: &TaskStore,
+    snapshot: &GoalFinalizationSnapshot,
+    decision: &GoalFinalizationDecision,
+    _authority: &FreshWorkspaceReobservationAuthority,
+) -> Result<Goal, GoalFinalizerError> {
+    commit_goal_finalization_inner(store, snapshot, decision, Some(_authority))
+}
+
+fn commit_goal_finalization_inner(
+    store: &TaskStore,
+    snapshot: &GoalFinalizationSnapshot,
+    decision: &GoalFinalizationDecision,
+    reobservation_authority: Option<&FreshWorkspaceReobservationAuthority>,
+) -> Result<Goal, GoalFinalizerError> {
     if decision.outcome == GoalFinalizationOutcome::AlreadyCompleted {
         return Ok(store.load_goal(snapshot.session_id(), snapshot.goal_id())?);
     }
     if decision.outcome != GoalFinalizationOutcome::ReadyToComplete {
         return Err(GoalFinalizerError::DecisionNotReady(decision.outcome));
     }
+    if !snapshot.goal.workspace_mode().is_primary() && reobservation_authority.is_none() {
+        return Err(GoalFinalizerError::DecisionNotReady(
+            GoalFinalizationOutcome::Blocked,
+        ));
+    }
     let expected_plan_revision = snapshot.plan_revision();
     let authority = GoalFinalizationAuthority::new();
     let goal = store.mutate_goal_snapshot(snapshot.session_id(), snapshot.goal_id(), snapshot.revision(), |goal, now| {
         if goal.plan_revision() != expected_plan_revision {
             return Err(OrchestratorError::InvalidDag(format!("goal finalization plan revision changed: expected {expected_plan_revision}, found {}", goal.plan_revision())));
+        }
+        if goal.managed_workspace_verification_evidence()
+            != snapshot
+                .goal
+                .managed_workspace_verification_evidence()
+        {
+            return Err(OrchestratorError::InvalidDag(
+                "managed workspace evidence changed before finalization commit".to_owned(),
+            ));
         }
         let current = evaluate_goal(goal)?;
         if current.outcome != GoalFinalizationOutcome::ReadyToComplete {
@@ -491,6 +528,17 @@ fn finalize_prepared_goal(
 ) -> Result<GoalFinalizationResult, GoalFinalizerError> {
     let decision = evaluate_goal_finalization(&snapshot)?;
     let goal = match decision.outcome {
+        GoalFinalizationOutcome::ReadyToComplete
+            if !snapshot.goal.workspace_mode().is_primary() =>
+        {
+            return Ok(finalization_result_with_blocker(
+                snapshot,
+                decision,
+                GoalFinalizationOutcome::Blocked,
+                "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED",
+                "synchronous finalization cannot complete a managed Goal without a fresh workspace observation",
+            ));
+        }
         GoalFinalizationOutcome::ReadyToComplete => {
             commit_goal_finalization(store, &snapshot, &decision)?
         }
@@ -516,6 +564,149 @@ pub(crate) fn finalize_goal_at_revision(
         ));
     }
     finalize_prepared_goal(store, session_id, goal_id, snapshot)
+}
+
+pub(crate) async fn finalize_goal_at_revision_with_session(
+    store: &TaskStore,
+    session: &crate::config::Session,
+    goal_id: &GoalId,
+    expected_revision: u64,
+) -> Result<GoalFinalizationResult, GoalFinalizerError> {
+    let snapshot = prepare_goal_finalization(store, &session.id, goal_id)?;
+    if snapshot.revision() != expected_revision {
+        return Err(GoalFinalizerError::Store(
+            OrchestratorError::RevisionConflict {
+                expected: expected_revision,
+                actual: snapshot.revision(),
+            },
+        ));
+    }
+    let decision = evaluate_goal_finalization(&snapshot)?;
+    if decision.outcome != GoalFinalizationOutcome::ReadyToComplete {
+        return Ok(finalization_result_without_commit(snapshot, decision));
+    }
+    if snapshot.goal.workspace_mode().is_primary() {
+        let goal = commit_goal_finalization(store, &snapshot, &decision)?;
+        return Ok(GoalFinalizationResult { decision, goal });
+    }
+
+    let expected_snapshot_digest = snapshot
+        .goal
+        .managed_workspace_verification_evidence()
+        .ok_or_else(|| {
+            GoalFinalizerError::InvalidDurableState(
+                "READY managed finalization lacks snapshot evidence".to_owned(),
+            )
+        })?
+        .workspace_snapshot_digest()
+        .to_owned();
+    let writer_paths =
+        match crate::managed_worktree_writer_paths::derive_writer_mutated_paths(&snapshot.goal) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return Ok(finalization_result_with_blocker(
+                    snapshot,
+                    decision,
+                    GoalFinalizationOutcome::Blocked,
+                    "MANAGED_WRITER_PATH_EVIDENCE_INVALID",
+                    error.to_string(),
+                ));
+            }
+        };
+    let observation =
+        match crate::managed_worktree_snapshot_coherence::observe_stable_managed_workspace(
+            &snapshot.goal,
+            session,
+            &writer_paths,
+        )
+        .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                let outcome = match &error {
+                crate::managed_worktree_snapshot_coherence::SnapshotCoherenceError::SnapshotUnstable(_)
+                | crate::managed_worktree_snapshot_coherence::SnapshotCoherenceError::GitObservationUnavailable(_)
+                | crate::managed_worktree_snapshot_coherence::SnapshotCoherenceError::IndexBlobObservationUnavailable(_)
+                | crate::managed_worktree_snapshot_coherence::SnapshotCoherenceError::FilesystemObservationUnavailable(_) => {
+                    GoalFinalizationOutcome::NotReady
+                }
+                _ => GoalFinalizationOutcome::Blocked,
+            };
+                return Ok(finalization_result_with_blocker(
+                    snapshot,
+                    decision,
+                    outcome,
+                    "MANAGED_WORKSPACE_REOBSERVATION_FAILED",
+                    error.to_string(),
+                ));
+            }
+        };
+    let manifest =
+        match crate::managed_worktree_snapshot_manifest::assemble_workspace_snapshot_manifest(
+            snapshot.goal.managed_worktree().ok_or_else(|| {
+                GoalFinalizerError::InvalidDurableState(
+                    "managed Goal lost its durable worktree record".to_owned(),
+                )
+            })?,
+            &observation,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return Ok(finalization_result_with_blocker(
+                    snapshot,
+                    decision,
+                    GoalFinalizationOutcome::Blocked,
+                    "MANAGED_WORKSPACE_SNAPSHOT_INVALID",
+                    error.to_string(),
+                ));
+            }
+        };
+    if manifest.digest() != expected_snapshot_digest {
+        return Ok(finalization_result_with_blocker(
+            snapshot,
+            decision,
+            GoalFinalizationOutcome::Blocked,
+            "MANAGED_WORKSPACE_SNAPSHOT_MISMATCH",
+            "fresh workspace snapshot digest differs from durable verification evidence",
+        ));
+    }
+    let reobservation_authority = FreshWorkspaceReobservationAuthority::new();
+    let goal =
+        commit_managed_goal_finalization(store, &snapshot, &decision, &reobservation_authority)?;
+    Ok(GoalFinalizationResult { decision, goal })
+}
+
+fn finalization_result_without_commit(
+    snapshot: GoalFinalizationSnapshot,
+    decision: GoalFinalizationDecision,
+) -> GoalFinalizationResult {
+    GoalFinalizationResult {
+        decision,
+        goal: snapshot.goal,
+    }
+}
+
+fn finalization_result_with_blocker(
+    snapshot: GoalFinalizationSnapshot,
+    mut decision: GoalFinalizationDecision,
+    outcome: GoalFinalizationOutcome,
+    code: &str,
+    detail: impl Into<String>,
+) -> GoalFinalizationResult {
+    decision.outcome = outcome;
+    decision.summary = match outcome {
+        GoalFinalizationOutcome::NotReady => "managed workspace re-observation is not ready",
+        GoalFinalizationOutcome::Blocked => "managed workspace integrity gate blocked completion",
+        _ => "managed workspace integrity gate refused completion",
+    }
+    .to_owned();
+    decision
+        .blockers
+        .push(GoalFinalizationBlocker::new(code, None, detail));
+    GoalFinalizationResult {
+        decision,
+        goal: snapshot.goal,
+    }
 }
 
 #[expect(

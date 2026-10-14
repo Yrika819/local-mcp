@@ -183,6 +183,13 @@ pub(crate) trait GoalRunnerAuthorities {
         &mut self,
         expected_revision: u64,
     ) -> Result<RunnerFinalizerStepResult, RunnerDriverError>;
+
+    async fn finalize_goal_async(
+        &mut self,
+        expected_revision: u64,
+    ) -> Result<RunnerFinalizerStepResult, RunnerDriverError> {
+        self.finalize_goal(expected_revision)
+    }
 }
 
 struct ProductionRunnerAuthorities<'a, P, RB, W, R, RP> {
@@ -249,6 +256,24 @@ where
             self.goal_id,
             expected_revision,
         )
+        .map(|result| RunnerFinalizerStepResult {
+            revision_after: result.goal().revision(),
+            outcome: result.decision().outcome(),
+        })
+        .map_err(map_finalizer_error)
+    }
+
+    async fn finalize_goal_async(
+        &mut self,
+        expected_revision: u64,
+    ) -> Result<RunnerFinalizerStepResult, RunnerDriverError> {
+        goal_finalizer::finalize_goal_at_revision_with_session(
+            self.store,
+            self.session,
+            self.goal_id,
+            expected_revision,
+        )
+        .await
         .map(|result| RunnerFinalizerStepResult {
             revision_after: result.goal().revision(),
             outcome: result.decision().outcome(),
@@ -443,7 +468,7 @@ where
 
         if current.status == GoalStatus::Verifying {
             let before = current.revision;
-            match authorities.finalize_goal(before) {
+            match authorities.finalize_goal_async(before).await {
                 Err(error) => {
                     let (after, stop_reason) = stop_from_driver_error(before, &error);
                     trace.push(GoalRunTraceEntry {
