@@ -589,10 +589,18 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "goal_pause" => with_goal_store(|store| goal_api::goal_pause(&args, &session, store)),
         "goal_resume" => with_goal_store(|store| goal_api::goal_resume(&args, &session, store)),
         "goal_cancel" => with_goal_store(|store| goal_api::goal_cancel(&args, &session, store)),
-        "goal_result" => with_goal_store(|store| goal_api::goal_result(&args, &session, store)),
+        "goal_result" => goal_result_tool(&args, &session).await,
         "goal_run" => goal_run(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
     }
+}
+
+async fn goal_result_tool(args: &Value, session: &config::Session) -> Result<Value> {
+    let result = match TaskStore::new() {
+        Ok(store) => goal_api::goal_result_async(args, session, &store).await,
+        Err(error) => Err(goal_api::GoalApiError::from_orchestrator(error)),
+    };
+    goal_tool_result(result)
 }
 
 fn with_goal_store<T, F>(operation: F) -> Result<Value>
@@ -1637,6 +1645,20 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn goal_result_failure_is_a_tool_error_not_a_successful_candidate() {
+        let error = goal_api::GoalApiError::from_orchestrator(
+            crate::orchestrator_error::OrchestratorError::CorruptGoal(
+                "terminal managed Goal lacks workspace verification evidence".to_owned(),
+            ),
+        );
+        let response = goal_tool_result::<serde_json::Value>(Err(error)).unwrap();
+        assert_eq!(response["isError"], true);
+        let body: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["code"], "GOAL_STATE_CORRUPT");
+    }
 
     struct DropNotice(Option<oneshot::Sender<()>>);
 
