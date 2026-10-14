@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,11 @@ use crate::goal::{
 use crate::managed_worktree::WorkspaceMode;
 use crate::managed_worktree_observe::HostGit;
 use crate::managed_worktree_prepare::ManagedWorkspaceError;
+use crate::managed_worktree_snapshot_coherence::{
+    SnapshotCoherenceError, StableWorkspaceObservation, observe_stable_managed_workspace,
+};
+use crate::managed_worktree_snapshot_manifest::assemble_workspace_snapshot_manifest;
+use crate::managed_worktree_writer_paths::derive_writer_mutated_paths;
 use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -23,6 +30,7 @@ use crate::task::{
     WorkerKind,
 };
 use crate::task_store::{TaskStore, utc_now_rfc3339};
+use crate::workspace_snapshot::NormalizedWorkspacePath;
 
 /// Bounded number of failed-task replan requests accepted in one `goal_resume`
 /// call, so a single request can supersede a small, explicitly named set of
@@ -117,6 +125,14 @@ impl GoalApiError {
             code: "IDEMPOTENCY_CONFLICT",
             message: "failed-task replan request conflicts with durable history".to_owned(),
             active_goal: Some(identity_view(goal)),
+        }
+    }
+
+    fn managed_result_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "MANAGED_WORKSPACE_RESULT_UNAVAILABLE",
+            message: message.into(),
+            active_goal: None,
         }
     }
 
@@ -383,9 +399,44 @@ pub(crate) struct GoalResultView {
     blockers: Vec<BlockerView>,
     verification: VerificationSummaryView,
     evidence_items: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_workspace: Option<ManagedWorkspaceResultView>,
     latest_checkpoint: Option<CheckpointSummaryView>,
     created_at: String,
     completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ManagedWorkspaceResultView {
+    worktree_id: String,
+    worktree_path: PathBuf,
+    branch_ref: String,
+    base_commit: String,
+    observed_head: String,
+    workspace_snapshot_digest: String,
+    final_verification_id: String,
+    task_verification_ids: Vec<ManagedTaskVerificationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staged_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untracked_paths: Option<Vec<String>>,
+    base_advanced: Option<ManagedBaseAdvancedView>,
+    // A matching snapshot is review evidence, not cleanup authorization.
+    cleanup_eligible: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ManagedTaskVerificationView {
+    task_id: String,
+    verification_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ManagedBaseAdvancedView {
+    old_base: String,
+    current_primary_head: String,
 }
 
 /// Where the host-owned managed-worktree root comes from.
@@ -872,6 +923,7 @@ pub(crate) fn goal_cancel(
     Ok(status_view(&durable))
 }
 
+#[cfg(test)]
 pub(crate) fn goal_result(
     args: &Value,
     session: &config::Session,
@@ -884,6 +936,113 @@ pub(crate) fn goal_result(
         .load_goal(&session.id, &goal_id)
         .map_err(GoalApiError::from_orchestrator)?;
     Ok(result_view(&goal))
+}
+
+type WorkspaceObservationFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<StableWorkspaceObservation, SnapshotCoherenceError>> + Send + 'a,
+    >,
+>;
+
+pub(crate) async fn goal_result_async(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+) -> Result<GoalResultView, GoalApiError> {
+    goal_result_with_observer(args, session, store, |goal, session, writer_paths| {
+        Box::pin(observe_stable_managed_workspace(
+            goal,
+            session,
+            writer_paths,
+        ))
+    })
+    .await
+}
+
+async fn goal_result_with_observer<O>(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    observe: O,
+) -> Result<GoalResultView, GoalApiError>
+where
+    O: for<'a> FnOnce(
+        &'a Goal,
+        &'a config::Session,
+        &'a [NormalizedWorkspacePath],
+    ) -> WorkspaceObservationFuture<'a>,
+{
+    let request: GoalResultRequest = parse_request(args)?;
+    validate_session_binding(&request.session_id, session)?;
+    let goal_id = parse_goal_id(&request.goal_id)?;
+    // Loading releases the store's read lock before observation; no mutation
+    // lease is held across Git/filesystem I/O or an await.
+    let goal = store
+        .load_goal(&session.id, &goal_id)
+        .map_err(GoalApiError::from_orchestrator)?;
+    let mut view = result_view(&goal);
+    if goal.workspace_mode().is_primary() {
+        return Ok(view);
+    }
+    let Some(evidence) = goal.managed_workspace_verification_evidence() else {
+        if goal.is_terminal() {
+            return Err(GoalApiError::from_orchestrator(
+                OrchestratorError::CorruptGoal(
+                    "terminal managed Goal lacks workspace verification evidence".to_owned(),
+                ),
+            ));
+        }
+        return Ok(view);
+    };
+    let writer_paths =
+        derive_writer_mutated_paths(&goal).map_err(GoalApiError::from_orchestrator)?;
+    let observation = observe(&goal, session, &writer_paths)
+        .await
+        .map_err(|error| GoalApiError::managed_result_unavailable(error.to_string()))?;
+    let record = goal.managed_worktree().ok_or_else(|| {
+        GoalApiError::from_orchestrator(OrchestratorError::CorruptGoal(
+            "managed workspace evidence lacks a durable worktree record".to_owned(),
+        ))
+    })?;
+    let manifest = assemble_workspace_snapshot_manifest(record, &observation)
+        .map_err(|error| GoalApiError::managed_result_unavailable(error.to_string()))?;
+    if manifest.digest() != evidence.workspace_snapshot_digest()
+        || observation.metadata.head != evidence.observed_head()
+    {
+        return Err(GoalApiError::managed_result_unavailable(
+            "fresh workspace snapshot differs from durable verification evidence",
+        ));
+    }
+    let workspace = view.managed_workspace.as_mut().ok_or_else(|| {
+        GoalApiError::from_orchestrator(OrchestratorError::CorruptGoal(
+            "validated managed evidence has no result view".to_owned(),
+        ))
+    })?;
+    workspace.changed_paths = Some(
+        observation
+            .metadata
+            .changed_paths
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect(),
+    );
+    workspace.staged_paths = Some(
+        observation
+            .metadata
+            .staged_paths
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect(),
+    );
+    workspace.untracked_paths = Some(
+        observation
+            .metadata
+            .untracked_paths
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect(),
+    );
+    Ok(view)
 }
 
 fn parse_request<T: DeserializeOwned>(args: &Value) -> Result<T, GoalApiError> {
@@ -1437,6 +1596,40 @@ fn status_view(goal: &Goal) -> GoalStatusView {
 }
 
 fn result_view(goal: &Goal) -> GoalResultView {
+    // TaskStore loads validate the durable evidence against this Goal. Absence
+    // never implies a verified snapshot, even if a managed record exists.
+    let managed_workspace = goal
+        .managed_workspace_verification_evidence()
+        .and_then(|evidence| {
+            let record = goal.managed_worktree()?;
+            Some(ManagedWorkspaceResultView {
+                worktree_id: record.worktree_id().as_str().to_owned(),
+                worktree_path: record.worktree_root().to_path_buf(),
+                branch_ref: record.branch_ref().to_owned(),
+                base_commit: record.base_commit().to_owned(),
+                observed_head: evidence.observed_head().to_owned(),
+                workspace_snapshot_digest: evidence.workspace_snapshot_digest().to_owned(),
+                final_verification_id: evidence.final_verification_id().as_str().to_owned(),
+                task_verification_ids: evidence
+                    .task_verification_identities()
+                    .iter()
+                    .map(|(task_id, verification_id)| ManagedTaskVerificationView {
+                        task_id: task_id.as_str().to_owned(),
+                        verification_id: verification_id.as_str().to_owned(),
+                    })
+                    .collect(),
+                changed_paths: None,
+                staged_paths: None,
+                untracked_paths: None,
+                base_advanced: evidence
+                    .base_advanced()
+                    .map(|advanced| ManagedBaseAdvancedView {
+                        old_base: advanced.old_base().to_owned(),
+                        current_primary_head: advanced.current_primary_head().to_owned(),
+                    }),
+                cleanup_eligible: false,
+            })
+        });
     let mandatory_task_outcomes = task_views(goal)
         .into_iter()
         .filter(|task| task.mandatory && task.status != TaskStatus::Superseded)
@@ -1463,6 +1656,7 @@ fn result_view(goal: &Goal) -> GoalResultView {
         blockers: blocker_views(goal),
         verification: verification_summary(goal),
         evidence_items,
+        managed_workspace,
         latest_checkpoint: latest_checkpoint(goal),
         created_at: goal.created_at().to_owned(),
         completed_at: goal.completed_at().map(str::to_owned),
@@ -1704,7 +1898,16 @@ mod tests {
     use serde_json::json;
 
     use crate::fallback::{SideEffectClass, SideEffectState};
-    use crate::goal::CheckpointReason;
+    use crate::goal::{
+        CheckpointReason, GoalCriterionBinding, GoalFinalVerificationRecord,
+        GoalFinalVerificationSpec, GoalVerificationRequirement, ManagedWorkspaceBaseAdvanced,
+        ManagedWorkspaceVerificationEvidenceV1,
+    };
+    use crate::managed_worktree::{ManagedWorktreeRecord, WorktreeId};
+    use crate::managed_worktree_snapshot_coherence::{
+        StableGitVisiblePath, StableSnapshotIndexEntry, StableSnapshotMetadata,
+    };
+    use crate::managed_worktree_snapshot_observe::{GitFileModePolicy, SnapshotIndexMode};
     use crate::mutation::{
         MutationIntent, MutationIntentState, MutationOperationIntent, MutationPreimage,
     };
@@ -1713,10 +1916,11 @@ mod tests {
     use crate::replanner::{ReplannerBackend, ReplannerError, ReplannerRequest};
     use crate::task::{
         AttemptOutcome, ReadonlyTransportRecoveryAuthorityKind, ReadonlyTransportRecoveryKind,
-        ReplaySafety, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
+        ReplaySafety, Task, TaskEvidence, TaskOperationKind, TaskScope, TaskStatus,
         TaskTransitionContext, VerificationResult, WorkerKind, WorkerReport,
     };
     use crate::task_store::FaultPoint;
+    use crate::workspace_snapshot::CandidateObjectIdentity;
     use crate::writer::{
         ReviewerBackend, ReviewerRequest, WriterBackend, WriterError, WriterRequest,
     };
@@ -3492,6 +3696,169 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    const RESULT_BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+    const RESULT_HEAD: &str = "1123456789abcdef0123456789abcdef01234567";
+    const RESULT_PRIMARY_HEAD: &str = "2123456789abcdef0123456789abcdef01234567";
+    const RESULT_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn managed_result_goal(session: &config::Session, root: &Path) -> Goal {
+        let id = GoalId::new();
+        let record = ManagedWorktreeRecord::requested(
+            &id,
+            WorktreeId::new(),
+            session.cwd.clone(),
+            root.join("common"),
+            root.join("managed"),
+            RESULT_BASE.to_owned(),
+            None,
+            1,
+            0,
+        )
+        .unwrap()
+        .to_prepared()
+        .unwrap()
+        .to_active(RESULT_HEAD, NOW)
+        .unwrap();
+        let mut goal = Goal::new_managed_with_id(
+            id,
+            session.id.clone(),
+            session.cwd.clone(),
+            "managed result".to_owned(),
+            None,
+            vec![],
+            vec!["verified task".to_owned()],
+            NOW,
+            record,
+        )
+        .unwrap();
+        let task = Task::new(
+            "task",
+            "objective",
+            true,
+            WorkerKind::CodexReadonly,
+            TaskScope::new(
+                vec![root.join("managed").join("src")],
+                vec![],
+                TaskOperationKind::ReadOnly,
+                ReplaySafety::SafeReadOnly,
+            ),
+            vec![],
+            1,
+            1,
+            NOW,
+        )
+        .unwrap();
+        let task_id = task.id().clone();
+        let binding = GoalCriterionBinding::new(
+            goal.completion_criteria()[0].id().clone(),
+            vec![GoalVerificationRequirement::TaskVerified {
+                task_id: task_id.clone(),
+            }],
+        );
+        goal.materialize_initial_plan_with_contract(
+            vec![task],
+            GoalFinalVerificationSpec::new(1, vec![binding]),
+            NOW,
+        )
+        .unwrap();
+        let settled = TaskTransitionContext {
+            active_worker_stopped: true,
+            side_effect_reconciled: true,
+        };
+        goal.transition_task(&task_id, TaskStatus::Running, settled, NOW)
+            .unwrap();
+        goal.transition_task(&task_id, TaskStatus::Verifying, settled, NOW)
+            .unwrap();
+        let verification = VerificationResult::new(VerificationOutcome::Passed, vec![], NOW, NOW);
+        let task_verification_id = verification.id().clone();
+        goal.task_record_verification_result(&task_id, verification)
+            .unwrap();
+        goal.transition_task(&task_id, TaskStatus::Completed, settled, NOW)
+            .unwrap();
+        let revision = goal.revision();
+        let final_verification = GoalFinalVerificationRecord::new(
+            VerificationOutcome::Passed,
+            goal.id().clone(),
+            revision,
+            revision,
+            1,
+            "b".repeat(64),
+            vec![],
+            NOW,
+            NOW,
+        );
+        let final_id = final_verification.id().clone();
+        let mut value = serde_json::to_value(&goal).unwrap();
+        value["final_verifications"] = json!([final_verification]);
+        let mut goal: Goal = serde_json::from_value(value).unwrap();
+        goal.validate().unwrap();
+        goal.bind_managed_workspace_verification_evidence(
+            ManagedWorkspaceVerificationEvidenceV1::new(
+                goal.id().clone(),
+                revision,
+                1,
+                goal.managed_worktree().unwrap().worktree_id().clone(),
+                RESULT_BASE.to_owned(),
+                RESULT_HEAD.to_owned(),
+                RESULT_DIGEST.to_owned(),
+                final_id,
+                vec![(task_id, task_verification_id)],
+                Some(
+                    ManagedWorkspaceBaseAdvanced::new(
+                        RESULT_BASE.to_owned(),
+                        RESULT_PRIMARY_HEAD.to_owned(),
+                    )
+                    .unwrap(),
+                ),
+                NOW.to_owned(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        goal
+    }
+
+    fn result_observation() -> StableWorkspaceObservation {
+        let path = |name: &str| NormalizedWorkspacePath::parse(name.to_owned()).unwrap();
+        let regular = || CandidateObjectIdentity::RegularFile {
+            content_sha256: RESULT_DIGEST.to_owned(),
+            size_bytes: 1,
+            executable: false,
+        };
+        StableWorkspaceObservation {
+            metadata: StableSnapshotMetadata {
+                head: RESULT_HEAD.to_owned(),
+                file_mode_policy: GitFileModePolicy::TrustExecutableBit,
+                changed_paths: vec![path("src/changed.rs")],
+                staged_paths: vec![path("src/staged.rs")],
+                untracked_paths: vec![path("src/new.rs")],
+                index_entries: vec![StableSnapshotIndexEntry {
+                    path: path("src/staged.rs"),
+                    mode: SnapshotIndexMode::Regular { executable: false },
+                    oid: RESULT_BASE.to_owned(),
+                }],
+            },
+            git_visible_paths: vec![
+                StableGitVisiblePath {
+                    path: path("src/changed.rs"),
+                    index_object: regular(),
+                    worktree_object: regular(),
+                },
+                StableGitVisiblePath {
+                    path: path("src/staged.rs"),
+                    index_object: regular(),
+                    worktree_object: regular(),
+                },
+                StableGitVisiblePath {
+                    path: path("src/new.rs"),
+                    index_object: CandidateObjectIdentity::Absent,
+                    worktree_object: regular(),
+                },
+            ],
+            writer_mutated_paths: vec![],
+        }
+    }
+
     #[test]
     fn result_distinguishes_nonterminal_failed_cancelled_and_completed() {
         let (root, session, store) = fixture("results");
@@ -3504,6 +3871,12 @@ mod tests {
         .unwrap();
         assert!(!nonterminal.terminal);
         assert_eq!(nonterminal.result_state, "NOT_TERMINAL");
+        assert!(
+            serde_json::to_value(&nonterminal)
+                .unwrap()
+                .get("managed_workspace")
+                .is_none()
+        );
 
         goal_cancel(
             &serde_json::json!({"session_id": session.id, "goal_id": started.goal_id}),
@@ -3549,6 +3922,208 @@ mod tests {
             Some(VerificationOutcome::Passed)
         );
         assert_eq!(completed_result.mandatory_task_outcomes.len(), 1);
+        assert!(
+            serde_json::to_value(&completed_result)
+                .unwrap()
+                .get("managed_workspace")
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_result_reports_only_bound_durable_evidence() {
+        let (root, session, store) = fixture("managed-result");
+        let goal = managed_result_goal(&session, &root);
+        let id = goal.id().clone();
+        let record = goal.managed_worktree().unwrap();
+        let evidence = goal.managed_workspace_verification_evidence().unwrap();
+        store.create_goal(&goal).unwrap();
+        let result = goal_result(
+            &json!({"session_id": session.id, "goal_id": id.as_str()}),
+            &session,
+            &store,
+        )
+        .unwrap();
+        let view = serde_json::to_value(result).unwrap();
+        assert_eq!(
+            view["managed_workspace"],
+            json!({
+                "worktree_id": record.worktree_id(),
+                "worktree_path": record.worktree_root(),
+                "branch_ref": record.branch_ref(),
+                "base_commit": RESULT_BASE,
+                "observed_head": RESULT_HEAD,
+                "workspace_snapshot_digest": RESULT_DIGEST,
+                "final_verification_id": evidence.final_verification_id(),
+                "task_verification_ids": [{
+                    "task_id": evidence.task_verification_identities()[0].0,
+                    "verification_id": evidence.task_verification_identities()[0].1,
+                }],
+                "base_advanced": {
+                    "old_base": RESULT_BASE,
+                    "current_primary_head": RESULT_PRIMARY_HEAD,
+                },
+                "cleanup_eligible": false,
+            })
+        );
+        assert!(
+            view["managed_workspace"]
+                .get("canonical_manifest")
+                .is_none()
+        );
+        assert!(view["managed_workspace"].get("diff").is_none());
+        for key in ["changed_paths", "staged_paths", "untracked_paths"] {
+            assert!(view["managed_workspace"].get(key).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_result_does_not_invent_missing_evidence_and_rejects_corrupt_evidence() {
+        let (root, session, store) = fixture("result-miss");
+        let goal_with_evidence = managed_result_goal(&session, &root);
+        let id = goal_with_evidence.id().clone();
+        let request = json!({"session_id": session.id, "goal_id": id.as_str()});
+        let mut document = serde_json::to_value(&goal_with_evidence).unwrap();
+        document["managed_workspace_verification_evidence"] = Value::Null;
+        let goal: Goal = serde_json::from_value(document).unwrap();
+        store.create_goal(&goal).unwrap();
+        let result = goal_result(&request, &session, &store).unwrap();
+        assert!(
+            serde_json::to_value(result)
+                .unwrap()
+                .get("managed_workspace")
+                .is_none()
+        );
+
+        let path = store.goal_path_for_test(&session.id, &id).unwrap();
+        let mut document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["managed_workspace_verification_evidence"] = json!({"schema_version": 1});
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let error = goal_result(&request, &session, &store).unwrap_err();
+        assert_eq!(error.code(), "GOAL_STATE_CORRUPT");
+
+        let mut document = serde_json::to_value(&goal_with_evidence).unwrap();
+        document["managed_workspace_verification_evidence"]["worktree_id"] =
+            json!(WorktreeId::new());
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(
+            goal_result(&request, &session, &store).unwrap_err().code(),
+            "GOAL_STATE_CORRUPT"
+        );
+
+        let mut document = serde_json::to_value(&goal_with_evidence).unwrap();
+        let identity =
+            document["managed_workspace_verification_evidence"]["task_verification_identities"][0]
+                .clone();
+        document["managed_workspace_verification_evidence"]["task_verification_identities"] =
+            json!(vec![
+                identity;
+                crate::goal::MAX_TASK_VERIFICATION_IDENTITIES + 1
+            ]);
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(
+            goal_result(&request, &session, &store).unwrap_err().code(),
+            "GOAL_STATE_CORRUPT"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_result_exposes_only_digest_bound_path_summaries() {
+        let (root, session, store) = fixture("async-result");
+        let observation = result_observation();
+        let goal = managed_result_goal(&session, &root);
+        let digest =
+            assemble_workspace_snapshot_manifest(goal.managed_worktree().unwrap(), &observation)
+                .unwrap()
+                .digest();
+        let mut document = serde_json::to_value(&goal).unwrap();
+        document["managed_workspace_verification_evidence"]["workspace_snapshot_digest"] =
+            json!(digest);
+        let goal: Goal = serde_json::from_value(document).unwrap();
+        store.create_goal(&goal).unwrap();
+        let args = json!({"session_id": session.id, "goal_id": goal.id().as_str()});
+        let matching = observation.clone();
+        let view = goal_result_with_observer(&args, &session, &store, move |_, _, paths| {
+            assert!(paths.is_empty());
+            Box::pin(async move { Ok(matching) })
+        })
+        .await
+        .unwrap();
+        let workspace = serde_json::to_value(view).unwrap()["managed_workspace"].clone();
+        assert_eq!(workspace["changed_paths"], json!(["src/changed.rs"]));
+        assert_eq!(workspace["staged_paths"], json!(["src/staged.rs"]));
+        assert_eq!(workspace["untracked_paths"], json!(["src/new.rs"]));
+        assert!(workspace.get("canonical_bytes").is_none());
+        assert!(workspace.get("diff").is_none());
+
+        let mut changed = observation;
+        changed.git_visible_paths[0].worktree_object = CandidateObjectIdentity::RegularFile {
+            content_sha256: "b".repeat(64),
+            size_bytes: 1,
+            executable: false,
+        };
+        let error = goal_result_with_observer(&args, &session, &store, move |_, _, _| {
+            Box::pin(async move { Ok(changed) })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "MANAGED_WORKSPACE_RESULT_UNAVAILABLE");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_result_rejects_terminal_managed_without_evidence_and_skips_primary_observation()
+    {
+        let (root, session, store) = fixture("async-result-missing");
+        let started = goal_start(&start_args(&session, "primary"), &session, &store).unwrap();
+        let primary = goal_result_with_observer(
+            &json!({"session_id": session.id, "goal_id": started.goal_id}),
+            &session,
+            &store,
+            |_, _, _| panic!("PRIMARY must not observe Git"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_value(primary)
+                .unwrap()
+                .get("managed_workspace")
+                .is_none()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (root, session, store) = fixture("async-result-managed");
+        let goal = managed_result_goal(&session, &root);
+        let mut value = serde_json::to_value(&goal).unwrap();
+        value["managed_workspace_verification_evidence"] = Value::Null;
+        let goal: Goal = serde_json::from_value(value).unwrap();
+        let args = json!({"session_id": session.id, "goal_id": goal.id().as_str()});
+        store.create_goal(&goal).unwrap();
+        let pending = goal_result_with_observer(&args, &session, &store, |_, _, _| {
+            panic!("nonterminal missing evidence must not observe Git")
+        })
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_value(pending)
+                .unwrap()
+                .get("managed_workspace")
+                .is_none()
+        );
+        store
+            .mutate_goal_snapshot(&session.id, goal.id(), goal.revision(), |goal, now| {
+                goal.transition_to(GoalStatus::Failed, now)
+            })
+            .unwrap();
+        let error = goal_result_with_observer(&args, &session, &store, |_, _, _| {
+            panic!("missing evidence must not observe Git")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "GOAL_STATE_CORRUPT");
         std::fs::remove_dir_all(root).unwrap();
     }
 

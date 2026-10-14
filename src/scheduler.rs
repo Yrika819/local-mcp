@@ -1,6 +1,7 @@
 use crate::config;
 use crate::goal::{
-    Goal, GoalId, GoalStatus, ManagedWorkspaceVerificationEvidenceV1, VerificationOrigin,
+    Goal, GoalId, GoalStatus, ManagedWorkspaceBaseAdvanced, ManagedWorkspaceVerificationEvidenceV1,
+    VerificationOrigin,
 };
 use crate::goal_verifier::{self, GoalVerifierError};
 use crate::orchestrator_error::OrchestratorError;
@@ -621,6 +622,25 @@ async fn persist_managed_workspace_verification_evidence(
         &observation,
     )
     .map_err(|error| error.to_string())?;
+    let primary_observation = crate::managed_worktree_observe::observe_repository(
+        &crate::managed_worktree_observe::HostGit::new(),
+        verified_goal.cwd(),
+        &[],
+        &[],
+    )
+    .map_err(|error| format!("primary HEAD observation failed: {error}"))?;
+    let current_primary_head = primary_observation
+        .head()
+        .ok_or_else(|| "primary HEAD is not a commit".to_owned())?;
+    let base_advanced = (current_primary_head != worktree.base_commit())
+        .then(|| {
+            ManagedWorkspaceBaseAdvanced::new(
+                worktree.base_commit().to_owned(),
+                current_primary_head.to_owned(),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let task_verification_identities = verified_goal
         .final_verification_spec()
         .into_iter()
@@ -657,7 +677,7 @@ async fn persist_managed_workspace_verification_evidence(
         manifest.digest(),
         verification_id.clone(),
         task_verification_identities,
-        None,
+        base_advanced,
         crate::task_store::utc_now_rfc3339(),
     )
     .map_err(|error| error.to_string())?;
