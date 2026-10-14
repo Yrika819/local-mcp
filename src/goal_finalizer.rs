@@ -401,7 +401,11 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
                     "managed snapshot evidence does not match the applicable final verification",
                 ));
             }
-            Some(_) => {}
+            Some(_) => blockers.push(GoalFinalizationBlocker::new(
+                "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED",
+                None,
+                "managed Goal remains fail-closed until the fresh finalizer re-observation gate is installed",
+            )),
         }
     }
     let outcome = if blockers.is_empty() {
@@ -420,6 +424,7 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
                 | "FINAL_VERIFICATION_INDETERMINATE"
                 | "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISSING"
                 | "MANAGED_WORKSPACE_SNAPSHOT_EVIDENCE_MISMATCH"
+                | "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED"
         )
     }) {
         GoalFinalizationOutcome::Blocked

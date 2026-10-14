@@ -845,7 +845,7 @@ fn bound_goal() -> Goal {
         revision,
         revision,
         1,
-        "b".repeat(64),
+        goal.final_verification_spec().unwrap().canonical_digest(),
         Vec::new(),
         NOW,
         NOW,
@@ -926,6 +926,30 @@ fn evidence_binding_is_idempotent_and_refuses_replacement() {
             .is_err()
     );
     assert_eq!(goal, committed, "different evidence must not overwrite");
+}
+
+#[test]
+fn managed_goal_with_snapshot_evidence_stays_blocked_until_fresh_reobservation_exists() {
+    let mut value = serde_json::to_value(bound_goal()).unwrap();
+    value["status"] = serde_json::to_value(GoalStatus::Verifying).unwrap();
+    let mut goal: Goal = serde_json::from_value(value).unwrap();
+    let evidence = serde_json::from_value(bound_evidence_value(&goal)).unwrap();
+    goal.bind_managed_workspace_verification_evidence(evidence)
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("local-mcp-slice-3c-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = TaskStore::with_state_root(root.clone());
+    store.create_goal(&goal).unwrap();
+    let snapshot = prepare_goal_finalization(&store, goal.session_id(), goal.id()).unwrap();
+    let decision = evaluate_goal_finalization(&snapshot).unwrap();
+    assert_eq!(decision.outcome(), GoalFinalizationOutcome::Blocked);
+    assert!(
+        decision
+            .blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED")
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
