@@ -321,6 +321,35 @@ impl Drop for Fixture {
     }
 }
 
+fn assert_external_workspace_change_blocks_finalization(fixture: &Fixture) {
+    fixture.assert_primary_unchanged();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime
+        .block_on(finalize_goal_at_revision_with_session(
+            &fixture.store,
+            &fixture.session,
+            fixture.goal.id(),
+            fixture.goal.revision(),
+        ))
+        .unwrap();
+    assert_eq!(
+        result.decision().outcome(),
+        GoalFinalizationOutcome::Blocked
+    );
+    assert!(
+        result
+            .decision()
+            .blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "MANAGED_WORKSPACE_SNAPSHOT_MISMATCH")
+    );
+    assert_eq!(result.goal().status(), crate::goal::GoalStatus::Verifying);
+    fixture.assert_primary_unchanged();
+}
+
 #[test]
 fn real_linked_worktree_snapshot_persists_and_finalizer_reobserves() {
     let synchronous = Fixture::new();
@@ -373,28 +402,57 @@ fn real_linked_worktree_snapshot_persists_and_finalizer_reobserves() {
     );
     clean.assert_primary_unchanged();
 
-    let mutated = Fixture::new();
-    std::fs::write(mutated.worktree.join("tracked.txt"), "external edit\n").unwrap();
-    mutated.assert_primary_unchanged();
+    let mutated_content = Fixture::new();
+    std::fs::write(
+        mutated_content.worktree.join("tracked.txt"),
+        "external edit\n",
+    )
+    .unwrap();
+    assert_external_workspace_change_blocks_finalization(&mutated_content);
+
+    let added_file = Fixture::new();
+    std::fs::write(added_file.worktree.join("untracked.txt"), "new file\n").unwrap();
+    assert_external_workspace_change_blocks_finalization(&added_file);
+
+    let deleted_file = Fixture::new();
+    std::fs::remove_file(deleted_file.worktree.join("tracked.txt")).unwrap();
+    assert_external_workspace_change_blocks_finalization(&deleted_file);
+
+    let changed_index = Fixture::new();
+    std::fs::write(changed_index.worktree.join("tracked.txt"), "staged edit\n").unwrap();
+    git(&changed_index.worktree, &["add", "tracked.txt"]);
+    std::fs::write(
+        changed_index.worktree.join("tracked.txt"),
+        "unstaged edit\n",
+    )
+    .unwrap();
+    assert_external_workspace_change_blocks_finalization(&changed_index);
+}
+
+#[test]
+fn moved_managed_worktree_cannot_finalize() {
+    let fixture = Fixture::new();
+    let moved = fixture.cleanup_root.join("managed").join("moved-candidate");
+    std::fs::rename(&fixture.worktree, &moved).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let result = runtime
         .block_on(finalize_goal_at_revision_with_session(
-            &mutated.store,
-            &mutated.session,
-            mutated.goal.id(),
-            mutated.goal.revision(),
+            &fixture.store,
+            &fixture.session,
+            fixture.goal.id(),
+            fixture.goal.revision(),
         ))
         .unwrap();
-    assert_eq!(
+    assert_ne!(result.goal().status(), crate::goal::GoalStatus::Completed);
+    assert!(matches!(
         result.decision().outcome(),
-        GoalFinalizationOutcome::Blocked
+        GoalFinalizationOutcome::Blocked | GoalFinalizationOutcome::NotReady
+    ));
+    assert_eq!(
+        git(&fixture.primary, &["rev-parse", "HEAD"]),
+        fixture.primary_head
     );
-    assert!(
-        result
-            .decision()
-            .blockers()
-            .iter()
-            .any(|blocker| { blocker.code() == "MANAGED_WORKSPACE_SNAPSHOT_MISMATCH" })
-    );
-    assert_eq!(result.goal().status(), crate::goal::GoalStatus::Verifying);
-    mutated.assert_primary_unchanged();
 }
