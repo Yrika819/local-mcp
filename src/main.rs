@@ -79,6 +79,8 @@ mod managed_worktree_creation_tests;
 #[cfg(test)]
 mod managed_worktree_discovery_tests;
 #[cfg(test)]
+mod managed_worktree_linked_acceptance_tests;
+#[cfg(test)]
 mod managed_worktree_snapshot_coherence_tests;
 #[cfg(test)]
 mod managed_worktree_snapshot_manifest_tests;

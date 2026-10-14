@@ -22,7 +22,8 @@ use crate::goal::{
     ManagedWorkspaceBaseAdvanced, ManagedWorkspaceVerificationEvidenceV1,
 };
 use crate::goal_finalizer::{
-    GoalFinalizationOutcome, evaluate_goal_finalization, prepare_goal_finalization,
+    GoalFinalizationOutcome, evaluate_goal_finalization, finalize_goal_at_revision,
+    prepare_goal_finalization,
 };
 use crate::managed_worktree::{ManagedWorktreeRecord, WorktreeId};
 use crate::orchestrator_error::OrchestratorError;
@@ -929,7 +930,7 @@ fn evidence_binding_is_idempotent_and_refuses_replacement() {
 }
 
 #[test]
-fn managed_goal_with_snapshot_evidence_stays_blocked_until_fresh_reobservation_exists() {
+fn managed_goal_without_fresh_reobservation_cannot_complete_synchronously() {
     let mut value = serde_json::to_value(bound_goal()).unwrap();
     value["status"] = serde_json::to_value(GoalStatus::Verifying).unwrap();
     let mut goal: Goal = serde_json::from_value(value).unwrap();
@@ -940,15 +941,20 @@ fn managed_goal_with_snapshot_evidence_stays_blocked_until_fresh_reobservation_e
     std::fs::create_dir_all(&root).unwrap();
     let store = TaskStore::with_state_root(root.clone());
     store.create_goal(&goal).unwrap();
-    let snapshot = prepare_goal_finalization(&store, goal.session_id(), goal.id()).unwrap();
-    let decision = evaluate_goal_finalization(&snapshot).unwrap();
-    assert_eq!(decision.outcome(), GoalFinalizationOutcome::Blocked);
+    let result =
+        finalize_goal_at_revision(&store, goal.session_id(), goal.id(), goal.revision()).unwrap();
+    assert_eq!(
+        result.decision().outcome(),
+        GoalFinalizationOutcome::Blocked
+    );
     assert!(
-        decision
+        result
+            .decision()
             .blockers()
             .iter()
             .any(|blocker| blocker.code() == "MANAGED_WORKSPACE_REOBSERVATION_REQUIRED")
     );
+    assert_eq!(result.goal().status(), GoalStatus::Verifying);
     std::fs::remove_dir_all(root).unwrap();
 }
 
