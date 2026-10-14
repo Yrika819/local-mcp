@@ -710,6 +710,39 @@ impl ManagedWorkspaceVerificationEvidenceV1 {
         // the bindings above have named their exact counterpart. Records that
         // violate both report the binding first; either layer fails closed.
         self.validate_structure()?;
+        let mut expected_task_ids = goal
+            .final_verification_spec()
+            .into_iter()
+            .flat_map(|spec| spec.criterion_bindings())
+            .flat_map(|binding| binding.requirements())
+            .map(GoalVerificationRequirement::task_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        expected_task_ids.sort();
+        expected_task_ids.dedup();
+        let expected_task_verifications = expected_task_ids
+            .into_iter()
+            .map(|task_id| {
+                let verification = goal
+                    .tasks
+                    .get(&task_id)
+                    .and_then(|task| task.verification_results().last())
+                    .filter(|verification| verification.outcome() == VerificationOutcome::Passed)
+                    .ok_or_else(|| {
+                        OrchestratorError::CorruptGoal(
+                            "workspace evidence task verification is absent or not passing"
+                                .to_owned(),
+                        )
+                    })?;
+                Ok((task_id, verification.id().clone()))
+            })
+            .collect::<Result<Vec<_>, OrchestratorError>>()?;
+        if self.task_verification_identities != expected_task_verifications {
+            return Err(OrchestratorError::CorruptGoal(
+                "workspace evidence task verification identities do not match Goal history"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1582,6 +1615,23 @@ impl Goal {
         self.managed_workspace_verification_evidence.as_ref()
     }
 
+    pub(crate) fn bind_managed_workspace_verification_evidence(
+        &mut self,
+        evidence: ManagedWorkspaceVerificationEvidenceV1,
+    ) -> Result<(), OrchestratorError> {
+        if let Some(existing) = &self.managed_workspace_verification_evidence {
+            if existing == &evidence {
+                return Ok(());
+            }
+            return Err(OrchestratorError::CorruptGoal(
+                "durable managed-workspace verification evidence cannot be replaced".to_owned(),
+            ));
+        }
+        evidence.validate_against_goal(self)?;
+        self.managed_workspace_verification_evidence = Some(evidence);
+        Ok(())
+    }
+
     /// Outstanding creation intent, if managed-worktree creation is in flight.
     pub(crate) fn managed_worktree_creation_intent(
         &self,
@@ -1813,9 +1863,22 @@ impl Goal {
         }
         let digest = self.final_verification_spec.as_ref()?.canonical_digest();
         self.final_verifications.iter().rev().find(|record| {
+            let evidence_commit_revision = self
+                .managed_workspace_verification_evidence
+                .as_ref()
+                .filter(|evidence| {
+                    evidence.final_verification_id() == &record.id
+                        && evidence.goal_revision() == record.committed_goal_revision
+                })
+                .and_then(|_| record.committed_goal_revision.checked_add(1));
             let revision_applicable = record.committed_goal_revision == self.revision
                 || (self.status == GoalStatus::Completed
-                    && record.committed_goal_revision.checked_add(1) == Some(self.revision));
+                    && record.committed_goal_revision.checked_add(1) == Some(self.revision))
+                || (self.status == GoalStatus::Verifying
+                    && evidence_commit_revision == Some(self.revision))
+                || (self.status == GoalStatus::Completed
+                    && evidence_commit_revision.and_then(|revision| revision.checked_add(1))
+                        == Some(self.revision));
             record.source == VerificationOrigin::HostDeterministicGoalVerifier
                 && record.goal_id == self.id
                 && record.plan_revision == self.plan_revision

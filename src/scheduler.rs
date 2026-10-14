@@ -1,5 +1,7 @@
 use crate::config;
-use crate::goal::{Goal, GoalId, GoalStatus};
+use crate::goal::{
+    Goal, GoalId, GoalStatus, ManagedWorkspaceVerificationEvidenceV1, VerificationOrigin,
+};
 use crate::goal_verifier::{self, GoalVerifierError};
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner::{self, PlannerBackend, PlannerError};
@@ -468,7 +470,32 @@ where
         }
         SchedulerDecision::VerifyGoal => {
             match goal_verifier::verify_goal(store, &session.id, goal_id, revision_before) {
-                Ok(_) => SchedulerStepOutcome::Applied,
+                Ok(result) => {
+                    if result.decision().outcome() != crate::task::VerificationOutcome::Passed
+                        || result.goal().workspace_mode().is_primary()
+                        || result
+                            .goal()
+                            .managed_workspace_verification_evidence()
+                            .is_some()
+                    {
+                        SchedulerStepOutcome::Applied
+                    } else {
+                        match persist_managed_workspace_verification_evidence(
+                            store,
+                            session,
+                            result.goal(),
+                            result.record_id(),
+                        )
+                        .await
+                        {
+                            Ok(()) => SchedulerStepOutcome::Applied,
+                            Err(detail) => SchedulerStepOutcome::LowerAuthorityError {
+                                authority: SchedulerAuthority::GoalVerifier,
+                                detail,
+                            },
+                        }
+                    }
+                }
                 Err(error) => map_goal_verifier_error(&error),
             }
         }
@@ -552,6 +579,116 @@ where
         revision_after,
         outcome,
     })
+}
+
+async fn persist_managed_workspace_verification_evidence(
+    store: &TaskStore,
+    session: &config::Session,
+    verified_goal: &Goal,
+    verification_id: Option<&crate::task::VerificationId>,
+) -> Result<(), String> {
+    let verification_id = verification_id
+        .cloned()
+        .ok_or_else(|| "passing Goal verification has no durable identity".to_owned())?;
+    let _final_verification = verified_goal
+        .latest_applicable_final_verification()
+        .filter(|record| {
+            record.id() == &verification_id
+                && record.source() == VerificationOrigin::HostDeterministicGoalVerifier
+                && record.outcome() == crate::task::VerificationOutcome::Passed
+        })
+        .ok_or_else(|| {
+            "passing Goal verification is not applicable to the durable Goal".to_owned()
+        })?;
+    if verified_goal.status() != GoalStatus::Verifying {
+        return Err("managed Goal did not enter VERIFYING after final verification".to_owned());
+    }
+    let worktree = verified_goal
+        .managed_worktree()
+        .ok_or_else(|| "managed Goal has no durable worktree record".to_owned())?;
+    let writer_paths =
+        crate::managed_worktree_writer_paths::derive_writer_mutated_paths(verified_goal)
+            .map_err(|error| error.to_string())?;
+    let observation = crate::managed_worktree_snapshot_coherence::observe_stable_managed_workspace(
+        verified_goal,
+        session,
+        &writer_paths,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let manifest = crate::managed_worktree_snapshot_manifest::assemble_workspace_snapshot_manifest(
+        worktree,
+        &observation,
+    )
+    .map_err(|error| error.to_string())?;
+    let task_verification_identities = verified_goal
+        .final_verification_spec()
+        .into_iter()
+        .flat_map(|spec| spec.criterion_bindings())
+        .flat_map(|binding| binding.requirements())
+        .map(crate::goal::GoalVerificationRequirement::task_id)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|task_id| {
+            let verification = verified_goal
+                .tasks()
+                .get(&task_id)
+                .and_then(|task| task.verification_results().last())
+                .filter(|verification| {
+                    verification.outcome() == crate::task::VerificationOutcome::Passed
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "final-verification Task {} lacks passing verification history",
+                        task_id.as_str()
+                    )
+                })?;
+            Ok((task_id, verification.id().clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let evidence = ManagedWorkspaceVerificationEvidenceV1::new(
+        verified_goal.id().clone(),
+        verified_goal.revision(),
+        verified_goal.plan_revision(),
+        worktree.worktree_id().clone(),
+        worktree.base_commit().to_owned(),
+        observation.metadata.head,
+        manifest.digest(),
+        verification_id.clone(),
+        task_verification_identities,
+        None,
+        crate::task_store::utc_now_rfc3339(),
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_revision = verified_goal.revision();
+    let expected_plan_revision = verified_goal.plan_revision();
+    store
+        .mutate_goal_snapshot(
+            session.id.as_str(),
+            verified_goal.id(),
+            expected_revision,
+            |goal, _now| {
+                if goal.status() != GoalStatus::Verifying
+                    || goal.plan_revision() != expected_plan_revision
+                    || goal
+                        .latest_applicable_final_verification()
+                        .is_none_or(|record| {
+                            record.id() != &verification_id
+                                || record.source()
+                                    != VerificationOrigin::HostDeterministicGoalVerifier
+                                || record.outcome() != crate::task::VerificationOutcome::Passed
+                        })
+                {
+                    return Err(OrchestratorError::InvalidDag(
+                        "managed snapshot evidence lost its final-verification binding".to_owned(),
+                    ));
+                }
+                goal.bind_managed_workspace_verification_evidence(evidence.clone())
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn action_for_decision(decision: &SchedulerDecision) -> SchedulerAction {
