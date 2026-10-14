@@ -323,8 +323,7 @@ pub(crate) async fn evaluate(
         let mut scope_ok = true;
         for path in paths {
             any = true;
-            scope_ok &= in_allowed(path, snapshot.scope.allowed_paths())
-                && !in_boundaries(path, snapshot.scope.forbidden_paths());
+            scope_ok &= file_snapshot_path_in_scope(path, &snapshot.scope);
         }
         observations.push(Observation {
             index: None,
@@ -890,6 +889,46 @@ fn in_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
     !allowed.is_empty() && in_boundaries(path, allowed)
 }
 
+fn file_snapshot_path_in_scope(path: &Path, scope: &TaskScope) -> bool {
+    let path = normalize_scope_path_spelling(path);
+    let allowed = scope
+        .allowed_paths()
+        .iter()
+        .map(|path| normalize_scope_path_spelling(path))
+        .collect::<Vec<_>>();
+    let forbidden = scope
+        .forbidden_paths()
+        .iter()
+        .map(|path| normalize_scope_path_spelling(path))
+        .collect::<Vec<_>>();
+    in_allowed(&path, &allowed) && !in_boundaries(&path, &forbidden)
+}
+
+// The Windows writer may persist a host-generated FileSnapshot with the
+// equivalent verbatim-disk spelling while durable TaskScope boundaries use an
+// ordinary drive path. Normalize only that disk-prefix spelling; device and
+// UNC namespaces retain distinct identities and cannot gain scope authority.
+fn normalize_scope_path_spelling(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next()
+            && let Prefix::VerbatimDisk(drive) = prefix.kind()
+            && matches!(components.next(), Some(Component::RootDir))
+        {
+            let mut normalized = PathBuf::from(format!("{}:\\", drive as char));
+            for component in components {
+                if !matches!(component, Component::RootDir) {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            return normalized;
+        }
+    }
+    path.to_path_buf()
+}
+
 fn in_boundaries(path: &Path, boundaries: &[PathBuf]) -> bool {
     boundaries
         .iter()
@@ -984,4 +1023,40 @@ pub(crate) async fn test_observe_git_with_policy(
     verifier_git_observation::observe_with_policy(root, session, requires_approval)
         .await
         .map_err(VerifierError::Observation)
+}
+
+#[cfg(all(test, windows))]
+mod scope_path_spelling_tests {
+    use super::*;
+    use crate::task::{ReplaySafety, TaskOperationKind};
+
+    #[test]
+    fn only_absolute_verbatim_disk_file_snapshots_match_equivalent_scope_paths() {
+        let scope = TaskScope::new(
+            vec![PathBuf::from(r"C:\repo")],
+            vec![PathBuf::from(r"C:\repo\.git")],
+            TaskOperationKind::LocalMutation,
+            ReplaySafety::VerifyBeforeRetry,
+        );
+        assert!(file_snapshot_path_in_scope(
+            Path::new(r"\\?\C:\repo\candidate.txt"),
+            &scope
+        ));
+        assert!(!file_snapshot_path_in_scope(
+            Path::new(r"\\?\C:repo\candidate.txt"),
+            &scope
+        ));
+        assert!(!file_snapshot_path_in_scope(
+            Path::new(r"\\?\UNC\server\share\repo\candidate.txt"),
+            &scope
+        ));
+        assert!(!file_snapshot_path_in_scope(
+            Path::new(r"\\.\C:\repo\candidate.txt"),
+            &scope
+        ));
+        assert!(!file_snapshot_path_in_scope(
+            Path::new(r"\\?\C:\repo\.git\config"),
+            &scope
+        ));
+    }
 }

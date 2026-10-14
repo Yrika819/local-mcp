@@ -27,6 +27,13 @@ use crate::task::{
     VerificationId, VerificationOutcome, VerificationResult, WorkerKind,
 };
 use crate::task_store::TaskStore;
+use crate::{
+    planner::{PlannerBackend, PlannerError, PlannerRequest},
+    readonly_worker::{ReadonlyBackend, ReadonlyError, ReadonlyRequest},
+    replanner::{ReplannerBackend, ReplannerError, ReplannerRequest},
+    scheduler::SchedulerStepOutcome,
+    writer::{ReviewerBackend, ReviewerRequest, WriterBackend, WriterError, WriterRequest},
+};
 
 const NOW: &str = "2026-10-12T00:00:00Z";
 
@@ -427,6 +434,363 @@ fn real_linked_worktree_snapshot_persists_and_finalizer_reobserves() {
     )
     .unwrap();
     assert_external_workspace_change_blocks_finalization(&changed_index);
+}
+
+#[cfg(windows)]
+fn ordinary_windows_drive_path(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    if let Some(Component::Prefix(prefix)) = components.next()
+        && let Prefix::VerbatimDisk(drive) = prefix.kind()
+        && matches!(components.next(), Some(Component::RootDir))
+    {
+        let mut normalized = PathBuf::from(format!("{}:\\", drive as char));
+        for component in components {
+            if !matches!(component, Component::RootDir) {
+                normalized.push(component.as_os_str());
+            }
+        }
+        return normalized;
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn ordinary_windows_drive_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+struct FullRunFixture {
+    cleanup_root: PathBuf,
+    primary: PathBuf,
+    worktree: PathBuf,
+    session: Session,
+    store: TaskStore,
+    goal_id: GoalId,
+    primary_head: String,
+    primary_bytes: Vec<u8>,
+}
+
+impl FullRunFixture {
+    fn new() -> Self {
+        let cleanup_root =
+            std::env::temp_dir().join(format!("local-mcp-phase5-3f-{}", Uuid::new_v4()));
+        let primary = cleanup_root.join("primary");
+        let worktree = cleanup_root.join("managed").join("candidate");
+        let state = cleanup_root.join("state");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        git(&primary, &["init", "-q", "."]);
+        git(&primary, &["config", "core.autocrlf", "false"]);
+        git(
+            &primary,
+            &["config", "user.email", "phase5@example.invalid"],
+        );
+        git(&primary, &["config", "user.name", "Phase 5 Acceptance"]);
+        git(&primary, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(primary.join("tracked.txt"), "base content\n").unwrap();
+        git(&primary, &["add", "tracked.txt"]);
+        git(&primary, &["commit", "-q", "-m", "base"]);
+        let base = git(&primary, &["rev-parse", "HEAD"]);
+        let primary_bytes = std::fs::read(primary.join("tracked.txt")).unwrap();
+        let goal_id = GoalId::new();
+        let worktree_id = WorktreeId::parse(&Uuid::new_v4().to_string()).unwrap();
+        let branch = format!("local-mcp/goal/{}", goal_id.as_str());
+        let branch_ref = format!("refs/heads/{branch}");
+        let worktree_string = worktree.to_string_lossy().into_owned();
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                &worktree_string,
+                &base,
+            ],
+        );
+        git(
+            &primary,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                &crate::managed_worktree::managed_lock_reason(&goal_id),
+                &worktree_string,
+            ],
+        );
+        let primary = std::fs::canonicalize(primary).unwrap();
+        let worktree = ordinary_windows_drive_path(std::fs::canonicalize(worktree).unwrap());
+        let common_reported = git(
+            &primary,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let common_dir = std::fs::canonicalize(common_reported).unwrap();
+        let session = Session {
+            id: format!("s{}", Uuid::new_v4().simple()),
+            cwd: primary.clone(),
+            permitted_directories: vec![primary.clone(), worktree.parent().unwrap().to_path_buf()],
+        };
+        let record = ManagedWorktreeRecord::requested(
+            &goal_id,
+            worktree_id,
+            primary.clone(),
+            common_dir,
+            worktree.clone(),
+            base,
+            Some(branch_ref),
+            1,
+            0,
+        )
+        .unwrap()
+        .to_prepared()
+        .unwrap()
+        .consume_creation_attempt()
+        .unwrap()
+        .to_active(&git(&worktree, &["rev-parse", "HEAD"]), NOW)
+        .unwrap();
+        let goal = Goal::new_managed_with_id(
+            goal_id.clone(),
+            session.id.clone(),
+            primary,
+            "create and verify a candidate in the managed worktree",
+            None,
+            Vec::new(),
+            vec!["the managed candidate is valid".to_owned()],
+            NOW,
+            record,
+        )
+        .unwrap();
+        let store = TaskStore::with_state_root(state);
+        store.create_goal(&goal).unwrap();
+        let primary_head = git(&session.cwd, &["rev-parse", "HEAD"]);
+        Self {
+            cleanup_root,
+            primary: session.cwd.clone(),
+            worktree,
+            session,
+            store,
+            goal_id,
+            primary_head,
+            primary_bytes,
+        }
+    }
+
+    fn assert_primary_unchanged(&self) {
+        assert_eq!(
+            git(&self.primary, &["rev-parse", "HEAD"]),
+            self.primary_head
+        );
+        assert_eq!(
+            std::fs::read(self.primary.join("tracked.txt")).unwrap(),
+            self.primary_bytes
+        );
+        assert_eq!(git(&self.primary, &["status", "--porcelain"]), "");
+    }
+}
+
+impl Drop for FullRunFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.cleanup_root);
+    }
+}
+
+struct FullRunPlanner;
+
+impl PlannerBackend for FullRunPlanner {
+    fn propose_initial_plan(&self, request: &PlannerRequest) -> Result<Vec<u8>, PlannerError> {
+        let request = serde_json::to_value(request).unwrap();
+        let criterion_bindings = request["completion_criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|criterion| {
+                json!({
+                    "criterion_id": criterion["criterion_id"],
+                    "task_refs": ["writer"]
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_vec(&json!({
+            "goal_id": request["goal_id"],
+            "goal_revision": request["goal_revision"],
+            "summary": "one managed-worktree writer task",
+            "tasks": [{
+                "proposal_id": "writer",
+                "title": "create candidate file",
+                "objective": "write target once in the managed candidate",
+                "mandatory": true,
+                "worker": "CODEX_WRITER",
+                "dependencies": [],
+                "scope": {
+                    "allowed_paths": ["candidate.txt"],
+                    "forbidden_paths": [],
+                    "operation_kind": "LOCAL_MUTATION",
+                    "replay_safety": "VERIFY_BEFORE_RETRY"
+                },
+                "verification": [{
+                    "kind": "FILE_EXISTS",
+                    "path": "candidate.txt",
+                    "must_be_file": true
+                }]
+            }],
+            "criterion_bindings": criterion_bindings
+        }))
+        .unwrap())
+    }
+}
+
+struct FullRunReadonly;
+
+impl ReadonlyBackend for FullRunReadonly {
+    fn investigate(&self, _request: &ReadonlyRequest) -> Result<Vec<u8>, ReadonlyError> {
+        Err(ReadonlyError::Backend(
+            "unexpected readonly call".to_owned(),
+        ))
+    }
+}
+
+struct FullRunWriter;
+
+impl WriterBackend for FullRunWriter {
+    fn propose(&self, request: &WriterRequest) -> Result<Vec<u8>, WriterError> {
+        Ok(json!({
+            "goal_id": request.goal_id(),
+            "task_id": request.task_id(),
+            "attempt_id": request.attempt_id(),
+            "goal_revision": request.goal_revision(),
+            "plan_revision": request.plan_revision(),
+            "status": "candidate_complete",
+            "summary": "write candidate through host writer authority",
+            "evidence": [],
+            "proposed_operations": [{
+                "kind": "WRITE_UTF8",
+                "path": "candidate.txt",
+                "expected_preimage": {"kind": "ABSENT"},
+                "content": "verified candidate\n"
+            }]
+        })
+        .to_string()
+        .into_bytes())
+    }
+}
+
+struct FullRunReviewer;
+
+impl ReviewerBackend for FullRunReviewer {
+    fn review(&self, request: &ReviewerRequest) -> Result<Vec<u8>, WriterError> {
+        Ok(json!({
+            "goal_id": request.goal_id(),
+            "task_id": request.task_id(),
+            "attempt_id": request.attempt_id(),
+            "goal_revision": request.goal_revision(),
+            "plan_revision": request.plan_revision(),
+            "summary": "deterministic acceptance review passed",
+            "blocking_findings": 0,
+            "evidence": []
+        })
+        .to_string()
+        .into_bytes())
+    }
+}
+
+struct FullRunReplanner;
+
+impl ReplannerBackend for FullRunReplanner {
+    fn propose_replan(&self, _request: &ReplannerRequest) -> Result<Vec<u8>, ReplannerError> {
+        Err(ReplannerError::ReplannerUnavailable)
+    }
+}
+
+#[tokio::test]
+async fn real_managed_goal_runs_writer_verifier_snapshot_and_finalizer_end_to_end() {
+    let fixture = FullRunFixture::new();
+    let initial = fixture
+        .store
+        .load_goal(&fixture.session.id, &fixture.goal_id)
+        .unwrap();
+
+    let mut current = initial.clone();
+    let mut scheduler_steps = 0;
+    while current.status() != crate::goal::GoalStatus::Verifying && scheduler_steps < 10 {
+        let step = crate::scheduler::scheduler_step(
+            &fixture.store,
+            &fixture.session,
+            &fixture.goal_id,
+            current.revision(),
+            &FullRunPlanner,
+            &FullRunReadonly,
+            &FullRunWriter,
+            &FullRunReviewer,
+            &FullRunReplanner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(step.outcome, SchedulerStepOutcome::Applied);
+        scheduler_steps += 1;
+        current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+    }
+    assert_eq!(current.status(), crate::goal::GoalStatus::Verifying);
+    let finalization = finalize_goal_at_revision_with_session(
+        &fixture.store,
+        &fixture.session,
+        &fixture.goal_id,
+        current.revision(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        finalization.decision().outcome(),
+        GoalFinalizationOutcome::ReadyToComplete
+    );
+    let completed = fixture
+        .store
+        .load_goal(&fixture.session.id, &fixture.goal_id)
+        .unwrap();
+    assert!(scheduler_steps >= 4);
+    assert_eq!(completed.status(), crate::goal::GoalStatus::Completed);
+    assert_ne!(initial.revision(), completed.revision());
+    assert_eq!(
+        std::fs::read(fixture.worktree.join("candidate.txt")).unwrap(),
+        b"verified candidate\n"
+    );
+    let evidence = completed
+        .managed_workspace_verification_evidence()
+        .expect("the full run must persist managed snapshot evidence");
+    assert_eq!(evidence.goal_id(), completed.id());
+    let final_verification = completed
+        .latest_applicable_final_verification()
+        .expect("the full run must persist deterministic Goal verification");
+    assert_eq!(evidence.final_verification_id(), final_verification.id());
+    assert_eq!(
+        evidence.goal_revision(),
+        final_verification.committed_goal_revision()
+    );
+    assert_eq!(evidence.plan_revision(), completed.plan_revision());
+    assert_eq!(
+        git(&fixture.worktree, &["rev-parse", "HEAD"]),
+        evidence.observed_head()
+    );
+    let result_view = crate::goal_api::goal_result_async(
+        &json!({
+            "session_id": fixture.session.id,
+            "goal_id": fixture.goal_id,
+        }),
+        &fixture.session,
+        &fixture.store,
+    )
+    .await
+    .unwrap();
+    let result_view = serde_json::to_value(result_view).unwrap();
+    assert_eq!(result_view["terminal"], true);
+    assert!(result_view["managed_workspace"]["workspace_snapshot_digest"].is_string());
+    fixture.assert_primary_unchanged();
 }
 
 #[test]
