@@ -243,11 +243,20 @@ async fn answer(stream: &mut SessionStream, verdict: &[u8]) {
 /// operation name and id are echoed (both already operator-visible); the
 /// detail is not repeated.
 fn evict_expired(pending: &mut VecDeque<PendingApproval>) {
+    evict_expired_at(pending, std::time::Instant::now());
+}
+
+/// Clock-injected eviction so tests never depend on machine uptime.
+///
+/// Asking a test to fabricate an 11-minute-old `Instant` via `checked_sub`
+/// fails on machines booted minutes ago (fresh CI runners): the subtraction
+/// underflows to `None` and the entry looks brand new. Passing `now` in keeps
+/// the test deterministic on any uptime.
+fn evict_expired_at(pending: &mut VecDeque<PendingApproval>, now: std::time::Instant) {
     let deadline = crate::resource_limits::APPROVAL_RESPONSE_TIMEOUT;
-    while pending
-        .front()
-        .is_some_and(|entry| entry.enqueued.elapsed() > deadline)
-    {
+    while pending.front().is_some_and(|entry| {
+        now.saturating_duration_since(entry.enqueued) > deadline
+    }) {
         if let Some(entry) = pending.pop_front() {
             eprintln!(
                 "[expired] {} {} (caller timed out; no approval granted)",
@@ -737,13 +746,15 @@ mod approval_stability_tests {
         }
     }
 
-    fn pending_entry(stream: SessionStream, age: Duration) -> PendingApproval {
+    fn pending_entry(stream: SessionStream) -> PendingApproval {
+        pending_entry_at(stream, std::time::Instant::now())
+    }
+
+    fn pending_entry_at(stream: SessionStream, enqueued: std::time::Instant) -> PendingApproval {
         PendingApproval {
             request: approval_request("without_sandbox"),
             stream,
-            enqueued: std::time::Instant::now()
-                .checked_sub(age)
-                .unwrap_or_else(std::time::Instant::now),
+            enqueued,
         }
     }
 
@@ -838,10 +849,7 @@ mod approval_stability_tests {
         drop(dead_client);
         let mut session = test_session();
         let mut yolo = false;
-        let mut pending = VecDeque::from([pending_entry(
-            Box::new(dead_server),
-            Duration::from_secs(11 * 60),
-        )]);
+        let mut pending = VecDeque::from([pending_entry(Box::new(dead_server))]);
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
             handle_input("y", &mut session, &mut yolo, &mut pending),
@@ -861,14 +869,34 @@ mod approval_stability_tests {
         // A request older than APPROVAL_RESPONSE_TIMEOUT has no live caller
         // (request() fails closed at exactly that age). It must be evicted so
         // the operator's next keystroke reaches a live approval.
-        let (dead_client, dead_server) = tokio::io::duplex(64);
-        drop(dead_client);
-        let (mut live_client, live_server) = tokio::io::duplex(64);
-        let mut pending = VecDeque::from([
-            pending_entry(Box::new(dead_server), Duration::from_secs(11 * 60)),
-            pending_entry(Box::new(live_server), Duration::ZERO),
+        // Fresh entries must survive the real clock: eviction only applies
+        // past APPROVAL_RESPONSE_TIMEOUT, never to live approvals.
+        let mut fresh = VecDeque::from([
+            pending_entry(Box::new(tokio::io::duplex(64).1)),
+            pending_entry(Box::new(tokio::io::duplex(64).1)),
         ]);
-        evict_expired(&mut pending);
+        evict_expired(&mut fresh);
+        assert_eq!(fresh.len(), 2, "live approvals must not be evicted");
+        drop(fresh);
+        // Age the queue deterministically with forward-only clock math (safe
+        // on any machine uptime): at the eviction point the stale entry is 11
+        // minutes old while the live one is 30 seconds old.
+        let t0 = std::time::Instant::now();
+        let (stale_client, stale_server) = tokio::io::duplex(64);
+        drop(stale_client);
+        let (mut live_client, live_server) = tokio::io::duplex(64);
+        let stale_at = t0;
+        let live_at = t0
+            .checked_add(Duration::from_secs(10 * 60 + 30))
+            .expect("test clock must advance");
+        let now = t0
+            .checked_add(Duration::from_secs(11 * 60))
+            .expect("test clock must advance");
+        let mut pending = VecDeque::from([
+            pending_entry_at(Box::new(stale_server), stale_at),
+            pending_entry_at(Box::new(live_server), live_at),
+        ]);
+        evict_expired_at(&mut pending, now);
         assert_eq!(pending.len(), 1, "only the live approval must remain");
         let mut session = test_session();
         let mut yolo = false;
@@ -896,10 +924,7 @@ mod approval_stability_tests {
         drop(dead_client);
         let mut session = test_session();
         let mut yolo = false;
-        let mut pending = VecDeque::from([pending_entry(
-            Box::new(dead_server),
-            Duration::from_secs(11 * 60),
-        )]);
+        let mut pending = VecDeque::from([pending_entry(Box::new(dead_server))]);
         let outcome = tokio::time::timeout(
             Duration::from_secs(20),
             handle_input("/permission yolo", &mut session, &mut yolo, &mut pending),
