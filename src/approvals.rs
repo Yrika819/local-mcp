@@ -254,9 +254,10 @@ fn evict_expired(pending: &mut VecDeque<PendingApproval>) {
 /// the test deterministic on any uptime.
 fn evict_expired_at(pending: &mut VecDeque<PendingApproval>, now: std::time::Instant) {
     let deadline = crate::resource_limits::APPROVAL_RESPONSE_TIMEOUT;
-    while pending.front().is_some_and(|entry| {
-        now.saturating_duration_since(entry.enqueued) > deadline
-    }) {
+    while pending
+        .front()
+        .is_some_and(|entry| now.saturating_duration_since(entry.enqueued) > deadline)
+    {
         if let Some(entry) = pending.pop_front() {
             eprintln!(
                 "[expired] {} {} (caller timed out; no approval granted)",
