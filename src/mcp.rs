@@ -140,9 +140,13 @@ where
     // reintroduce the "accumulate the whole line before inspecting it" contract
     // this bound exists to avoid.
     let mut reader = frame_reader(reader);
-    // Set once the writer task ends. `None` means stdin reached EOF first and
-    // the writer is still draining; `Some` carries the writer's own result.
+    // Set once the writer task ends. `None` means the read loop ended first
+    // (clean EOF or stdin error) with the writer still draining; `Some`
+    // carries the writer's own result. `read_error` likewise records a read
+    // failure instead of returning early, so every exit funnels through the
+    // common shutdown below and no path can skip job cleanup.
     let mut writer_result: Option<Result<()>> = None;
+    let mut read_error: Option<anyhow::Error> = None;
     loop {
         // Wait for the next frame *or* the writer's termination, whichever
         // comes first. Checking `is_finished` only at the top of the loop
@@ -152,143 +156,199 @@ where
         // Cancelling a half-read `next_frame` here is safe: bytes already
         // consumed from the stream are retained in the reader across calls,
         // and the writer arm always exits the loop.
-        let frame = tokio::select! {
-            frame = reader.next_frame(MAX_MCP_REQUEST_FRAME_BYTES) => frame?,
+        tokio::select! {
+            frame = reader.next_frame(MAX_MCP_REQUEST_FRAME_BYTES) => match frame {
+                Err(error) => {
+                    read_error = Some(error.into());
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(frame)) => {
+                    if let Err(error) = process_one_frame(
+                        frame,
+                        &response_tx,
+                        &control_permits,
+                        &execution_permits,
+                    )
+                    .await
+                    {
+                        read_error = Some(error);
+                        break;
+                    }
+                }
+            },
             result = &mut writer_handle => {
-                writer_result = Some(result.context("response writer task panicked")?);
+                writer_result = Some(
+                    result
+                        .context("response writer task panicked")
+                        .and_then(std::convert::identity),
+                );
                 break;
             }
-        };
-        let Some(frame) = frame else {
-            break;
-        };
-        let line = match frame {
-            Frame::Empty => continue,
-            Frame::TooLarge => {
-                // Reported without parsing: an oversized frame is never parsed as
-                // JSON, valid or not. The frame has already been consumed, so the
-                // connection continues on the next frame boundary.
-                let error = crate::resource_limits::limit_error(
-                    crate::resource_limits::ResourceLimit::McpRequestFrame,
-                    "request frame exceeded the maximum and was discarded without parsing",
-                );
+        }
+    }
+    finish_transport(
+        writer_handle,
+        writer_result,
+        read_error,
+        response_tx,
+        shutdown,
+    )
+    .await
+}
+
+/// Handle one framed input: parse, admit, and dispatch, or answer a framing
+/// failure without spending a worker permit.
+///
+/// Framing is bounded before parsing, and both happen before a dispatch
+/// permit is acquired, so a far-too-large request neither allocates
+/// without limit nor consumes a worker permit to be rejected. Failures that
+/// must end the transport are returned; anything answered inline returns
+/// `Ok` and the read loop continues.
+async fn process_one_frame(
+    frame: Frame,
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<()> {
+    let line = match frame {
+        Frame::Empty => return Ok(()),
+        Frame::TooLarge => {
+            // Reported without parsing: an oversized frame is never parsed as
+            // JSON, valid or not. The frame has already been consumed, so the
+            // connection continues on the next frame boundary.
+            let error = crate::resource_limits::limit_error(
+                crate::resource_limits::ResourceLimit::McpRequestFrame,
+                "request frame exceeded the maximum and was discarded without parsing",
+            );
+            send_response_bounded(
+                response_tx,
+                bounded_error_response(Value::Null, JSONRPC_RESOURCE_LIMIT, &format!("{error:#}")),
+            )
+            .await
+            .context("response writer task terminated unexpectedly")?;
+            return Ok(());
+        }
+        Frame::Complete(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
                 send_response_bounded(
-                    &response_tx,
+                    response_tx,
                     bounded_error_response(
                         Value::Null,
-                        JSONRPC_RESOURCE_LIMIT,
-                        &format!("{error:#}"),
+                        JSONRPC_SERVER_ERROR,
+                        "request frame is not valid UTF-8",
                     ),
                 )
                 .await
                 .context("response writer task terminated unexpectedly")?;
-                continue;
+                return Ok(());
             }
-            Frame::Complete(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(_) => {
-                    send_response_bounded(
-                        &response_tx,
-                        bounded_error_response(
-                            Value::Null,
-                            JSONRPC_SERVER_ERROR,
-                            "request frame is not valid UTF-8",
-                        ),
-                    )
-                    .await
-                    .context("response writer task terminated unexpectedly")?;
-                    continue;
-                }
-            },
-        };
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                // Malformed JSON is answered immediately; it is not a valid
-                // request and must not consume a dispatch permit.
-                send_response_bounded(
-                    &response_tx,
-                    bounded_error_response(Value::Null, -32700, &error.to_string()),
-                )
-                .await
-                .context("response writer task terminated unexpectedly")?;
-                continue;
-            }
-        };
-        // Per the JSON-RPC/MCP model, notifications (requests without an `id`)
-        // never receive a response, so they are dropped here.
-        if request.get("id").is_none() {
-            continue;
+        },
+    };
+    let request: Value = match serde_json::from_str(&line) {
+        Ok(value) => value,
+        Err(error) => {
+            // Malformed JSON is answered immediately; it is not a valid
+            // request and must not consume a dispatch permit.
+            send_response_bounded(
+                response_tx,
+                bounded_error_response(Value::Null, -32700, &error.to_string()),
+            )
+            .await
+            .context("response writer task terminated unexpectedly")?;
+            return Ok(());
         }
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
+    };
+    // Per the JSON-RPC/MCP model, notifications (requests without an `id`)
+    // never receive a response, so they are dropped here.
+    if request.get("id").is_none() {
+        return Ok(());
+    }
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
 
-        let admitted = acquire_admission(&request, &control_permits, &execution_permits).await;
-        let permit = match admitted {
-            Ok(permit) => permit,
-            Err(reason) => {
-                // Refused before any work starts. Reported as a resource failure,
-                // never as an authority or permission failure. Bounded so a
-                // stalled writer cannot wedge the read loop here either.
-                let _ = send_response_bounded(
-                    &response_tx,
-                    bounded_error_response(id, JSONRPC_RESOURCE_LIMIT, reason),
-                )
-                .await;
-                continue;
+    let admitted = acquire_admission(&request, control_permits, execution_permits).await;
+    let permit = match admitted {
+        Ok(permit) => permit,
+        Err(reason) => {
+            // Refused before any work starts. Reported as a resource failure,
+            // never as an authority or permission failure. Bounded so a
+            // stalled writer cannot wedge the read loop here either.
+            let _ = send_response_bounded(
+                response_tx,
+                bounded_error_response(id, JSONRPC_RESOURCE_LIMIT, reason),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let response_tx = response_tx.clone();
+    tokio::spawn(async move {
+        // Hold the permit for the entire dispatch so the concurrency bound
+        // reflects genuinely in-flight work.
+        let _permit = permit;
+        // Panic containment: a panicking handler must not silently drop
+        // the request (leaving the client waiting on that ID forever).
+        // Supervise the inner dispatch and synthesize a JSON-RPC internal
+        // error on panic so the request always receives exactly one
+        // response and the panic can never poison the read loop, the
+        // writer task, or any other in-flight request.
+        let dispatch_task = tokio::spawn(async move { dispatch(&request).await });
+        let outcome = match dispatch_task.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(anyhow::anyhow!(
+                "internal error: request handler failed ({})",
+                if join_error.is_panic() {
+                    "panic"
+                } else {
+                    "cancelled"
+                }
+            )),
+        };
+        let response = match outcome {
+            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            Err(error) => {
+                // A resource bound keeps its own code, so a client can tell
+                // "too large" from "failed" and a resource failure is never
+                // presented as an authority or permission failure.
+                let code = if error
+                    .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+                    .is_some()
+                {
+                    JSONRPC_RESOURCE_LIMIT
+                } else {
+                    JSONRPC_SERVER_ERROR
+                };
+                bounded_error_response(id, code, &format!("{error:#}"))
             }
         };
-        let response_tx = response_tx.clone();
-        tokio::spawn(async move {
-            // Hold the permit for the entire dispatch so the concurrency bound
-            // reflects genuinely in-flight work.
-            let _permit = permit;
-            // Panic containment: a panicking handler must not silently drop
-            // the request (leaving the client waiting on that ID forever).
-            // Supervise the inner dispatch and synthesize a JSON-RPC internal
-            // error on panic so the request always receives exactly one
-            // response and the panic can never poison the read loop, the
-            // writer task, or any other in-flight request.
-            let dispatch_task = tokio::spawn(async move { dispatch(&request).await });
-            let outcome = match dispatch_task.await {
-                Ok(outcome) => outcome,
-                Err(join_error) => Err(anyhow::anyhow!(
-                    "internal error: request handler failed ({})",
-                    if join_error.is_panic() {
-                        "panic"
-                    } else {
-                        "cancelled"
-                    }
-                )),
-            };
-            let response = match outcome {
-                Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-                Err(error) => {
-                    // A resource bound keeps its own code, so a client can tell
-                    // "too large" from "failed" and a resource failure is never
-                    // presented as an authority or permission failure.
-                    let code = if error
-                        .downcast_ref::<crate::resource_limits::ResourceLimitError>()
-                        .is_some()
-                    {
-                        JSONRPC_RESOURCE_LIMIT
-                    } else {
-                        JSONRPC_SERVER_ERROR
-                    };
-                    bounded_error_response(id, code, &format!("{error:#}"))
-                }
-            };
-            // A failed send means the writer is gone or has not drained for
-            // `MCP_RESPONSE_SEND_TIMEOUT`: the transport is dying or dead, and
-            // the read loop independently observes writer termination (via the
-            // `select!` above) and ends the transport with an explicit error.
-            // Dropping this one response therefore surfaces to the client as a
-            // transport EOF, never as an infinite wait on this id. The permit
-            // is freed with the task either way, so a stalled writer cannot
-            // leak admission capacity.
-            let _ = send_response_bounded(&response_tx, response).await;
-        });
-    }
+        // A failed send means the writer is gone or has not drained for
+        // `MCP_RESPONSE_SEND_TIMEOUT`: the transport is dying or dead, and
+        // the read loop independently observes writer termination (via the
+        // `select!` above) and ends the transport with an explicit error.
+        // Dropping this one response therefore surfaces to the client as a
+        // transport EOF, never as an infinite wait on this id. The permit
+        // is freed with the task either way, so a stalled writer cannot
+        // leak admission capacity.
+        let _ = send_response_bounded(&response_tx, response).await;
+    });
+    Ok(())
+}
 
+/// Common shutdown for every transport exit.
+///
+/// Clean EOF, stdin I/O errors, response-send failures, writer death, and
+/// writer panic ALL arrive here. Retained jobs are released for the owning
+/// policy before the loop's outcome is reported, so no exit can orphan
+/// background jobs that another exit would have reaped. Error precedence is
+/// fixed by [`report_shutdown_outcome`] and unit-tested.
+async fn finish_transport(
+    writer_handle: tokio::task::JoinHandle<Result<()>>,
+    writer_result: Option<Result<()>>,
+    read_error: Option<anyhow::Error>,
+    response_tx: tokio::sync::mpsc::Sender<Value>,
+    shutdown: ShutdownPolicy,
+) -> Result<()> {
     // stdin closed (EOF): stop accepting requests, then drain and flush all
     // in-flight responses so the client sees every answer before we exit.
     // Writer death (transport failure) takes the same shutdown path: retained
@@ -296,16 +356,35 @@ where
     // transport on a dead client can never orphan a background job that a
     // clean EOF would have reaped.
     drop(response_tx);
-    let shutdown_result = match writer_result {
+    let drain_outcome: Result<()> = match writer_result {
+        // The writer already ended: nothing left to drain.
         Some(result) => result,
+        // The loop ended first with the writer alive: drain in-flight
+        // responses before reporting, exactly as a clean EOF always did.
         None => writer_handle
             .await
-            .context("response writer task panicked")?,
+            .context("response writer task panicked")
+            .and_then(std::convert::identity),
     };
     if shutdown == ShutdownPolicy::ReleaseAllJobs {
         release_all_jobs().await;
     }
-    shutdown_result?;
+    report_shutdown_outcome(drain_outcome, read_error)
+}
+
+/// Fixed shutdown error precedence: a drain/writer failure outranks a
+/// normally-completed loop, and a recorded read failure outranks success.
+/// Nothing is swallowed: at most one error is reported, but cleanup always
+/// runs first (see [`finish_transport`]).
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the stability tests"))]
+pub(crate) fn report_shutdown_outcome(
+    drain_outcome: Result<()>,
+    read_error: Option<anyhow::Error>,
+) -> Result<()> {
+    drain_outcome?;
+    if let Some(error) = read_error {
+        return Err(error);
+    }
     Ok(())
 }
 

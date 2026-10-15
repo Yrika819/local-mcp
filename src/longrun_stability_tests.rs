@@ -12,7 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::mcp::{
     JSONRPC_RESOURCE_LIMIT, ShutdownPolicy, acquire_admission, admission_pool,
-    send_response_bounded, serve_with_io, write_message, write_response_or_substitute,
+    report_shutdown_outcome, send_response_bounded, serve_with_io, write_message,
+    write_response_or_substitute,
 };
 use crate::resource_limits::{
     APPROVAL_IO_TIMEOUT, APPROVAL_RESPONSE_TIMEOUT, CONTROL_ADMISSION_WAIT_TIMEOUT,
@@ -265,6 +266,69 @@ async fn silent_responder_is_bounded_by_timeout_pattern() {
 async fn futures_lite_hold() {
     // Hold without depending on new crates: pend forever until aborted.
     std::future::pending::<()>().await;
+}
+
+/// Reader that fails on the first read (simulates a broken stdin pipe).
+struct FailingReader;
+
+impl tokio::io::AsyncRead for FailingReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        _bytes: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "test stdin broken",
+        )))
+    }
+}
+
+#[tokio::test]
+async fn stdin_io_error_is_reported_not_swallowed() {
+    // Every transport exit funnels through the common shutdown: a non-EOF
+    // stdin failure must surface as an explicit error (after cleanup),
+    // never as a hang and never as a silent success.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (_client, writer) = tokio::io::duplex(64 * 1024);
+        let result = serve_with_io(FailingReader, writer, ShutdownPolicy::LeaveRegistry).await;
+        assert!(
+            result.is_err(),
+            "broken stdin must end the transport with an error"
+        );
+    });
+    outcome
+        .await
+        .expect("transport hung on stdin I/O error: regression");
+}
+
+#[tokio::test]
+async fn shutdown_outcome_precedence_is_fixed() {
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // Writer/drain failure outranks everything: it is the reason the
+        // transport cannot deliver anything.
+        let drained: Result<(), anyhow::Error> = Err(anyhow::anyhow!("writer gone"));
+        let read: Option<anyhow::Error> = Some(anyhow::anyhow!("stdin broken"));
+        assert!(
+            report_shutdown_outcome(drained, read).is_err(),
+            "drain failure must be reported"
+        );
+        // A recorded read failure outranks a drained success.
+        let drained: Result<(), anyhow::Error> = Ok(());
+        let read: Option<anyhow::Error> = Some(anyhow::anyhow!("stdin broken"));
+        let error = report_shutdown_outcome(drained, read).expect_err("read error must surface");
+        assert!(
+            format!("{error:#}").contains("stdin"),
+            "the read error itself must be reported, got: {error:#}"
+        );
+        // Clean drain with no read failure is success (clean EOF path).
+        let drained: Result<(), anyhow::Error> = Ok(());
+        assert!(
+            report_shutdown_outcome(drained, None).is_ok(),
+            "clean shutdown must stay success"
+        );
+    });
+    outcome.await.expect("precedence check hung: regression");
 }
 
 #[tokio::test]

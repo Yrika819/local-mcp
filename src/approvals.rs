@@ -199,17 +199,69 @@ struct PendingApproval {
 /// stall of the single accept/read sequence that every later connection waits
 /// behind, and never as a dead session UI (callers drop the connection and
 /// continue instead of propagating with `?`).
+/// Read one newline-delimited message, accumulating at most `max` bytes.
+///
+/// The timeout bounds *duration*; this bounds *memory*. A connection that
+/// trickles bytes without a newline could otherwise make the session UI hold
+/// an arbitrarily large buffer for the whole deadline. A body past the cap is
+/// refused whole and the connection is dropped; the caller fails closed.
+/// An EOF before any byte is `None` (closed connection); an EOF mid-line
+/// yields the partial line, which the caller rejects as an invalid message —
+/// the same outcome the old unbounded `read_line` produced.
+async fn read_bounded_line(
+    reader: &mut BufReader<&mut SessionStream>,
+    max: usize,
+) -> Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = Vec::new();
+    loop {
+        // One `fill_buf` per iteration: copy the take out, then consume it.
+        // Holding the borrowed chunk across `consume` would not compile, and
+        // re-calling `fill_buf` to copy would be subtly wrong under mutation.
+        let (take, newline) = {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(if line.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8(line).context("invalid session message")?)
+                });
+            }
+            let (end, newline) = match chunk.iter().position(|&byte| byte == b'\n') {
+                Some(position) => (position, true),
+                None => (chunk.len(), false),
+            };
+            if line.len() + end > max {
+                anyhow::bail!("approval message exceeded the maximum and was discarded");
+            }
+            (chunk[..end].to_vec(), newline)
+        };
+        reader.consume(take.len() + usize::from(newline));
+        line.extend_from_slice(&take);
+        if newline {
+            return Ok(Some(
+                String::from_utf8(line).context("invalid session message")?,
+            ));
+        }
+    }
+}
+
 async fn read_session_message_with_timeout(
     stream: &mut SessionStream,
     timeout: Duration,
 ) -> Result<Message> {
-    let mut line = String::new();
-    let read = tokio::time::timeout(timeout, BufReader::new(&mut *stream).read_line(&mut line))
-        .await
-        .map_err(|_| anyhow::anyhow!("session message read timed out"))??;
-    if read == 0 {
+    let line = tokio::time::timeout(
+        timeout,
+        read_bounded_line(
+            &mut BufReader::new(&mut *stream),
+            crate::resource_limits::MAX_APPROVAL_MESSAGE_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("session message read timed out"))??;
+    let Some(line) = line else {
         anyhow::bail!("session connection closed before a complete message");
-    }
+    };
     serde_json::from_str(&line).context("invalid session message")
 }
 
@@ -232,6 +284,85 @@ async fn answer(stream: &mut SessionStream, verdict: &[u8]) {
         stream.write_all(verdict),
     )
     .await;
+}
+
+/// Queue a new approval and return the id the UI now shows.
+///
+/// The UI always shows the queue head — the request the next answer will
+/// apply to — so the displayed operation and the decided operation can never
+/// diverge however fast approvals arrive. Showing each newcomer instead meant
+/// the last-displayed operation differed from the FIFO head an answer pops.
+///
+/// A full queue refuses the newcomer with an explicit `deny` (fail-closed,
+/// never `allow`, never silent): the operator is already behind, and the
+/// caller learns the refusal immediately instead of waiting out its own
+/// timeout behind requests that will never surface.
+async fn enqueue_approval(
+    pending: &mut VecDeque<PendingApproval>,
+    request: Request,
+    stream: SessionStream,
+) -> Uuid {
+    evict_expired(pending);
+    if pending.len() >= crate::resource_limits::MAX_PENDING_APPROVALS {
+        return refuse_overload(pending, request, stream).await;
+    }
+    let fresh_arrival = pending.is_empty();
+    let newcomer = request.operation.clone();
+    pending.push_back(PendingApproval {
+        request,
+        stream,
+        enqueued: std::time::Instant::now(),
+    });
+    let head = pending.front().expect("queue holds the entry just pushed");
+    if !fresh_arrival {
+        // The newcomer waits behind older work: remind the operator what the
+        // next answer will actually decide instead of only showing the
+        // newcomer that must wait.
+        eprintln!(
+            "Queued {} ({} pending); awaiting decision on:",
+            newcomer,
+            pending.len()
+        );
+    }
+    let _ = show_request(&head.request);
+    head.request.id
+}
+
+/// Refuse one approval that cannot be queued, and return the id the UI keeps
+/// showing (the unaffected head). The deny is best-effort like every other
+/// answer: a dead stream just drops it, and the caller still fails closed.
+async fn refuse_overload(
+    pending: &mut VecDeque<PendingApproval>,
+    request: Request,
+    mut stream: SessionStream,
+) -> Uuid {
+    eprintln!(
+        "[full] denying {} {} (approval queue holds {})",
+        request.operation,
+        request.id,
+        pending.len()
+    );
+    answer(&mut stream, b"deny\n").await;
+    pending
+        .front()
+        .expect("a full queue holds at least one entry")
+        .request
+        .id
+}
+
+/// Answer the queue head and report what was decided.
+///
+/// Every operator answer applies to the head — the same request the UI shows
+/// — and the returned `(id, operation)` lets the caller confirm the decision
+/// against the display instead of assuming it. Returns `None` when nothing
+/// was queued.
+async fn answer_head(
+    pending: &mut VecDeque<PendingApproval>,
+    verdict: &[u8],
+) -> Option<(Uuid, String)> {
+    let mut entry = pending.pop_front()?;
+    answer(&mut entry.stream, verdict).await;
+    Some((entry.request.id, entry.request.operation))
 }
 
 /// Drop queued approvals whose caller already timed out.
@@ -297,6 +428,13 @@ pub async fn request(
         .map_err(|_| anyhow::anyhow!("approval IPC connect timed out"))?
         .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
     let payload = serde_json::to_vec(&Message::Approval { request })?;
+    // Bounded before any IPC: an oversized message never reaches the session
+    // UI and fails here as a typed resource refusal, never as an approval.
+    crate::resource_limits::ensure_resource(
+        payload.len() <= crate::resource_limits::MAX_APPROVAL_MESSAGE_BYTES,
+        crate::resource_limits::ResourceLimit::ApprovalMessage,
+        "approval message exceeded the maximum and was not sent",
+    )?;
     tokio::time::timeout(io_timeout, stream.write_all(&payload))
         .await
         .map_err(|_| anyhow::anyhow!("approval IPC write timed out"))??;
@@ -528,34 +666,12 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
     let mut yolo = false;
     loop {
         tokio::select! {
-            connection = listener.accept() => {
-                let mut stream = connection?;
-                match read_session_message(&mut stream).await {
-                    Err(error) => {
-                        // Partial frame, silent client, disconnect, or garbage:
-                        // drop this connection and keep serving. Propagating
-                        // with `?` here killed the whole session UI on one bad
-                        // client, taking every later approval down with it.
-                        eprintln!("Ignoring session connection: {error:#}");
-                        continue;
-                    }
-                    Ok(Message::Activity { title, detail }) => {
-                        show_activity(&title, detail.as_deref())
-                    }
-                    Ok(Message::Approval { request }) if yolo => {
-                        eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
-                        answer(&mut stream, b"allow\n").await;
-                    }
-                    Ok(Message::Approval { request }) => {
-                        evict_expired(&mut pending);
-                        show_request(&request)?;
-                        pending.push_back(PendingApproval {
-                            request,
-                            stream,
-                            enqueued: std::time::Instant::now(),
-                        });
-                    }
-                }
+            served = handle_approval_connection(&mut listener, &mut pending, yolo) => {
+                // Accept failures (`served` Err) still end the session: without
+                // a listener there is nobody to approve anything, and silently
+                // looping would wedge every future approval. Per-connection
+                // failures are already contained inside (dropped + noted).
+                served?;
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
@@ -564,6 +680,39 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
             }
         }
     }
+}
+
+/// Serve one session connection: read one bounded message and route it.
+///
+/// Extracted from `start()`'s accept arm so the routing — activity display,
+/// yolo auto-allow, head-showing enqueue, and fail-closed drops — is drivable
+/// in isolation with real listeners and fake clients. Per-connection failures
+/// (partial frame, silence, disconnect, garbage, oversize) are dropped with a
+/// note and reported as `Ok`; only listener-level accept failures propagate.
+async fn handle_approval_connection(
+    listener: &mut SessionListener,
+    pending: &mut VecDeque<PendingApproval>,
+    yolo: bool,
+) -> Result<()> {
+    let mut stream = listener.accept().await?;
+    match read_session_message(&mut stream).await {
+        Err(error) => {
+            // Partial frame, silent client, disconnect, garbage, or oversize:
+            // drop this connection and keep serving. Propagating with `?`
+            // here killed the whole session UI on one bad client, taking
+            // every later approval down with it.
+            eprintln!("Ignoring session connection: {error:#}");
+        }
+        Ok(Message::Activity { title, detail }) => show_activity(&title, detail.as_deref()),
+        Ok(Message::Approval { request }) if yolo => {
+            eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+            answer(&mut stream, b"allow\n").await;
+        }
+        Ok(Message::Approval { request }) => {
+            enqueue_approval(pending, request, stream).await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(
@@ -633,13 +782,17 @@ async fn handle_input(
             eprintln!("Permissions: ask");
         }
         "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
-            let mut entry = pending.pop_front().unwrap();
-            answer(&mut entry.stream, b"allow\n").await;
+            // The head is what the UI shows, so confirming its id here keeps
+            // the display and the decision visibly linked.
+            if let Some((id, operation)) = answer_head(pending, b"allow\n").await {
+                eprintln!("Allowed {operation} {id}");
+            }
             show_next(pending)?;
         }
         "n" | "N" | "no" | "NO" if !pending.is_empty() => {
-            let mut entry = pending.pop_front().unwrap();
-            answer(&mut entry.stream, b"deny\n").await;
+            if let Some((id, operation)) = answer_head(pending, b"deny\n").await {
+                eprintln!("Denied {operation} {id}");
+            }
             show_next(pending)?;
         }
         "/permission list" | "/permissions list" => show_permissions(session),
@@ -677,9 +830,9 @@ async fn handle_input(
         }
         "" => {}
         command if !pending.is_empty() => {
-            let mut entry = pending.pop_front().unwrap();
-            answer(&mut entry.stream, b"deny\n").await;
-            eprintln!("Denied request (unrecognized response: {command})");
+            if let Some((id, operation)) = answer_head(pending, b"deny\n").await {
+                eprintln!("Denied {operation} {id} (unrecognized response: {command})");
+            }
             show_next(pending)?;
         }
         command => eprintln!("Unknown command: {command}"),
@@ -728,7 +881,7 @@ fn show_next(pending: &VecDeque<PendingApproval>) -> Result<()> {
 #[cfg(test)]
 mod approval_stability_tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     fn test_session() -> Session {
         Session {
@@ -764,6 +917,223 @@ mod approval_stability_tests {
         let mut bytes = serde_json::to_vec(&Message::Approval { request }).unwrap();
         bytes.push(b'\n');
         bytes
+    }
+
+    async fn read_client_line(stream: &mut tokio::io::DuplexStream) -> Option<String> {
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::io::BufReader::new(&mut *stream).read_line(&mut line),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        Some(line)
+    }
+
+    #[tokio::test]
+    async fn displayed_request_is_always_the_answered_head() -> Result<()> {
+        // The review's core case: A arrives (shown), B arrives (shown?) — the
+        // answer must apply to the shown head A, never to the last arrival.
+        let (mut client_a, server_a) = tokio::io::duplex(64);
+        let (mut client_b, server_b) = tokio::io::duplex(64);
+        let (mut client_c, server_c) = tokio::io::duplex(64);
+        let mut pending = VecDeque::new();
+        let shown_a =
+            enqueue_approval(&mut pending, approval_request("op-a"), Box::new(server_a)).await;
+        let shown_after_b =
+            enqueue_approval(&mut pending, approval_request("op-b"), Box::new(server_b)).await;
+        assert_eq!(
+            shown_after_b, shown_a,
+            "a second arrival must not move the display off the head"
+        );
+        let decided = answer_head(&mut pending, b"allow\n")
+            .await
+            .expect("head must be answerable");
+        assert_eq!(decided.0, shown_a, "the answer must decide the shown head");
+        assert_eq!(decided.1, "op-a");
+        assert_eq!(
+            read_client_line(&mut client_a).await.as_deref(),
+            Some("allow\n"),
+            "the shown client must receive the verdict"
+        );
+        // The next display and the next decision track the new head together.
+        let shown_after_answer = pending.front().expect("B must remain").request.id;
+        let shown_after_c =
+            enqueue_approval(&mut pending, approval_request("op-c"), Box::new(server_c)).await;
+        assert_eq!(shown_after_c, shown_after_answer);
+        let decided = answer_head(&mut pending, b"deny\n")
+            .await
+            .expect("new head must be answerable");
+        assert_eq!(decided.1, "op-b");
+        assert_eq!(
+            read_client_line(&mut client_b).await.as_deref(),
+            Some("deny\n")
+        );
+        // C is still queued and still answerable: arrivals after answers
+        // keep tracking the head too.
+        let decided = answer_head(&mut pending, b"allow\n")
+            .await
+            .expect("C must be answerable");
+        assert_eq!(decided.1, "op-c");
+        assert_eq!(
+            read_client_line(&mut client_c).await.as_deref(),
+            Some("allow\n")
+        );
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_keeps_display_and_answer_aligned() -> Result<()> {
+        // A stale head plus a new arrival: eviction runs inside enqueue, so
+        // the display lands on the live request and the answer follows it.
+        let t0 = std::time::Instant::now();
+        let (stale_client, stale_server) = tokio::io::duplex(64);
+        drop(stale_client);
+        let (mut live_client, live_server) = tokio::io::duplex(64);
+        let mut pending = VecDeque::from([pending_entry_at(Box::new(stale_server), t0)]);
+        let now = t0
+            .checked_add(Duration::from_secs(11 * 60))
+            .expect("test clock must advance");
+        evict_expired_at(&mut pending, now);
+        let live = approval_request("op-live");
+        let live_id = live.id;
+        let shown = enqueue_approval(&mut pending, live, Box::new(live_server)).await;
+        assert_eq!(shown, live_id, "display must land on the live request");
+        let decided = answer_head(&mut pending, b"allow\n")
+            .await
+            .expect("live head must be answerable");
+        assert_eq!(decided.0, live_id);
+        assert_eq!(
+            read_client_line(&mut live_client).await.as_deref(),
+            Some("allow\n")
+        );
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_keeps_fifo_display_and_answer() -> Result<()> {
+        // Dead head, live second: the answer still decides the (dead) head —
+        // FIFO is preserved — and the display then tracks the live one.
+        let (dead_client, dead_server) = tokio::io::duplex(64);
+        drop(dead_client);
+        let (mut live_client, live_server) = tokio::io::duplex(64);
+        let mut pending = VecDeque::from([
+            pending_entry(Box::new(dead_server)),
+            pending_entry(Box::new(live_server)),
+        ]);
+        let head_id = pending.front().expect("headed").request.id;
+        let decided = answer_head(&mut pending, b"allow\n")
+            .await
+            .expect("dead head must still pop");
+        assert_eq!(decided.0, head_id, "FIFO order survives disconnects");
+        let new_head = pending.front().expect("live remains").request.id;
+        assert_ne!(new_head, head_id);
+        let decided = answer_head(&mut pending, b"allow\n")
+            .await
+            .expect("live head must be answerable");
+        assert_eq!(decided.0, new_head);
+        assert_eq!(
+            read_client_line(&mut live_client).await.as_deref(),
+            Some("allow\n")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_denies_the_newcomer_fast_and_fail_closed() -> Result<()> {
+        // Fill the queue to its cap, then prove the next arrival gets an
+        // explicit deny promptly (fail-closed) while the head is untouched.
+        let cap = crate::resource_limits::MAX_PENDING_APPROVALS;
+        let mut pending = VecDeque::new();
+        let mut clients = Vec::new();
+        for _ in 0..cap {
+            let (client, server) = tokio::io::duplex(64);
+            enqueue_approval(&mut pending, approval_request("queued"), Box::new(server)).await;
+            clients.push(client);
+        }
+        assert_eq!(pending.len(), cap);
+        let head_id = pending.front().expect("headed").request.id;
+        let (mut extra_client, extra_server) = tokio::io::duplex(64);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            enqueue_approval(
+                &mut pending,
+                approval_request("overflow"),
+                Box::new(extra_server),
+            ),
+        )
+        .await
+        .expect("overflow refusal must not hang");
+        assert_eq!(outcome, head_id, "the display must stay on the head");
+        assert_eq!(pending.len(), cap, "overflow must not grow the queue");
+        assert_eq!(
+            read_client_line(&mut extra_client).await.as_deref(),
+            Some("deny\n"),
+            "overflow must be an explicit deny, never allow and never silence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_message_is_refused_and_exact_size_parses() -> Result<()> {
+        let max = crate::resource_limits::MAX_APPROVAL_MESSAGE_BYTES;
+        // One chunk past the cap: refused whole without hanging. The writer
+        // runs detached because the reader stops consuming once the bound
+        // trips; awaiting the write inline would wedge the test itself.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let flood = vec![b'x'; max + 8192];
+        let writer = tokio::spawn(async move {
+            let mut client = client;
+            let _ = client.write_all(&flood).await;
+        });
+        let mut stream: SessionStream = Box::new(server);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_session_message_with_timeout(&mut stream, Duration::from_secs(5)),
+        )
+        .await
+        .expect("oversize must not hang");
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("oversize must be refused"),
+        };
+        writer.abort();
+        assert!(
+            format!("{error:#}").contains("exceeded the maximum"),
+            "oversize must report the bound, got: {error:#}"
+        );
+        // Exactly at the cap with invalid JSON: size accepted, parse rejected.
+        // The message proves which layer decided. The writer runs detached:
+        // a megabyte cannot be pushed inline into a small duplex without a
+        // concurrent reader (that self-deadlock hung this test at first).
+        let (client, server) = tokio::io::duplex(2 * 1024);
+        let mut body = vec![b'x'; max];
+        body.push(b'\n');
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut client = client;
+            let _ = client.write_all(&body).await;
+        });
+        let mut stream: SessionStream = Box::new(server);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_session_message_with_timeout(&mut stream, Duration::from_secs(5)),
+        )
+        .await
+        .expect("exact-size read must not hang");
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("non-JSON must still be rejected"),
+        };
+        writer.abort();
+        assert!(
+            format!("{error:#}").contains("invalid session message"),
+            "exact-size body must pass the size layer, got: {error:#}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -916,6 +1286,132 @@ mod approval_stability_tests {
         .expect("live client must be answered promptly")?;
         assert_eq!(line, "allow\n", "live approval must receive the answer");
         assert!(pending.is_empty());
+        Ok(())
+    }
+
+    async fn test_listener() -> Result<(SessionListener, PathBuf)> {
+        let id = format!("stability-accept-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let listener = bind_listener(&path)?;
+        Ok((listener, path))
+    }
+
+    async fn send_frame(path: &std::path::Path, frame: &[u8]) -> Result<SessionStream> {
+        let mut stream = connect(path).await?;
+        stream.write_all(frame).await?;
+        stream.write_all(b"\n").await?;
+        stream.shutdown().await?;
+        Ok(stream)
+    }
+
+    #[tokio::test]
+    async fn slow_connection_does_not_block_later_ones() -> Result<()> {
+        // A client that connects and trickles bytes held the old accept/read
+        // sequence with no deadline, head-blocking every later approval. The
+        // slow one must be dropped on its timeout while the legitimate one is
+        // still queued and answerable — whichever order accept observes them.
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let (mut listener, path) = test_listener().await?;
+            let slow_path = path.clone();
+            let slow = tokio::spawn(async move {
+                let mut stream = connect(&slow_path).await?;
+                stream.write_all(b"{\"type\":\"approv").await?;
+                let _: () = std::future::pending().await;
+                Ok::<(), anyhow::Error>(())
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let legit_path = path.clone();
+            let legit = tokio::spawn(async move {
+                let stream = send_frame(&legit_path, &approval_frame("op-legit")).await?;
+                Ok::<_, anyhow::Error>(stream)
+            });
+            let mut pending = VecDeque::new();
+            handle_approval_connection(&mut listener, &mut pending, false).await?;
+            handle_approval_connection(&mut listener, &mut pending, false).await?;
+            assert_eq!(pending.len(), 1, "only the legitimate approval queues");
+            assert_eq!(
+                pending.front().expect("queued").request.operation,
+                "op-legit"
+            );
+            let mut legit_stream = legit.await??;
+            let mut line = String::new();
+            // The queued approval is still undecided: no answer yet, and the
+            // slow connection never poisoned the queue.
+            let answered = tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio::io::BufReader::new(&mut legit_stream).read_line(&mut line),
+            )
+            .await;
+            assert!(
+                answered.is_err(),
+                "queued approval must wait for the operator, not self-answer"
+            );
+            slow.abort();
+            Ok::<(), anyhow::Error>(())
+        });
+        outcome
+            .await
+            .expect("slow-connection test hung: regression")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flood_refuses_exactly_one_newcomer_with_explicit_deny() -> Result<()> {
+        // More concurrent approvals than the queue cap: all must be served
+        // promptly (no head-of-line stall), exactly the overflow is denied
+        // fail-closed, and the queue holds precisely the cap.
+        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+            let (mut listener, path) = test_listener().await?;
+            let cap = crate::resource_limits::MAX_PENDING_APPROVALS;
+            let total = cap + 1;
+            let mut clients = Vec::new();
+            for index in 0..total {
+                let client_path = path.clone();
+                clients.push(tokio::spawn(async move {
+                    let frame = approval_frame(&format!("op-flood-{index}"));
+                    let mut stream = send_frame(&client_path, &frame).await?;
+                    let mut line = String::new();
+                    let answered = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        tokio::io::BufReader::new(&mut stream).read_line(&mut line),
+                    )
+                    .await;
+                    Ok::<_, anyhow::Error>(
+                        answered
+                            .ok()
+                            .and_then(|read| read.ok().filter(|_| !line.is_empty()).map(|_| line)),
+                    )
+                }));
+            }
+            let mut pending = VecDeque::new();
+            for _ in 0..total {
+                handle_approval_connection(&mut listener, &mut pending, false).await?;
+            }
+            assert_eq!(
+                pending.len(),
+                cap,
+                "queue must hold exactly the cap after a flood"
+            );
+            let mut denies = 0;
+            let mut undecided = 0;
+            for client in clients {
+                match client.await?? {
+                    Some(line) => {
+                        assert_eq!(line, "deny\n", "overflow must be explicit deny");
+                        denies += 1;
+                    }
+                    None => undecided += 1,
+                }
+            }
+            assert_eq!(denies, 1, "exactly the overflow must be denied");
+            assert_eq!(undecided, cap, "the capped queue waits for the operator");
+            Ok::<(), anyhow::Error>(())
+        });
+        outcome.await.expect("flood test hung: regression")?;
         Ok(())
     }
 

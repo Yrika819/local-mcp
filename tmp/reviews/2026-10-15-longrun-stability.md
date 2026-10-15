@@ -268,3 +268,99 @@ fail-closed (error, never allow) で bound。
   transport/resource 既存は次回 CI + 個別実行で確認。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: clean。
 - GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。
+
+### CI 失敗と修正 (PR #11、同一ブランチ)
+
+1. `test (windows-x64)` が `expired_approvals_are_evicted...` で失敗
+   (2 件残存 vs 1 件期待)。原因はテストヘルパーの
+   `Instant::checked_sub(660s)` が起動直後の CI マシン (uptime < 11 分) で
+   アンダーフロー → entry が fresh 扱い。生産コードは無罪
+   (evict 判定は `elapsed` 参照)。修正は時刻注入 (`evict_expired_at`、
+   前方向 checked_add + saturating_duration_since) + fresh 非 evict の
+   assertion 追加 (`537372c`)。
+2. 続いて `quality (ubuntu-24.04)` が `cargo fmt --check` で失敗。
+   上記修正コミット直前の fmt 実行と最終編集の順序が逆で、整形差分が
+   残ったまま push していた。eviction helper の空白のみ修正 (`4880996`)、
+   fmt clean + approval_stability 14 件 pass を確認して push。
+   教訓: コミット直前に必ず `cargo fmt --all -- --check` を実行する。
+   (以前の `echo $?` 方式では Select-Object の終了状態を見ており、
+   `cargo fmt` 自体の成否を見ていなかった。今後は `$LASTEXITCODE` を使用。)
+3. API rate limit: CI 監視の `gh api` 連打で 403 を踏んだ。監視は間隔を
+   空けた `gh pr checks` のみに制限する。
+
+### 最終 CI 結果 (HEAD 4880996)
+
+- PR #11 の全 22 checks が SUCCESS (quality + test + compat の
+  Windows/macOS/Linux matrix)。`test (windows-x64)` の再発なし。
+- マージ・タグ・リリースは未実施 (Draft 維持)。本番バイナリ・Tunnel・
+  永続 Goal 状態・既存未追跡ファイルは無改変。
+
+## R6. 独立レビュー第3ラウンド (同一ブランチ、未マージ)
+
+### 最優先: 承認の表示/回答の取り違え
+
+- 実証 (コード): 新規到着ごとに `show_request(新規)` を表示する一方、
+  回答は FIFO 先頭を pop。A 表示→B 到着表示→"y" で A が承認される。
+  最後に表示された操作と承認される操作が一致しない。
+- 修正: `enqueue_approval` が常に head を表示して表示 id を返す
+  (到着時は head が新規自身なので従来表示と同一、2 件目以降は
+  "Queued …; awaiting decision on:" + head 再表示)。
+  `answer_head` が決定内容 `(id, operation)` を返し、y/n/未認識の各 arm が
+  "Allowed/Denied <operation> <id>" を確認表示。yolo 即時許可は逐次表示の
+  まま (到着=決定で乖離なし)。FIFO・allow/deny・fail-closed 不変。
+- テスト: 表示==回答の対応付け (連続到着・回答後追加到着)、期限切れ後も
+  対応維持、切断でも FIFO 維持、の 3 件 + 既存 phase0 FIFO 契約は不変で pass。
+
+### MCP 終了経路の統一
+
+- 監査で早期 return (release_all_jobs 迂回) 4 箇所を特定:
+  stdin 非 EOF I/O error の `?`、read-loop 送信 error の `?` ×3、
+  writer JoinError の `?`。いずれも cleanup なしで return していた。
+- 修正: frame 処理を `process_one_frame` に抽出 (`continue`→`Ok`) し、
+  read 失敗は `read_error` に記録して break、writer 結果も格納して break。
+  全終了は `finish_transport` (drain→release→report の単一経路) のみ。
+  error 優先順位は `report_shutdown_outcome` に固定し unit test。
+  `release_all_jobs` 呼び出しは全コードで 1 箇所のみ (grep 検証)。
+- テスト: LeaveRegistry のみで全 exit の明示終了を証明
+  (stdin error→Err、writer 死亡→Err、EOF→Ok)。
+  グローバル registry を触る e2e は並列テスト干渉
+  (phase0_mcp の legacy job を release_all が巻き込む) のため採用せず、
+  制限として明記。単一 tail + precedence unit + 既存全 suite の無変化で担保。
+
+### 追加監査: 入力サイズ・pending 上限・低速大量接続
+
+- `MAX_APPROVAL_MESSAGE_BYTES=1MB` (正規 argv 由来の正当 traffic は
+  compile-time assert で適合保証) + 新 `ResourceLimit::ApprovalMessage`。
+  送信側は送信前に typed refusal、受信側は `read_bounded_line` で増分 cap
+  (timeout は時間、cap はメモリを bound)。超過は whole 拒否+接続破棄。
+- `MAX_PENDING_APPROVALS=32` (= 輸送並列総数)。超過は明示 `deny`
+  (fail-closed、never allow) で即時回答、head 不変。
+- accept 本体を `handle_approval_connection` に抽出し実リスナーで検証:
+  部分送信は timeout 破棄し後続が queue 化、低速→正規の順序不定でも成立、
+  33 並列 flood は 32 queue + ちょうど 1 deny。
+- テスト事故の記録: exact-size テスト初版が同一タスク内で 1MB を inline
+  write_all (reader なし) して自己デッドロック (CPU 0、timer 不発) した。
+  原因特定に pump/reader/volume の三段階プローブを使用。
+  教訓: バッファ超の write は必ず concurrent reader と組にする。
+  本件はテストコードのみの問題で生産コードは無罪 (reader 自体は全容量で
+  正常動作をプローブで証明)。
+
+### 再監査 (新 deadlock/orphan/権限)
+
+- select 構造不変 (process 抽出は逐次実行、cancel 対象は next_frame のみ)。
+  enqueue/answer/evict は同期+bounded のみ。refuse の deny は inline await
+  (flood 時の task 無限増殖を避けるため spawn しない)。
+- evict/refuse は何も許可せず、deny は fail-closed。yolo 意味不変。
+  expiry 表示は operation+id のみ。秘密情報ログなし。
+- 残存: ReleaseAllJobs の e2e (上記理由で非採用)、dispatch-cancel orphan・
+  file lock・実機長時間観測 (従来どおり未検証)。
+
+### R6 検証
+
+- `cargo fmt --check`: clean (コミット直前実行)。
+- `cargo check --locked --all-targets --jobs 2`: pass、警告なし。
+- 新規・更新: longrun 11 件、approval 76 件 (stability 28 を含む)、
+  resource 66 件、すべて pass。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: clean
+  (抽出に伴う `&&` 二重参照を修正)。
+- GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。
