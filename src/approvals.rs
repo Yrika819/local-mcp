@@ -201,17 +201,35 @@ pub async fn request(
     };
     let path = config::socket_path(session_id)?;
 
-    let mut stream = connect(&path)
+    // Machine IPC steps are bounded by APPROVAL_IO_TIMEOUT: a dead pipe must
+    // surface as an error quickly, never as an indefinite stall of the calling
+    // dispatch (which holds its execution permit while waiting).
+    let io_timeout = crate::resource_limits::APPROVAL_IO_TIMEOUT;
+    let mut stream = tokio::time::timeout(io_timeout, connect(&path))
         .await
+        .map_err(|_| anyhow::anyhow!("approval IPC connect timed out"))?
         .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
-    stream
-        .write_all(&serde_json::to_vec(&Message::Approval { request })?)
-        .await?;
-    stream.write_all(b"\n").await?;
-    stream.shutdown().await?;
+    let payload = serde_json::to_vec(&Message::Approval { request })?;
+    tokio::time::timeout(io_timeout, stream.write_all(&payload))
+        .await
+        .map_err(|_| anyhow::anyhow!("approval IPC write timed out"))??;
+    tokio::time::timeout(io_timeout, stream.write_all(b"\n"))
+        .await
+        .map_err(|_| anyhow::anyhow!("approval IPC write timed out"))??;
+    tokio::time::timeout(io_timeout, stream.shutdown())
+        .await
+        .map_err(|_| anyhow::anyhow!("approval IPC shutdown timed out"))??;
 
+    // Human latency is generous (APPROVAL_RESPONSE_TIMEOUT) but still bounded:
+    // when the session UI disappears, the wait must fail closed (error, never
+    // allow) instead of leaking the dispatch and its permit forever.
     let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
+    tokio::time::timeout(
+        crate::resource_limits::APPROVAL_RESPONSE_TIMEOUT,
+        BufReader::new(stream).read_line(&mut response),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("approval response timed out"))??;
     match response.trim() {
         "allow" => Ok(true),
         "deny" => Ok(false),

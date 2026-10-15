@@ -184,6 +184,52 @@ pub(crate) const EXECUTION_PERMITS: usize = 16;
 /// Total transport concurrency. Unchanged from before Resource Bounds V1.
 pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 32;
 
+/// How long one response frame write may take before it is treated as a
+/// stalled transport rather than a slow client.
+///
+/// Stdout is a local pipe to a single client; a normal frame (usually KiB)
+/// completes in milliseconds. Waiting indefinitely in `write_all`/`flush`
+/// wedges the single serialized writer, fills the bounded response channel,
+/// and leaks both admission pools while the read loop stops draining stdin.
+/// Timing out converts that silent stall into an explicit transport failure
+/// the host can observe and recover from (process exit / supervisor restart)
+/// instead of a session that keeps running commands but answers nothing.
+pub(crate) const MCP_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a response-channel send may wait when the writer is behind.
+///
+/// Dispatch tasks hold their admission permit while sending, so an unbounded
+/// send is a permit leak whenever the writer stalls. Bounding the send keeps
+/// permits flowing even if an individual response has to be dropped; a missing
+/// response for one id is strictly better than a session-wide stall.
+pub(crate) const MCP_RESPONSE_SEND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// How long a control-plane request waits for a reserved permit before it is
+/// refused with a bounded resource error instead of blocking the read loop.
+///
+/// Control work is a map lookup or state read, so the wait is normally short.
+/// Without a bound, stalled control dispatches (for example ones blocked on a
+/// stalled writer) wedge the read loop forever on the next control request.
+pub(crate) const CONTROL_ADMISSION_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// How long approval IPC waits for the session UI to answer.
+///
+/// Human approval legitimately takes time, so this is generous (10 minutes),
+/// but it must still be bounded: an unbounded `read_line` holds the calling
+/// dispatch (and its execution permit) forever when the UI disappears, and the
+/// pending queue in `approvals::start` grows without limit behind a stalled
+/// head. Expiry fails closed (error, never allow).
+pub(crate) const APPROVAL_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// How long approval IPC waits for a single connect/write/shutdown step.
+///
+/// The response wait above covers human latency; these steps are machine IPC
+/// and must be fast. Bounding them keeps a dead pipe from holding a dispatch.
+pub(crate) const APPROVAL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Compile-time relationships
 // ---------------------------------------------------------------------------
@@ -423,6 +469,14 @@ mod tests {
             CONTROL_PLANE_PERMITS + EXECUTION_PERMITS,
             MAX_CONCURRENT_REQUESTS
         );
+        // Long-run stability timeouts: bounded, non-zero, and ordered so that a
+        // single slow frame (write/send) fails before control admission gives up,
+        // and machine IPC (approval I/O) fails long before a human answer is due.
+        assert!(MCP_WRITE_TIMEOUT.as_millis() > 0);
+        assert!(MCP_RESPONSE_SEND_TIMEOUT.as_millis() > 0);
+        assert!(CONTROL_ADMISSION_WAIT_TIMEOUT >= MCP_WRITE_TIMEOUT);
+        assert!(APPROVAL_IO_TIMEOUT.as_millis() > 0);
+        assert!(APPROVAL_RESPONSE_TIMEOUT > APPROVAL_IO_TIMEOUT);
     }
 
     #[test]

@@ -110,10 +110,18 @@ where
     let writer_handle = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(response) = response_rx.recv().await {
-            // Never end this task on a per-frame failure: returning here would drop
-            // the receiver, after which every later response is silently discarded
-            // and the client waits forever.
-            write_response_or_substitute(&mut writer, &response).await;
+            // Size violations are substituted with a bounded resource-limit
+            // frame and the loop continues. Transport I/O failures (broken
+            // pipe, stalled client, write timeout) return false and end the
+            // loop: the receiver is dropped, further sends fail fast instead
+            // of blocking forever, and the read loop observes the finished
+            // writer and exits with an explicit error. A silent stall where the
+            // server keeps running commands but answers nothing is strictly
+            // worse than an explicit transport termination a supervisor can
+            // observe and recover from.
+            if !write_response_or_substitute(&mut writer, &response).await {
+                anyhow::bail!("response writer transport failure: client unreachable or stalled");
+            }
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -133,6 +141,12 @@ where
     // this bound exists to avoid.
     let mut reader = frame_reader(reader);
     loop {
+        // If the writer already terminated on a transport failure, stop reading:
+        // spawning more dispatches whose responses can never be delivered would
+        // recreate the silent stall this bound exists to prevent.
+        if writer_handle.is_finished() {
+            anyhow::bail!("response writer task terminated unexpectedly");
+        }
         // Framing is bounded before parsing, and both happen before a dispatch
         // permit is acquired, so a far-too-large request neither allocates
         // without limit nor consumes a worker permit to be rejected.
@@ -150,27 +164,31 @@ where
                     crate::resource_limits::ResourceLimit::McpRequestFrame,
                     "request frame exceeded the maximum and was discarded without parsing",
                 );
-                response_tx
-                    .send(bounded_error_response(
+                send_response_bounded(
+                    &response_tx,
+                    bounded_error_response(
                         Value::Null,
                         JSONRPC_RESOURCE_LIMIT,
                         &format!("{error:#}"),
-                    ))
-                    .await
-                    .context("response writer task terminated unexpectedly")?;
+                    ),
+                )
+                .await
+                .context("response writer task terminated unexpectedly")?;
                 continue;
             }
             Frame::Complete(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => text,
                 Err(_) => {
-                    response_tx
-                        .send(bounded_error_response(
+                    send_response_bounded(
+                        &response_tx,
+                        bounded_error_response(
                             Value::Null,
                             JSONRPC_SERVER_ERROR,
                             "request frame is not valid UTF-8",
-                        ))
-                        .await
-                        .context("response writer task terminated unexpectedly")?;
+                        ),
+                    )
+                    .await
+                    .context("response writer task terminated unexpectedly")?;
                     continue;
                 }
             },
@@ -180,14 +198,12 @@ where
             Err(error) => {
                 // Malformed JSON is answered immediately; it is not a valid
                 // request and must not consume a dispatch permit.
-                response_tx
-                    .send(bounded_error_response(
-                        Value::Null,
-                        -32700,
-                        &error.to_string(),
-                    ))
-                    .await
-                    .context("response writer task terminated unexpectedly")?;
+                send_response_bounded(
+                    &response_tx,
+                    bounded_error_response(Value::Null, -32700, &error.to_string()),
+                )
+                .await
+                .context("response writer task terminated unexpectedly")?;
                 continue;
             }
         };
@@ -203,10 +219,13 @@ where
             Ok(permit) => permit,
             Err(reason) => {
                 // Refused before any work starts. Reported as a resource failure,
-                // never as an authority or permission failure.
-                let _ = response_tx
-                    .send(bounded_error_response(id, JSONRPC_RESOURCE_LIMIT, reason))
-                    .await;
+                // never as an authority or permission failure. Bounded so a
+                // stalled writer cannot wedge the read loop here either.
+                let _ = send_response_bounded(
+                    &response_tx,
+                    bounded_error_response(id, JSONRPC_RESOURCE_LIMIT, reason),
+                )
+                .await;
                 continue;
             }
         };
@@ -251,8 +270,9 @@ where
                 }
             };
             // If the client disconnected the writer task will have terminated;
-            // the request's response is simply dropped.
-            let _ = response_tx.send(response).await;
+            // the request's response is simply dropped. Bounded so a stalled
+            // writer cannot leak this dispatch's permit forever.
+            let _ = send_response_bounded(&response_tx, response).await;
         });
     }
 
@@ -298,29 +318,63 @@ async fn release_all_jobs() {
     terminate_jobs(released).await;
 }
 
+/// Send one response without holding the caller (and its admission permit)
+/// indefinitely when the writer is behind.
+///
+/// Returns `Ok(())` when the frame entered the bounded channel, `Err` on
+/// timeout or when the writer is gone. Dispatch callers drop the response on
+/// `Err` (freeing the permit); read-loop callers propagate it so a stalled
+/// writer ends the transport explicitly instead of wedging stdin.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the stability tests"))]
+pub(crate) async fn send_response_bounded(
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    response: Value,
+) -> Result<()> {
+    tokio::time::timeout(
+        crate::resource_limits::MCP_RESPONSE_SEND_TIMEOUT,
+        response_tx.send(response),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("response channel stalled: writer not draining"))?
+    .map_err(|_| anyhow::anyhow!("response writer task terminated unexpectedly"))?;
+    Ok(())
+}
+
 /// Write one response, replacing it with a bounded error frame if it does not fit.
 ///
-/// This is what keeps a single oversized result from bricking the transport. An
-/// earlier version let `write_message`'s error end the writer task, which dropped
-/// the response receiver: every later response was then discarded silently while
-/// the server kept running the client's commands.
+/// Size violations are substituted and the transport continues. Transport I/O
+/// failures (broken pipe, stalled client, write timeout) are *not* size
+/// violations: no substitute is attempted for them and `false` is returned so
+/// the writer task terminates explicitly instead of looping on a dead client.
 ///
-/// Returns whether the frame itself was written.
+/// Returns `true` when any frame (original or size-substitute) was written,
+/// `false` on transport I/O failure.
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
 pub(crate) async fn write_response_or_substitute<W>(writer: &mut W, response: &Value) -> bool
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if write_message(writer, response).await.is_ok() {
-        return true;
+    match write_message(writer, response).await {
+        Ok(()) => true,
+        Err(error) => {
+            // Only a size violation earns a substitute frame. Treating every
+            // I/O failure as "too large" would mask broken pipes and stalls
+            // behind a resource-limit code and retry a write that cannot succeed.
+            if error
+                .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+                .is_none()
+            {
+                return false;
+            }
+            let id = response.get("id").cloned().unwrap_or(Value::Null);
+            let replacement = bounded_error_response(
+                id,
+                JSONRPC_RESOURCE_LIMIT,
+                "response exceeded the maximum and was not written",
+            );
+            write_message(writer, &replacement).await.is_ok()
+        }
     }
-    let id = response.get("id").cloned().unwrap_or(Value::Null);
-    let replacement = bounded_error_response(
-        id,
-        JSONRPC_RESOURCE_LIMIT,
-        "response exceeded the maximum and was not written",
-    );
-    write_message(writer, &replacement).await.is_ok()
 }
 
 /// Writes one complete, newline-delimited JSON-RPC frame.
@@ -335,6 +389,10 @@ where
 /// Method-level bounds are what make a normal response small; this is the
 /// defence in depth that guarantees no oversized frame ever reaches the socket,
 /// and it fails by returning a bounded error rather than truncating valid JSON.
+///
+/// Every I/O step is bounded by [`crate::resource_limits::MCP_WRITE_TIMEOUT`]:
+/// a client that stops reading stdout must surface as a timeout error, never
+/// as an indefinite stall of the single serialized writer.
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the transport tests"))]
 pub(crate) async fn write_message<W>(writer: &mut W, message: &Value) -> Result<()>
 where
@@ -346,9 +404,16 @@ where
         crate::resource_limits::ResourceLimit::McpResponseFrame,
         "response exceeded the maximum and was not written",
     )?;
-    writer.write_all(&encoded).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    let timeout = crate::resource_limits::MCP_WRITE_TIMEOUT;
+    tokio::time::timeout(timeout, writer.write_all(&encoded))
+        .await
+        .map_err(|_| anyhow::anyhow!("response write timed out: client not reading"))??;
+    tokio::time::timeout(timeout, writer.write_all(b"\n"))
+        .await
+        .map_err(|_| anyhow::anyhow!("response write timed out: client not reading"))??;
+    tokio::time::timeout(timeout, writer.flush())
+        .await
+        .map_err(|_| anyhow::anyhow!("response flush timed out: client not reading"))??;
     Ok(())
 }
 
@@ -1269,8 +1334,13 @@ pub(crate) fn admission_pool(request: &Value) -> Pool {
 
 /// Reserve dispatch capacity for one request.
 ///
-/// Control-plane requests **wait** for a reserved permit, and that wait is short
-/// because control work is a map lookup or a state read.
+/// Control-plane requests **wait** for a reserved permit, but only up to
+/// [`crate::resource_limits::CONTROL_ADMISSION_WAIT_TIMEOUT`]: control work is
+/// a map lookup or a state read, so a longer wait means stalled dispatches are
+/// holding the pool (for example behind a stalled writer) and blocking the
+/// read loop forever would recreate the stall this bound exists to prevent.
+/// Expiry refuses with the same bounded resource error a saturated execution
+/// pool uses, letting the client retry.
 ///
 /// Execution requests do **not** wait. They reserve capacity without blocking,
 /// because a reader that blocks on a saturated execution pool is exactly the
@@ -1286,11 +1356,15 @@ pub(crate) async fn acquire_admission(
     execution: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
     match admission_pool(request) {
-        Pool::Control => control
-            .clone()
-            .acquire_owned()
+        Pool::Control => {
+            let wait = tokio::time::timeout(
+                crate::resource_limits::CONTROL_ADMISSION_WAIT_TIMEOUT,
+                control.clone().acquire_owned(),
+            )
             .await
-            .map_err(|_| "control dispatch capacity closed"),
+            .map_err(|_| "control dispatch capacity exhausted")?;
+            wait.map_err(|_| "control dispatch capacity closed")
+        }
         Pool::Execution => execution
             .clone()
             .try_acquire_owned()
