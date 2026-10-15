@@ -16,7 +16,7 @@ fn phase0_approval_session() -> (Session, PathBuf) {
 fn phase0_pending(
     operation: &str,
     cwd: &Path,
-) -> (tokio::io::DuplexStream, (Request, SessionStream)) {
+) -> (tokio::io::DuplexStream, PendingApproval) {
     let (client, server) = tokio::io::duplex(1024);
     let request = Request {
         id: Uuid::new_v4(),
@@ -24,7 +24,14 @@ fn phase0_pending(
         detail: operation.to_owned(),
         cwd: cwd.to_owned(),
     };
-    (client, (request, Box::new(server)))
+    (
+        client,
+        PendingApproval {
+            request,
+            stream: Box::new(server),
+            enqueued: std::time::Instant::now(),
+        },
+    )
 }
 
 #[tokio::test]

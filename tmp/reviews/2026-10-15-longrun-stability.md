@@ -180,3 +180,91 @@ fail-closed (error, never allow) で bound。
 - 残作業: dispatch-cancel orphan の明示停止、OS file lock の try/timeout 化、
   approval pending queue の上限・skip 機構、実機での長時間観測
   (本番バイナリ更新は対象外のため未検証)。
+
+## R1-R5. 独立レビュー指摘への再対応 (PR #11 同一ブランチ、未マージ)
+
+レビューで追加の懸念 4 件 + テスト監査 1 件。いずれも同一ブランチで
+再現テスト (修正前失敗確認) → 最小修正 → 回帰 → CI の順で対応。
+
+### R1. writer 終了後に read loop が next_frame に残る
+
+- 実証: `is_finished()` の loop 先頭チェックだけでは、追加入力のない stdin で
+  `next_frame().await` に永久残留。新規テスト 2 件
+  (`broken_writer_ends_transport_without_further_input`,
+  `stalled_writer_ends_transport_without_further_input`) が修正前に失敗
+  (各 outer deadline で hang 検出、30.03 s で 2 件とも FAILED)。
+- 修正: `tokio::select!` で `next_frame` と `writer_handle` を同時待ち。
+  writer 側が先に終われば loop を抜けて明示終了。半読み `next_frame` の
+  cancel は安全 (保持バイトは reader 側に残り、本 arm は必ず loop 脱出)。
+- 修正後: 2 件とも pass (10.02 s)。正常 EOF 経路・frame 境界・admission 意味は不変。
+
+### R2. 承認 10 分期限切れ後の stale pending
+
+- 実証 (コード): request 側 timeout 後も server の `VecDeque` に
+  `(Request, Stream)` が残り、(a) operator の回答 `write_all(...).await?` が
+  死 stream で Err → `handle_input` の `?` → `start()` 終了 (UI 死亡)、
+  (b) yolo drain・未認識入力も同形、(c) stale が先頭 block。
+- 修正: `PendingApproval { request, stream, enqueued }` を導入。
+  回答は best-effort `answer()` (10 s bound、失敗 swallow、pop 先行)。
+  `evict_expired()` が `APPROVAL_RESPONSE_TIMEOUT` 超の先頭連続 corpses を
+  破棄 ([expired] を operation+id のみで表示、detail 非出力)。
+  Evict は何も許可・拒否しない (client は既に fail-closed 終了済み)。
+- テスト 7 件 (`approval_stability_tests`、phase0 include 経由で二重実行=14):
+  dead 回答でも UI 生存、期限切れ evict 後に live 承認へ `allow\n` 到達、
+  yolo drain 生存。既存 phase0 契約 (FIFO・allow/deny・yolo・allow/revoke)
+  は helper の型更新のみで assertion 不変 (弱体化なし)。
+
+### R3. send 失敗時の個別レスポンス破棄
+
+- 整理: dispatch 同時最大 32 < channel 64 のため、live writer 下で dispatch
+  送信だけが詰まることはない。送信失敗は writer 死亡/stall を意味し、
+  R1 の select が transport を明示終了させる。破棄は transport EOF として
+  client に表面化し、id 単位の無限待ちにならない。
+- 修正: 上記因果を dispatch コメントに明記。加えて writer 失敗経路でも
+  `release_all_jobs()` を実行してから error を返すよう順序修正
+  (PR #11 時点では `??` が先に return し cleanup を skip する新 orphan が
+  あったため)。in-flight dispatch の扱いは EOF 経路と同一
+  (serve return → runtime 終了で cancel)。
+- テスト: R1 の 2 件が transport 終了 (明示 error、hang なし) を証明。
+
+### R4. server 側 accept 後の read_line head-of-line
+
+- 実証 (コード): 旧 accept arm は `read_line().await?` 無期限 + `?` 伝播。
+  部分送信・無応答が単一 accept/read 順序を占有し後続接続を block、
+  切断・garbage は `?` で UI 全体を死亡させた。
+- 修正: `read_session_message_with_timeout` (production は
+  `APPROVAL_IO_TIMEOUT`) に抽出。accept arm は失敗時に当該接続を破棄して
+  継続 (`eprintln` のみ)。yolo 即時許可の write も best-effort。
+- テスト 4 件: 正常 frame 受理、garbage 拒否 (hang なし)、部分送信 timeout、
+  切断 fail-closed。いずれも duplex 隔離・outer deadline 付き。
+
+### R5. 既存 7 件の監査
+
+- 7 件は production 関数 (`write_message`, `write_response_or_substitute`,
+  `send_response_bounded`, `acquire_admission`, `admission_pool`, 定数) を
+  直接呼ぶ真正な検証。不足は統合経路
+  (`serve_with_io` end-to-end、承認 server 側、stale queue) であり、
+  今回 2 + 7 件で充填。`silent_responder` は機構証明に留まる旨を明記
+  (request 側 production bound は Windows pipe 実テストとコードで担保)。
+
+### 再監査 (新デッドロック・孤立・権限)
+
+- デッドロック: select 両 arm は即時 break/継続、await 跨ぎの lock なし、
+  evict は同期 VecDeque 操作のみ。`answer` は pop 後に bound 実行のため
+  先頭 block なし。FIFO + 単調 Instant のため front-only evict で完全。
+- 孤立: writer 失敗経路の cleanup 順序を修正済み。承認 evict は死 stream
+  解放 (旧は回答まで蓄積)。権限: evict は何も付与せず、best-effort 回答は
+  operator 決定済み verdict のみ、yolo 意味不変、pipe からの yolo 有効化なし
+  (既存テスト pass)、秘密情報のログなし。
+- 残存: stdin 非 EOF I/O error 時の早期 return (修正前からの挙動、今回は不変)、
+  transient channel-full 時の単発 drop (上記因果で transport 終了に収束)、
+  dispatch-cancel orphan・file lock・実機長時間観測 (前回報告どおり未検証)。
+
+### R2 対応の検証
+
+- `cargo fmt --check`: clean。
+- `cargo check --locked --all-targets --jobs 2`: pass、警告なし。
+- 新規・更新: longrun 9 件 pass (20.24 s)、approval 系 62 件 pass、
+  transport/resource 既存は次回 CI + 個別実行で確認。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: clean。
+- GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。

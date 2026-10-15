@@ -8,11 +8,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWrite};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::mcp::{
-    JSONRPC_RESOURCE_LIMIT, acquire_admission, admission_pool, send_response_bounded,
-    write_message, write_response_or_substitute,
+    JSONRPC_RESOURCE_LIMIT, ShutdownPolicy, acquire_admission, admission_pool,
+    send_response_bounded, serve_with_io, write_message, write_response_or_substitute,
 };
 use crate::resource_limits::{
     APPROVAL_IO_TIMEOUT, APPROVAL_RESPONSE_TIMEOUT, CONTROL_ADMISSION_WAIT_TIMEOUT,
@@ -265,4 +265,57 @@ async fn silent_responder_is_bounded_by_timeout_pattern() {
 async fn futures_lite_hold() {
     // Hold without depending on new crates: pend forever until aborted.
     std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn broken_writer_ends_transport_without_further_input() {
+    // Review concern R1: after the writer task ends on a transport failure,
+    // the read loop must notice even when no further input arrives. Here the
+    // writer fails on the very first frame while stdin stays open and silent.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut client = client;
+        client
+            .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .await
+            .expect("test input must be writable");
+        client.write_all(b"\n").await.expect("newline must fit");
+        // stdin stays open: no more input, no EOF. The transport must still
+        // terminate once the writer reports the broken client.
+        let result = serve_with_io(server, FailingWriter, ShutdownPolicy::LeaveRegistry).await;
+        let error = result.expect_err("broken writer must end the transport with an error");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("writer") || rendered.contains("transport"),
+            "transport end must name the writer failure, got: {rendered}"
+        );
+    });
+    outcome
+        .await
+        .expect("transport hung after writer death with silent stdin: regression");
+}
+
+#[tokio::test]
+async fn stalled_writer_ends_transport_without_further_input() {
+    // Full stall chain end to end: the client stops reading (PendingWriter),
+    // the write times out (MCP_WRITE_TIMEOUT), the writer terminates, and the
+    // read loop ends the transport although stdin stays open and silent. No
+    // per-ID wait may outlive the transport itself.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut client = client;
+        client
+            .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+            .await
+            .expect("test input must be writable");
+        client.write_all(b"\n").await.expect("newline must fit");
+        let result = serve_with_io(server, PendingWriter, ShutdownPolicy::LeaveRegistry).await;
+        assert!(
+            result.is_err(),
+            "stalled writer must end the transport with an error, not hang"
+        );
+    });
+    outcome
+        .await
+        .expect("transport hung after writer stall with silent stdin: regression");
 }

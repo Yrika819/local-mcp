@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -178,6 +177,84 @@ enum Message {
         title: String,
         detail: Option<String>,
     },
+}
+
+/// One approval waiting for the operator's answer, with its enqueue time.
+///
+/// The enqueue time is what lets the session UI drop requests whose caller is
+/// already gone: `request()` fails closed after `APPROVAL_RESPONSE_TIMEOUT`,
+/// so any entry older than that has no live client. Answering it would grant
+/// authority to nobody while consuming the operator's keystroke, and holding
+/// it would head-block every newer approval behind a corpse.
+struct PendingApproval {
+    request: Request,
+    stream: SessionStream,
+    enqueued: std::time::Instant,
+}
+
+/// Read one session message with an explicit deadline.
+///
+/// A client that connects and then sends a partial frame, nothing, or
+/// disconnects must surface as an error quickly — never as an indefinite
+/// stall of the single accept/read sequence that every later connection waits
+/// behind, and never as a dead session UI (callers drop the connection and
+/// continue instead of propagating with `?`).
+async fn read_session_message_with_timeout(
+    stream: &mut SessionStream,
+    timeout: Duration,
+) -> Result<Message> {
+    let mut line = String::new();
+    let read = tokio::time::timeout(timeout, BufReader::new(&mut *stream).read_line(&mut line))
+        .await
+        .map_err(|_| anyhow::anyhow!("session message read timed out"))??;
+    if read == 0 {
+        anyhow::bail!("session connection closed before a complete message");
+    }
+    serde_json::from_str(&line).context("invalid session message")
+}
+
+/// Production reader: bounded by `APPROVAL_IO_TIMEOUT`, the machine-IPC
+/// budget. Human latency is handled by the pending queue, not by this read.
+async fn read_session_message(stream: &mut SessionStream) -> Result<Message> {
+    read_session_message_with_timeout(stream, crate::resource_limits::APPROVAL_IO_TIMEOUT).await
+}
+
+/// Answer one pending approval on a best-effort basis.
+///
+/// The operator already made this decision (or yolo mode made it); a dead
+/// stream means the caller is gone and there is nobody to grant anything to.
+/// Failing here would propagate through `handle_input` and kill the whole
+/// session UI, taking every later approval down with one corpse.
+/// Errors are therefore swallowed after a bounded write attempt.
+async fn answer(stream: &mut SessionStream, verdict: &[u8]) {
+    let _ = tokio::time::timeout(
+        crate::resource_limits::APPROVAL_IO_TIMEOUT,
+        stream.write_all(verdict),
+    )
+    .await;
+}
+
+/// Drop queued approvals whose caller already timed out.
+///
+/// Entries older than `APPROVAL_RESPONSE_TIMEOUT` have no live client:
+/// `request()` fails closed at exactly that age. Eviction grants nothing and
+/// denies nothing — it only frees the operator from clearing corpses one
+/// keystroke at a time so later approvals are processed correctly. Only the
+/// operation name and id are echoed (both already operator-visible); the
+/// detail is not repeated.
+fn evict_expired(pending: &mut VecDeque<PendingApproval>) {
+    let deadline = crate::resource_limits::APPROVAL_RESPONSE_TIMEOUT;
+    while pending
+        .front()
+        .is_some_and(|entry| entry.enqueued.elapsed() > deadline)
+    {
+        if let Some(entry) = pending.pop_front() {
+            eprintln!(
+                "[expired] {} {} (caller timed out; no approval granted)",
+                entry.request.operation, entry.request.id
+            );
+        }
+    }
 }
 
 #[cfg_attr(
@@ -437,29 +514,42 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
     );
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut pending = VecDeque::<(Request, SessionStream)>::new();
+    let mut pending = VecDeque::<PendingApproval>::new();
     let mut yolo = false;
     loop {
         tokio::select! {
             connection = listener.accept() => {
                 let mut stream = connection?;
-                let mut line = String::new();
-                BufReader::new(&mut stream).read_line(&mut line).await?;
-                let message: Message = serde_json::from_str(&line).context("invalid session message")?;
-                match message {
-                    Message::Activity { title, detail } => show_activity(&title, detail.as_deref()),
-                    Message::Approval { request } if yolo => {
-                        eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
-                        stream.write_all(b"allow\n").await?;
+                match read_session_message(&mut stream).await {
+                    Err(error) => {
+                        // Partial frame, silent client, disconnect, or garbage:
+                        // drop this connection and keep serving. Propagating
+                        // with `?` here killed the whole session UI on one bad
+                        // client, taking every later approval down with it.
+                        eprintln!("Ignoring session connection: {error:#}");
+                        continue;
                     }
-                    Message::Approval { request } => {
+                    Ok(Message::Activity { title, detail }) => {
+                        show_activity(&title, detail.as_deref())
+                    }
+                    Ok(Message::Approval { request }) if yolo => {
+                        eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+                        answer(&mut stream, b"allow\n").await;
+                    }
+                    Ok(Message::Approval { request }) => {
+                        evict_expired(&mut pending);
                         show_request(&request)?;
-                        pending.push_back((request, stream));
+                        pending.push_back(PendingApproval {
+                            request,
+                            stream,
+                            enqueued: std::time::Instant::now(),
+                        });
                     }
                 }
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
+                evict_expired(&mut pending);
                 handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
             }
         }
@@ -512,7 +602,7 @@ async fn handle_input(
     input: &str,
     session: &mut Session,
     yolo: &mut bool,
-    pending: &mut VecDeque<(Request, SessionStream)>,
+    pending: &mut VecDeque<PendingApproval>,
 ) -> Result<()> {
     match input {
         "/permissions yolo" | "/permission yolo" => {
@@ -520,9 +610,12 @@ async fn handle_input(
             eprintln!(
                 "WARNING: Permissions yolo allows every approval-gated host-native call for this session only; restart resets it. MCP callers cannot enable yolo."
             );
-            while let Some((request, mut stream)) = pending.pop_front() {
-                eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
-                stream.write_all(b"allow\n").await?;
+            while let Some(mut entry) = pending.pop_front() {
+                eprintln!(
+                    "[yolo] allowing {}: {}",
+                    entry.request.operation, entry.request.detail
+                );
+                answer(&mut entry.stream, b"allow\n").await;
             }
         }
         "/permissions ask" | "/permission ask" => {
@@ -530,13 +623,13 @@ async fn handle_input(
             eprintln!("Permissions: ask");
         }
         "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
-            let (_, mut stream) = pending.pop_front().unwrap();
-            stream.write_all(b"allow\n").await?;
+            let mut entry = pending.pop_front().unwrap();
+            answer(&mut entry.stream, b"allow\n").await;
             show_next(pending)?;
         }
         "n" | "N" | "no" | "NO" if !pending.is_empty() => {
-            let (_, mut stream) = pending.pop_front().unwrap();
-            stream.write_all(b"deny\n").await?;
+            let mut entry = pending.pop_front().unwrap();
+            answer(&mut entry.stream, b"deny\n").await;
             show_next(pending)?;
         }
         "/permission list" | "/permissions list" => show_permissions(session),
@@ -574,8 +667,8 @@ async fn handle_input(
         }
         "" => {}
         command if !pending.is_empty() => {
-            let (_, mut stream) = pending.pop_front().unwrap();
-            stream.write_all(b"deny\n").await?;
+            let mut entry = pending.pop_front().unwrap();
+            answer(&mut entry.stream, b"deny\n").await;
             eprintln!("Denied request (unrecognized response: {command})");
             show_next(pending)?;
         }
@@ -615,11 +708,212 @@ fn show_request(request: &Request) -> Result<()> {
     Ok(())
 }
 
-fn show_next(pending: &VecDeque<(Request, SessionStream)>) -> Result<()> {
-    if let Some((request, _)) = pending.front() {
-        show_request(request)?;
+fn show_next(pending: &VecDeque<PendingApproval>) -> Result<()> {
+    if let Some(entry) = pending.front() {
+        show_request(&entry.request)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod approval_stability_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn test_session() -> Session {
+        Session {
+            id: format!("stability-{}", Uuid::new_v4()),
+            cwd: std::env::temp_dir(),
+            permitted_directories: vec![std::env::temp_dir()],
+        }
+    }
+
+    fn approval_request(operation: &str) -> Request {
+        Request {
+            id: Uuid::new_v4(),
+            operation: operation.to_owned(),
+            detail: "stability test".to_owned(),
+            cwd: std::env::temp_dir(),
+        }
+    }
+
+    fn pending_entry(stream: SessionStream, age: Duration) -> PendingApproval {
+        PendingApproval {
+            request: approval_request("without_sandbox"),
+            stream,
+            enqueued: std::time::Instant::now()
+                .checked_sub(age)
+                .unwrap_or_else(std::time::Instant::now),
+        }
+    }
+
+    fn approval_frame(operation: &str) -> Vec<u8> {
+        let request = approval_request(operation);
+        let mut bytes = serde_json::to_vec(&Message::Approval { request }).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[tokio::test]
+    async fn session_reader_accepts_a_valid_approval_frame() -> Result<()> {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(&approval_frame("execute")).await?;
+        let mut stream: SessionStream = Box::new(server);
+        let message = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_session_message_with_timeout(&mut stream, Duration::from_secs(2)),
+        )
+        .await
+        .expect("valid frame must not hang")?;
+        assert!(
+            matches!(message, Message::Approval { .. }),
+            "valid approval frame must parse"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_reader_rejects_garbage_without_hanging_or_killing_the_ui() -> Result<()> {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"not json\n").await?;
+        let mut stream: SessionStream = Box::new(server);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_session_message_with_timeout(&mut stream, Duration::from_secs(2)),
+        )
+        .await
+        .expect("garbage must not hang the reader");
+        assert!(
+            outcome.is_err(),
+            "garbage must be an error the accept loop drops instead of a `?` that kills the UI"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_reader_times_out_on_a_partial_frame() -> Result<()> {
+        // A client that connects and sends bytes without a newline held the
+        // old accept/read sequence forever, head-blocking every later
+        // connection behind it.
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"{\"type\":\"approval\"").await?;
+        let mut stream: SessionStream = Box::new(server);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_session_message_with_timeout(&mut stream, Duration::from_millis(200)),
+        )
+        .await
+        .expect("partial frame must not hang the test");
+        assert!(
+            outcome.is_err(),
+            "partial frame must time out instead of blocking later connections"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_reader_fails_closed_on_disconnect() -> Result<()> {
+        let (client, server) = tokio::io::duplex(4096);
+        drop(client);
+        let mut stream: SessionStream = Box::new(server);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_session_message_with_timeout(&mut stream, Duration::from_secs(2)),
+        )
+        .await
+        .expect("disconnect must not hang the reader");
+        assert!(
+            outcome.is_err(),
+            "disconnect before a complete message must be an error"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn answering_a_dead_approval_does_not_kill_the_session_ui() -> Result<()> {
+        // The caller timed out and is gone; the operator's answer must still
+        // succeed (best-effort) so the UI survives for later approvals. The
+        // old `write_all(...).await?` returned Err here and `start()` exited.
+        let (dead_client, dead_server) = tokio::io::duplex(64);
+        drop(dead_client);
+        let mut session = test_session();
+        let mut yolo = false;
+        let mut pending = VecDeque::from([pending_entry(
+            Box::new(dead_server),
+            Duration::from_secs(11 * 60),
+        )]);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            handle_input("y", &mut session, &mut yolo, &mut pending),
+        )
+        .await
+        .expect("dead-stream answer must not hang");
+        assert!(
+            outcome.is_ok(),
+            "answering a stale approval must not kill the UI"
+        );
+        assert!(pending.is_empty(), "answered entry must be popped");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_approvals_are_evicted_and_later_ones_are_answered() -> Result<()> {
+        // A request older than APPROVAL_RESPONSE_TIMEOUT has no live caller
+        // (request() fails closed at exactly that age). It must be evicted so
+        // the operator's next keystroke reaches a live approval.
+        let (dead_client, dead_server) = tokio::io::duplex(64);
+        drop(dead_client);
+        let (mut live_client, live_server) = tokio::io::duplex(64);
+        let mut pending = VecDeque::from([
+            pending_entry(Box::new(dead_server), Duration::from_secs(11 * 60)),
+            pending_entry(Box::new(live_server), Duration::ZERO),
+        ]);
+        evict_expired(&mut pending);
+        assert_eq!(pending.len(), 1, "only the live approval must remain");
+        let mut session = test_session();
+        let mut yolo = false;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            handle_input("y", &mut session, &mut yolo, &mut pending),
+        )
+        .await
+        .expect("live answer must not hang")?;
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::BufReader::new(&mut live_client).read_line(&mut line),
+        )
+        .await
+        .expect("live client must be answered promptly")?;
+        assert_eq!(line, "allow\n", "live approval must receive the answer");
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn yolo_drain_survives_dead_streams() -> Result<()> {
+        let (dead_client, dead_server) = tokio::io::duplex(64);
+        drop(dead_client);
+        let mut session = test_session();
+        let mut yolo = false;
+        let mut pending = VecDeque::from([pending_entry(
+            Box::new(dead_server),
+            Duration::from_secs(11 * 60),
+        )]);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            handle_input("/permission yolo", &mut session, &mut yolo, &mut pending),
+        )
+        .await
+        .expect("yolo drain must not hang");
+        assert!(
+            outcome.is_ok(),
+            "yolo drain over dead streams must not kill the UI"
+        );
+        assert!(yolo);
+        assert!(pending.is_empty());
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]

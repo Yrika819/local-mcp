@@ -107,7 +107,7 @@ where
     // one complete JSON-RPC frame is written at a time (no byte interleaving)
     // and that no dispatch task ever touches stdout directly.
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
-    let writer_handle = tokio::spawn(async move {
+    let mut writer_handle = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(response) = response_rx.recv().await {
             // Size violations are substituted with a bounded resource-limit
@@ -140,17 +140,25 @@ where
     // reintroduce the "accumulate the whole line before inspecting it" contract
     // this bound exists to avoid.
     let mut reader = frame_reader(reader);
+    // Set once the writer task ends. `None` means stdin reached EOF first and
+    // the writer is still draining; `Some` carries the writer's own result.
+    let mut writer_result: Option<Result<()>> = None;
     loop {
-        // If the writer already terminated on a transport failure, stop reading:
-        // spawning more dispatches whose responses can never be delivered would
-        // recreate the silent stall this bound exists to prevent.
-        if writer_handle.is_finished() {
-            anyhow::bail!("response writer task terminated unexpectedly");
-        }
-        // Framing is bounded before parsing, and both happen before a dispatch
-        // permit is acquired, so a far-too-large request neither allocates
-        // without limit nor consumes a worker permit to be rejected.
-        let frame = reader.next_frame(MAX_MCP_REQUEST_FRAME_BYTES).await?;
+        // Wait for the next frame *or* the writer's termination, whichever
+        // comes first. Checking `is_finished` only at the top of the loop
+        // left a hole: after the writer died on a transport failure, a read
+        // loop with no further input sat in `next_frame` forever, so the
+        // transport never ended and every unanswered id waited forever.
+        // Cancelling a half-read `next_frame` here is safe: bytes already
+        // consumed from the stream are retained in the reader across calls,
+        // and the writer arm always exits the loop.
+        let frame = tokio::select! {
+            frame = reader.next_frame(MAX_MCP_REQUEST_FRAME_BYTES) => frame?,
+            result = &mut writer_handle => {
+                writer_result = Some(result.context("response writer task panicked")?);
+                break;
+            }
+        };
         let Some(frame) = frame else {
             break;
         };
@@ -269,22 +277,35 @@ where
                     bounded_error_response(id, code, &format!("{error:#}"))
                 }
             };
-            // If the client disconnected the writer task will have terminated;
-            // the request's response is simply dropped. Bounded so a stalled
-            // writer cannot leak this dispatch's permit forever.
+            // A failed send means the writer is gone or has not drained for
+            // `MCP_RESPONSE_SEND_TIMEOUT`: the transport is dying or dead, and
+            // the read loop independently observes writer termination (via the
+            // `select!` above) and ends the transport with an explicit error.
+            // Dropping this one response therefore surfaces to the client as a
+            // transport EOF, never as an infinite wait on this id. The permit
+            // is freed with the task either way, so a stalled writer cannot
+            // leak admission capacity.
             let _ = send_response_bounded(&response_tx, response).await;
         });
     }
 
     // stdin closed (EOF): stop accepting requests, then drain and flush all
     // in-flight responses so the client sees every answer before we exit.
+    // Writer death (transport failure) takes the same shutdown path: retained
+    // jobs are released before the writer's error is reported, so ending the
+    // transport on a dead client can never orphan a background job that a
+    // clean EOF would have reaped.
     drop(response_tx);
-    writer_handle
-        .await
-        .context("response writer task panicked")??;
+    let shutdown_result = match writer_result {
+        Some(result) => result,
+        None => writer_handle
+            .await
+            .context("response writer task panicked")?,
+    };
     if shutdown == ShutdownPolicy::ReleaseAllJobs {
         release_all_jobs().await;
     }
+    shutdown_result?;
     Ok(())
 }
 
