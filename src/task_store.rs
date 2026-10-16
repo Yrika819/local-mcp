@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -37,6 +37,9 @@ const _: () = assert!(
     GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION + 1,
     "goal schema migration chain must be extended when GOAL_SCHEMA_VERSION advances"
 );
+
+const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,6 +667,18 @@ impl TaskStore {
     where
         F: FnOnce() -> Result<T, OrchestratorError>,
     {
+        self.with_session_lock_for(session_id, SESSION_LOCK_TIMEOUT, operation)
+    }
+
+    fn with_session_lock_for<T, F>(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+        operation: F,
+    ) -> Result<T, OrchestratorError>
+    where
+        F: FnOnce() -> Result<T, OrchestratorError>,
+    {
         let directory = self.session_goal_dir(session_id)?;
         let goals_root = self.state_root.join("goals");
         secure_fs::ensure_private_directory(&self.state_root, None)?;
@@ -671,7 +686,7 @@ impl TaskStore {
         secure_fs::ensure_private_directory(&directory, Some(&goals_root))?;
         let lock_path = directory.join(".lock");
         let lock = secure_fs::create_or_open_lock(&lock_path)?;
-        lock.lock()?;
+        acquire_session_lock(&lock, timeout)?;
         let result = operation();
         let unlock_result = lock.unlock();
         match (result, unlock_result) {
@@ -696,6 +711,29 @@ impl TaskStore {
         Ok(self
             .session_goal_dir(session_id)?
             .join(format!("{}.json", goal_id.as_str())))
+    }
+}
+
+fn acquire_session_lock(file: &std::fs::File, timeout: Duration) -> std::io::Result<()> {
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= timeout {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for the session Goal lock",
+            ));
+        }
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    continue;
+                }
+                std::thread::sleep(remaining.min(SESSION_LOCK_RETRY_INTERVAL));
+            }
+        }
     }
 }
 
@@ -1555,6 +1593,131 @@ mod tests {
         first.unlock().unwrap();
         second.try_lock().unwrap();
         second.unlock().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lock_holder_child() {
+        let Some(lock_path) = std::env::var_os("LOCAL_MCP_TEST_LOCK_PATH") else {
+            return;
+        };
+        let ready_path = std::env::var_os("LOCAL_MCP_TEST_LOCK_READY")
+            .expect("parent supplies lock readiness path");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        std::fs::write(ready_path, b"locked").unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn process_death_releases_lock_and_waiters_recover() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session_id = "lock-process-session";
+        store.create_goal(&goal(session_id)).unwrap();
+        let directory = store.session_goal_dir(session_id).unwrap();
+        let lock_path = directory.join(".lock");
+        let ready_path = directory.join("child-ready");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("task_store::tests::lock_holder_child")
+            .arg("--nocapture")
+            .env("LOCAL_MCP_TEST_LOCK_PATH", &lock_path)
+            .env("LOCAL_MCP_TEST_LOCK_READY", &ready_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = KillOnDrop(child);
+        let started = Instant::now();
+        while !ready_path.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "child did not acquire the process lock"
+        );
+
+        let timed_out =
+            store.with_session_lock_for(session_id, Duration::from_millis(100), || Ok(()));
+        assert!(matches!(
+            timed_out,
+            Err(OrchestratorError::PersistenceIo(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let recovered =
+            store.with_session_lock_for(session_id, Duration::from_millis(100), || Ok("recovered"));
+        assert_eq!(recovered.unwrap(), "recovered");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_lock_contention_times_out_and_recovers_after_release() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session_id = "lock-timeout-session";
+        store.create_goal(&goal(session_id)).unwrap();
+        let directory = store.session_goal_dir(session_id).unwrap();
+        let lock = secure_fs::create_or_open_lock(&directory.join(".lock")).unwrap();
+        lock.lock().unwrap();
+
+        let operation_ran = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let timeout = store.with_session_lock_for(session_id, Duration::from_millis(100), || {
+            operation_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let elapsed = started.elapsed();
+        assert!(matches!(
+            timeout,
+            Err(OrchestratorError::PersistenceIo(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "lock wait timed out too early"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "lock wait exceeded its bound"
+        );
+        assert!(
+            !operation_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "operation must not run without owning the lock"
+        );
+
+        lock.unlock().unwrap();
+        let resumed =
+            store.with_session_lock_for(session_id, Duration::from_millis(100), || Ok("acquired"));
+        assert_eq!(resumed.unwrap(), "acquired");
+
+        let held_lock = secure_fs::create_or_open_lock(&directory.join(".lock")).unwrap();
+        held_lock.lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            held_lock.unlock().unwrap();
+        });
+        let acquired_after_release =
+            store.with_session_lock_for(session_id, Duration::from_secs(1), || Ok("released"));
+        releaser.join().unwrap();
+        assert_eq!(acquired_after_release.unwrap(), "released");
         std::fs::remove_dir_all(root).unwrap();
     }
 
