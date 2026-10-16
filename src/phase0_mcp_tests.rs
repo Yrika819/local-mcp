@@ -371,6 +371,50 @@ async fn job_stop_unknown_owner_and_failure_are_frozen() {
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn start_command_dispatch_token_reclaims_job_when_writer_rejects_response() {
+    let (session, cwd) = phase0_session();
+    config::save_session(&session).await.unwrap();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tools/call",
+        "params": {
+            "name": "start_command",
+            "arguments": {
+                "session_id": session.id,
+                "command": ["sleep", "60"]
+            }
+        }
+    });
+
+    let outcome = dispatch(&request).await.expect("start_command dispatch");
+    let new_job = outcome
+        .new_job
+        .as_ref()
+        .expect("start_command must return typed ownership for its new job");
+    let job_id = new_job.job_id;
+    assert_eq!(new_job.session_id, session.id);
+    assert!(crate::job_registry::registry().contains_key_for_test(&job_id));
+
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+    drop(response_rx);
+    assert!(
+        !enqueue_dispatch_response(
+            &response_tx,
+            json!({"jsonrpc":"2.0","id":17,"result":outcome.result}),
+            &Ok(outcome),
+        )
+        .await
+    );
+    assert!(
+        !crate::job_registry::registry().contains_key_for_test(&job_id),
+        "writer rejection must reclaim the job created by this dispatch"
+    );
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
 #[tokio::test]
 async fn lost_poll_response_does_not_reclaim_an_existing_job() {
     let (session, cwd) = phase0_session();
