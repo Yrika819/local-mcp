@@ -717,16 +717,19 @@ impl TaskStore {
 fn acquire_session_lock(file: &std::fs::File, timeout: Duration) -> std::io::Result<()> {
     let started = Instant::now();
     loop {
+        if started.elapsed() >= timeout {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for the session Goal lock",
+            ));
+        }
         match file.try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
             Err(std::fs::TryLockError::WouldBlock) => {
                 let remaining = timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "timed out waiting for the session Goal lock",
-                    ));
+                    continue;
                 }
                 std::thread::sleep(remaining.min(SESSION_LOCK_RETRY_INTERVAL));
             }
@@ -1614,6 +1617,14 @@ mod tests {
 
     #[test]
     fn process_death_releases_lock_and_waiters_recover() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let root = state_root();
         let store = TaskStore::with_state_root(root.clone());
         let session_id = "lock-process-session";
@@ -1631,7 +1642,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let mut child = child;
+        let mut child = KillOnDrop(child);
         let started = Instant::now();
         while !ready_path.exists() && started.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(10));
@@ -1649,8 +1660,8 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
 
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
         let recovered =
             store.with_session_lock_for(session_id, Duration::from_millis(100), || Ok("recovered"));
         assert_eq!(recovered.unwrap(), "recovered");
@@ -1667,9 +1678,12 @@ mod tests {
         let lock = secure_fs::create_or_open_lock(&directory.join(".lock")).unwrap();
         lock.lock().unwrap();
 
+        let operation_ran = std::sync::atomic::AtomicBool::new(false);
         let started = Instant::now();
-        let timeout =
-            store.with_session_lock_for(session_id, Duration::from_millis(100), || Ok(()));
+        let timeout = store.with_session_lock_for(session_id, Duration::from_millis(100), || {
+            operation_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
         let elapsed = started.elapsed();
         assert!(matches!(
             timeout,
@@ -1677,8 +1691,16 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
         assert!(
+            elapsed >= Duration::from_millis(80),
+            "lock wait timed out too early"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
             "lock wait exceeded its bound"
+        );
+        assert!(
+            !operation_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "operation must not run without owning the lock"
         );
 
         lock.unlock().unwrap();
