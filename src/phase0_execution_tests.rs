@@ -141,7 +141,7 @@ fn phase0_exec_text(value: &Value) -> &str {
 #[tokio::test]
 async fn execute_uses_current_sandboxed_result_contract() {
     let (session, cwd) = phase0_exec_session();
-    let result = execute(&json!({"command": ["/usr/bin/printf", "phase0"]}), &session)
+    let (result, _) = execute(&json!({"command": ["/usr/bin/printf", "phase0"]}), &session)
         .await
         .unwrap();
     let payload: Value = serde_json::from_str(phase0_exec_text(&result)).unwrap();
@@ -157,7 +157,7 @@ async fn execute_uses_current_sandboxed_result_contract() {
 #[tokio::test]
 async fn start_command_returns_job_and_poll_reaches_terminal_result() {
     let (session, cwd) = phase0_exec_session();
-    let started = start_command(
+    let (started, _) = start_command(
         &json!({"command": ["/usr/bin/printf", "async-phase0"]}),
         &session,
     )
@@ -204,7 +204,7 @@ async fn stop_job_cancellation_kills_sandboxed_process_group() {
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    let started = start_command(
+    let (started, _) = start_command(
         &json!({"command": [script.to_string_lossy().into_owned()]}),
         &session,
     )
