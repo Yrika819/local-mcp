@@ -275,7 +275,7 @@ async fn process_one_frame_observed(
     response_tx: &tokio::sync::mpsc::Sender<Value>,
     control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
     execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
-    completed: tokio::sync::oneshot::Sender<()>,
+    completed: tokio::sync::oneshot::Sender<bool>,
 ) -> Result<()> {
     process_one_frame_inner(
         frame,
@@ -292,7 +292,7 @@ async fn process_one_frame_inner(
     response_tx: &tokio::sync::mpsc::Sender<Value>,
     control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
     execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
-    completed: Option<tokio::sync::oneshot::Sender<()>>,
+    completed: Option<tokio::sync::oneshot::Sender<bool>>,
 ) -> Result<()> {
     let line = match frame {
         Frame::Empty => return Ok(()),
@@ -405,7 +405,7 @@ async fn process_one_frame_inner(
         // never a job inferred from response text (e.g. a poll_job result).
         enqueue_dispatch_response(&response_tx_outer, response, &outcome).await;
         if let Some(completed) = completed {
-            let _ = completed.send(());
+            let _ = completed.send(outcome.is_ok());
         }
     });
     Ok(())

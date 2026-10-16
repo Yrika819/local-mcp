@@ -406,10 +406,11 @@ async fn lost_poll_response_does_not_reclaim_an_existing_job() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), completed_rx)
+    let dispatch_succeeded = tokio::time::timeout(Duration::from_secs(2), completed_rx)
         .await
         .expect("dispatch completion should be bounded")
         .unwrap();
+    assert!(dispatch_succeeded, "poll dispatch must succeed before asserting cleanup");
 
     assert!(
         crate::job_registry::registry().contains_key_for_test(&id),
