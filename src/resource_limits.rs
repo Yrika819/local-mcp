@@ -248,6 +248,17 @@ pub(crate) const MAX_APPROVAL_MESSAGE_BYTES: usize = 1024 * 1024;
 /// and must be fast. Bounding them keeps a dead pipe from holding a dispatch.
 pub(crate) const APPROVAL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long transport shutdown waits for in-flight responses to drain.
+///
+/// The drain ends when every dispatch has sent (dropping its sender) and the
+/// writer has flushed them. A dispatch that never finishes — an approval
+/// with no UI, an unbounded wait — would otherwise hold its sender forever
+/// and delay all cleanup behind it without limit. Thirty seconds covers any
+/// number of already-computed frames (each send and write is itself bounded
+/// near ten) while keeping abnormal shutdowns bounded. Expiry reports an
+/// error; it never silently drops the shutdown.
+pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Compile-time relationships
 // ---------------------------------------------------------------------------
@@ -507,6 +518,10 @@ mod tests {
         assert!(APPROVAL_RESPONSE_TIMEOUT > APPROVAL_IO_TIMEOUT);
         assert_eq!(MAX_PENDING_APPROVALS, MAX_CONCURRENT_REQUESTS);
         assert_eq!(MAX_APPROVAL_MESSAGE_BYTES, 1024 * 1024);
+        // The shutdown drain must outlive any single bounded write or send
+        // it may wait on, or a healthy shutdown could time out.
+        assert!(SHUTDOWN_DRAIN_TIMEOUT >= MCP_WRITE_TIMEOUT);
+        assert!(SHUTDOWN_DRAIN_TIMEOUT >= MCP_RESPONSE_SEND_TIMEOUT);
     }
 
     #[test]

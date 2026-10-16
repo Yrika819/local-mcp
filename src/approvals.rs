@@ -377,6 +377,30 @@ fn evict_expired(pending: &mut VecDeque<PendingApproval>) {
     evict_expired_at(pending, std::time::Instant::now());
 }
 
+/// Verify the operator's answer still targets what they saw.
+///
+/// Snapshot the head *before* expiry, evict, then compare: if the head moved
+/// (the shown request timed out while the operator was deciding), the input
+/// is discarded by the caller and the new head is shown for a fresh
+/// confirmation instead of deciding anything. Returns true when the answer
+/// may proceed. Uniform for allow and deny alike: deciding a different
+/// request than the shown one is wrong in both directions, and silently
+/// applying it would also consume the operator's single keystroke.
+fn still_showing(
+    pending: &mut VecDeque<PendingApproval>,
+    shown: Option<Uuid>,
+    now: std::time::Instant,
+) -> bool {
+    evict_expired_at(pending, now);
+    if pending.front().map(|entry| entry.request.id) != shown {
+        eprintln!(
+            "The shown request expired before your answer; input discarded. Please confirm the request now shown."
+        );
+        return false;
+    }
+    true
+}
+
 /// Clock-injected eviction so tests never depend on machine uptime.
 ///
 /// Asking a test to fabricate an 11-minute-old `Instant` via `checked_sub`
@@ -675,7 +699,9 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
-                evict_expired(&mut pending);
+                // No eviction here: handle_input snapshots the shown head
+                // first, so an expiry between display and answer discards the
+                // input instead of deciding a request the operator never saw.
                 handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
             }
         }
@@ -763,12 +789,31 @@ async fn handle_input(
     yolo: &mut bool,
     pending: &mut VecDeque<PendingApproval>,
 ) -> Result<()> {
+    handle_input_at(input, session, yolo, pending, std::time::Instant::now()).await
+}
+
+/// Handle one console input line with an injected clock.
+///
+/// The clock is injected so tests can place entries on either side of the
+/// response deadline deterministically on any machine uptime.
+async fn handle_input_at(
+    input: &str,
+    session: &mut Session,
+    yolo: &mut bool,
+    pending: &mut VecDeque<PendingApproval>,
+    now: std::time::Instant,
+) -> Result<()> {
+    // Snapshot what the operator currently sees BEFORE expiry can move it.
+    // Decision inputs below are checked against this snapshot: answering
+    // anything else would grant or deny a request the operator never saw.
+    let shown = pending.front().map(|entry| entry.request.id);
     match input {
         "/permissions yolo" | "/permission yolo" => {
             *yolo = true;
             eprintln!(
                 "WARNING: Permissions yolo allows every approval-gated host-native call for this session only; restart resets it. MCP callers cannot enable yolo."
             );
+            evict_expired_at(pending, now);
             while let Some(mut entry) = pending.pop_front() {
                 eprintln!(
                     "[yolo] allowing {}: {}",
@@ -784,12 +829,20 @@ async fn handle_input(
         "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
             // The head is what the UI shows, so confirming its id here keeps
             // the display and the decision visibly linked.
+            if !still_showing(pending, shown, now) {
+                show_next(pending)?;
+                return Ok(());
+            }
             if let Some((id, operation)) = answer_head(pending, b"allow\n").await {
                 eprintln!("Allowed {operation} {id}");
             }
             show_next(pending)?;
         }
         "n" | "N" | "no" | "NO" if !pending.is_empty() => {
+            if !still_showing(pending, shown, now) {
+                show_next(pending)?;
+                return Ok(());
+            }
             if let Some((id, operation)) = answer_head(pending, b"deny\n").await {
                 eprintln!("Denied {operation} {id}");
             }
@@ -830,6 +883,10 @@ async fn handle_input(
         }
         "" => {}
         command if !pending.is_empty() => {
+            if !still_showing(pending, shown, now) {
+                show_next(pending)?;
+                return Ok(());
+            }
             if let Some((id, operation)) = answer_head(pending, b"deny\n").await {
                 eprintln!("Denied {operation} {id} (unrecognized response: {command})");
             }
@@ -1008,6 +1065,87 @@ mod approval_stability_tests {
         assert_eq!(
             read_client_line(&mut live_client).await.as_deref(),
             Some("allow\n")
+        );
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_display_answer_is_discarded_never_allowed() -> Result<()> {
+        // P1 repro: A is displayed but stale, B is live. The operator answers
+        // the displayed A with "y". The answer must NEVER allow B: the input
+        // is discarded and B needs a fresh confirmation afterwards.
+        let t0 = std::time::Instant::now();
+        let (stale_client, stale_server) = tokio::io::duplex(64);
+        drop(stale_client);
+        let (mut live_client, live_server) = tokio::io::duplex(64);
+        let live_at = t0
+            .checked_add(Duration::from_secs(10 * 60 + 30))
+            .expect("test clock must advance");
+        let now = t0
+            .checked_add(Duration::from_secs(11 * 60))
+            .expect("test clock must advance");
+        let mut pending = VecDeque::from([
+            pending_entry_at(Box::new(stale_server), t0),
+            pending_entry_at(Box::new(live_server), live_at),
+        ]);
+        // Same sequencing as start()'s input path: the shown head expires
+        // between display and answer, so the answer must be discarded.
+        let mut session = test_session();
+        let mut yolo = false;
+        handle_input_at("y", &mut session, &mut yolo, &mut pending, now).await?;
+        assert!(
+            read_client_line(&mut live_client).await.is_none(),
+            "an answer meant for the expired display must never decide the next request"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "the live request must still await confirmation"
+        );
+        // A fresh confirmation now decides B.
+        handle_input_at("y", &mut session, &mut yolo, &mut pending, now).await?;
+        assert_eq!(
+            read_client_line(&mut live_client).await.as_deref(),
+            Some("allow\n"),
+            "fresh confirmation decides the shown head"
+        );
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_display_deny_is_discarded_never_denies_next() -> Result<()> {
+        // Same race on the deny path: a "no" meant for the expired display
+        // must not deny the next request either. Uniform discard keeps one
+        // predictable rule for every decision input.
+        let t0 = std::time::Instant::now();
+        let (stale_client, stale_server) = tokio::io::duplex(64);
+        drop(stale_client);
+        let (mut live_client, live_server) = tokio::io::duplex(64);
+        let live_at = t0
+            .checked_add(Duration::from_secs(10 * 60 + 30))
+            .expect("test clock must advance");
+        let now = t0
+            .checked_add(Duration::from_secs(11 * 60))
+            .expect("test clock must advance");
+        let mut pending = VecDeque::from([
+            pending_entry_at(Box::new(stale_server), t0),
+            pending_entry_at(Box::new(live_server), live_at),
+        ]);
+        let mut session = test_session();
+        let mut yolo = false;
+        handle_input_at("n", &mut session, &mut yolo, &mut pending, now).await?;
+        assert!(
+            read_client_line(&mut live_client).await.is_none(),
+            "a deny meant for the expired display must not decide the next request"
+        );
+        assert_eq!(pending.len(), 1);
+        handle_input_at("n", &mut session, &mut yolo, &mut pending, now).await?;
+        assert_eq!(
+            read_client_line(&mut live_client).await.as_deref(),
+            Some("deny\n"),
+            "fresh denial decides the shown head"
         );
         assert!(pending.is_empty());
         Ok(())

@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::mcp::{
-    JSONRPC_RESOURCE_LIMIT, ShutdownPolicy, acquire_admission, admission_pool,
-    report_shutdown_outcome, send_response_bounded, serve_with_io, write_message,
-    write_response_or_substitute,
+    JSONRPC_RESOURCE_LIMIT, ShutdownPolicy, acquire_admission, admission_pool, finish_transport,
+    finish_transport_with_timeout, report_shutdown_outcome, send_response_bounded, serve_with_io,
+    write_message, write_response_or_substitute,
 };
 use crate::resource_limits::{
     APPROVAL_IO_TIMEOUT, APPROVAL_RESPONSE_TIMEOUT, CONTROL_ADMISSION_WAIT_TIMEOUT,
@@ -382,4 +382,66 @@ async fn stalled_writer_ends_transport_without_further_input() {
     outcome
         .await
         .expect("transport hung after writer stall with silent stdin: regression");
+}
+
+#[tokio::test]
+async fn shutdown_drain_is_bounded_when_a_sender_never_drops() {
+    // P2 repro: stdin is gone but one dispatch never finishes, so its sender
+    // lives forever. The shutdown drain must not wait forever either: cleanup
+    // (JobRegistry release, child teardown) must run and the failure must be
+    // reported instead of hanging the transport teardown. The injected
+    // 300 ms bound stands in for the 30 s production deadline.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        // A dispatch that never finishes: its sender never drops.
+        let stuck_sender = response_tx.clone();
+        let _stuck = tokio::spawn(async move {
+            let _held = stuck_sender;
+            std::future::pending::<()>().await;
+        });
+        let writer_handle = tokio::spawn(async move {
+            while response_rx.recv().await.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        let result = finish_transport_with_timeout(
+            writer_handle,
+            None,
+            Some(anyhow::anyhow!("stdin broken")),
+            response_tx,
+            ShutdownPolicy::LeaveRegistry,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let error = result.expect_err("an undrainable shutdown must be reported, not Ok");
+        assert!(
+            format!("{error:#}").contains("drain"),
+            "the report must name the drain timeout, got: {error:#}"
+        );
+    });
+    outcome
+        .await
+        .expect("shutdown hung behind an unfinished dispatch: regression");
+}
+
+#[tokio::test]
+async fn shutdown_drain_still_delivers_when_senders_drop() {
+    // The bound must not break the normal path: with no stuck senders the
+    // drain completes immediately and a clean shutdown stays success.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        let writer_handle = tokio::spawn(async move {
+            while response_rx.recv().await.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        finish_transport(
+            writer_handle,
+            None,
+            None,
+            response_tx,
+            ShutdownPolicy::LeaveRegistry,
+        )
+        .await
+        .expect("clean drain must stay success");
+    });
+    outcome.await.expect("clean drain hung: regression");
 }

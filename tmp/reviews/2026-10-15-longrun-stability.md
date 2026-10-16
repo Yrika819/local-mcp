@@ -364,3 +364,44 @@ fail-closed (error, never allow) で bound。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: clean
   (抽出に伴う `&&` 二重参照を修正)。
 - GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。
+
+## R7. 独立レビュー第4ラウンド (同一ブランチ、未マージ)
+
+### P1: 期限切れ表示と入力の競合
+
+- 実証: A (期限切れ・表示中) + B (有効) で "y" を入力すると、evict で A が
+  消えた直後に B が承認される。新規テスト 2 件 (allow/deny) が修正前に
+  4 件とも FAILED (B が決定されることを確認)。
+- 修正: `handle_input` を時刻注入の `handle_input_at` に分割
+  (既存呼び出しは wrapper 経由で不変)。表示 head を snapshot してから
+  evict し、`still_showing` で一致検証。不一致なら入力破棄+新 head 表示で
+  再確認 (allow も deny も決定しない)。yolo 切替・permission 系は
+  対象外 (表示への回答ではない)。start() arm 側の先行 evict は撤去
+  (snapshot 前に evict すると guard が発火しないため)。
+- 修正後: 4 件とも pass。既存 phase0 契約 (fresh entry) は無変化で pass。
+
+### P2: 終了ドレインの上限
+
+- 監査: `finish_transport` の drain (`writer_handle.await`) は全 sender
+  drop待ち。未完了 dispatch が sender を保持し続けると無期限待機し、
+  release・子プロセス終了の全 cleanup が遅延する。旧コードで同シナリオ
+  (leak した sender + 待機 writer) のテストが outer deadline で FAILED
+  することを確認 (red)。
+- 修正: drain→release の順序は維持 (clean EOF の応答配送意味を不変にし、
+  正常な長時間 Goal=background job 化済みに影響させない) し、
+  drain のみ `SHUTDOWN_DRAIN_TIMEOUT=30s` で bound
+  (`finish_transport_with_timeout` に抽出、生産 wrapper は定数使用)。
+  期限切れは error 報告 (黙殺なし)。単一 tail・precedence 構造は不変。
+- テスト: 300ms 注入で期限切れ Err (名前に "drain" を含む) を即時証明、
+  sender 正常時は即時 Ok。既存の shutdown-cancel 契約テストも pass。
+- serve 経由の stuck-dispatch e2e は安価な実 request では構築不可
+  (全 dispatch が即時完了する) のため、finish 層の直接検証+配線レビューで
+  代替することを明記。
+
+### R7 検証
+
+- `cargo fmt --check`: clean (コミット直前、`$LASTEXITCODE` 使用)。
+- `cargo check --locked --all-targets --jobs 2`: pass、警告なし。
+- longrun 13 件、approval 80 件、resource 66 件、すべて pass。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: clean。
+- GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。

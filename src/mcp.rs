@@ -342,12 +342,44 @@ async fn process_one_frame(
 /// policy before the loop's outcome is reported, so no exit can orphan
 /// background jobs that another exit would have reaped. Error precedence is
 /// fixed by [`report_shutdown_outcome`] and unit-tested.
-async fn finish_transport(
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the stability tests"))]
+pub(crate) async fn finish_transport(
     writer_handle: tokio::task::JoinHandle<Result<()>>,
     writer_result: Option<Result<()>>,
     read_error: Option<anyhow::Error>,
     response_tx: tokio::sync::mpsc::Sender<Value>,
     shutdown: ShutdownPolicy,
+) -> Result<()> {
+    finish_transport_with_timeout(
+        writer_handle,
+        writer_result,
+        read_error,
+        response_tx,
+        shutdown,
+        crate::resource_limits::SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+/// Shutdown with an injectable drain bound so tests never wait out the
+/// production deadline. The order is load-bearing:///
+/// 1. Drop the read loop's sender so the writer can observe the drain end.
+/// 2. Drain in-flight responses, bounded: dispatches that already computed
+///    their frames still deliver them (clean EOF is unchanged), while a
+///    dispatch that never finishes cannot delay cleanup without limit.
+///    Normal long Goal runs are unaffected — they already returned as
+///    background jobs, and only the retained entries (not running work) are
+///    released below.
+/// 3. Release retained jobs for the owning policy, then report. Cleanup runs
+///    on every exit, including an expired drain.
+#[cfg_attr(test, allow(dead_code, reason = "asserted by the stability tests"))]
+pub(crate) async fn finish_transport_with_timeout(
+    writer_handle: tokio::task::JoinHandle<Result<()>>,
+    writer_result: Option<Result<()>>,
+    read_error: Option<anyhow::Error>,
+    response_tx: tokio::sync::mpsc::Sender<Value>,
+    shutdown: ShutdownPolicy,
+    drain_timeout: std::time::Duration,
 ) -> Result<()> {
     // stdin closed (EOF): stop accepting requests, then drain and flush all
     // in-flight responses so the client sees every answer before we exit.
@@ -360,9 +392,12 @@ async fn finish_transport(
         // The writer already ended: nothing left to drain.
         Some(result) => result,
         // The loop ended first with the writer alive: drain in-flight
-        // responses before reporting, exactly as a clean EOF always did.
-        None => writer_handle
+        // responses before reporting, exactly as a clean EOF always did —
+        // but bounded, so an unfinished dispatch holding its sender cannot
+        // stall teardown (and everything after it) forever.
+        None => tokio::time::timeout(drain_timeout, writer_handle)
             .await
+            .map_err(|_| anyhow::anyhow!("response drain timed out during shutdown"))?
             .context("response writer task panicked")
             .and_then(std::convert::identity),
     };
