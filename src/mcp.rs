@@ -282,17 +282,12 @@ async fn process_one_frame(
             return Ok(());
         }
     };
-    let response_tx = response_tx.clone();
+    let response_tx_outer = response_tx.clone();
     tokio::spawn(async move {
         // Hold the permit for the entire dispatch so the concurrency bound
         // reflects genuinely in-flight work.
         let _permit = permit;
-        // Panic containment: a panicking handler must not silently drop
-        // the request (leaving the client waiting on that ID forever).
-        // Supervise the inner dispatch and synthesize a JSON-RPC internal
-        // error on panic so the request always receives exactly one
-        // response and the panic can never poison the read loop, the
-        // writer task, or any other in-flight request.
+        // Panic containment...
         let dispatch_task = tokio::spawn(async move { dispatch(&request).await });
         let outcome = match dispatch_task.await {
             Ok(outcome) => outcome,
@@ -308,9 +303,6 @@ async fn process_one_frame(
         let response = match outcome {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
             Err(error) => {
-                // A resource bound keeps its own code, so a client can tell
-                // "too large" from "failed" and a resource failure is never
-                // presented as an authority or permission failure.
                 let code = if error
                     .downcast_ref::<crate::resource_limits::ResourceLimitError>()
                     .is_some()
@@ -322,15 +314,16 @@ async fn process_one_frame(
                 bounded_error_response(id, code, &format!("{error:#}"))
             }
         };
-        // A failed send means the writer is gone or has not drained for
-        // `MCP_RESPONSE_SEND_TIMEOUT`: the transport is dying or dead, and
-        // the read loop independently observes writer termination (via the
-        // `select!` above) and ends the transport with an explicit error.
-        // Dropping this one response therefore surfaces to the client as a
-        // transport EOF, never as an infinite wait on this id. The permit
-        // is freed with the task either way, so a stalled writer cannot
-        // leak admission capacity.
-        let _ = send_response_bounded(&response_tx, response).await;
+        // Deliver the response. If delivery fails the client can no longer
+        // receive the result or any job_id it may carry, so reclaim any
+        // background job that dispatch just registered instead of leaving it
+        // running without an owner.
+        let delivered = send_response_bounded(&response_tx_outer, response.clone())
+            .await
+            .is_ok();
+        if !delivered {
+            terminate_jobs_from_response(&response).await;
+        }
     });
     Ok(())
 }
@@ -449,6 +442,35 @@ pub(crate) fn report_shutdown_outcome(
         return Err(error);
     }
     Ok(())
+}
+
+async fn terminate_jobs_from_response(response: &Value) {
+    let Some(result) = response.get("result") else {
+        return;
+    };
+    let Some(text) = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Ok(inner) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    let Some(job_id) = inner
+        .get("job_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return;
+    };
+    let job = job_registry::registry().take_by_id(job_id);
+    if let Some(job) = job {
+        job.terminate().await;
+    }
 }
 
 /// Terminate every retained background job on explicit server shutdown.
@@ -1139,7 +1161,13 @@ async fn store_execution_job(
     session: &config::Session,
     job: execution::BackgroundExecution,
 ) -> Result<Value> {
-    store_job(session, job.rendered_command, job.handle, job.activity).await
+    store_job(
+        session,
+        job.rendered_command,
+        job.handle.into_inner(),
+        job.activity,
+    )
+    .await
 }
 
 async fn execution_outcome(
@@ -1243,6 +1271,10 @@ async fn store_job(
     }
 
     let job_id = job_registry::new_job_id();
+    // Keep the spawned task cancellation-safe until it is either retained by the
+    // registry or explicitly stopped below. A dropped tokio::JoinHandle would
+    // detach the task instead of cancelling it.
+    let task_guard = execution::AbortOnDropJoinHandle::new(handle);
     // Capacity and retention happen under one lock, so they cannot disagree, and
     // the lock is released before anything is awaited.
     let admission = {
@@ -1252,13 +1284,21 @@ async fn store_job(
                 jobs.insert(
                     job_registry::now(),
                     job_id,
-                    Job::new(session.id.clone(), rendered_command.clone(), handle),
+                    Job::new(
+                        session.id.clone(),
+                        rendered_command.clone(),
+                        task_guard.into_inner(),
+                    ),
                 );
                 Admission::Retained
             }
             Err(error) => Admission::Refused {
                 error,
-                job: Job::new(session.id.clone(), rendered_command.clone(), handle),
+                job: Job::new(
+                    session.id.clone(),
+                    rendered_command.clone(),
+                    task_guard.into_inner(),
+                ),
             },
         }
     };

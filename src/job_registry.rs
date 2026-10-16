@@ -259,7 +259,16 @@ impl JobRegistry {
             .collect()
     }
 
-    /// Remove and return every retained job.
+    /// Remove a job by identifier without a session check.
+    ///
+    /// Used only by host-side cleanup paths where the originating session can
+    /// no longer be reached but the job must still be terminated so its task
+    /// and process do not outlive their response (for example, when the
+    /// response carrying its `job_id` was lost). It is not an authorization
+    /// surface; the identifier is treated as the proof it was validly issued.
+    pub(crate) fn take_by_id(&mut self, job_id: Uuid) -> Option<Job> {
+        self.jobs.remove(&job_id)
+    }
     ///
     /// Used when the process that owns the registry is shutting down. Abnormal
     /// parent death is a separate, later concern; this is explicit shutdown only.
