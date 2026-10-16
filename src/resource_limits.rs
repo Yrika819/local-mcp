@@ -184,6 +184,81 @@ pub(crate) const EXECUTION_PERMITS: usize = 16;
 /// Total transport concurrency. Unchanged from before Resource Bounds V1.
 pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 32;
 
+/// How long one response frame write may take before it is treated as a
+/// stalled transport rather than a slow client.
+///
+/// Stdout is a local pipe to a single client; a normal frame (usually KiB)
+/// completes in milliseconds. Waiting indefinitely in `write_all`/`flush`
+/// wedges the single serialized writer, fills the bounded response channel,
+/// and leaks both admission pools while the read loop stops draining stdin.
+/// Timing out converts that silent stall into an explicit transport failure
+/// the host can observe and recover from (process exit / supervisor restart)
+/// instead of a session that keeps running commands but answers nothing.
+pub(crate) const MCP_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a response-channel send may wait when the writer is behind.
+///
+/// Dispatch tasks hold their admission permit while sending, so an unbounded
+/// send is a permit leak whenever the writer stalls. Bounding the send keeps
+/// permits flowing even if an individual response has to be dropped; a missing
+/// response for one id is strictly better than a session-wide stall.
+pub(crate) const MCP_RESPONSE_SEND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// How long a control-plane request waits for a reserved permit before it is
+/// refused with a bounded resource error instead of blocking the read loop.
+///
+/// Control work is a map lookup or state read, so the wait is normally short.
+/// Without a bound, stalled control dispatches (for example ones blocked on a
+/// stalled writer) wedge the read loop forever on the next control request.
+pub(crate) const CONTROL_ADMISSION_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// How long approval IPC waits for the session UI to answer.
+///
+/// Human approval legitimately takes time, so this is generous (10 minutes),
+/// but it must still be bounded: an unbounded `read_line` holds the calling
+/// dispatch (and its execution permit) forever when the UI disappears, and the
+/// pending queue in `approvals::start` grows without limit behind a stalled
+/// head. Expiry fails closed (error, never allow).
+pub(crate) const APPROVAL_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// Maximum approvals waiting for the operator's answer.
+///
+/// The queue is human-paced while arrivals are machine-paced, so without a cap
+/// a flood of requests (or a stalled head) grows it without bound. The value
+/// matches total transport concurrency: more waiters than in-flight requests
+/// can never be legitimate. Overflow refuses the newcomer with an explicit
+/// `deny` — fail-closed, never `allow`.
+pub(crate) const MAX_PENDING_APPROVALS: usize = MAX_CONCURRENT_REQUESTS;
+
+/// Largest approval IPC message: one newline-delimited JSON frame.
+///
+/// Legitimate approval details are bounded renderings (argv totals, paths,
+/// staged-path summaries) well under a megabyte. Without a cap, a single
+/// connection could make the session UI accumulate unbounded memory while the
+/// read deadline still runs. Oversized messages are refused whole and the
+/// connection is dropped; the caller fails closed.
+pub(crate) const MAX_APPROVAL_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// How long approval IPC waits for a single connect/write/shutdown step.
+///
+/// The response wait above covers human latency; these steps are machine IPC
+/// and must be fast. Bounding them keeps a dead pipe from holding a dispatch.
+pub(crate) const APPROVAL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long transport shutdown waits for in-flight responses to drain.
+///
+/// The drain ends when every dispatch has sent (dropping its sender) and the
+/// writer has flushed them. A dispatch that never finishes — an approval
+/// with no UI, an unbounded wait — would otherwise hold its sender forever
+/// and delay all cleanup behind it without limit. Thirty seconds covers any
+/// number of already-computed frames (each send and write is itself bounded
+/// near ten) while keeping abnormal shutdowns bounded. Expiry reports an
+/// error; it never silently drops the shutdown.
+pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Compile-time relationships
 // ---------------------------------------------------------------------------
@@ -230,6 +305,13 @@ const _: () = assert!(MAX_RESOURCE_ERROR_MESSAGE_BYTES < MAX_DISPATCH_ERROR_MESS
 const _: () =
     assert!(MAX_EXECUTE_ARGV_TOTAL_BYTES <= MAX_EXECUTE_ARGV_ITEMS * MAX_EXECUTE_ARG_BYTES);
 
+// A legitimate approval detail embeds bounded renderings (argv totals, paths,
+// staged-path summaries), so the approval message cap must admit the largest
+// legitimate argv payload with room to spare — while staying far below the
+// request frame, which it never approaches.
+const _: () = assert!(MAX_EXECUTE_ARGV_TOTAL_BYTES <= MAX_APPROVAL_MESSAGE_BYTES);
+const _: () = assert!(MAX_APPROVAL_MESSAGE_BYTES <= MAX_MCP_REQUEST_FRAME_BYTES);
+
 // One Session may not be able to consume the whole registry.
 const _: () = assert!(MAX_BACKGROUND_JOBS_PER_SESSION <= MAX_BACKGROUND_JOBS_GLOBAL);
 
@@ -261,6 +343,7 @@ pub(crate) enum ResourceLimit {
     ExecuteArgBytes,
     ExecuteArgvTotalBytes,
     ExecutePathBytes,
+    ApprovalMessage,
     BackgroundJobsPerSession,
     BackgroundJobsGlobal,
 }
@@ -283,6 +366,7 @@ impl ResourceLimit {
             Self::ExecuteArgBytes => MAX_EXECUTE_ARG_BYTES,
             Self::ExecuteArgvTotalBytes => MAX_EXECUTE_ARGV_TOTAL_BYTES,
             Self::ExecutePathBytes => MAX_EXECUTE_PATH_BYTES,
+            Self::ApprovalMessage => MAX_APPROVAL_MESSAGE_BYTES,
             Self::BackgroundJobsPerSession => MAX_BACKGROUND_JOBS_PER_SESSION,
             Self::BackgroundJobsGlobal => MAX_BACKGROUND_JOBS_GLOBAL,
         }
@@ -305,6 +389,7 @@ impl ResourceLimit {
             Self::ExecuteArgBytes => "command argument bytes",
             Self::ExecuteArgvTotalBytes => "command argument total bytes",
             Self::ExecutePathBytes => "command path bytes",
+            Self::ApprovalMessage => "approval message",
             Self::BackgroundJobsPerSession => "background jobs for this session",
             Self::BackgroundJobsGlobal => "background jobs overall",
         }
@@ -423,6 +508,20 @@ mod tests {
             CONTROL_PLANE_PERMITS + EXECUTION_PERMITS,
             MAX_CONCURRENT_REQUESTS
         );
+        // Long-run stability timeouts: bounded, non-zero, and ordered so that a
+        // single slow frame (write/send) fails before control admission gives up,
+        // and machine IPC (approval I/O) fails long before a human answer is due.
+        assert!(MCP_WRITE_TIMEOUT.as_millis() > 0);
+        assert!(MCP_RESPONSE_SEND_TIMEOUT.as_millis() > 0);
+        assert!(CONTROL_ADMISSION_WAIT_TIMEOUT >= MCP_WRITE_TIMEOUT);
+        assert!(APPROVAL_IO_TIMEOUT.as_millis() > 0);
+        assert!(APPROVAL_RESPONSE_TIMEOUT > APPROVAL_IO_TIMEOUT);
+        assert_eq!(MAX_PENDING_APPROVALS, MAX_CONCURRENT_REQUESTS);
+        assert_eq!(MAX_APPROVAL_MESSAGE_BYTES, 1024 * 1024);
+        // The shutdown drain must outlive any single bounded write or send
+        // it may wait on, or a healthy shutdown could time out.
+        assert!(SHUTDOWN_DRAIN_TIMEOUT >= MCP_WRITE_TIMEOUT);
+        assert!(SHUTDOWN_DRAIN_TIMEOUT >= MCP_RESPONSE_SEND_TIMEOUT);
     }
 
     #[test]
@@ -518,6 +617,7 @@ mod tests {
             ResourceLimit::ExecuteArgBytes,
             ResourceLimit::ExecuteArgvTotalBytes,
             ResourceLimit::ExecutePathBytes,
+            ResourceLimit::ApprovalMessage,
             ResourceLimit::BackgroundJobsPerSession,
             ResourceLimit::BackgroundJobsGlobal,
         ] {

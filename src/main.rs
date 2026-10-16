@@ -73,6 +73,8 @@ mod goal_runner_tests;
 #[cfg(test)]
 mod goal_verifier_tests;
 #[cfg(test)]
+mod longrun_stability_tests;
+#[cfg(test)]
 mod managed_workspace_verification_evidence_tests;
 #[cfg(test)]
 mod managed_worktree_creation_tests;
