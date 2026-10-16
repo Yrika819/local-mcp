@@ -15,7 +15,7 @@ const CODEX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct BackgroundExecution {
     pub(crate) rendered_command: String,
-    pub(crate) handle: JoinHandle<Result<String>>,
+    pub(crate) handle: AbortOnDropJoinHandle<Result<String>>,
     pub(crate) activity: &'static str,
 }
 
@@ -32,7 +32,7 @@ impl<T> AbortOnDropJoinHandle<T> {
         self.0.as_mut().expect("guard always owns its task")
     }
 
-    fn into_inner(mut self) -> JoinHandle<T> {
+    pub(crate) fn into_inner(mut self) -> JoinHandle<T> {
         self.0.take().expect("guard always owns its task")
     }
 }
@@ -164,7 +164,7 @@ pub(crate) async fn execute(args: &Value, session: &config::Session) -> Result<E
         )),
         Err(_) => Ok(ExecutionOutcome::Background(BackgroundExecution {
             rendered_command,
-            handle: handle.into_inner(),
+            handle,
             activity: "Backgrounded",
         })),
     }
@@ -178,7 +178,7 @@ pub(crate) async fn start_command(
         spawn_sandboxed_command("start_command", args, session).await?;
     Ok(BackgroundExecution {
         rendered_command,
-        handle,
+        handle: AbortOnDropJoinHandle::new(handle),
         activity: "Started",
     })
 }
@@ -1665,7 +1665,7 @@ pub(crate) async fn codex_fallback(
     });
     Ok(BackgroundExecution {
         rendered_command: label,
-        handle,
+        handle: AbortOnDropJoinHandle::new(handle),
         activity: "Started",
     })
 }
@@ -1714,7 +1714,7 @@ pub(crate) async fn without_sandbox(
         )),
         Err(_) => Ok(ExecutionOutcome::Background(BackgroundExecution {
             rendered_command,
-            handle: handle.into_inner(),
+            handle,
             activity: "Backgrounded host command",
         })),
     }
