@@ -394,15 +394,22 @@ async fn lost_poll_response_does_not_reclaim_an_existing_job() {
     });
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(1);
     drop(response_rx);
-    process_one_frame(
+    let control_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let execution_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    process_one_frame_observed(
         Frame::Complete(serde_json::to_vec(&request).unwrap()),
         &response_tx,
-        &std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-        &std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        &control_permits,
+        &execution_permits,
+        completed_tx,
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(2), completed_rx)
+        .await
+        .expect("dispatch completion should be bounded")
+        .unwrap();
 
     assert!(
         crate::job_registry::registry().contains_key_for_test(&id),
@@ -561,7 +568,12 @@ async fn response_loss_cleanup_is_session_bound_and_only_uses_typed_ownership() 
             session_id: session.id.clone(),
         }),
     });
-    reclaim_new_job_after_response_loss(&owned_response).await;
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+    drop(response_rx);
+    assert!(
+        !enqueue_dispatch_response(&response_tx, json!({"id": 3}), &owned_response).await,
+        "closed writer channel must reject the response"
+    );
     assert!(!crate::job_registry::registry().contains_key_for_test(&id));
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }

@@ -265,6 +265,35 @@ async fn process_one_frame(
     control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
     execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
+    process_one_frame_inner(frame, response_tx, control_permits, execution_permits, None).await
+}
+
+#[cfg(test)]
+#[allow(dead_code, reason = "used by the process-one-frame regression test")]
+async fn process_one_frame_observed(
+    frame: Frame,
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    completed: tokio::sync::oneshot::Sender<()>,
+) -> Result<()> {
+    process_one_frame_inner(
+        frame,
+        response_tx,
+        control_permits,
+        execution_permits,
+        Some(completed),
+    )
+    .await
+}
+
+async fn process_one_frame_inner(
+    frame: Frame,
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    completed: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let line = match frame {
         Frame::Empty => return Ok(()),
         Frame::TooLarge => {
@@ -374,11 +403,9 @@ async fn process_one_frame(
         // client acknowledgment; this branch only handles rejection by the
         // writer channel. Reclaim only the job this dispatch newly registered,
         // never a job inferred from response text (e.g. a poll_job result).
-        let enqueued = send_response_bounded(&response_tx_outer, response.clone())
-            .await
-            .is_ok();
-        if !enqueued {
-            reclaim_new_job_after_response_loss(&outcome).await;
+        enqueue_dispatch_response(&response_tx_outer, response, &outcome).await;
+        if let Some(completed) = completed {
+            let _ = completed.send(());
         }
     });
     Ok(())
@@ -500,9 +527,22 @@ pub(crate) fn report_shutdown_outcome(
     Ok(())
 }
 
+/// Enqueue one response and reclaim a request-owned background job only when
+/// the writer channel rejects it. A successful enqueue is not client receipt.
+async fn enqueue_dispatch_response(
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    response: Value,
+    outcome: &Result<DispatchOutcome>,
+) -> bool {
+    if send_response_bounded(response_tx, response).await.is_ok() {
+        return true;
+    }
+    reclaim_new_job_after_response_loss(outcome).await;
+    false
+}
+
 /// Reclaim only a newly registered job whose typed ownership token came from
-/// this request. A response queued to the writer is not client acknowledgment;
-/// this cleanup runs only when the writer channel rejects the response.
+/// this request; never infer ownership from response text.
 async fn reclaim_new_job_after_response_loss(outcome: &Result<DispatchOutcome>) {
     let Ok(dispatch_outcome) = outcome else {
         return;
