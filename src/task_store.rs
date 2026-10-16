@@ -1707,6 +1707,17 @@ mod tests {
         let resumed =
             store.with_session_lock_for(session_id, Duration::from_millis(100), || Ok("acquired"));
         assert_eq!(resumed.unwrap(), "acquired");
+
+        let held_lock = secure_fs::create_or_open_lock(&directory.join(".lock")).unwrap();
+        held_lock.lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            held_lock.unlock().unwrap();
+        });
+        let acquired_after_release =
+            store.with_session_lock_for(session_id, Duration::from_secs(1), || Ok("released"));
+        releaser.join().unwrap();
+        assert_eq!(acquired_after_release.unwrap(), "released");
         std::fs::remove_dir_all(root).unwrap();
     }
 
