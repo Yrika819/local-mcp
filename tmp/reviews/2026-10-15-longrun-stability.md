@@ -405,3 +405,61 @@ fail-closed (error, never allow) で bound。
 - longrun 13 件、approval 80 件、resource 66 件、すべて pass。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: clean。
 - GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。
+
+## R8. 独立レビュー第5ラウンド: P2 タイムアウト経路の回帰 (同一ブランチ、未マージ)
+
+レビュー指摘: `timeout(drain_timeout, writer_handle).await.map_err(...)?` は
+タイムアウト時に `?` で早期 return し、ReleaseAllJobs でも
+release_all_jobs() が実行されない。
+
+### 実証
+
+- 構造的事実: `?` の下にあった release 呼び出しは到達不能
+  (drain timeout / writer 失敗の異常系すべて)。
+- 実行証拠: cleanup 順序を変えた一時版 (report-first) に対し、
+  新規 hook テスト 2 件が FAILED (flag 未設定を検出)。
+  正常系テストは通過したため、異常系のみ cleanup が欠落することが確定。
+
+### 修正
+
+- 終了結果を `Result` として保持し、cleanup 後に報告する構造に変更。
+  `finish_transport_with_timeout` は cleanup hook
+  (`impl Future<Output = ()>`) を受け、生産側は policy 対応の
+  release_all_jobs future を渡す。LeaveRegistry のテストでは何も実行
+  されないため、グローバル JobRegistry に触れずに ReleaseAllJobs 相当の
+  順序 (cleanup→報告) を証明できる。
+- drain は `select!` (handle 保持) + deadline で競合させ、タイムアウト時は
+  writer を abort して join (reap) するため detached task を残さない。
+  abort により receiver が落ち、send 待ち dispatch は高速失敗して終了する。
+- `timeout()` (handle を消費して abort 不能になる) は不採用。
+
+### 終了 4 経路の再監査 (cleanup 順序と error 優先順位)
+
+全 exit は単一 tail (drop → drain → release → report) を通る:
+
+1. 正常 EOF: drain (bounded) → release → Ok 報告 (drain 期限切れ時のみ Err)。
+2. Writer 異常終了 (transport 失敗・panic): drain skip (task 終了済み、
+   handle 完了のため leak なし) → release → writer error 報告。
+3. stdin I/O エラー (read-loop 送信失敗含む): bounded drain → release →
+   報告は drain-Ok なら read error、drain 期限切れなら drain error
+   (優先順位は unit test で固定)。
+4. ドレインタイムアウト: writer abort+reap → release 実行 →
+   drain-timeout error 報告。cleanup 後の報告を hook flag で証明。
+
+- 正常な長時間 Goal 実行は background job 化済みのため drain 対象外
+  (dispatch の send 完了のみ待つ)。release が retained entry を止める点は
+  従来の EOF 経路と同一。
+- 権限: hook は policy 対応の既存 release のみ実行し、LeaveRegistry では
+  何も poll しない。新規権限なし。`terminate().await` の無期限待機は
+  従来経路と同一のため残存事項として記録 (今回の対象外)。
+- permit/channel は serve 単位の local のため、process 終了時の teardown
+  で回収される。cross-serve の共有状態なし。
+
+### R8 検証
+
+- `cargo fmt --check`: clean (コミット直前)。
+- `cargo check --locked --all-targets --jobs 2`: pass、警告なし。
+- 新規: cleanup 順序 3 件 + reap 1 件、すべて pass。
+  (red 版では順序 2 件が FAILED したことを確認済み)
+- longrun / approval / resource 全件、clippy: 下記実行結果を参照。
+- GitHub Actions: PR #11 更新後に自動実行、結果を追記予定。

@@ -5,6 +5,10 @@
 //! writers, and fake responders — never the Tunnel, never production Goal state.
 
 use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 
 use serde_json::{Value, json};
@@ -384,6 +388,14 @@ async fn stalled_writer_ends_transport_without_further_input() {
         .expect("transport hung after writer stall with silent stdin: regression");
 }
 
+/// Stand-in for ReleaseAllJobs cleanup: records that cleanup ran without
+/// touching the global registry (which parallel tests share).
+async fn cleanup_probe(flag: &Arc<AtomicBool>) {
+    flag.store(true, Ordering::SeqCst);
+}
+
+async fn no_cleanup() {}
+
 #[tokio::test]
 async fn shutdown_drain_is_bounded_when_a_sender_never_drops() {
     // P2 repro: stdin is gone but one dispatch never finishes, so its sender
@@ -395,7 +407,7 @@ async fn shutdown_drain_is_bounded_when_a_sender_never_drops() {
         let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
         // A dispatch that never finishes: its sender never drops.
         let stuck_sender = response_tx.clone();
-        let _stuck = tokio::spawn(async move {
+        let stuck = tokio::spawn(async move {
             let _held = stuck_sender;
             std::future::pending::<()>().await;
         });
@@ -403,12 +415,13 @@ async fn shutdown_drain_is_bounded_when_a_sender_never_drops() {
             while response_rx.recv().await.is_some() {}
             Ok::<(), anyhow::Error>(())
         });
+        let cleaned = Arc::new(AtomicBool::new(false));
         let result = finish_transport_with_timeout(
             writer_handle,
             None,
             Some(anyhow::anyhow!("stdin broken")),
             response_tx,
-            ShutdownPolicy::LeaveRegistry,
+            cleanup_probe(&cleaned),
             std::time::Duration::from_millis(300),
         )
         .await;
@@ -417,10 +430,107 @@ async fn shutdown_drain_is_bounded_when_a_sender_never_drops() {
             format!("{error:#}").contains("drain"),
             "the report must name the drain timeout, got: {error:#}"
         );
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup must run before the drain-timeout error is returned"
+        );
+        stuck.abort();
     });
     outcome
         .await
         .expect("shutdown hung behind an unfinished dispatch: regression");
+}
+
+#[tokio::test]
+async fn shutdown_cleanup_runs_on_clean_drain_and_writer_death() {
+    // The hook must also run on the non-timeout exits; otherwise the fix
+    // would only cover the drain path it was written for.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        // Clean drain: no stuck senders.
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        let writer_handle = tokio::spawn(async move {
+            while response_rx.recv().await.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        let cleaned = Arc::new(AtomicBool::new(false));
+        finish_transport_with_timeout(
+            writer_handle,
+            None,
+            None,
+            response_tx,
+            cleanup_probe(&cleaned),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect("clean drain must stay success");
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup must run on the clean path too"
+        );
+        // Writer already dead: no drain to wait for, cleanup still runs, and
+        // the writer's own error is what gets reported.
+        let (response_tx, _) = tokio::sync::mpsc::channel::<Value>(64);
+        let writer_handle =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("writer gone")) });
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let error = finish_transport_with_timeout(
+            writer_handle,
+            Some(Err(anyhow::anyhow!("writer gone"))),
+            None,
+            response_tx,
+            cleanup_probe(&cleaned),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("writer death must be reported");
+        assert!(
+            format!("{error:#}").contains("writer gone"),
+            "the writer's error must survive, got: {error:#}"
+        );
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup must run on the writer-death path too"
+        );
+    });
+    outcome.await.expect("shutdown paths hung: regression");
+}
+
+#[tokio::test]
+async fn timed_out_writer_is_reaped_not_detached() {
+    // After a drain timeout the writer task must be aborted and reaped: a
+    // detached survivor would hold its receiver (and anything it captured)
+    // past shutdown. The Weak proves no live task retains the guard.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        let stuck_sender = response_tx.clone();
+        let stuck = tokio::spawn(async move {
+            let _held = stuck_sender;
+            std::future::pending::<()>().await;
+        });
+        let guard = Arc::new(());
+        let weak = Arc::downgrade(&guard);
+        let writer_handle = tokio::spawn(async move {
+            let _guard = guard;
+            while response_rx.recv().await.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        let result = finish_transport_with_timeout(
+            writer_handle,
+            None,
+            None,
+            response_tx,
+            no_cleanup(),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(result.is_err(), "drain must time out here");
+        assert!(
+            weak.upgrade().is_none(),
+            "the timed-out writer must be reaped, not detached"
+        );
+        stuck.abort();
+    });
+    outcome.await.expect("writer-reap check hung: regression");
 }
 
 #[tokio::test]

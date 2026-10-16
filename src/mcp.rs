@@ -350,35 +350,47 @@ pub(crate) async fn finish_transport(
     response_tx: tokio::sync::mpsc::Sender<Value>,
     shutdown: ShutdownPolicy,
 ) -> Result<()> {
+    // The cleanup hook encodes the shutdown policy so tests can substitute an
+    // observable probe: the structure under test (cleanup runs before the
+    // report on every exit) is identical, while the global registry is never
+    // touched outside production.
+    let release = async move {
+        if shutdown == ShutdownPolicy::ReleaseAllJobs {
+            release_all_jobs().await;
+        }
+    };
     finish_transport_with_timeout(
         writer_handle,
         writer_result,
         read_error,
         response_tx,
-        shutdown,
+        release,
         crate::resource_limits::SHUTDOWN_DRAIN_TIMEOUT,
     )
     .await
 }
 
-/// Shutdown with an injectable drain bound so tests never wait out the
-/// production deadline. The order is load-bearing:///
+/// Shutdown with injectable drain bound and cleanup hook so tests observe the
+/// shutdown contract without waiting out production deadlines or touching the
+/// global registry. The order is load-bearing:
 /// 1. Drop the read loop's sender so the writer can observe the drain end.
 /// 2. Drain in-flight responses, bounded: dispatches that already computed
 ///    their frames still deliver them (clean EOF is unchanged), while a
 ///    dispatch that never finishes cannot delay cleanup without limit.
 ///    Normal long Goal runs are unaffected — they already returned as
 ///    background jobs, and only the retained entries (not running work) are
-///    released below.
-/// 3. Release retained jobs for the owning policy, then report. Cleanup runs
-///    on every exit, including an expired drain.
+///    released below. A timed-out writer is aborted and reaped so no
+///    detached task survives shutdown.
+/// 3. Run cleanup, then report. Cleanup runs on every exit, including an
+///    expired drain — returning the drain error first would orphan exactly
+///    the jobs shutdown exists to stop.
 #[cfg_attr(test, allow(dead_code, reason = "asserted by the stability tests"))]
 pub(crate) async fn finish_transport_with_timeout(
     writer_handle: tokio::task::JoinHandle<Result<()>>,
     writer_result: Option<Result<()>>,
     read_error: Option<anyhow::Error>,
     response_tx: tokio::sync::mpsc::Sender<Value>,
-    shutdown: ShutdownPolicy,
+    release: impl std::future::Future<Output = ()>,
     drain_timeout: std::time::Duration,
 ) -> Result<()> {
     // stdin closed (EOF): stop accepting requests, then drain and flush all
@@ -388,22 +400,38 @@ pub(crate) async fn finish_transport_with_timeout(
     // transport on a dead client can never orphan a background job that a
     // clean EOF would have reaped.
     drop(response_tx);
+    let mut writer_handle = writer_handle;
     let drain_outcome: Result<()> = match writer_result {
         // The writer already ended: nothing left to drain.
         Some(result) => result,
         // The loop ended first with the writer alive: drain in-flight
         // responses before reporting, exactly as a clean EOF always did —
         // but bounded, so an unfinished dispatch holding its sender cannot
-        // stall teardown (and everything after it) forever.
-        None => tokio::time::timeout(drain_timeout, writer_handle)
-            .await
-            .map_err(|_| anyhow::anyhow!("response drain timed out during shutdown"))?
-            .context("response writer task panicked")
-            .and_then(std::convert::identity),
+        // stall teardown (and everything after it) forever. Racing with
+        // `select!` (rather than `timeout`, which would consume the handle)
+        // keeps the handle so a timed-out writer can be aborted and reaped
+        // instead of detached.
+        None => {
+            let completed = tokio::select! {
+                result = &mut writer_handle => Some(result),
+                _ = tokio::time::sleep(drain_timeout) => None,
+            };
+            match completed {
+                None => {
+                    writer_handle.abort();
+                    let _ = writer_handle.await;
+                    Err(anyhow::anyhow!("response drain timed out during shutdown"))
+                }
+                Some(join) => join
+                    .context("response writer task panicked")
+                    .and_then(std::convert::identity),
+            }
+        }
     };
-    if shutdown == ShutdownPolicy::ReleaseAllJobs {
-        release_all_jobs().await;
-    }
+    // The drain outcome is held while cleanup runs, and only then reported:
+    // returning the error first would skip cleanup on exactly the abnormal
+    // exits (drain timeout, writer death) that need it most.
+    release.await;
     report_shutdown_outcome(drain_outcome, read_error)
 }
 
