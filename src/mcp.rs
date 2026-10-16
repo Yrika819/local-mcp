@@ -1436,6 +1436,29 @@ async fn store_job(
     handle: tokio::task::JoinHandle<Result<String>>,
     activity: &str,
 ) -> Result<(Value, Uuid)> {
+    let session_id = session.id.clone();
+    let title = format!("{activity} {rendered_command}");
+    store_job_with_activity(
+        session,
+        rendered_command,
+        handle,
+        move |job_id| async move {
+            approvals::activity(&session_id, title, Some(format!("└ job {job_id}"))).await;
+        },
+    )
+    .await
+}
+
+async fn store_job_with_activity<F, Fut>(
+    session: &config::Session,
+    rendered_command: String,
+    handle: tokio::task::JoinHandle<Result<String>>,
+    report_activity: F,
+) -> Result<(Value, Uuid)>
+where
+    F: FnOnce(Uuid) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     /// Outcome of trying to retain a job.
     enum Admission {
         Retained,
@@ -1487,12 +1510,7 @@ async fn store_job(
         return Err(error);
     }
     let registration = PendingJobRegistration::new(job_id, session.id.clone());
-    approvals::activity(
-        &session.id,
-        format!("{activity} {rendered_command}"),
-        Some(format!("└ job {job_id}")),
-    )
-    .await;
+    report_activity(job_id).await;
     let result = text_result(json!({"status":"running","job_id":job_id}).to_string())?;
     registration.commit();
     Ok((result, job_id))

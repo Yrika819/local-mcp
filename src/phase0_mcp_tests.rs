@@ -415,19 +415,109 @@ async fn lost_poll_response_does_not_reclaim_an_existing_job() {
 }
 
 #[tokio::test]
-async fn cancelled_registration_guard_releases_and_aborts_its_job() {
+async fn cancelled_registration_future_releases_and_aborts_its_job() {
+    struct TaskDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for TaskDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     let (session, cwd) = phase0_session();
-    let handle = tokio::spawn(async {
+    let task_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_dropped_by_job = std::sync::Arc::clone(&task_dropped);
+    let handle = tokio::spawn(async move {
+        let _drop_signal = TaskDrop(task_dropped_by_job);
         std::future::pending::<()>().await;
         Ok("finished".to_owned())
     });
-    let (_, id) = store_job(&session, "registration-cancellation".into(), handle, "Started")
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel();
+    let session_for_task = session.clone();
+    let registration = tokio::spawn(async move {
+        store_job_with_activity(
+            &session_for_task,
+            "registration-cancellation".into(),
+            handle,
+            move |id| async move {
+                let _ = id_tx.send(id);
+                std::future::pending::<()>().await;
+            },
+        )
+        .await
+    });
+    let id = id_rx.await.unwrap();
+    assert!(crate::job_registry::registry().contains_key_for_test(&id));
+
+    registration.abort();
+    let _ = registration.await;
+    for _ in 0..100 {
+        if task_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!crate::job_registry::registry().contains_key_for_test(&id));
+    assert!(task_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn registry_rejection_terminates_the_unretained_job_without_disturbing_others() {
+    use crate::resource_limits::MAX_BACKGROUND_JOBS_PER_SESSION;
+
+    let (session, cwd) = phase0_session();
+    let mut retained = Vec::new();
+    for index in 0..MAX_BACKGROUND_JOBS_PER_SESSION {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok("finished".to_owned())
+        });
+        let (response, _) = store_job(
+            &session,
+            format!("retained-{index}"),
+            handle,
+            "Started",
+        )
         .await
         .unwrap();
+        retained.push(job_id(&response));
+    }
 
-    drop(PendingJobRegistration::new(id, session.id.clone()));
-
-    assert!(!crate::job_registry::registry().contains_key_for_test(&id));
+    let rejected_task_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = std::sync::Arc::clone(&rejected_task_dropped);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        struct SignalDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SignalDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _drop_signal = SignalDrop(signal);
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+        Ok("finished".to_owned())
+    });
+    started_rx.await.unwrap();
+    let rejected = store_job_with_activity(&session, "rejected".into(), handle, |_| async {})
+        .await
+        .expect_err("full registry must reject rather than orphan the new job");
+    assert!(rejected
+        .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+        .is_some());
+    for _ in 0..100 {
+        if rejected_task_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(rejected_task_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    for id in &retained {
+        assert!(crate::job_registry::registry().contains_key_for_test(id));
+        stop_job(&json!({"job_id": id.to_string()}), &session)
+            .await
+            .unwrap();
+    }
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }
 
