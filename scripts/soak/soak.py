@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-import argparse, json, os, subprocess, time, uuid, pathlib, statistics, threading, signal
+import argparse, json, os, subprocess, time, uuid, pathlib, statistics, threading
+
+def pct(sorted_lats, p):
+    if not sorted_lats:
+        return None
+    idx = int(p * len(sorted_lats))
+    if idx >= len(sorted_lats):
+        idx = len(sorted_lats) - 1
+    return sorted_lats[idx]
 
 def main():
     ap = argparse.ArgumentParser()
@@ -18,86 +26,128 @@ def main():
     sessions_dir.mkdir(parents=True)
     cwd = state / "cwd"; cwd.mkdir()
     sid = str(uuid.uuid4())
-    (sessions_dir / f"{sid}.json").write_text(json.dumps({"id": sid, "cwd": str(cwd), "permitted_directories": [str(cwd)]}))
+    (sessions_dir / f"{sid}.json").write_text(json.dumps(
+        {"id": sid, "cwd": str(cwd), "permitted_directories": [str(cwd)]}))
 
     env = os.environ.copy()
     env["LOCALAPPDATA"] = str(state)
     env["APPDATA"] = str(state)
 
-    proc = subprocess.Popen([args.binary, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
-    # reader thread collects responses
+    proc = subprocess.Popen([args.binary, "mcp"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, bufsize=1)
     lock = threading.Lock()
     pending = {}
     results = []
     stop = threading.Event()
+    stderr_buf = []
+    child_gone = threading.Event()
 
     def reader():
         while not stop.is_set():
             line = proc.stdout.readline()
             if not line:
                 break
-            line=line.strip()
-            if not line: continue
+            line = line.strip()
+            if not line:
+                continue
             try:
-                obj=json.loads(line)
+                obj = json.loads(line)
             except Exception:
                 continue
-            rid=obj.get("id")
-            t=time.time()
+            rid = obj.get("id")
+            t = time.time()
             with lock:
                 if rid in pending:
-                    lat=t-pending.pop(rid)
+                    lat = t - pending.pop(rid)
                     results.append((rid, lat, obj))
-    rt=threading.Thread(target=reader, daemon=True)
+    rt = threading.Thread(target=reader, daemon=True)
     rt.start()
 
-    req_id=0
-    rid_lock=threading.Lock()
+    def err_reader():
+        while not stop.is_set():
+            line = proc.stderr.readline()
+            if not line:
+                break
+            stderr_buf.append(line.rstrip())
+    et = threading.Thread(target=err_reader, daemon=True)
+    et.start()
+
+    req_id = 0
+    rid_lock = threading.Lock()
+    inflight_at_exit = {}
+
     def send_one(method):
         nonlocal req_id
         with rid_lock:
-            req_id+=1; rid=req_id
-        t0=time.time()
-        req={"jsonrpc":"2.0","id":rid,"method":method}
+            req_id += 1; rid = req_id
+        t0 = time.time()
+        req = {"jsonrpc": "2.0", "id": rid, "method": method}
         with lock:
-            pending[rid]=t0
+            pending[rid] = t0
         try:
-            proc.stdin.write(json.dumps(req)+"\n"); proc.stdin.flush()
+            proc.stdin.write(json.dumps(req) + "\n"); proc.stdin.flush()
         except (OSError, BrokenPipeError, ValueError):
             stop.set()
             raise
         return rid
 
-    methods=["ping","tools/list"]
-    end=time.time()+args.duration
+    methods = ["ping", "tools/list"]
+    start = time.time()
+    end = start + args.duration
     import random
+    early = None
     try:
-        while time.time()<end and not stop.is_set():
+        while time.time() < end and not stop.is_set():
+            if proc.poll() is not None:
+                child_gone.set()
+                break
             for _ in range(args.concurrency):
                 if stop.is_set():
                     break
                 send_one(random.choice(methods))
             time.sleep(0.05)
     except Exception as e:
-        print("stopped early:", repr(e))
+        early = repr(e)
 
-    time.sleep(1)
+    elapsed = time.time() - start
+
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    time.sleep(0.5)
     stop.set()
-    proc.stdin.close()
-    proc.wait(timeout=10)
+    with lock:
+        inflight_at_exit = dict(pending)
 
-    lats=[r[1]*1000 for r in results]
-    summary={
-        "duration_sec": args.duration,
+    lats = sorted(r[1] * 1000 for r in results)
+    summary = {
+        "requested_duration_sec": args.duration,
+        "elapsed_sec": round(elapsed, 1),
+        "completed_full_duration": elapsed >= args.duration - 2 and early is None and not child_gone.is_set(),
         "requests": len(results),
         "success": len(results),
+        "inflight_at_exit": len(inflight_at_exit),
+        "child_returncode": proc.returncode,
+        "child_exited_early": child_gone.is_set() or (proc.returncode is not None and elapsed < args.duration - 2),
+        "early_error": early,
+        "stderr_tail": stderr_buf[-40:],
         "p50_ms": statistics.median(lats) if lats else None,
-        "p95_ms": sorted(lats)[int(0.95*len(lats))-1] if lats else None,
-        "p99_ms": sorted(lats)[int(0.99*len(lats))-1] if lats else None,
+        "p95_ms": pct(lats, 0.95),
+        "p99_ms": pct(lats, 0.99),
         "max_ms": max(lats) if lats else None,
     }
     pathlib.Path(args.out).write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
