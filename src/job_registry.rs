@@ -259,10 +259,8 @@ impl JobRegistry {
             .collect()
     }
 
-    /// Remove and return every retained job.
-    ///
-    /// Used when the process that owns the registry is shutting down. Abnormal
-    /// parent death is a separate, later concern; this is explicit shutdown only.
+    /// Release every retained job when the process that owns the registry is
+    /// shutting down. Abnormal parent death is a separate, later concern.
     pub(crate) fn release_all(&mut self) -> Vec<Job> {
         self.jobs.drain().map(|(_, job)| job).collect()
     }
