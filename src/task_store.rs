@@ -48,6 +48,7 @@ pub(crate) enum FaultPoint {
     BeforeReplace,
 }
 
+#[derive(Clone)]
 pub(crate) struct TaskStore {
     state_root: PathBuf,
     #[cfg(test)]
