@@ -40,7 +40,6 @@ const _: () = assert!(
 
 const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FaultPoint {
