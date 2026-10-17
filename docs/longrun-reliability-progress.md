@@ -26,6 +26,21 @@ Phase 4 soak in progress (30-min verified run). Phase 5/6/7 pending.
 - 30-min soak attempt (first): server exited code 1 after 1082s with stderr
   `response writer transport failure: client unreachable or stalled`, 161182 requests all
   successful, max latency 48831ms.
+- 30-min soak (fixed harness, concurrency 8): 1800.0s full duration, returncode 0,
+  no stderr, 254911 requests, 100% success, 0 error responses, 1.58GB responses read,
+  server working set flat 11.6MB -> ~6-7MB, p50 5.0ms, p95 14.0ms, p99 2784ms,
+  max 28413ms.
+- Release dry-run on integrated SHA (4113260), run 39049854348: plan + 6 platform
+  builds (linux x86_64/aarch64, windows x86_64/aarch64, macos x86_64/aarch64) +
+  checksums all succeeded; `publish` skipped as designed for workflow_dispatch.
+
+## Residual risk: soak tail latency
+The 30-min soak's p99 (2.78s) and max (28.4s) are far above the 5-/10-min runs
+(p99 15-16ms, max 0.9-1.7s). All requests still succeeded and the server never
+exited, so this is a latency-tail phenomenon, not a transport failure. Candidate
+causes are client-side (Python GIL / OS scheduling / 1.58GB of stdout parsing) or
+host memory pressure rather than a server defect (server working set was flat).
+Needs time-clustered sampling to attribute.
 
 ## 30-min failure root cause (harness, not product)
 The original harness retained every full response object (including multi-KB `tools/list`

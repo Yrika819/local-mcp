@@ -66,9 +66,11 @@ def main():
     lats = []
     error_count = 0
     bytes_read = 0
+    slow_events = []
     stop = threading.Event()
     stderr_buf = []
     child_gone = threading.Event()
+    t_start = time.time()
 
     def reader():
         nonlocal error_count, bytes_read
@@ -93,6 +95,8 @@ def main():
                     lats.append(lat)
                     if err:
                         error_count += 1
+                    if lat >= 0.1 and len(slow_events) < 5000:
+                        slow_events.append((round(t - t_start, 2), round(lat * 1000, 1)))
                 del obj
     rt = threading.Thread(target=reader, daemon=True)
     rt.start()
@@ -191,6 +195,8 @@ def main():
         "child_working_set_kb_end": mem_samples[-1][1] if mem_samples else None,
         "child_working_set_kb_max": max((m[1] for m in mem_samples), default=None),
         "mem_samples": mem_samples[::5],
+        "slow_event_count": len(slow_events),
+        "slow_events": slow_events,
         "p50_ms": statistics.median(sorted_lats) if sorted_lats else None,
         "p95_ms": pct(sorted_lats, 0.95),
         "p99_ms": pct(sorted_lats, 0.99),
