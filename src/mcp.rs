@@ -1006,35 +1006,50 @@ async fn call_tool_with_outcome(params: &Value) -> Result<DispatchOutcome> {
             Ok(DispatchOutcome { result, new_job })
         }
         "goal_start" => {
-            let result = with_goal_store(|store| goal_api::goal_start(&args, &session, store))?;
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_start(&args, &session, store)).await?;
             Ok(DispatchOutcome {
                 result,
                 new_job: None,
             })
         }
         "goal_status" => {
-            let result = with_goal_store(|store| goal_api::goal_status(&args, &session, store))?;
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_status(&args, &session, store)).await?;
             Ok(DispatchOutcome {
                 result,
                 new_job: None,
             })
         }
         "goal_pause" => {
-            let result = with_goal_store(|store| goal_api::goal_pause(&args, &session, store))?;
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_pause(&args, &session, store)).await?;
             Ok(DispatchOutcome {
                 result,
                 new_job: None,
             })
         }
         "goal_resume" => {
-            let result = with_goal_store(|store| goal_api::goal_resume(&args, &session, store))?;
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_resume(&args, &session, store)).await?;
             Ok(DispatchOutcome {
                 result,
                 new_job: None,
             })
         }
         "goal_cancel" => {
-            let result = with_goal_store(|store| goal_api::goal_cancel(&args, &session, store))?;
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_cancel(&args, &session, store)).await?;
             Ok(DispatchOutcome {
                 result,
                 new_job: None,
@@ -1066,15 +1081,17 @@ async fn goal_result_tool(args: &Value, session: &config::Session) -> Result<Val
     goal_tool_result(result)
 }
 
-fn with_goal_store<T, F>(operation: F) -> Result<Value>
+async fn with_goal_store<T, F>(operation: F) -> Result<Value>
 where
-    T: Serialize,
-    F: FnOnce(&TaskStore) -> std::result::Result<T, goal_api::GoalApiError>,
+    T: Serialize + Send + 'static,
+    F: FnOnce(&TaskStore) -> std::result::Result<T, goal_api::GoalApiError> + Send + 'static,
 {
-    let result = match TaskStore::new() {
-        Ok(store) => operation(&store),
-        Err(error) => Err(goal_api::GoalApiError::from_orchestrator(error)),
-    };
+    let result = tokio::task::spawn_blocking(move || {
+        let store = TaskStore::new().map_err(goal_api::GoalApiError::from_orchestrator)?;
+        operation(&store)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("goal store task failed: {error}"))?;
     goal_tool_result(result)
 }
 
