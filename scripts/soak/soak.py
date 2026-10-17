@@ -61,16 +61,25 @@ def main():
         req={"jsonrpc":"2.0","id":rid,"method":method}
         with lock:
             pending[rid]=t0
-        proc.stdin.write(json.dumps(req)+"\n"); proc.stdin.flush()
+        try:
+            proc.stdin.write(json.dumps(req)+"\n"); proc.stdin.flush()
+        except (OSError, BrokenPipeError, ValueError):
+            stop.set()
+            raise
         return rid
 
     methods=["ping","tools/list"]
     end=time.time()+args.duration
     import random
-    while time.time()<end:
-        for _ in range(args.concurrency):
-            send_one(random.choice(methods))
-        time.sleep(0.05)
+    try:
+        while time.time()<end and not stop.is_set():
+            for _ in range(args.concurrency):
+                if stop.is_set():
+                    break
+                send_one(random.choice(methods))
+            time.sleep(0.05)
+    except Exception as e:
+        print("stopped early:", repr(e))
 
     time.sleep(1)
     stop.set()
