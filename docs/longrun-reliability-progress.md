@@ -1,15 +1,16 @@
 # GoalLatch Long-Run Reliability Campaign Progress
 
 ## Current phase
-Phase 4 soak in progress (30-min verified run). Phase 5/6/7 pending.
+Phase 4 soak complete (5/10/30-min). Phase 5 audit complete. Phase 6 release
+dry-run complete. Phase 7 final report pending.
 
-## Branches
+## Branches (all CI green)
 - main: 48acd8e5d8e89a26406686debf42118ba2986b71
-- PR #12 hardening/execution-ownership-v1: d08ede4a4926bca75d813e41da3d114fef444048 (DRAFT)
-- PR #13 hardening/durable-lock-v1: e7e931917eb1f4a826a278d43d3c575b9ed3f5ee (DRAFT)
-- PR #14 hardening/runtime-responsiveness-v1: 80ff6b1... (DRAFT, depends on #12)
-- PR #15 integration/longrun-audit-v1: 4113260... (DRAFT, verification-only; includes PR #12+#13+#14+#16)
-- PR #16 fix/windows-snapshot-job-timeout-v1: 8b07e1442284e848706d2d48d6da1c794762b456 (DRAFT)
+- PR #12 hardening/execution-ownership-v1: d08ede4a4926bca75d813e41da3d114fef444048 (DRAFT, CI success 38931681909)
+- PR #13 hardening/durable-lock-v1: e7e931917eb1f4a826a278d43d3c575b9ed3f5ee (DRAFT, CI success 38925308079)
+- PR #14 hardening/runtime-responsiveness-v1: 629097c5427f0f2a71a7f099a19490bd0f5a420f (DRAFT, depends on #12, CI success 39052256039)
+- PR #15 integration/longrun-audit-v1: 744630a71c979c2cc24dc41bb69bab04de81c7e1 (DRAFT, verification-only; includes PR #12+#13+#14+#16, CI success 39053003971 + 39053007921)
+- PR #16 fix/windows-snapshot-job-timeout-v1: 7db93c35530749ad17eea32f6cbffb239a3ec102 (DRAFT, CI success 39052144878)
 
 ## Implemented
 - PR #14: moved Goal store operations (goal_start/status/pause/resume/cancel and goal_result loading) onto spawn_blocking.
@@ -74,11 +75,9 @@ latencies and adding child working-set sampling. A 120s validation run completed
 success with the server working set flat (~12MB), confirming no server-side memory leak.
 
 ## Pending
-- 30-min verified soak with the fixed harness (running).
-- 2-hour extended soak.
-- Release dry-run on integrated SHA (4113260).
-- Independent re-audit.
-- PR #15 body update to note PR #16 inclusion.
+- 2-hour extended soak (not run; host contention makes it low-signal here).
+- PR #15 body update to note PR #16 inclusion (done via gh).
+- Final Japanese report (Phase 7).
 
 ## Cautions
 - Do not disturb live local-mcp processes started 2026-10-15 (production GoalLatch/Tunnel).
