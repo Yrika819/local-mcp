@@ -37,10 +37,32 @@ Phase 4 soak in progress (30-min verified run). Phase 5/6/7 pending.
 ## Residual risk: soak tail latency
 The 30-min soak's p99 (2.78s) and max (28.4s) are far above the 5-/10-min runs
 (p99 15-16ms, max 0.9-1.7s). All requests still succeeded and the server never
-exited, so this is a latency-tail phenomenon, not a transport failure. Candidate
-causes are client-side (Python GIL / OS scheduling / 1.58GB of stdout parsing) or
-host memory pressure rather than a server defect (server working set was flat).
-Needs time-clustered sampling to attribute.
+exited, so this is a latency-tail phenomenon, not a transport failure.
+
+Attribution (time-clustered slow-event sampling + controlled runs):
+- Clean 180s run with no concurrent host activity: slow events (>100ms) = 0,
+  p50 5.0ms, p95 12.5ms, p99 16.0ms, max 36ms, 28504 requests, 100% success.
+- 600s probe run while the host was concurrently doing heavy git diff/build/gh
+  work: throughput halved (~71 vs ~142 req/s), slow_event_count hit the 5000 cap,
+  p95 7945ms, p99 25624ms, max 37325ms. Slow events arrived in bursts (responses
+  queued during multi-second client starvation, then drained), the signature of a
+  starved reader rather than server slowness.
+- Server working set stayed flat in every run (7-20MB), never exited, and
+  returned 0 error responses, so there is no server-side resource leak or
+  correctness defect. The tail is host/client contention.
+
+Conclusion: verified reliable on the core contract (no crash, no hang, no failed
+or errored request). Tail latency must be re-measured on a release build and a
+dedicated host; this 4-vCPU/8GB shared machine starves the soak client under load.
+
+## Line-ending hygiene
+`main` stores Rust sources with LF. Edits made through the Windows editor had
+introduced CRLF into `src/goal_api.rs`, `src/task_store.rs`, and
+`src/managed_worktree_snapshot_index_blob.rs`, which rewrote those files
+wholesale in `git diff`. Normalized back to LF on
+`integration/longrun-audit-v1`, `hardening/runtime-responsiveness-v1` (PR #14),
+and `fix/windows-snapshot-job-timeout-v1` (PR #16). Diffs vs `main` are now the
+real changes only (PR #14: 653 insertions; PR #16: 1 line).
 
 ## 30-min failure root cause (harness, not product)
 The original harness retained every full response object (including multi-KB `tools/list`
