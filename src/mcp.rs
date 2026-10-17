@@ -28,6 +28,60 @@ use crate::resource_limits::{
 };
 use crate::task_store::TaskStore;
 use crate::workspace_publish;
+
+/// A newly created background job, tracked through dispatch so that a lost
+/// response can only ever reclaim a job this request actually created.
+#[derive(Clone)]
+struct NewJob {
+    job_id: Uuid,
+    session_id: String,
+}
+
+/// Typed outcome of dispatching one request.
+struct DispatchOutcome {
+    result: Value,
+    new_job: Option<NewJob>,
+}
+
+/// Keeps a retained job owned by the registration path until dispatch can
+/// return its typed ownership token. Cancellation during activity reporting
+/// removes the registry entry and aborts its task instead of orphaning it.
+struct PendingJobRegistration {
+    job_id: Uuid,
+    session_id: String,
+    committed: bool,
+}
+
+impl PendingJobRegistration {
+    fn new(job_id: Uuid, session_id: String) -> Self {
+        Self {
+            job_id,
+            session_id,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingJobRegistration {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let job =
+            { job_registry::registry().take(job_registry::now(), self.job_id, &self.session_id) };
+        match job {
+            Ok(job) => job.request_termination(),
+            Err(error) => eprintln!(
+                "failed to roll back background job {} after registration cancellation: {error:#}",
+                self.job_id
+            ),
+        }
+    }
+}
 use crate::{approvals, config, execution, fallback, goal_api, sandbox};
 
 /// Total transport concurrency lives in [`crate::resource_limits`] as
@@ -211,6 +265,35 @@ async fn process_one_frame(
     control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
     execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
+    process_one_frame_inner(frame, response_tx, control_permits, execution_permits, None).await
+}
+
+#[cfg(test)]
+#[allow(dead_code, reason = "used by the process-one-frame regression test")]
+async fn process_one_frame_observed(
+    frame: Frame,
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    completed: tokio::sync::oneshot::Sender<bool>,
+) -> Result<()> {
+    process_one_frame_inner(
+        frame,
+        response_tx,
+        control_permits,
+        execution_permits,
+        Some(completed),
+    )
+    .await
+}
+
+async fn process_one_frame_inner(
+    frame: Frame,
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    control_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    execution_permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    completed: Option<tokio::sync::oneshot::Sender<bool>>,
+) -> Result<()> {
     let line = match frame {
         Frame::Empty => return Ok(()),
         Frame::TooLarge => {
@@ -282,17 +365,12 @@ async fn process_one_frame(
             return Ok(());
         }
     };
-    let response_tx = response_tx.clone();
+    let response_tx_outer = response_tx.clone();
     tokio::spawn(async move {
         // Hold the permit for the entire dispatch so the concurrency bound
         // reflects genuinely in-flight work.
         let _permit = permit;
-        // Panic containment: a panicking handler must not silently drop
-        // the request (leaving the client waiting on that ID forever).
-        // Supervise the inner dispatch and synthesize a JSON-RPC internal
-        // error on panic so the request always receives exactly one
-        // response and the panic can never poison the read loop, the
-        // writer task, or any other in-flight request.
+        // Panic containment...
         let dispatch_task = tokio::spawn(async move { dispatch(&request).await });
         let outcome = match dispatch_task.await {
             Ok(outcome) => outcome,
@@ -305,12 +383,11 @@ async fn process_one_frame(
                 }
             )),
         };
-        let response = match outcome {
-            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+        let response = match &outcome {
+            Ok(dispatch_outcome) => {
+                json!({"jsonrpc":"2.0","id":id,"result":dispatch_outcome.result})
+            }
             Err(error) => {
-                // A resource bound keeps its own code, so a client can tell
-                // "too large" from "failed" and a resource failure is never
-                // presented as an authority or permission failure.
                 let code = if error
                     .downcast_ref::<crate::resource_limits::ResourceLimitError>()
                     .is_some()
@@ -322,15 +399,14 @@ async fn process_one_frame(
                 bounded_error_response(id, code, &format!("{error:#}"))
             }
         };
-        // A failed send means the writer is gone or has not drained for
-        // `MCP_RESPONSE_SEND_TIMEOUT`: the transport is dying or dead, and
-        // the read loop independently observes writer termination (via the
-        // `select!` above) and ends the transport with an explicit error.
-        // Dropping this one response therefore surfaces to the client as a
-        // transport EOF, never as an infinite wait on this id. The permit
-        // is freed with the task either way, so a stalled writer cannot
-        // leak admission capacity.
-        let _ = send_response_bounded(&response_tx, response).await;
+        // Enqueue the response for the writer. A successful enqueue is not a
+        // client acknowledgment; this branch only handles rejection by the
+        // writer channel. Reclaim only the job this dispatch newly registered,
+        // never a job inferred from response text (e.g. a poll_job result).
+        enqueue_dispatch_response(&response_tx_outer, response, &outcome).await;
+        if let Some(completed) = completed {
+            let _ = completed.send(outcome.is_ok());
+        }
     });
     Ok(())
 }
@@ -449,6 +525,40 @@ pub(crate) fn report_shutdown_outcome(
         return Err(error);
     }
     Ok(())
+}
+
+/// Enqueue one response and reclaim a request-owned background job only when
+/// the writer channel rejects it. A successful enqueue is not client receipt.
+async fn enqueue_dispatch_response(
+    response_tx: &tokio::sync::mpsc::Sender<Value>,
+    response: Value,
+    outcome: &Result<DispatchOutcome>,
+) -> bool {
+    if send_response_bounded(response_tx, response).await.is_ok() {
+        return true;
+    }
+    reclaim_new_job_after_response_loss(outcome).await;
+    false
+}
+
+/// Reclaim only a newly registered job whose typed ownership token came from
+/// this request; never infer ownership from response text.
+async fn reclaim_new_job_after_response_loss(outcome: &Result<DispatchOutcome>) {
+    let Ok(dispatch_outcome) = outcome else {
+        return;
+    };
+    let Some(new_job) = &dispatch_outcome.new_job else {
+        return;
+    };
+    let job =
+        { job_registry::registry().take(job_registry::now(), new_job.job_id, &new_job.session_id) };
+    match job {
+        Ok(job) => job.terminate().await,
+        Err(error) => eprintln!(
+            "failed to reclaim background job {} after response loss: {error:#}",
+            new_job.job_id
+        ),
+    }
 }
 
 /// Terminate every retained background job on explicit server shutdown.
@@ -580,21 +690,30 @@ where
     Ok(())
 }
 
-async fn dispatch(request: &Value) -> Result<Value> {
+async fn dispatch(request: &Value) -> Result<DispatchOutcome> {
     match request
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
-        })),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null)).await,
+        "initialize" => Ok(DispatchOutcome {
+            result: json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
+            }),
+            new_job: None,
+        }),
+        "ping" => Ok(DispatchOutcome {
+            result: json!({}),
+            new_job: None,
+        }),
+        "tools/list" => Ok(DispatchOutcome {
+            result: json!({"tools": tools()}),
+            new_job: None,
+        }),
+        "tools/call" => call_tool_with_outcome(request.get("params").unwrap_or(&Value::Null)).await,
         method => anyhow::bail!("method not found: {method}"),
     }
 }
@@ -732,7 +851,15 @@ pub(crate) fn tools() -> Value {
     tools
 }
 
+#[cfg(test)]
+#[allow(dead_code, reason = "used by the MCP tool unit tests")]
 async fn call_tool(params: &Value) -> Result<Value> {
+    call_tool_with_outcome(params)
+        .await
+        .map(|outcome| outcome.result)
+}
+
+async fn call_tool_with_outcome(params: &Value) -> Result<DispatchOutcome> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -743,10 +870,15 @@ async fn call_tool(params: &Value) -> Result<Value> {
         .unwrap_or_else(|| json!({}));
     let session_id = required_session_id(&args)?;
     let session = config::load_session(&session_id).await?;
+    let session_id_str = session.id.clone();
     match name {
         "session_info" => {
             approvals::activity(&session.id, "Read session info", None).await;
-            text_result(serde_json::to_string_pretty(&session)?)
+            let result = text_result(serde_json::to_string_pretty(&session)?)?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
         }
         "get_image" => {
             let requested = resolve_path(&session.cwd, required_path(&args, "path")?);
@@ -762,7 +894,10 @@ async fn call_tool(params: &Value) -> Result<Value> {
                 &result,
             )
             .await;
-            result
+            Ok(DispatchOutcome {
+                result: result?,
+                new_job: None,
+            })
         }
         "read_file" => {
             let requested = resolve_path(&session.cwd, required_path(&args, "path")?);
@@ -787,7 +922,11 @@ async fn call_tool(params: &Value) -> Result<Value> {
                 &result,
             )
             .await;
-            text_result(result?)
+            let result = text_result(result?)?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
         }
         "list_directory" => {
             let requested = resolve_path(&session.cwd, required_path(&args, "path")?);
@@ -803,22 +942,133 @@ async fn call_tool(params: &Value) -> Result<Value> {
                 &result,
             )
             .await;
-            text_result(result?)
+            let result = text_result(result?)?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
         }
-        "write_file" => write_file(&args, &session).await,
-        "execute" => execute(&args, &session).await,
-        "start_command" => start_command(&args, &session).await,
-        "poll_job" => poll_job(&args, &session).await,
-        "stop_job" => stop_job(&args, &session).await,
-        "codex_fallback" => codex_fallback(&args, &session).await,
-        "without_sandbox" => without_sandbox(&args, &session).await,
-        "goal_start" => with_goal_store(|store| goal_api::goal_start(&args, &session, store)),
-        "goal_status" => with_goal_store(|store| goal_api::goal_status(&args, &session, store)),
-        "goal_pause" => with_goal_store(|store| goal_api::goal_pause(&args, &session, store)),
-        "goal_resume" => with_goal_store(|store| goal_api::goal_resume(&args, &session, store)),
-        "goal_cancel" => with_goal_store(|store| goal_api::goal_cancel(&args, &session, store)),
-        "goal_result" => goal_result_tool(&args, &session).await,
-        "goal_run" => goal_run(&args, &session).await,
+        "write_file" => {
+            let result = write_file(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "execute" => {
+            let (result, job_id) = execute(&args, &session).await?;
+            let new_job = job_id.map(|job_id| NewJob {
+                job_id,
+                session_id: session_id_str,
+            });
+            Ok(DispatchOutcome { result, new_job })
+        }
+        "start_command" => {
+            let (result, job_id) = start_command(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: Some(NewJob {
+                    job_id,
+                    session_id: session_id_str,
+                }),
+            })
+        }
+        "poll_job" => {
+            let result = poll_job(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "stop_job" => {
+            let result = stop_job(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "codex_fallback" => {
+            let (result, job_id) = codex_fallback(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: Some(NewJob {
+                    job_id,
+                    session_id: session_id_str,
+                }),
+            })
+        }
+        "without_sandbox" => {
+            let (result, job_id) = without_sandbox(&args, &session).await?;
+            let new_job = job_id.map(|job_id| NewJob {
+                job_id,
+                session_id: session_id_str,
+            });
+            Ok(DispatchOutcome { result, new_job })
+        }
+        "goal_start" => {
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_start(&args, &session, store)).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_status" => {
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_status(&args, &session, store)).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_pause" => {
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_pause(&args, &session, store)).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_resume" => {
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_resume(&args, &session, store)).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_cancel" => {
+            let args = args.clone();
+            let session = session.clone();
+            let result =
+                with_goal_store(move |store| goal_api::goal_cancel(&args, &session, store)).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_result" => {
+            let result = goal_result_tool(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_run" => {
+            let result = goal_run(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
 }
@@ -831,15 +1081,17 @@ async fn goal_result_tool(args: &Value, session: &config::Session) -> Result<Val
     goal_tool_result(result)
 }
 
-fn with_goal_store<T, F>(operation: F) -> Result<Value>
+async fn with_goal_store<T, F>(operation: F) -> Result<Value>
 where
-    T: Serialize,
-    F: FnOnce(&TaskStore) -> std::result::Result<T, goal_api::GoalApiError>,
+    T: Serialize + Send + 'static,
+    F: FnOnce(&TaskStore) -> std::result::Result<T, goal_api::GoalApiError> + Send + 'static,
 {
-    let result = match TaskStore::new() {
-        Ok(store) => operation(&store),
-        Err(error) => Err(goal_api::GoalApiError::from_orchestrator(error)),
-    };
+    let result = tokio::task::spawn_blocking(move || {
+        let store = TaskStore::new().map_err(goal_api::GoalApiError::from_orchestrator)?;
+        operation(&store)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("goal store task failed: {error}"))?;
     goal_tool_result(result)
 }
 
@@ -1138,21 +1390,30 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
 async fn store_execution_job(
     session: &config::Session,
     job: execution::BackgroundExecution,
-) -> Result<Value> {
-    store_job(session, job.rendered_command, job.handle, job.activity).await
+) -> Result<(Value, Uuid)> {
+    store_job(
+        session,
+        job.rendered_command,
+        job.handle.into_inner(),
+        job.activity,
+    )
+    .await
 }
 
 async fn execution_outcome(
     session: &config::Session,
     outcome: execution::ExecutionOutcome,
-) -> Result<Value> {
+) -> Result<(Value, Option<Uuid>)> {
     match outcome {
-        execution::ExecutionOutcome::Completed(text) => text_result(text),
-        execution::ExecutionOutcome::Background(job) => store_execution_job(session, job).await,
+        execution::ExecutionOutcome::Completed(text) => Ok((text_result(text)?, None)),
+        execution::ExecutionOutcome::Background(job) => {
+            let (value, job_id) = store_execution_job(session, job).await?;
+            Ok((value, Some(job_id)))
+        }
     }
 }
 
-async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
+async fn execute(args: &Value, session: &config::Session) -> Result<(Value, Option<Uuid>)> {
     // No capacity pre-check here on purpose: a command that finishes inside the
     // foreground window never creates a job, and refusing it because the registry
     // is full would couple the most-used tool to background-job occupancy.
@@ -1162,7 +1423,7 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     execution_outcome(session, outcome).await
 }
 
-async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
+async fn start_command(args: &Value, session: &config::Session) -> Result<(Value, Uuid)> {
     let job = execution::start_command(args, session).await?;
     store_execution_job(session, job).await
 }
@@ -1231,7 +1492,30 @@ async fn store_job(
     rendered_command: String,
     handle: tokio::task::JoinHandle<Result<String>>,
     activity: &str,
-) -> Result<Value> {
+) -> Result<(Value, Uuid)> {
+    let session_id = session.id.clone();
+    let title = format!("{activity} {rendered_command}");
+    store_job_with_activity(
+        session,
+        rendered_command,
+        handle,
+        move |job_id| async move {
+            approvals::activity(&session_id, title, Some(format!("└ job {job_id}"))).await;
+        },
+    )
+    .await
+}
+
+async fn store_job_with_activity<F, Fut>(
+    session: &config::Session,
+    rendered_command: String,
+    handle: tokio::task::JoinHandle<Result<String>>,
+    report_activity: F,
+) -> Result<(Value, Uuid)>
+where
+    F: FnOnce(Uuid) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     /// Outcome of trying to retain a job.
     enum Admission {
         Retained,
@@ -1243,6 +1527,10 @@ async fn store_job(
     }
 
     let job_id = job_registry::new_job_id();
+    // Keep the spawned task cancellation-safe until it is either retained by the
+    // registry or explicitly stopped below. A dropped tokio::JoinHandle would
+    // detach the task instead of cancelling it.
+    let task_guard = execution::AbortOnDropJoinHandle::new(handle);
     // Capacity and retention happen under one lock, so they cannot disagree, and
     // the lock is released before anything is awaited.
     let admission = {
@@ -1252,13 +1540,21 @@ async fn store_job(
                 jobs.insert(
                     job_registry::now(),
                     job_id,
-                    Job::new(session.id.clone(), rendered_command.clone(), handle),
+                    Job::new(
+                        session.id.clone(),
+                        rendered_command.clone(),
+                        task_guard.into_inner(),
+                    ),
                 );
                 Admission::Retained
             }
             Err(error) => Admission::Refused {
                 error,
-                job: Job::new(session.id.clone(), rendered_command.clone(), handle),
+                job: Job::new(
+                    session.id.clone(),
+                    rendered_command.clone(),
+                    task_guard.into_inner(),
+                ),
             },
         }
     };
@@ -1270,13 +1566,11 @@ async fn store_job(
         job.terminate().await;
         return Err(error);
     }
-    approvals::activity(
-        &session.id,
-        format!("{activity} {rendered_command}"),
-        Some(format!("└ job {job_id}")),
-    )
-    .await;
-    text_result(json!({"status":"running","job_id":job_id}).to_string())
+    let registration = PendingJobRegistration::new(job_id, session.id.clone());
+    report_activity(job_id).await;
+    let result = text_result(json!({"status":"running","job_id":job_id}).to_string())?;
+    registration.commit();
+    Ok((result, job_id))
 }
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1333,12 +1627,12 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
     execution::required_command(args)
 }
 
-async fn codex_fallback(args: &Value, session: &config::Session) -> Result<Value> {
+async fn codex_fallback(args: &Value, session: &config::Session) -> Result<(Value, Uuid)> {
     let job = execution::codex_fallback(args, session).await?;
     store_execution_job(session, job).await
 }
 
-async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
+async fn without_sandbox(args: &Value, session: &config::Session) -> Result<(Value, Option<Uuid>)> {
     let outcome = execution::without_sandbox(args, session).await?;
     execution_outcome(session, outcome).await
 }
@@ -2198,8 +2492,8 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert_eq!(result["serverInfo"]["name"], "local-mcp");
-        assert_eq!(result["protocolVersion"], "2025-06-18");
+        assert_eq!(result.result["serverInfo"]["name"], "local-mcp");
+        assert_eq!(result.result["protocolVersion"], "2025-06-18");
     }
 
     #[test]
