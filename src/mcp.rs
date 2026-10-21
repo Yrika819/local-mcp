@@ -453,10 +453,11 @@ pub(crate) async fn finish_transport(
 /// 2. Drain in-flight responses, bounded: dispatches that already computed
 ///    their frames still deliver them (clean EOF is unchanged), while a
 ///    dispatch that never finishes cannot delay cleanup without limit.
-///    Normal long Goal runs are unaffected — they already returned as
-///    background jobs, and only the retained entries (not running work) are
-///    released below. A timed-out writer is aborted and reaped so no
-///    detached task survives shutdown.
+///    An in-flight `goal_run` is foreground durable work: transport EOF is not
+///    its cancellation signal; explicit `goal_cancel` persists that transition
+///    and stops subsequent scheduling. The cleanup below releases only legacy
+///    retained jobs. A timed-out writer is aborted and reaped; this drain bound
+///    does not cancel or bound an in-flight foreground Goal.
 /// 3. Run cleanup, then report. Cleanup runs on every exit, including an
 ///    expired drain — returning the drain error first would orphan exactly
 ///    the jobs shutdown exists to stop.
