@@ -32,11 +32,11 @@
 ## PR Status
 | PR | HEAD | Base | Current CI |
 |---|---|---|---|
-| #12 | d08ede4a4926bca75d813e41da3d114fef444048 | main @ 48acd8e | 22/22 success (prior runs; unchanged) |
-| #13 | e7e931917eb1f4a826a278d43d3c575b9ed3f5ee | main @ 48acd8e | 22/22 success (prior runs; unchanged) |
-| #14 | ee06e29a7ddf51c7d6dc501fff11503cf68bffb4 | PR #12 @ d08ede4 | 22/22 success on this HEAD; macOS Intel network failure rerun passed |
-| #16 | 7d46f66dfcbd058f388d835d193c7fd27017f2cc | main @ 48acd8e | new HEAD CI queued (runs 39596831970, 39596822070) |
-| #15 | 33ce3378cc8256821bb74eca57a7105d356216c1 | main @ 48acd8e | 11/11 jobs success on this baseline; final campaign update pending |
+| #12 | d08ede4a4926bca75d813e41da3d114fef444048 | main @ 48acd8e | Green on unchanged HEAD; current PR checks all SUCCESS |
+| #13 | e7e931917eb1f4a826a278d43d3c575b9ed3f5ee | main @ 48acd8e | Green on unchanged HEAD; current PR checks all SUCCESS |
+| #14 | ee06e29a7ddf51c7d6dc501fff11503cf68bffb4 | PR #12 @ d08ede4 | Green on this HEAD; run 39569615363 includes successful macOS Intel rerun |
+| #16 | 7d46f66dfcbd058f388d835d193c7fd27017f2cc | main @ 48acd8e | Green; run 39596831970, 11/11 jobs including macOS Intel rerun |
+| #15 | cd1feacee5962e74b5644abbbab045a76ba92d26 | main @ 48acd8e | Green; PR run 39601789967, 11/11 jobs (verification-only; never merge) |
 
 ## PR Dependency and Merge Simulations
 - #12 alone changes execution/job ownership and MCP ownership tests. #13 alone changes bounded durable session-lock waits in `src/task_store.rs`; it is not in #14's ancestry. #16 alone changes the Windows PID-witness wait from 10s to 30s; Job Object termination assertions are unchanged.
@@ -46,6 +46,12 @@
 - Recommended actual method: normal merge commits, preserving #12 ancestry on #14. Keep #14 based on #12 for review; after #12 merges, retarget #14 to main and merge normally. #15 remains verification-only and must not be merged.
 - Main is unchanged. Simulations are isolated branches/worktrees only.
 
+## Final Candidate CI (2026-10-21)
+- PR #15 HEAD `cd1feacee5962e74b5644abbbab045a76ba92d26`: https://github.com/Yrika819/local-mcp/actions/runs/39601789967 — success, all 11 jobs, including quality (fmt/check/clippy/harness regression), Linux test, Windows test/compat, and macOS test/compat.
+- PR #16 HEAD `7d46f66dfcbd058f388d835d193c7fd27017f2cc`: https://github.com/Yrika819/local-mcp/actions/runs/39596831970 — success, all 11 jobs; the cancelled duplicate job was rerun individually and succeeded.
+- A duplicate push-triggered integration run `39601780835` was cancelled to conserve Actions capacity; the PR-triggered run above completed fully and successfully. The cancellation is not test evidence and is not used as a pass.
+- PR #12/#13/#14 current check surfaces were queried after finalization and had no non-success checks; their heads did not change.
+
 ## Release Dry-Run
 - Previous: run 39049854348 on c2966066 (success, 6 platforms + checksums)
 - Run 39446430810 on 5ec4294: success; plan + six platform builds + checksums succeeded; publish skipped.
@@ -53,7 +59,7 @@
 
 ## Pre-Merge Checklist
 - [x] Historical quality gates pass on HEAD 5ec4294; current-candidate full local `cargo test` remains timed out and must be covered by final CI.
-- [ ] All current PR CIs green (PR #16 and final #15 HEAD still pending).
+- [x] All current source PR CIs green; integration candidate #15 HEAD cd1feace CI run 39601789967 is 11/11 successful. PR #16 HEAD 7d46f66 CI run 39596831970 is 11/11 successful.
 - [ ] 2h process run completed, but all-successful-send completion is unproven: 21 pending; legacy send counters absent.
 - [x] Release dry-run on c2966066 (success)
 - [x] Release dry-run on 5ec4294 (run 39446430810, success, 6 platforms + checksums, publish skipped)
