@@ -55,7 +55,7 @@
 - [x] All PR CIs green
 - [x] 2h Soak completed (1,029,243 req, 100% success)
 - [x] Release dry-run on c2966066 (success)
-- [ ] Release dry-run on 5ec4294 (queued, runner capacity)
+- [x] Release dry-run on 5ec4294 (run 39446430810, success, 6 platforms + checksums, publish skipped)
 - [x] Independent code audit (Phase 5)
 - [x] Windows test audit documented
 - [x] No P0/P1 defects found
