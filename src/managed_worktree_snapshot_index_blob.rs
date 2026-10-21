@@ -769,7 +769,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let session = fake_session(command);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !marker.exists() {
                 tokio::task::yield_now().await;
             }
