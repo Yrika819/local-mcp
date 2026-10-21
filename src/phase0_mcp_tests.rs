@@ -228,9 +228,9 @@ async fn initialize_contract_is_frozen() {
     }))
     .await
     .unwrap();
-    assert_eq!(value["protocolVersion"], "2025-06-18");
-    assert_eq!(value["capabilities"]["tools"]["listChanged"], false);
-    assert_eq!(value["serverInfo"]["name"], "local-mcp");
+    assert_eq!(value.result["protocolVersion"], "2025-06-18");
+    assert_eq!(value.result["capabilities"]["tools"]["listChanged"], false);
+    assert_eq!(value.result["serverInfo"]["name"], "local-mcp");
 }
 
 #[tokio::test]
@@ -243,7 +243,7 @@ async fn job_running_completion_and_completed_poll_are_frozen() {
             .expect("test must release the background job");
         Ok("{\"exit_code\":0,\"stdout\":\"done\",\"stderr\":\"\"}".to_owned())
     });
-    let started = store_job(&session, "phase0-job".into(), handle, "Started")
+    let (started, _) = store_job(&session, "phase0-job".into(), handle, "Started")
         .await
         .unwrap();
     let id = job_id(&started);
@@ -287,7 +287,7 @@ async fn finished_poll_atomically_owns_job_before_concurrent_stop() {
     while !handle.is_finished() {
         tokio::task::yield_now().await;
     }
-    let started = store_job(&session, "phase0-poll-race".into(), handle, "Started")
+    let (started, _) = store_job(&session, "phase0-poll-race".into(), handle, "Started")
         .await
         .unwrap();
     let id = job_id(&started);
@@ -333,7 +333,7 @@ async fn job_stop_unknown_owner_and_failure_are_frozen() {
         tokio::time::sleep(Duration::from_secs(5)).await;
         Ok("never".to_owned())
     });
-    let started = store_job(&session, "phase0-stop".into(), handle, "Started")
+    let (started, _) = store_job(&session, "phase0-stop".into(), handle, "Started")
         .await
         .unwrap();
     let id = job_id(&started);
@@ -358,7 +358,7 @@ async fn job_stop_unknown_owner_and_failure_are_frozen() {
     );
 
     let failed_handle = tokio::spawn(async { anyhow::bail!("phase0 background failure") });
-    let failed = store_job(&session, "phase0-fail".into(), failed_handle, "Started")
+    let (failed, _) = store_job(&session, "phase0-fail".into(), failed_handle, "Started")
         .await
         .unwrap();
     let failed_id = job_id(&failed);
@@ -368,6 +368,258 @@ async fn job_stop_unknown_owner_and_failure_are_frozen() {
         .unwrap_err();
     assert!(err.to_string().contains("phase0 background failure"));
 
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn start_command_dispatch_token_reclaims_job_when_writer_rejects_response() {
+    let (session, cwd) = phase0_session();
+    config::save_session(&session).await.unwrap();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tools/call",
+        "params": {
+            "name": "start_command",
+            "arguments": {
+                "session_id": session.id,
+                "command": ["sleep", "60"]
+            }
+        }
+    });
+
+    let outcome = dispatch(&request).await.expect("start_command dispatch");
+    let new_job = outcome
+        .new_job
+        .as_ref()
+        .expect("start_command must return typed ownership for its new job");
+    let job_id = new_job.job_id;
+    assert_eq!(new_job.session_id, session.id);
+    assert!(crate::job_registry::registry().contains_key_for_test(&job_id));
+
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+    drop(response_rx);
+    assert!(
+        !enqueue_dispatch_response(
+            &response_tx,
+            json!({"jsonrpc":"2.0","id":17,"result":outcome.result}),
+            &Ok(outcome),
+        )
+        .await
+    );
+    assert!(
+        !crate::job_registry::registry().contains_key_for_test(&job_id),
+        "writer rejection must reclaim the job created by this dispatch"
+    );
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn lost_poll_response_does_not_reclaim_an_existing_job() {
+    let (session, cwd) = phase0_session();
+    let handle = tokio::spawn(async {
+        std::future::pending::<()>().await;
+        Ok("finished".to_owned())
+    });
+    let (started, _) = store_job(&session, "poll-response-loss".into(), handle, "Started")
+        .await
+        .unwrap();
+    let id = job_id(&started);
+    config::save_session(&session).await.unwrap();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "poll_job",
+            "arguments": {"session_id": session.id, "job_id": id.to_string()}
+        }
+    });
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+    drop(response_rx);
+    let control_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let execution_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    process_one_frame_observed(
+        Frame::Complete(serde_json::to_vec(&request).unwrap()),
+        &response_tx,
+        &control_permits,
+        &execution_permits,
+        completed_tx,
+    )
+    .await
+    .unwrap();
+    let dispatch_succeeded = tokio::time::timeout(Duration::from_secs(2), completed_rx)
+        .await
+        .expect("dispatch completion should be bounded")
+        .unwrap();
+    assert!(dispatch_succeeded, "poll dispatch must succeed before asserting cleanup");
+
+    assert!(
+        crate::job_registry::registry().contains_key_for_test(&id),
+        "failed poll response enqueue must preserve the already-owned job"
+    );
+    stop_job(&json!({"job_id": id.to_string()}), &session)
+        .await
+        .unwrap();
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn cancelled_registration_future_releases_and_aborts_its_job() {
+    struct TaskDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for TaskDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let (session, cwd) = phase0_session();
+    let task_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_dropped_by_job = std::sync::Arc::clone(&task_dropped);
+    let handle = tokio::spawn(async move {
+        let _drop_signal = TaskDrop(task_dropped_by_job);
+        std::future::pending::<()>().await;
+        Ok("finished".to_owned())
+    });
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel();
+    let session_for_task = session.clone();
+    let registration = tokio::spawn(async move {
+        store_job_with_activity(
+            &session_for_task,
+            "registration-cancellation".into(),
+            handle,
+            move |id| async move {
+                let _ = id_tx.send(id);
+                std::future::pending::<()>().await;
+            },
+        )
+        .await
+    });
+    let id = id_rx.await.unwrap();
+    assert!(crate::job_registry::registry().contains_key_for_test(&id));
+
+    registration.abort();
+    let _ = registration.await;
+    for _ in 0..100 {
+        if task_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!crate::job_registry::registry().contains_key_for_test(&id));
+    assert!(task_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn registry_rejection_terminates_the_unretained_job_without_disturbing_others() {
+    use crate::resource_limits::MAX_BACKGROUND_JOBS_PER_SESSION;
+
+    let (session, cwd) = phase0_session();
+    let mut retained = Vec::new();
+    for index in 0..MAX_BACKGROUND_JOBS_PER_SESSION {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok("finished".to_owned())
+        });
+        let (response, _) = store_job(
+            &session,
+            format!("retained-{index}"),
+            handle,
+            "Started",
+        )
+        .await
+        .unwrap();
+        retained.push(job_id(&response));
+    }
+
+    let rejected_task_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = std::sync::Arc::clone(&rejected_task_dropped);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        struct SignalDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SignalDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _drop_signal = SignalDrop(signal);
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+        Ok("finished".to_owned())
+    });
+    started_rx.await.unwrap();
+    let rejected = store_job_with_activity(&session, "rejected".into(), handle, |_| async {})
+        .await
+        .expect_err("full registry must reject rather than orphan the new job");
+    assert!(rejected
+        .downcast_ref::<crate::resource_limits::ResourceLimitError>()
+        .is_some());
+    for _ in 0..100 {
+        if rejected_task_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(rejected_task_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    for id in &retained {
+        assert!(crate::job_registry::registry().contains_key_for_test(id));
+        stop_job(&json!({"job_id": id.to_string()}), &session)
+            .await
+            .unwrap();
+    }
+    let _ = tokio::fs::remove_dir_all(cwd).await;
+}
+
+#[tokio::test]
+async fn response_loss_cleanup_is_session_bound_and_only_uses_typed_ownership() {
+    let (session, cwd) = phase0_session();
+    let foreign = config::Session {
+        id: format!("phase0-foreign-{}", Uuid::new_v4()),
+        cwd: session.cwd.clone(),
+        permitted_directories: session.permitted_directories.clone(),
+    };
+    let handle = tokio::spawn(async {
+        std::future::pending::<()>().await;
+        Ok("finished".to_owned())
+    });
+    let (_, id) = store_job(&session, "session-bound-cleanup".into(), handle, "Started")
+        .await
+        .unwrap();
+
+    let mismatched_owner = Ok(DispatchOutcome {
+        result: json!({"job_id": id.to_string()}),
+        new_job: Some(NewJob {
+            job_id: id,
+            session_id: foreign.id,
+        }),
+    });
+    reclaim_new_job_after_response_loss(&mismatched_owner).await;
+    assert!(crate::job_registry::registry().contains_key_for_test(&id));
+
+    let unrelated_text = Ok(DispatchOutcome {
+        result: json!({"text": format!("unrelated UUID: {id}")}),
+        new_job: None,
+    });
+    reclaim_new_job_after_response_loss(&unrelated_text).await;
+    assert!(crate::job_registry::registry().contains_key_for_test(&id));
+
+    let owned_response = Ok(DispatchOutcome {
+        result: json!({"job_id": id.to_string()}),
+        new_job: Some(NewJob {
+            job_id: id,
+            session_id: session.id.clone(),
+        }),
+    });
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+    drop(response_rx);
+    assert!(
+        !enqueue_dispatch_response(&response_tx, json!({"id": 3}), &owned_response).await,
+        "closed writer channel must reject the response"
+    );
+    assert!(!crate::job_registry::registry().contains_key_for_test(&id));
     let _ = tokio::fs::remove_dir_all(cwd).await;
 }
 
@@ -386,7 +638,7 @@ async fn goal_lifecycle_operations_leave_legacy_job_authority_untouched() {
         tokio::time::sleep(Duration::from_secs(30)).await;
         Ok("legacy job completed".to_owned())
     });
-    let started = store_job(&session, "legacy-independent-job".into(), handle, "Started")
+    let (started, _) = store_job(&session, "legacy-independent-job".into(), handle, "Started")
         .await
         .unwrap();
     let legacy_job_id = job_id(&started);
