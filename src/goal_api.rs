@@ -977,9 +977,20 @@ where
     let goal_id = parse_goal_id(&request.goal_id)?;
     // Loading releases the store's read lock before observation; no mutation
     // lease is held across Git/filesystem I/O or an await.
-    let goal = store
-        .load_goal(&session.id, &goal_id)
-        .map_err(GoalApiError::from_orchestrator)?;
+    let store = store.clone();
+    let session_id = session.id.clone();
+    let goal_id_for_load = goal_id.clone();
+    let goal = tokio::task::spawn_blocking(move || {
+        store
+            .load_goal(&session_id, &goal_id_for_load)
+            .map_err(GoalApiError::from_orchestrator)
+    })
+    .await
+    .map_err(|error| {
+        GoalApiError::from_orchestrator(OrchestratorError::PersistenceIo(std::io::Error::other(
+            error.to_string(),
+        )))
+    })??;
     let mut view = result_view(&goal);
     if goal.workspace_mode().is_primary() {
         return Ok(view);

@@ -91,6 +91,9 @@ jobs:
           # archives so this costs no build time and needs no toolchain.
           python3 scripts/release/test_release_scripts.py
 
+      - name: Run soak harness regression tests
+        run: python3 -m unittest discover -s scripts/soak -p 'test_*.py' -v
+
   # ---------------------------------------------------------------------
   # Tier 1 - PRIMARY
   # Full locked test suite, release build, CLI smoke, and architecture
