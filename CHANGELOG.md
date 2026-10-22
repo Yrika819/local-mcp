@@ -9,6 +9,34 @@
   executable, existing release asset names, and durable compatibility identifiers.
   This branding change does not alter runtime behavior, authority, or stored state.
 
+## 0.1.1 — Stability release
+
+### Reliability
+
+- Strengthened job ownership and cleanup for lost responses.
+- Capped durable Goal lock wait at 5 seconds.
+- Moved synchronous Goal store work off async Tokio workers to reduce worker
+  starvation.
+- Stabilized Windows snapshot job timeout tests.
+
+### Verification
+
+- 1,301 Rust tests pass.
+- Linux / macOS / Windows CI green.
+- 2-hour continuous operation observed; old soak harness did not prove complete
+  response coverage for every sent request.
+- Improved harness short-duration full-response verification.
+- 6-platform release builds.
+
+### Known limitations
+
+- Windows remains experimental.
+- Linux aarch64 sandbox closure not release-validated.
+- Known inherited dependency advisories remain disclosed.
+- Long-running mixed Goal/Job load not fully verified.
+- Tail latency under high load.
+- No signing/notarization.
+
 ## 0.1.0 — Initial release
 
 ### Goal / orchestration

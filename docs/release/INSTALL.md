@@ -3,8 +3,8 @@
 GoalLatch Public v1 keeps the `local-mcp` executable and archive names for
 compatibility. This is the per-platform install guide for the Public v1 archives. For what the
 project is and what it does, see the [release
-notes](RELEASE_NOTES_v0.1.0.md). For the security model, read
-[`SECURITY.md`](../../SECURITY.md) — it is the authoritative description, and
+notes](RELEASE_NOTES_v0.1.1.md). For the security model, read
+[`SECURITY.md`](../../SECURITY.md)  Eit is the authoritative description, and
 this page only tells you how to unpack a download.
 
 ## Before you start: verify what you downloaded
@@ -32,12 +32,12 @@ Pick the archive that matches your platform:
 
 | Platform | Archive |
 | --- | --- |
-| Linux x86_64 | `local-mcp-v0.1.0-linux-x86_64.tar.gz` |
-| Linux aarch64 (ARM) | `local-mcp-v0.1.0-linux-aarch64.tar.gz` |
-| macOS Intel | `local-mcp-v0.1.0-macos-x86_64.tar.gz` |
-| macOS Apple Silicon | `local-mcp-v0.1.0-macos-aarch64.tar.gz` |
-| Windows x86_64 | `local-mcp-v0.1.0-windows-x86_64.zip` |
-| Windows ARM64 | `local-mcp-v0.1.0-windows-aarch64.zip` |
+| Linux x86_64 | `local-mcp-v0.1.1-linux-x86_64.tar.gz` |
+| Linux aarch64 (ARM) | `local-mcp-v0.1.1-linux-aarch64.tar.gz` |
+| macOS Intel | `local-mcp-v0.1.1-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `local-mcp-v0.1.1-macos-aarch64.tar.gz` |
+| Windows x86_64 | `local-mcp-v0.1.1-windows-x86_64.zip` |
+| Windows ARM64 | `local-mcp-v0.1.1-windows-aarch64.zip` |
 
 Each archive contains a single versioned directory with the binaries, project
 `LICENSE`, `README.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, and the
@@ -50,9 +50,9 @@ Codex revision. Extracting it does not scatter files into your current directory
 
 Two executables, and **both are required**:
 
-- `local-mcp` — the MCP server and approval UI.
-- `codex-linux-sandbox` — the Bubblewrap sandbox helper.
-- `atomic-publish` — the file-commit helper (see below).
+- `local-mcp`  Ethe MCP server and approval UI.
+- `codex-linux-sandbox`  Ethe Bubblewrap sandbox helper.
+- `atomic-publish`  Ethe file-commit helper (see below).
 
 They must be installed in the **same directory**. `local-mcp` locates both helpers
 as siblings of its own executable and refuses to run a sandboxed command, or to
@@ -72,11 +72,11 @@ depends on. Every release archive ships it.
 ### Install
 
 ```sh
-tar -xzf local-mcp-v0.1.0-linux-x86_64.tar.gz
+tar -xzf local-mcp-v0.1.1-linux-x86_64.tar.gz
 sudo install -d /usr/local/lib/local-mcp
-sudo install -m 0755 local-mcp-v0.1.0-linux-x86_64/local-mcp \
-  local-mcp-v0.1.0-linux-x86_64/codex-linux-sandbox \
-  local-mcp-v0.1.0-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
+sudo install -m 0755 local-mcp-v0.1.1-linux-x86_64/local-mcp \
+  local-mcp-v0.1.1-linux-x86_64/codex-linux-sandbox \
+  local-mcp-v0.1.1-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
 ```
 
 Both were installed with mode `0755`; the archive preserves that. Put them on
@@ -102,7 +102,7 @@ bwrap --version   # must report 0.12.0 or newer
 0.12.0 is the first release fixing
 [CVE-2026-87766](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx).
 The helper checks the version before starting anything and exits `126` on a
-missing, malformed, or older one — the requested command never starts. Ubuntu
+missing, malformed, or older one  Ethe requested command never starts. Ubuntu
 currently ships a version the check rejects on purpose; see
 [docs/linux_sandbox.md](../linux_sandbox.md) for why, and do not work around it
 by disabling AppArmor or using an unofficial repository.
@@ -132,18 +132,18 @@ vendored OpenSSL does not require a separate system OpenSSL library. Exact
 
 Two executables, and **both are required**:
 
-- `local-mcp` — the MCP server and approval UI.
-- `atomic-publish` — the file-commit helper. macOS sandboxes through the system
+- `local-mcp`  Ethe MCP server and approval UI.
+- `atomic-publish`  Ethe file-commit helper. macOS sandboxes through the system
   `sandbox-exec`, which is part of the OS, so there is no sandbox helper to
-  install — but the commit still has to happen inside that sandbox, and this is
+  install  Ebut the commit still has to happen inside that sandbox, and this is
   the program that does it. Omitting it makes every file write fail.
 
 ### Install
 
 ```sh
-tar -xzf local-mcp-v0.1.0-macos-aarch64.tar.gz
-install -m 0755 local-mcp-v0.1.0-macos-aarch64/local-mcp /usr/local/bin/local-mcp
-install -m 0755 local-mcp-v0.1.0-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
+tar -xzf local-mcp-v0.1.1-macos-aarch64.tar.gz
+install -m 0755 local-mcp-v0.1.1-macos-aarch64/local-mcp /usr/local/bin/local-mcp
+install -m 0755 local-mcp-v0.1.1-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
 ```
 
 The binary links to system libraries as listed by `otool -L` in the release
@@ -174,8 +174,8 @@ against `SHA256SUMS`.
 
 Two executables, and **both are required**:
 
-- `local-mcp.exe` — the MCP server and approval UI.
-- `atomic-publish.exe` — the file-commit helper. Windows has no process
+- `local-mcp.exe`  Ethe MCP server and approval UI.
+- `atomic-publish.exe`  Ethe file-commit helper. Windows has no process
   sandbox, so there is no sandbox helper to install, but the commit is still the
   shell-free mechanism that performs the write. Omitting it makes every file
   write fail.
@@ -186,10 +186,10 @@ Extract the zip, then either add the directory to `PATH` or copy the binaries
 somewhere already on it. Both must end up in the same directory:
 
 ```powershell
-Expand-Archive -Path local-mcp-v0.1.0-windows-x86_64.zip -DestinationPath .
+Expand-Archive -Path local-mcp-v0.1.1-windows-x86_64.zip -DestinationPath .
 New-Item -ItemType Directory -Force C:\tools | Out-Null
-Copy-Item local-mcp-v0.1.0-windows-x86_64\local-mcp.exe C:\tools\
-Copy-Item local-mcp-v0.1.0-windows-x86_64\atomic-publish.exe C:\tools\
+Copy-Item local-mcp-v0.1.1-windows-x86_64\local-mcp.exe C:\tools\
+Copy-Item local-mcp-v0.1.1-windows-x86_64\atomic-publish.exe C:\tools\
 ```
 
 ```powershell
@@ -200,7 +200,7 @@ local-mcp.exe mcp
 Verify a download on Windows with:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 local-mcp-v0.1.0-windows-x86_64.zip
+Get-FileHash -Algorithm SHA256 local-mcp-v0.1.1-windows-x86_64.zip
 ```
 
 and compare against the line for that file in `SHA256SUMS`. SmartScreen may
