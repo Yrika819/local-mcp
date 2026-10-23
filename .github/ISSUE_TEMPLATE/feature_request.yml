@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a scoped improvement.
+title: "Feature request: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets, private project data, or personal information.
+        Feature requests must not expand authority or bypass safety refusals implicitly.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user need or limitation does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful change and any alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility and safety considerations
+      description: Note affected platforms, permissions, sandboxing, data, and recovery behavior.
+    validations:
+      required: false

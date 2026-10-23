@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible problem (not for security vulnerabilities).
+title: "Bug report: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security vulnerabilities, follow SECURITY.md and do not post an exploit publicly.
+        Remove secrets, personal data, private paths, and credentials from all logs before sharing.
+  - type: input
+    id: version
+    attributes:
+      label: GoalLatch version
+      placeholder: "0.1.1"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "Linux x86_64"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include the smallest safe reproduction. Redact private paths and data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant redacted output
+      description: Review carefully; logs may contain commands, paths, diffs, or personal information. Never attach secrets.
+    validations:
+      required: false
