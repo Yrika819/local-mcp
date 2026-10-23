@@ -116,7 +116,7 @@ The Linux archive contains **three** executables—`local-mcp`,
 `codex-linux-sandbox`, and `atomic-publish`—and all must stay in the same
 directory. `local-mcp` finds the sandbox and file-commit helpers next to itself;
 sandboxed commands and file writes refuse to proceed if their required helper
-is missing. See the [Linux install guide](https://github.com/Yrika819/local-mcp/blob/v0.1.1/docs/release/INSTALL.md)
+is missing. See the [Linux install guide](INSTALL.md)
 and [Linux sandbox documentation](https://github.com/Yrika819/local-mcp/blob/v0.1.1/docs/linux_sandbox.md) for the full contract.
 
 ## Known limitations
