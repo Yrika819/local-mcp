@@ -4,8 +4,8 @@ GoalLatch Public v1 keeps the `local-mcp` executable and archive names for
 compatibility. This is the per-platform install guide for the Public v1 archives. For what the
 project is and what it does, see the [release
 notes](RELEASE_NOTES_v0.1.1.md). For the security model, read
-[`SECURITY.md`](../../SECURITY.md)  Eit is the authoritative description, and
-this page only tells you how to unpack a download.
+[`SECURITY.md`](../../SECURITY.md) is the authoritative security reference;
+this guide focuses on archive contents, platform requirements, and installation.
 
 ## Before you start: verify what you downloaded
 
@@ -48,11 +48,11 @@ Codex revision. Extracting it does not scatter files into your current directory
 
 ### What is in the archive
 
-Two executables, and **both are required**:
+Three executables, and **all three are required**:
 
-- `local-mcp`  Ethe MCP server and approval UI.
-- `codex-linux-sandbox`  Ethe Bubblewrap sandbox helper.
-- `atomic-publish`  Ethe file-commit helper (see below).
+- `local-mcp` — the MCP server and approval UI.
+- `codex-linux-sandbox` — the Bubblewrap sandbox helper.
+- `atomic-publish` — the file-commit helper (see below).
 
 They must be installed in the **same directory**. `local-mcp` locates both helpers
 as siblings of its own executable and refuses to run a sandboxed command, or to
@@ -79,7 +79,7 @@ sudo install -m 0755 local-mcp-v0.1.1-linux-x86_64/local-mcp \
   local-mcp-v0.1.1-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
 ```
 
-Both were installed with mode `0755`; the archive preserves that. Put them on
+All three were installed with mode `0755`; the archive preserves that. Put them on
 your `PATH` with a symlink, or add the directory to `PATH` directly:
 
 ```sh
@@ -102,7 +102,7 @@ bwrap --version   # must report 0.12.0 or newer
 0.12.0 is the first release fixing
 [CVE-2026-87766](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx).
 The helper checks the version before starting anything and exits `126` on a
-missing, malformed, or older one  Ethe requested command never starts. Ubuntu
+missing, malformed, or older one — the requested command never starts. Ubuntu
 currently ships a version the check rejects on purpose; see
 [docs/linux_sandbox.md](../linux_sandbox.md) for why, and do not work around it
 by disabling AppArmor or using an unofficial repository.
@@ -132,10 +132,10 @@ vendored OpenSSL does not require a separate system OpenSSL library. Exact
 
 Two executables, and **both are required**:
 
-- `local-mcp`  Ethe MCP server and approval UI.
-- `atomic-publish`  Ethe file-commit helper. macOS sandboxes through the system
+- `local-mcp` — the MCP server and approval UI.
+- `atomic-publish` — the file-commit helper. macOS sandboxes through the system
   `sandbox-exec`, which is part of the OS, so there is no sandbox helper to
-  install  Ebut the commit still has to happen inside that sandbox, and this is
+  install — but the commit still has to happen inside that sandbox, and this is
   the program that does it. Omitting it makes every file write fail.
 
 ### Install
@@ -174,8 +174,8 @@ against `SHA256SUMS`.
 
 Two executables, and **both are required**:
 
-- `local-mcp.exe`  Ethe MCP server and approval UI.
-- `atomic-publish.exe`  Ethe file-commit helper. Windows has no process
+- `local-mcp.exe` — the MCP server and approval UI.
+- `atomic-publish.exe` — the file-commit helper. Windows has no process
   sandbox, so there is no sandbox helper to install, but the commit is still the
   shell-free mechanism that performs the write. Omitting it makes every file
   write fail.
