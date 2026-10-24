@@ -51,7 +51,7 @@ GoalLatch v0.1.1 is formally released. Download the matching archive from the
 [v0.1.1 GitHub release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.1),
 verify its checksum, and follow the platform steps in the
 [Quick Start guide](docs/QUICK_START.md). The full archive contents and install
-requirements are in [the installation guide](docs/release/INSTALL.md).
+requirements are in [the installation guide](docs/release/INSTALL.md) and [Install Contract V1](docs/INSTALL_CONTRACT_V1.md).
 
 For a reproducible source build (requires Rust 1.96 as specified in
 `Cargo.toml`):

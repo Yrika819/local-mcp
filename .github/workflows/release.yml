@@ -148,6 +148,7 @@ jobs:
           set -euo pipefail
           python3 scripts/release/test_release_scripts.py
           python3 scripts/release/test_workflow_policy.py
+          python3 scripts/release/test_install_contract.py
 
   # ---------------------------------------------------------------------
   # Build, smoke test, and package one platform per matrix cell.
@@ -365,6 +366,24 @@ jobs:
             test -f "$root/local-mcp.exe"
           fi
           printf 'extracted_root=%s\n' "$root"
+
+      - name: Verify install contract from the packaged archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          KEY: ${{ matrix.key }}
+          # This runner was already asserted to match the matrix cell, so the
+          # override keeps the native check meaningful even if the interpreter
+          # reports an emulated machine.
+          GOALLATCH_HOST_TARGET: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          name=$(python3 -c "import sys; sys.path.insert(0,'scripts/release'); from targets import get; print(get('$KEY').archive_name('$VERSION'))")
+          # Re-extract into a private temporary directory, check the installed
+          # layout and helper placement, then execute only because this runner
+          # is the target's native host.
+          python3 scripts/release/install_contract.py archive \
+            --target "$KEY" --version "$VERSION" --archive "dist/$name"
 
       - name: Upload release archive
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
