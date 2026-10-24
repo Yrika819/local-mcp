@@ -21,6 +21,7 @@ import shutil
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -168,6 +169,52 @@ class ExtractionAndLayoutTest(unittest.TestCase):
         with self.assertRaises((install_contract.InstallContractError, tarfile.TarError)):
             install_contract.safe_extract(corrupt, self.work / "corrupt-out")
 
+    def test_member_count_limit_is_explicit(self) -> None:
+        bounds = install_contract.verify_package.ArchiveBounds(max_members=1)
+        bounds.check_member("one", 0)
+        with self.assertRaisesRegex(
+            install_contract.verify_package.VerificationError, "more than 1 members"
+        ):
+            bounds.check_member("two", 0)
+
+    def test_expansion_ratio_limit_is_explicit(self) -> None:
+        bounds = install_contract.verify_package.ArchiveBounds(max_compression_ratio=10)
+        with self.assertRaisesRegex(
+            install_contract.verify_package.VerificationError, "above the 10 limit"
+        ):
+            bounds.check_compression_ratio(10, 101)
+
+    def test_archive_is_structural_only_unless_execute_is_explicit(self) -> None:
+        archive = self._package("linux-x86_64")
+        with mock.patch.object(install_contract, "check_launch_modes") as launch:
+            report, problems = install_contract.check_archive(
+                "linux-x86_64", "0.1.1", archive
+            )
+        launch.assert_not_called()
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            report["runtime"],
+            "not-run (structural verification only; --execute not requested)",
+        )
+
+    def test_archive_execution_requires_local_build_attestation(self) -> None:
+        archive = self._package("linux-x86_64")
+        with mock.patch.object(install_contract, "check_archive") as check_archive:
+            result = install_contract.main(
+                [
+                    "archive",
+                    "--target",
+                    "linux-x86_64",
+                    "--version",
+                    "0.1.1",
+                    "--archive",
+                    str(archive),
+                    "--execute",
+                ]
+            )
+        self.assertEqual(result, 1)
+        check_archive.assert_not_called()
+
     def _tar_with(self, name: str, members) -> Path:
         archive = self.work / name
         with archive.open("wb") as handle:
@@ -271,6 +318,92 @@ class ChecksumAndVersionTest(unittest.TestCase):
         checksums.write_text("not-a-checksum  file.tar.gz\n", encoding="utf-8")
         with self.assertRaises(install_contract.InstallContractError):
             install_contract.read_checksums(checksums)
+
+    def test_published_hash_mismatch_never_calls_archive_processing(self) -> None:
+        archive = self.work / targets.get("windows-x86_64").archive_name("0.1.1")
+        archive.write_bytes(b"untrusted executable archive bytes")
+        def download(url: str, destination: Path) -> None:
+            destination.write_text(
+                f"{'0' * 64}  {archive.name}\n", encoding="utf-8"
+            )
+
+        with mock.patch.object(install_contract, "_download", side_effect=download), mock.patch.object(
+            install_contract, "check_archive"
+        ) as check_archive:
+            report, problems = install_contract.check_published(
+                "windows-x86_64", "0.1.1", execute=True, download_dir=self.work
+            )
+        check_archive.assert_not_called()
+        self.assertTrue(any("sha256 mismatch" in item for item in problems), problems)
+        self.assertEqual(report["formal"], "FAIL")
+        self.assertIn("not extracted", report["runtime"])
+
+    def test_missing_checksum_entry_never_calls_archive_processing(self) -> None:
+        archive = self.work / targets.get("windows-x86_64").archive_name("0.1.1")
+        archive.write_bytes(b"untrusted executable archive bytes")
+        def download(url: str, destination: Path) -> None:
+            destination.write_text(f"{'0' * 64}  other.zip\n", encoding="utf-8")
+
+        with mock.patch.object(install_contract, "_download", side_effect=download), mock.patch.object(
+            install_contract, "check_archive"
+        ) as check_archive:
+            report, problems = install_contract.check_published(
+                "windows-x86_64", "0.1.1", execute=True, download_dir=self.work
+            )
+        check_archive.assert_not_called()
+        self.assertTrue(any("no entry" in item for item in problems), problems)
+        self.assertIn("not extracted", report["runtime"])
+
+    def test_malformed_official_checksums_never_calls_archive_processing(self) -> None:
+        archive = self.work / targets.get("windows-x86_64").archive_name("0.1.1")
+        archive.write_bytes(b"untrusted executable archive bytes")
+
+        def download(url: str, destination: Path) -> None:
+            destination.write_text("malformed checksum manifest\n", encoding="utf-8")
+
+        with mock.patch.object(install_contract, "_download", side_effect=download), mock.patch.object(
+            install_contract, "check_archive"
+        ) as check_archive:
+            report, problems = install_contract.check_published(
+                "windows-x86_64", "0.1.1", execute=True, download_dir=self.work
+            )
+        check_archive.assert_not_called()
+        self.assertTrue(any("SHA256SUMS is unusable" in item for item in problems), problems)
+        self.assertIn("not extracted", report["runtime"])
+
+    def test_download_dir_checksum_is_never_trusted_as_official(self) -> None:
+        archive = self.work / targets.get("windows-x86_64").archive_name("0.1.1")
+        archive.write_bytes(b"caller-controlled archive")
+        (self.work / install_contract.CHECKSUMS_NAME).write_text(
+            f"{install_contract.sha256_of(archive)}  {archive.name}\n",
+            encoding="utf-8",
+        )
+
+        def download(url: str, destination: Path) -> None:
+            self.assertTrue(url.endswith("/SHA256SUMS"))
+            destination.write_text(f"{'0' * 64}  {archive.name}\n", encoding="utf-8")
+
+        with mock.patch.object(install_contract, "_download", side_effect=download), mock.patch.object(
+            install_contract, "check_archive"
+        ) as check_archive:
+            report, problems = install_contract.check_published(
+                "windows-x86_64", "0.1.1", execute=True, download_dir=self.work
+            )
+        check_archive.assert_not_called()
+        self.assertTrue(any("sha256 mismatch" in item for item in problems), problems)
+        self.assertIn("not extracted", report["runtime"])
+
+    def test_unconfirmed_host_override_cannot_produce_native_target(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"GOALLATCH_HOST_TARGET": "linux-x86_64"},
+            clear=True,
+        ), mock.patch.object(install_contract, "detected_host_key", return_value="windows-x86_64"), mock.patch.object(
+            install_contract, "runner_evidence_key", return_value=None
+        ):
+            evidence = install_contract.host_target_evidence()
+        self.assertIsNone(evidence.target)
+        self.assertEqual(evidence.evidence, "override-unconfirmed")
 
     @unittest.skipIf(os.name == "nt", "uses a POSIX shell fixture")
     def test_runtime_version_mismatch_is_detected(self) -> None:

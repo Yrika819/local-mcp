@@ -372,18 +372,22 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           KEY: ${{ matrix.key }}
-          # This runner was already asserted to match the matrix cell, so the
-          # override keeps the native check meaningful even if the interpreter
-          # reports an emulated machine.
+          # This runner was already asserted to match the matrix cell (runner
+          # OS/architecture and the Rust host triple), so the override is
+          # corroborated evidence rather than an unchecked claim.
           GOALLATCH_HOST_TARGET: ${{ matrix.key }}
         run: |
           set -euo pipefail
           name=$(python3 -c "import sys; sys.path.insert(0,'scripts/release'); from targets import get; print(get('$KEY').archive_name('$VERSION'))")
-          # Re-extract into a private temporary directory, check the installed
-          # layout and helper placement, then execute only because this runner
-          # is the target's native host.
+          # These archives are managed build artifacts built by this job, and
+          # the runner identity was asserted above, so this is the one place
+          # where the explicit --execute opt-in is justified. The default for
+          # every other invocation is structural verification only: a
+          # well-formed archive is never, by itself, a reason to run what is
+          # inside it.
           python3 scripts/release/install_contract.py archive \
-            --target "$KEY" --version "$VERSION" --archive "dist/$name"
+            --target "$KEY" --version "$VERSION" --archive "dist/$name" \
+            --execute --trusted-local-build
 
       - name: Upload release archive
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0

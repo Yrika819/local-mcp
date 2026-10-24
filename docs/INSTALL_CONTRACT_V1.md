@@ -17,7 +17,7 @@ what it may rely on.
 | `linux-x86_64` | Linux | x86_64 | `.tar.gz` | Supported |
 | `linux-aarch64` | Linux | aarch64 | `.tar.gz` | Experimental (sandbox closure evidence is x86_64 only) |
 | `macos-x86_64` | macOS | x86_64 | `.tar.gz` | Supported |
-| `macos-aarch64` | macOS | aarch64 | `.tar.gz` | Supported |
+| `macos-aarch64` | macOS | aarch64 | `.tar.gz` | CI target; local Apple Silicon release closure not verified |
 | `windows-x86_64` | Windows | x86_64 | `.zip` | Experimental (no Unix-equivalent process sandbox) |
 | `windows-aarch64` | Windows | aarch64 | `.zip` | Experimental (no Unix-equivalent process sandbox) |
 
@@ -180,7 +180,7 @@ As of 2026-10-24, on the Windows x86_64 host used for this campaign:
 | Linux x86_64 | PASS (SHA256SUMS matched) | not-run on Windows host |
 | Linux aarch64 | PASS (SHA256SUMS matched) | not-run (foreign architecture) |
 | macOS x86_64 | PASS (SHA256SUMS matched) | not-run on Windows host |
-| macOS aarch64 | PASS (SHA256SUMS matched) | not-run (foreign architecture) |
+| macOS aarch64 | PASS (SHA256SUMS matched) | not-run (foreign architecture; Apple Silicon CI is not local release closure) |
 | Windows x86_64 | PASS (SHA256SUMS matched) | PASS: direct, PATH, symlink, helper startup |
 | Windows aarch64 | PASS (SHA256SUMS matched) | not-run (foreign architecture) |
 
@@ -200,16 +200,27 @@ malformed frame). `codex-linux-sandbox` was not executed: this host is Windows,
 and the helper is not part of a Windows install.
 
 CI adds native install-contract checks on each matching runner in the test
-matrix (Linux x86_64, macOS Intel, macOS Apple Silicon, Windows x64). The
-release build job repeats the archive-based native check on all six release
-runners, including Linux ARM64 and Windows ARM64. Those two remain experimental
-and are not promoted to parity by a passing install check.
+matrix (Linux x86_64, macOS Intel, macOS Apple Silicon, Windows x64). This is
+remote CI evidence, not a local run or proof of the published macOS Apple
+Silicon release closure. The release build job repeats the archive-based native
+check on all six managed build runners, including Linux ARM64 and Windows ARM64.
+Those two remain experimental and are not promoted to parity by a passing
+install check. macOS Apple Silicon is a CI target, but the release closure is
+not claimed locally; do not conflate a CI build/check with locally observed
+execution of the published release asset.
 
 ## Negative tests
 
 The contract test refuses all of the following. Each case is constructed in an
 isolated temporary fixture; no existing session, Goal, project, or install is
 modified.
+
+Archive/download resource caps are intentionally much larger than the published
+v0.1.1 assets (3.2–5.8 MB compressed): 256 MiB per archive, 256 MiB per
+member, 512 MiB total declared uncompressed content, at most 256 members, and a
+maximum declared expansion ratio of 1000:1. Downloads are streamed in 1 MiB
+chunks with the same 256 MiB cap; the checksum manifest is limited to 1 MiB.
+Exceeding a cap is a failure, not a partial verification.
 
 | Case | Expected result |
 | --- | --- |
@@ -222,6 +233,10 @@ modified.
 | Wrong architecture header | FAIL (existing `verify_package.py` check) |
 | Corrupt/truncated archive | FAIL, extraction refused |
 | Wrong SHA-256 | FAIL, checksum mismatch |
+| Missing archive entry in `SHA256SUMS` | FAIL before archive processing; not extracted or executed |
+| Malformed `SHA256SUMS` | FAIL before archive processing; not extracted or executed |
+| Structurally valid archive without `--execute` | structural check only; no executable is launched |
+| Uncorroborated `GOALLATCH_HOST_TARGET` | UNKNOWN / not-run; never a native PASS |
 | Archive containing a symlink or hard link | FAIL, extraction refused |
 | Archive escaping its destination (`..`, absolute, drive prefix) | FAIL, extraction refused |
 | Non-executable required binary on Unix | FAIL, executable bit missing |
@@ -335,7 +350,16 @@ python3 scripts/release/install_contract.py published \
   --target windows-x86_64 --version 0.1.1
 ```
 
+`archive` defaults to structural verification only and does not execute an
+archive member. `--execute` requires the additional `--trusted-local-build`
+attestation; use it only for a locally produced build or a managed CI build
+artifact on the matching verified runner. Do not use this attestation for
+externally acquired archives. For those, use `published --execute`, which only
+reaches archive processing after matching the official `SHA256SUMS`. Archive
+format and member layout are not trust signals and never authorize execution.
+
 `published` uses the official URL
 `https://github.com/Yrika819/local-mcp/releases/download/v<version>/<asset>`,
-compares the archive against `SHA256SUMS`, extracts into a temporary directory,
-and executes only when the target matches the host.
+downloads in bounded chunks, verifies SHA-256 before opening or extracting the
+archive, and is structural-only by default. Add `--execute` only when the
+verified artifact is intended to be run on the corroborated native host.

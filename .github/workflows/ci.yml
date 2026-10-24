@@ -282,7 +282,10 @@ jobs:
           set -euo pipefail
           # Stage the just-built release binaries as an install, then observe
           # direct, PATH, symlink, and helper-startup behavior on this native
-          # runner. A non-native target is reported as not-run, never as a pass.
+          # runner. The override is corroborated in install_contract.py against
+          # RUNNER_OS/RUNNER_ARCH (asserted in the earlier architecture step,
+          # together with the Rust host triple); an uncorroborated override is
+          # reported as unconfirmed and never yields a native pass.
           version=$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
           test -n "$version"
           GOALLATCH_HOST_TARGET="$INSTALL_TARGET" \

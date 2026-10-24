@@ -18,8 +18,26 @@ Commands:
     install_contract.py native --version 0.1.1 --binary-dir target/release
     install_contract.py published --target windows-x86_64 --version 0.1.1
 
-`archive` and `published` execute only when the target matches the host. A
-foreign-architecture binary is never run; the report says `not-run` instead.
+Trust model (execution as explicit opt-in):
+
+* `archive` and `published` verify structure only by default. A well-formed
+  archive is never, by itself, a reason to run what is inside it.
+* Native launch verification requires an explicit `--execute` opt-in and is
+  only meaningful for artifacts whose origin and integrity can be established:
+  a local build you produced, the managed archives this repository's CI builds
+  on its own runners, or a published release archive whose SHA-256 was
+  verified against the official SHA256SUMS before anything was extracted.
+* `published` extracts nothing until the downloaded archive matches
+  SHA256SUMS; a checksum mismatch, a missing entry, or a malformed checksum
+  file stops the check without extraction or execution.
+* Untrusted-lifetime bounds from `verify_package.ArchiveBounds` apply while
+  scanning and extracting, so hostile archives fail as explicit resource
+  errors instead of exhausting memory or disk.
+
+`archive` and `published` execute only when the target matches the
+*corroborated* host. A foreign-architecture binary is never run; a host target
+that was merely typed into `GOALLATCH_HOST_TARGET` without matching host
+evidence is reported as `not-run`, never as a native pass.
 """
 
 from __future__ import annotations
@@ -53,6 +71,11 @@ from targets import DOCUMENT_FILES, TARGET_ORDER, TARGETS, Target, get  # noqa: 
 CONTRACT_VERSION = 1
 RELEASE_BASE_URL = "https://github.com/Yrika819/local-mcp/releases/download"
 CHECKSUMS_NAME = "SHA256SUMS"
+
+#: Download cap shared with the archive-reading bounds: the official v0.1.1
+#: assets are well under 6 MB, so this never rejects a real artifact, but a
+#: hostile or mispointed URL cannot stream unbounded data to disk.
+MAX_DOWNLOAD_BYTES = verify_package.MAX_ARCHIVE_BYTES
 
 #: The Install Contract V1 matrix. `targets.py` remains the build/archive source
 #: of truth; this table is the installed-runtime specification and the contract
@@ -208,21 +231,8 @@ def validate_contract_matrix() -> List[str]:
     return problems
 
 
-def host_target_key() -> Optional[str]:
-    """The matrix key for the current host, or None when it is unsupported.
-
-    CI may set `GOALLATCH_HOST_TARGET` after it has already asserted the runner
-    architecture. That keeps the native check meaningful on runners where the
-    interpreter reports an emulated machine, without letting the override
-    silently turn a foreign binary into a native pass.
-    """
-    override = os.environ.get("GOALLATCH_HOST_TARGET")
-    if override:
-        if override not in TARGETS:
-            raise InstallContractError(
-                f"GOALLATCH_HOST_TARGET={override!r} is not a release target"
-            )
-        return override
+def detected_host_key() -> Optional[str]:
+    """The OS/architecture pair the Python interpreter actually reports."""
     system = sys.platform
     machine = platform.machine().lower()
     if machine in ("arm64", "aarch64"):
@@ -243,6 +253,79 @@ def host_target_key() -> Optional[str]:
     return key if key in TARGETS else None
 
 
+#: GitHub-hosted runner identity -> release-matrix components. `RUNNER_OS` and
+#: `RUNNER_ARCH` are set by the platform on every hosted runner, and the
+#: workflow steps that set `GOALLATCH_HOST_TARGET` assert them (plus the Rust
+#: host triple) in the same job before the override exists.
+_RUNNER_OS_MAP = {"Linux": "linux", "macOS": "macos", "Windows": "windows"}
+_RUNNER_ARCH_MAP = {"X64": "x86_64", "ARM64": "aarch64"}
+
+
+def runner_evidence_key() -> Optional[str]:
+    """The matrix key implied by GitHub runner identity, or None."""
+    runner_os = os.environ.get("RUNNER_OS", "")
+    runner_arch = os.environ.get("RUNNER_ARCH", "")
+    if runner_os not in _RUNNER_OS_MAP or runner_arch not in _RUNNER_ARCH_MAP:
+        return None
+    return f"{_RUNNER_OS_MAP[runner_os]}-{_RUNNER_ARCH_MAP[runner_arch]}"
+
+
+@dataclass(frozen=True)
+class HostEvidence:
+    """A confirmed-or-unknown answer to "can this host run a native check?".
+
+    ``target`` is set only when independent host evidence corroborated a
+    platform-derived key or a `GOALLATCH_HOST_TARGET` override. ``None`` means
+    the native question stays UNKNOWN: callers report `not-run` and never
+    promote a result to a native pass.
+    """
+
+    target: Optional[str]
+    evidence: str
+
+
+def host_target_evidence() -> HostEvidence:
+    """Determine the host target with corroborated evidence only.
+
+    `GOALLATCH_HOST_TARGET` is an *override input*; by itself it carries no
+    evidence. It is accepted only when it matches:
+
+    * the OS/architecture pair the Python interpreter reports on this host
+      (`platform` evidence), or
+    * GitHub's `RUNNER_OS`/`RUNNER_ARCH` runner identity (`runner` evidence),
+      which the workflow asserts against the expected matrix cell and the
+      Rust host triple before the override is read.
+
+    An override that neither can confirm leaves the host UNKNOWN: the report
+    says the check was not run instead of manufacturing a native pass.
+    """
+    detected = detected_host_key()
+    override = os.environ.get("GOALLATCH_HOST_TARGET")
+    if override:
+        if override not in TARGETS:
+            raise InstallContractError(
+                f"GOALLATCH_HOST_TARGET={override!r} is not a release target"
+            )
+        if override == detected:
+            return HostEvidence(override, "platform")
+        if override == runner_evidence_key():
+            return HostEvidence(override, "runner")
+        return HostEvidence(None, "override-unconfirmed")
+    if detected:
+        return HostEvidence(detected, "platform")
+    return HostEvidence(None, "unknown")
+
+
+def host_target_key() -> Optional[str]:
+    """The matrix key for the current host, or None when UNKNOWN.
+
+    A `GOALLATCH_HOST_TARGET` override is honored only when independent host
+    evidence corroborates it; see `host_target_evidence`. An uncorroborated
+    override yields None so no caller can escalate it into a native pass.
+    """
+    return host_target_evidence().target
+
+
 def sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -260,6 +343,10 @@ def verify_archive_checksum(path: Path, expected: str) -> None:
 
 
 def read_checksums(path: Path) -> Dict[str, str]:
+    if path.stat().st_size > 1024 * 1024:
+        raise InstallContractError(
+            f"{path}: checksum file exceeds the 1 MiB parsing limit"
+        )
     entries: Dict[str, str] = {}
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), 1
@@ -275,6 +362,10 @@ def read_checksums(path: Path) -> Dict[str, str]:
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise InstallContractError(
                 f"{path}: line {line_number} has an invalid sha256: {digest!r}"
+            )
+        if not name or name in entries:
+            raise InstallContractError(
+                f"{path}: line {line_number} has an empty or duplicate asset name: {name!r}"
             )
         entries[name] = digest
     return entries
@@ -293,26 +384,64 @@ def _normalise_member(name: str) -> str:
     return "/".join(parts)
 
 
-def _write_member(destination: Path, member: str, data: bytes, mode: int) -> None:
+def _write_member(
+    destination: Path, member: str, handle, declared_size: int, mode: int, bounds
+) -> None:
+    """Write one member to the destination, reading it in bounded chunks.
+
+    ``handle`` may be shorter than ``declared_size`` when the archive is
+    corrupt; that is reported instead of silently writing partial content.
+    """
     relative = _normalise_member(member)
+    # The caller accounts members from archive metadata before opening them.
     if not relative:
+        # Bound the read even when nothing is written.
+        _drain(handle, member, declared_size)
         return
     target = destination / Path(*relative.split("/"))
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not target.is_file():
         raise InstallContractError(f"archive member collides with a directory: {member!r}")
-    target.write_bytes(data)
+    remaining = declared_size
+    with target.open("wb") as output:
+        while remaining > 0:
+            chunk = handle.read(min(verify_package.READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                raise InstallContractError(
+                    f"archive member {member!r} is truncated after {declared_size - remaining} of {declared_size} bytes"
+                )
+            output.write(chunk)
+            remaining -= len(chunk)
     if os.name != "nt":
         target.chmod(mode & 0o777)
 
 
-def safe_extract(archive: Path, destination: Path) -> Path:
+def _drain(handle, member: str, declared_size: int) -> None:
+    remaining = declared_size
+    while remaining > 0:
+        chunk = handle.read(min(verify_package.READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise InstallContractError(
+                f"archive member {member!r} is truncated after {declared_size - remaining} of {declared_size} bytes"
+            )
+        remaining -= len(chunk)
+
+
+def safe_extract(
+    archive: Path,
+    destination: Path,
+    *,
+    bounds: Optional[verify_package.ArchiveBounds] = None,
+) -> Path:
     """Extract an archive without trusting member names, links, or metadata.
 
     The destination must be a new/empty directory. The result is the single
     top-level directory the Install Contract requires. Symlinks, hard links,
     device nodes, absolute paths, and `..` are refused rather than filtered.
+    Reads and writes are bounded by `verify_package.ArchiveBounds` so a
+    hostile or oversized archive fails as an explicit resource error.
     """
+    bounds = bounds if bounds is not None else verify_package.ArchiveBounds()
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
         raise InstallContractError(f"extraction destination is not empty: {destination}")
@@ -320,14 +449,28 @@ def safe_extract(archive: Path, destination: Path) -> Path:
     name = archive.name
     try:
         if name.endswith(".tar.gz"):
+            compressed = archive.stat().st_size
+            if compressed > bounds.max_archive_bytes:
+                raise InstallContractError(
+                    f"archive is {compressed} bytes, above the "
+                    f"{bounds.max_archive_bytes}-byte archive limit"
+                )
             with tarfile.open(archive, "r:gz") as source:
-                for info in source.getmembers():
-                    if info.isdir():
-                        continue
+                try:
+                    verify_package.gzip_expansion_guard(archive, bounds)
+                except verify_package.VerificationError as error:
+                    raise InstallContractError(str(error)) from error
+                while True:
+                    info = source.next()
+                    if info is None:
+                        break
+                    bounds.check_member(info.name, info.size)
                     if info.issym() or info.islnk():
                         raise InstallContractError(
                             f"archive contains a link member, which the install contract refuses: {info.name}"
                         )
+                    if info.isdir():
+                        continue
                     if not info.isfile():
                         raise InstallContractError(
                             f"archive contains a non-regular member: {info.name}"
@@ -337,27 +480,44 @@ def safe_extract(archive: Path, destination: Path) -> Path:
                         raise InstallContractError(
                             f"could not read archive member: {info.name}"
                         )
-                    _write_member(destination, info.name, handle.read(), info.mode)
+                    _write_member(destination, info.name, handle, info.size, info.mode, bounds)
         elif name.endswith(".zip"):
+            compressed = archive.stat().st_size
+            if compressed > bounds.max_archive_bytes:
+                raise InstallContractError(
+                    f"archive is {compressed} bytes, above the "
+                    f"{bounds.max_archive_bytes}-byte archive limit"
+                )
             with zipfile.ZipFile(archive, "r") as source:
-                for info in source.infolist():
+                infos = source.infolist()
+                bounds.check_compression_ratio(
+                    archive.stat().st_size, sum(info.file_size for info in infos)
+                )
+                for info in infos:
                     if info.is_dir():
+                        # Directory entries still count against the bound.
+                        bounds.check_member(info.filename, 0)
                         continue
-                    unix_mode = (info.external_attr >> 16) & 0o170000
-                    if unix_mode == stat.S_IFLNK:
+                    if (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK:
                         raise InstallContractError(
                             f"archive contains a symlink member, which the install contract refuses: {info.filename}"
                         )
-                    _write_member(
-                        destination,
-                        info.filename,
-                        source.read(info),
-                        (info.external_attr >> 16) & 0o777,
-                    )
+                    bounds.check_member(info.filename, info.file_size)
+                    with source.open(info) as handle:
+                        _write_member(
+                            destination,
+                            info.filename,
+                            handle,
+                            info.file_size,
+                            (info.external_attr >> 16) & 0o777,
+                            bounds,
+                        )
         else:
             raise InstallContractError(f"unsupported archive format: {name}")
     except InstallContractError:
         raise
+    except verify_package.VerificationError as error:
+        raise InstallContractError(str(error)) from error
     except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError) as error:
         raise InstallContractError(f"archive is corrupt or unreadable: {error}") from error
 
@@ -502,19 +662,27 @@ def check_atomic_publish_startup(root: Path, target: Target) -> Tuple[bool, str]
 def check_launch_modes(
     target: Target, version: str, root: Path, work: Path
 ) -> Dict[str, object]:
-    """Observe direct, PATH, and symlink launches on the native host only."""
-    host = host_target_key()
+    """Observe direct, PATH, and symlink launches on the corroborated native host only."""
+    evidence = host_target_evidence()
+    host = evidence.target
     report: Dict[str, object] = {
         "target": target.key,
         "host_target": host,
+        "host_evidence": evidence.evidence,
         "native": host == target.key,
         "modes": {},
     }
     modes: Dict[str, object] = report["modes"]  # type: ignore[assignment]
     if host != target.key:
-        modes["direct"] = "not-run (non-native target)"
-        modes["path"] = "not-run (non-native target)"
-        modes["symlink"] = "not-run (non-native target)"
+        # A host target that was not corroborated (a bare override value or an
+        # unsupported platform) stays UNKNOWN. The check reports not-run and
+        # nothing is executed; it is never promoted to a native pass.
+        reason = {
+            "override-unconfirmed": "not-run (GOALLATCH_HOST_TARGET is not corroborated by host evidence)",
+        }.get(evidence.evidence, "not-run (non-native target)")
+        modes["direct"] = reason
+        modes["path"] = reason
+        modes["symlink"] = reason
         return report
 
     executable = root / contract_for(target.key).local_mcp
@@ -588,9 +756,16 @@ def check_archive(
     version: str,
     archive: Path,
     *,
-    execute: bool,
+    execute: bool = False,
 ) -> Tuple[Dict[str, object], List[str]]:
-    """Verify an archive and then the install it produces."""
+    """Verify an archive and then the install it produces.
+
+    ``execute`` is an explicit opt-in: structural verification alone never
+    runs anything. Callers must only set it for an artifact whose origin and
+    integrity they can establish (their own build, this repository's CI
+    runners, or a published archive already verified against SHA256SUMS).
+    Execution additionally requires the target to match the corroborated host.
+    """
     target = get(target_key)
     problems: List[str] = []
     report: Dict[str, object] = {
@@ -641,18 +816,48 @@ def check_archive(
             if runtime["modes"].get("_failed"):  # type: ignore[union-attr]
                 problems.append("native launch checks failed")
         elif not execute:
-            report["runtime"] = "not-run (--structural-only)"
+            report["runtime"] = "not-run (structural verification only; --execute not requested)"
         else:
             report["runtime"] = "not-run (formal checks failed)"
     return report, problems
 
 
 def _download(url: str, destination: Path) -> None:
+    """Download in bounded chunks; never buffer a whole response in memory.
+
+    A partial download is deleted so a later run with the same --download-dir
+    cannot mistake truncated bytes for a completed artifact.
+    """
     request = urllib.request.Request(url, headers={"User-Agent": "goallatch-install-contract"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            destination.write_bytes(response.read())
+            declared = response.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > MAX_DOWNLOAD_BYTES:
+                raise InstallContractError(
+                    f"download for {url} declares {declared} bytes, above the "
+                    f"{MAX_DOWNLOAD_BYTES}-byte limit; refusing to store it"
+                )
+            received = 0
+            try:
+                with destination.open("wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                        if received > MAX_DOWNLOAD_BYTES:
+                            raise InstallContractError(
+                                f"download for {url} exceeded the "
+                                f"{MAX_DOWNLOAD_BYTES}-byte limit; refusing to store it"
+                            )
+                        output.write(chunk)
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+    except InstallContractError:
+        raise
     except (urllib.error.URLError, TimeoutError, OSError) as error:
+        destination.unlink(missing_ok=True)
         raise InstallContractError(f"download failed for {url}: {error}") from error
 
 
@@ -660,32 +865,74 @@ def check_published(
     target_key: str,
     version: str,
     *,
-    execute: bool,
+    execute: bool = False,
     download_dir: Optional[Path],
 ) -> Tuple[Dict[str, object], List[str]]:
+    """Verify a published GitHub Release artifact.
+
+    Checksum first, everything else second: an archive is extracted (and only
+    then, on an explicit request, executed) solely after its SHA-256 matches
+    the official SHA256SUMS. A mismatch, a missing entry, or a malformed
+    checksum file stops the check; the unverified bytes are never extracted
+    and never passed to later processing.
+    """
     target = get(target_key)
     archive_name = target.archive_name(version)
     base = f"{RELEASE_BASE_URL}/v{version}"
     with tempfile.TemporaryDirectory(prefix="goallatch-published-contract-") as temporary:
-        work = Path(download_dir) if download_dir else Path(temporary)
+        verification_work = Path(temporary)
+        work = Path(download_dir) if download_dir else verification_work
         work.mkdir(parents=True, exist_ok=True)
-        checksums = work / CHECKSUMS_NAME
+        # Never trust a caller-provided checksum file in --download-dir. Fetch
+        # the official SHA256SUMS into a fresh private directory on every run;
+        # otherwise a caller-controlled archive+checksum pair could bless and
+        # execute arbitrary bytes while appearing to have passed the published
+        # release integrity check.
+        checksums = verification_work / CHECKSUMS_NAME
         archive = work / archive_name
-        if not checksums.is_file():
-            _download(f"{base}/{CHECKSUMS_NAME}", checksums)
+        _download(f"{base}/{CHECKSUMS_NAME}", checksums)
         if not archive.is_file():
             _download(f"{base}/{archive_name}", archive)
 
         problems: List[str] = []
+        checksum_verified = False
         try:
             entries = read_checksums(checksums)
+        except InstallContractError as error:
+            entries = None
+            problems.append(f"SHA256SUMS is unusable, so nothing is verified: {error}")
+
+        if entries is not None:
             expected = entries.get(archive_name)
             if expected is None:
-                problems.append(f"SHA256SUMS has no entry for {archive_name}")
+                problems.append(
+                    f"SHA256SUMS has no entry for {archive_name}; refusing to use the archive"
+                )
             else:
-                verify_archive_checksum(archive, expected)
-        except InstallContractError as error:
-            problems.append(str(error))
+                try:
+                    verify_archive_checksum(archive, expected)
+                except InstallContractError as error:
+                    problems.append(str(error))
+                else:
+                    checksum_verified = True
+
+        report: Dict[str, object]
+        if not checksum_verified:
+            # Fail closed before the archive is opened: report the digest the
+            # untrusted file actually has, but never extract or execute it.
+            report = {
+                "contract_version": CONTRACT_VERSION,
+                "target": target_key,
+                "version": version,
+                "archive": archive.name,
+                "sha256": sha256_of(archive) if archive.is_file() else None,
+                "source": f"{base}/{archive_name}",
+                "checksums_source": f"{base}/{CHECKSUMS_NAME}",
+                "experimental": target.experimental,
+                "formal": "FAIL",
+                "runtime": "not-run (checksum verification failed; archive not extracted)",
+            }
+            return report, problems
 
         report, archive_problems = check_archive(
             target_key, version, archive, execute=execute and not problems
@@ -735,9 +982,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     archive_parser.add_argument("--version", required=True)
     archive_parser.add_argument("--archive", required=True)
     archive_parser.add_argument(
-        "--structural-only",
+        "--execute",
         action="store_true",
-        help="do not execute anything, even on the native host",
+        help=(
+            "also observe the native launch after a structural pass, on the "
+            "corroborated native host only. Default is structural "
+            "verification only. Opt in solely for an archive whose origin and "
+            "integrity you can establish: your own build, this repository's "
+            "CI build artifacts, or a published archive already verified "
+            "against SHA256SUMS. A well-formed archive alone is never a "
+            "reason to run an executable from it."
+        ),
+    )
+    archive_parser.add_argument(
+        "--trusted-local-build",
+        action="store_true",
+        help=(
+            "assert that this archive was produced locally by you or by this "
+            "repository's managed CI build job. Required together with "
+            "--execute; never use this assertion for externally acquired "
+            "archives (use `published --execute`, which verifies SHA256SUMS)."
+        ),
     )
 
     native_parser = subparsers.add_parser(
@@ -757,9 +1022,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="keep downloads here instead of a temporary directory",
     )
     published_parser.add_argument(
-        "--structural-only",
+        "--execute",
         action="store_true",
-        help="do not execute anything, even on the native host",
+        help=(
+            "also observe the native launch, only after the downloaded "
+            "archive has matched SHA256SUMS and on the corroborated native "
+            "host. Default is verification of the checksum and structure "
+            "only."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -773,23 +1043,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1 if problems else 0
 
     if args.command == "archive":
+        if args.execute and not args.trusted_local_build:
+            _print_report(
+                {
+                    "target": args.target,
+                    "version": args.version,
+                    "archive": Path(args.archive).name,
+                    "formal": "not-run",
+                    "runtime": "not-run (execution refused without --trusted-local-build)",
+                },
+                [
+                    "archive execution requires --trusted-local-build because an "
+                    "archive's structure alone proves neither origin nor integrity; "
+                    "for an external release archive use `published --execute`"
+                ],
+            )
+            return 1
         report, problems = check_archive(
             args.target,
             args.version,
             Path(args.archive),
-            execute=not args.structural_only,
+            execute=args.execute,
         )
         _print_report(report, problems)
         return 1 if problems else 0
 
     if args.command == "native":
         version = args.version or _read_cargo_version()
-        host = host_target_key()
+        evidence = host_target_evidence()
+        host = evidence.target
         if host is None:
+            # UNKNOWN stays UNKNOWN: without corroborated host evidence the
+            # native observation is refused instead of manufactured.
             print(
-                f"error: unsupported host {sys.platform}/{platform.machine()}; no install-contract target",
+                "error: the native host target could not be corroborated "
+                f"(evidence={evidence.evidence}); refusing a native check instead "
+                "of promoting an unverified pass",
                 file=sys.stderr,
             )
+            if evidence.evidence == "override-unconfirmed":
+                print(
+                    "error: GOALLATCH_HOST_TARGET is accepted only when the "
+                    "Python-reported OS/architecture or the GitHub runner "
+                    "identity (RUNNER_OS/RUNNER_ARCH, asserted by the same job) "
+                    "matches it",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"error: unsupported host {sys.platform}/{platform.machine()}; "
+                    "no install-contract target",
+                    file=sys.stderr,
+                )
             return 1
         target = get(host)
         with tempfile.TemporaryDirectory(prefix="goallatch-native-contract-") as temporary:
@@ -804,6 +1109,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report: Dict[str, object] = {
                 "contract_version": CONTRACT_VERSION,
                 "target": host,
+                "host_evidence": evidence.evidence,
                 "version": version,
                 "experimental": target.experimental,
                 "formal": "PASS" if not problems else "FAIL",
@@ -821,7 +1127,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report, problems = check_published(
             args.target,
             args.version,
-            execute=not args.structural_only,
+            execute=args.execute,
             download_dir=Path(args.download_dir) if args.download_dir else None,
         )
         _print_report(report, problems)
