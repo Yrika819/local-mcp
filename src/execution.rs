@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, atomic_publish_frame, config, fallback, sandbox, workspace_publish};
+use crate::{
+    approvals, atomic_publish_frame, config, fallback, install_contract, sandbox, workspace_publish,
+};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(20);
@@ -85,31 +87,26 @@ pub(crate) async fn publish_workspace_write(
 /// commit mechanism. When the helper is absent the publication is refused rather than
 /// falling back to a non-atomic write.
 fn atomic_publish_helper() -> Result<String> {
-    let executable_dir = std::env::current_exe()
-        .context("local-mcp executable has no path")?
-        .parent()
-        .context("local-mcp executable has no parent directory")?
-        .to_path_buf();
-    let name = if cfg!(windows) {
-        "atomic-publish.exe"
-    } else {
-        "atomic-publish"
-    };
+    let executable = std::env::current_exe().context("local-mcp executable has no path")?;
     #[cfg_attr(
         not(test),
         allow(unused_mut, reason = "only the test build adds a fallback candidate")
     )]
-    let mut candidates = vec![executable_dir.join(name)];
+    let mut candidates =
+        install_contract::sibling_candidates(&executable, install_contract::ATOMIC_PUBLISH);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "local-mcp executable has no parent directory"
+    );
     #[cfg(test)]
-    if executable_dir.file_name().is_some_and(|dir| dir == "deps")
+    if let Some(executable_dir) = executable.parent()
+        && executable_dir.file_name().is_some_and(|dir| dir == "deps")
         && let Some(profile_dir) = executable_dir.parent()
     {
-        candidates.push(profile_dir.join(name));
+        candidates.push(profile_dir.join(install_contract::ATOMIC_PUBLISH));
     }
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
+    if let Some(candidate) = install_contract::first_existing(&candidates) {
+        return Ok(candidate.to_string_lossy().into_owned());
     }
     anyhow::bail!(
         "atomic publication helper is missing; looked in {}",

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import posixpath
 import struct
 import sys
@@ -49,23 +50,152 @@ PE_MACHINE_ARM64 = 0xAA64
 # Mach-O filetype for an executable.
 MACHO_FILETYPE_EXEC = 0x2
 
+# ---------------------------------------------------------------------------
+# Resource bounds for reading untrusted archives.
+#
+# The v0.1.1 release assets are around 3-6 MB compressed and decompress to a
+# few dozen MB, so these generous caps never reject a real asset. What they do
+# change: a crafted "archive bomb" (a huge expansion ratio, an absurd member
+# count, a member that claims to be petabytes long) is refused as an explicit
+# resource failure instead of exhausting memory or disk while verification is
+# reading it.
+# ---------------------------------------------------------------------------
+#: Maximum compressed size of one archive file.
+MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+#: Maximum number of archive members, including directory entries.
+MAX_MEMBER_COUNT = 256
+#: Maximum declared uncompressed size of a single member.
+MAX_MEMBER_BYTES = 256 * 1024 * 1024
+#: Maximum total declared uncompressed size of all members combined.
+MAX_TOTAL_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+#: Maximum declared-uncompressed : compressed-bytes ratio.
+MAX_COMPRESSION_RATIO = 1000
+#: Chunk size used for every streaming read.
+READ_CHUNK_BYTES = 1024 * 1024
+
+
+class ArchiveBounds:
+    """Resource caps enforced while reading one archive.
+
+    The counters make this single-use: create a fresh instance per archive
+    (the module functions do that automatically when called without one).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_archive_bytes: int = MAX_ARCHIVE_BYTES,
+        max_members: int = MAX_MEMBER_COUNT,
+        max_member_bytes: int = MAX_MEMBER_BYTES,
+        max_total_bytes: int = MAX_TOTAL_UNCOMPRESSED_BYTES,
+        max_compression_ratio: int = MAX_COMPRESSION_RATIO,
+    ) -> None:
+        self.max_archive_bytes = max_archive_bytes
+        self.max_members = max_members
+        self.max_member_bytes = max_member_bytes
+        self.max_total_bytes = max_total_bytes
+        self.max_compression_ratio = max_compression_ratio
+        self.total_declared_bytes = 0
+        self.member_count = 0
+
+    def check_member(self, name: str, declared_size: int) -> None:
+        """Account one member before any of its bytes are read."""
+        self.member_count += 1
+        if self.member_count > self.max_members:
+            raise VerificationError(
+                f"archive has more than {self.max_members} members, which the "
+                "release contract bounds refuse"
+            )
+        if declared_size < 0:
+            raise VerificationError(
+                f"archive member {name!r} declares a negative size, which the "
+                "release contract bounds refuse"
+            )
+        if declared_size > self.max_member_bytes:
+            raise VerificationError(
+                f"archive member {name!r} declares {declared_size} bytes, above "
+                f"the {self.max_member_bytes}-byte single-member limit"
+            )
+        if self.total_declared_bytes + declared_size > self.max_total_bytes:
+            raise VerificationError(
+                f"archive declares more than {self.max_total_bytes} bytes of "
+                "uncompressed content in total, which the release contract "
+                "bounds refuse"
+            )
+        self.total_declared_bytes += declared_size
+
+    def check_compression_ratio(self, compressed_bytes: int, declared_total: int) -> None:
+        """Refuse an expansion ratio far above anything a real asset needs."""
+        if compressed_bytes <= 0 or declared_total <= 0:
+            return
+        ratio = declared_total / compressed_bytes
+        if ratio > self.max_compression_ratio:
+            raise VerificationError(
+                f"archive expands to {declared_total} bytes from "
+                f"{compressed_bytes} compressed bytes (ratio {ratio:.0f}, above "
+                f"the {self.max_compression_ratio} limit); refusing before read"
+            )
+
+
+def _truncated(name: str, read: int, declared: int) -> VerificationError:
+    return VerificationError(
+        f"archive member {name!r} is truncated: read {read} of {declared} bytes"
+    )
+
+
+def _read_member(handle, name: str, declared_size: int) -> bytes:
+    """Read exactly ``declared_size`` bytes in bounded chunks."""
+    if declared_size == 0:
+        return b""
+    data = bytearray()
+    remaining = declared_size
+    while remaining > 0:
+        chunk = handle.read(min(READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise _truncated(name, len(data), declared_size)
+        data.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(data)
+
 
 class VerificationError(Exception):
     """Raised with a complete list of problems found in an archive."""
 
 
-def read_archive(path: Path) -> List[Tuple[str, int, bytes]]:
+def read_archive(
+    path: Path, *, bounds: Optional[ArchiveBounds] = None
+) -> List[Tuple[str, int, bytes]]:
     """Return ``(member_name, unix_mode, contents)`` for every file member.
 
     Directory entries are skipped: a tar that stores an explicit root directory
     entry and one that does not are equally valid, and requiring a particular
     choice here would fail correct archives.
+
+    All reads are bounded: when ``bounds`` is None a fresh default
+    :class:`ArchiveBounds` is used, and an archive that exceeds a cap fails
+    with an explicit resource error instead of consuming unbounded memory.
     """
+    bounds = bounds if bounds is not None else ArchiveBounds()
+    compressed_size = path.stat().st_size
+    if compressed_size > bounds.max_archive_bytes:
+        raise VerificationError(
+            f"archive is {compressed_size} bytes, above the "
+            f"{bounds.max_archive_bytes}-byte archive limit"
+        )
+
     name = path.name
     if name.endswith(".tar.gz"):
         members: List[Tuple[str, int, bytes]] = []
         with tarfile.open(path, "r:gz") as archive:
-            for info in archive.getmembers():
+            # Use the gzip ISIZE footer for a cheap up-front expansion check.
+            # ISIZE counts the bytes tarfile will actually decompress, so a
+            # bomb is refused here before any member data is read.
+            gzip_expansion_guard(path, bounds)
+            while True:
+                info = archive.next()
+                if info is None:
+                    break
+                bounds.check_member(info.name, info.size)
                 if info.isdir():
                     continue
                 if not info.isfile():
@@ -73,22 +203,50 @@ def read_archive(path: Path) -> List[Tuple[str, int, bytes]]:
                         f"unexpected non-regular member in archive: {info.name}"
                     )
                 handle = archive.extractfile(info)
-                members.append((info.name, info.mode, handle.read() if handle else b""))
+                if handle is None:
+                    raise VerificationError(f"could not read archive member: {info.name}")
+                members.append((info.name, info.mode, _read_member(handle, info.name, info.size)))
         return members
 
     if name.endswith(".zip"):
         members = []
         with zipfile.ZipFile(path, "r") as archive:
-            for info in archive.infolist():
+            infos = archive.infolist()
+            declared_total = sum(info.file_size for info in infos)
+            bounds.check_compression_ratio(compressed_size, declared_total)
+            for info in infos:
+                bounds.check_member(info.filename, info.file_size)
                 if info.is_dir():
                     continue
                 # external_attr holds the Unix mode in the high 16 bits when
                 # the entry was written with create_system = 3.
                 mode = (info.external_attr >> 16) & 0o7777
-                members.append((info.filename, mode, archive.read(info)))
+                with archive.open(info) as handle:
+                    members.append(
+                            (info.filename, mode, _read_member(handle, info.filename, info.file_size))
+                    )
         return members
 
     raise VerificationError(f"unsupported archive format: {name}")
+
+
+def gzip_expansion_guard(path: Path, bounds: ArchiveBounds) -> None:
+    """Refuse a gzip archive whose ISIZE expansion ratio is absurd.
+
+    A truncated or corrupt file may have no readable footer; that case is
+    left to the normal corrupt-archive path instead of inventing a ratio.
+    """
+    try:
+        isize = _gzip_isize(path)
+    except (OSError, struct.error, ValueError):
+        return
+    bounds.check_compression_ratio(path.stat().st_size, isize)
+
+
+def _gzip_isize(path: Path) -> int:
+    with path.open("rb") as handle:
+        handle.seek(-4, os.SEEK_END)
+        return struct.unpack("<I", handle.read(4))[0]
 
 
 def check_membership(
