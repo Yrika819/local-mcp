@@ -177,6 +177,51 @@ class ExtractionAndLayoutTest(unittest.TestCase):
         ):
             bounds.check_member("two", 0)
 
+    def test_negative_declared_member_size_is_rejected(self) -> None:
+        bounds = install_contract.verify_package.ArchiveBounds()
+        with self.assertRaisesRegex(
+            install_contract.verify_package.VerificationError, "negative size"
+        ):
+            bounds.check_member("malformed", -1)
+
+    def test_member_and_total_size_limits_accept_boundary_and_refuse_overflow(self) -> None:
+        bounds = install_contract.verify_package.ArchiveBounds(
+            max_member_bytes=5, max_total_bytes=8
+        )
+        bounds.check_member("at-member-limit", 5)
+        bounds.check_member("at-total-limit", 3)
+        with self.assertRaisesRegex(
+            install_contract.verify_package.VerificationError, "more than 8 bytes"
+        ):
+            bounds.check_member("over-total-limit", 1)
+
+        too_large_member = install_contract.verify_package.ArchiveBounds(
+            max_member_bytes=5, max_total_bytes=8
+        )
+        with self.assertRaisesRegex(
+            install_contract.verify_package.VerificationError, "single-member limit"
+        ):
+            too_large_member.check_member("over-member-limit", 6)
+
+    def test_archive_size_limit_accepts_boundary_and_refuses_overflow(self) -> None:
+        archive = self._package("linux-x86_64")
+        exact = archive.stat().st_size
+        install_contract.verify_package.read_archive(
+            archive,
+            bounds=install_contract.verify_package.ArchiveBounds(
+                max_archive_bytes=exact
+            ),
+        )
+        with self.assertRaisesRegex(
+            install_contract.verify_package.VerificationError, "above the"
+        ):
+            install_contract.verify_package.read_archive(
+                archive,
+                bounds=install_contract.verify_package.ArchiveBounds(
+                    max_archive_bytes=exact - 1
+                ),
+            )
+
     def test_expansion_ratio_limit_is_explicit(self) -> None:
         bounds = install_contract.verify_package.ArchiveBounds(max_compression_ratio=10)
         with self.assertRaisesRegex(
@@ -197,7 +242,7 @@ class ExtractionAndLayoutTest(unittest.TestCase):
             "not-run (structural verification only; --execute not requested)",
         )
 
-    def test_archive_execution_requires_local_build_attestation(self) -> None:
+    def test_archive_execution_requires_explicit_local_build_assertion(self) -> None:
         archive = self._package("linux-x86_64")
         with mock.patch.object(install_contract, "check_archive") as check_archive:
             result = install_contract.main(
@@ -313,6 +358,23 @@ class ChecksumAndVersionTest(unittest.TestCase):
         with self.assertRaises(install_contract.InstallContractError):
             install_contract.verify_archive_checksum(archive, "0" * 64)
 
+    def test_oversized_archive_is_refused_before_checksum_scanning(self) -> None:
+        archive = self.work / "oversized.tar.gz"
+        archive.write_bytes(b"not scanned")
+        stat = type(
+            "FakeStat",
+            (),
+            {"st_size": install_contract.verify_package.MAX_ARCHIVE_BYTES + 1},
+        )()
+        with mock.patch.object(Path, "stat", return_value=stat), mock.patch.object(
+            install_contract, "sha256_of"
+        ) as sha256_of:
+            with self.assertRaisesRegex(
+                install_contract.InstallContractError, "above the"
+            ):
+                install_contract.verify_archive_checksum(archive, "0" * 64)
+        sha256_of.assert_not_called()
+
     def test_checksums_parser_rejects_malformed_entries(self) -> None:
         checksums = self.work / "SHA256SUMS"
         checksums.write_text("not-a-checksum  file.tar.gz\n", encoding="utf-8")
@@ -398,8 +460,24 @@ class ChecksumAndVersionTest(unittest.TestCase):
             os.environ,
             {"GOALLATCH_HOST_TARGET": "linux-x86_64"},
             clear=True,
-        ), mock.patch.object(install_contract, "detected_host_key", return_value="windows-x86_64"), mock.patch.object(
-            install_contract, "runner_evidence_key", return_value=None
+        ), mock.patch.object(
+            install_contract, "detected_host_key", return_value="windows-x86_64"
+        ):
+            evidence = install_contract.host_target_evidence()
+        self.assertIsNone(evidence.target)
+        self.assertEqual(evidence.evidence, "override-unconfirmed")
+
+    def test_runner_environment_cannot_override_detected_host(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GOALLATCH_HOST_TARGET": "linux-x86_64",
+                "RUNNER_OS": "Linux",
+                "RUNNER_ARCH": "X64",
+            },
+            clear=True,
+        ), mock.patch.object(
+            install_contract, "detected_host_key", return_value="windows-x86_64"
         ):
             evidence = install_contract.host_target_evidence()
         self.assertIsNone(evidence.target)

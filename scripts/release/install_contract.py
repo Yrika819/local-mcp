@@ -253,23 +253,6 @@ def detected_host_key() -> Optional[str]:
     return key if key in TARGETS else None
 
 
-#: GitHub-hosted runner identity -> release-matrix components. `RUNNER_OS` and
-#: `RUNNER_ARCH` are set by the platform on every hosted runner, and the
-#: workflow steps that set `GOALLATCH_HOST_TARGET` assert them (plus the Rust
-#: host triple) in the same job before the override exists.
-_RUNNER_OS_MAP = {"Linux": "linux", "macOS": "macos", "Windows": "windows"}
-_RUNNER_ARCH_MAP = {"X64": "x86_64", "ARM64": "aarch64"}
-
-
-def runner_evidence_key() -> Optional[str]:
-    """The matrix key implied by GitHub runner identity, or None."""
-    runner_os = os.environ.get("RUNNER_OS", "")
-    runner_arch = os.environ.get("RUNNER_ARCH", "")
-    if runner_os not in _RUNNER_OS_MAP or runner_arch not in _RUNNER_ARCH_MAP:
-        return None
-    return f"{_RUNNER_OS_MAP[runner_os]}-{_RUNNER_ARCH_MAP[runner_arch]}"
-
-
 @dataclass(frozen=True)
 class HostEvidence:
     """A confirmed-or-unknown answer to "can this host run a native check?".
@@ -288,16 +271,14 @@ def host_target_evidence() -> HostEvidence:
     """Determine the host target with corroborated evidence only.
 
     `GOALLATCH_HOST_TARGET` is an *override input*; by itself it carries no
-    evidence. It is accepted only when it matches:
+    evidence. It is accepted only when it matches the OS/architecture pair the
+    Python interpreter reports for this host (`platform` evidence). GitHub
+    runner variables are useful workflow assertions, but are environment
+    inputs too and cannot independently turn a different or unknown local host
+    into a native PASS.
 
-    * the OS/architecture pair the Python interpreter reports on this host
-      (`platform` evidence), or
-    * GitHub's `RUNNER_OS`/`RUNNER_ARCH` runner identity (`runner` evidence),
-      which the workflow asserts against the expected matrix cell and the
-      Rust host triple before the override is read.
-
-    An override that neither can confirm leaves the host UNKNOWN: the report
-    says the check was not run instead of manufacturing a native pass.
+    An override the local platform cannot confirm leaves the host UNKNOWN: the
+    report says the check was not run instead of manufacturing a native pass.
     """
     detected = detected_host_key()
     override = os.environ.get("GOALLATCH_HOST_TARGET")
@@ -308,8 +289,6 @@ def host_target_evidence() -> HostEvidence:
             )
         if override == detected:
             return HostEvidence(override, "platform")
-        if override == runner_evidence_key():
-            return HostEvidence(override, "runner")
         return HostEvidence(None, "override-unconfirmed")
     if detected:
         return HostEvidence(detected, "platform")
@@ -334,7 +313,20 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _reported_sha256(path: Path) -> Optional[str]:
+    """Avoid scanning an oversized archive merely to populate a report."""
+    if not path.is_file() or path.stat().st_size > verify_package.MAX_ARCHIVE_BYTES:
+        return None
+    return sha256_of(path)
+
+
 def verify_archive_checksum(path: Path, expected: str) -> None:
+    size = path.stat().st_size
+    if size > verify_package.MAX_ARCHIVE_BYTES:
+        raise InstallContractError(
+            f"archive is {size} bytes, above the "
+            f"{verify_package.MAX_ARCHIVE_BYTES}-byte archive limit"
+        )
     actual = sha256_of(path)
     if actual != expected:
         raise InstallContractError(
@@ -773,7 +765,7 @@ def check_archive(
         "target": target_key,
         "version": version,
         "archive": archive.name,
-        "sha256": sha256_of(archive) if archive.is_file() else None,
+        "sha256": _reported_sha256(archive),
         "experimental": target.experimental,
         "formal": "pending",
         "runtime": "not-run",
@@ -925,7 +917,7 @@ def check_published(
                 "target": target_key,
                 "version": version,
                 "archive": archive.name,
-                "sha256": sha256_of(archive) if archive.is_file() else None,
+                "sha256": _reported_sha256(archive),
                 "source": f"{base}/{archive_name}",
                 "checksums_source": f"{base}/{CHECKSUMS_NAME}",
                 "experimental": target.experimental,
@@ -1084,9 +1076,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if evidence.evidence == "override-unconfirmed":
                 print(
                     "error: GOALLATCH_HOST_TARGET is accepted only when the "
-                    "Python-reported OS/architecture or the GitHub runner "
-                    "identity (RUNNER_OS/RUNNER_ARCH, asserted by the same job) "
-                    "matches it",
+                    "Python-reported local OS/architecture matches it; "
+                    "RUNNER_OS/RUNNER_ARCH are not host evidence",
                     file=sys.stderr,
                 )
             else:

@@ -106,6 +106,11 @@ class ArchiveBounds:
                 f"archive has more than {self.max_members} members, which the "
                 "release contract bounds refuse"
             )
+        if declared_size < 0:
+            raise VerificationError(
+                f"archive member {name!r} declares a negative size, which the "
+                "release contract bounds refuse"
+            )
         if declared_size > self.max_member_bytes:
             raise VerificationError(
                 f"archive member {name!r} declares {declared_size} bytes, above "

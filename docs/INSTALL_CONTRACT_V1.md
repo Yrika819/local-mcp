@@ -352,11 +352,13 @@ python3 scripts/release/install_contract.py published \
 
 `archive` defaults to structural verification only and does not execute an
 archive member. `--execute` requires the additional `--trusted-local-build`
-attestation; use it only for a locally produced build or a managed CI build
-artifact on the matching verified runner. Do not use this attestation for
-externally acquired archives. For those, use `published --execute`, which only
-reaches archive processing after matching the official `SHA256SUMS`. Archive
-format and member layout are not trust signals and never authorize execution.
+caller assertion; this flag is not a cryptographic attestation and proves
+neither origin nor integrity. Use it only for a locally produced build or a
+managed CI build artifact on the matching verified runner. Do not use this
+assertion for externally acquired archives. For those, use the `published`
+command with `--execute`; it reaches archive processing only after matching the
+official `SHA256SUMS`. Archive format and member layout are not trust signals
+and never authorize execution.
 
 `published` uses the official URL
 `https://github.com/Yrika819/local-mcp/releases/download/v<version>/<asset>`,

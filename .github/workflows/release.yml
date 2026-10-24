@@ -379,12 +379,12 @@ jobs:
         run: |
           set -euo pipefail
           name=$(python3 -c "import sys; sys.path.insert(0,'scripts/release'); from targets import get; print(get('$KEY').archive_name('$VERSION'))")
-          # These archives are managed build artifacts built by this job, and
-          # the runner identity was asserted above, so this is the one place
-          # where the explicit --execute opt-in is justified. The default for
-          # every other invocation is structural verification only: a
-          # well-formed archive is never, by itself, a reason to run what is
-          # inside it.
+          # These archives were built by this job, and the matrix runner was
+          # asserted above. The verifier separately requires the target to
+          # match Python's locally reported OS/CPU. The explicit opt-in and
+          # --trusted-local-build are workflow assertions, not cryptographic
+          # attestations. Elsewhere, verification is structural-only by
+          # default: a well-formed archive alone never authorizes execution.
           python3 scripts/release/install_contract.py archive \
             --target "$KEY" --version "$VERSION" --archive "dist/$name" \
             --execute --trusted-local-build
