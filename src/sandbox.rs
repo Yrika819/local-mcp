@@ -17,6 +17,8 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+#[cfg(target_os = "linux")]
+use crate::install_contract;
 use crate::process_group::ProcessGroup;
 
 pub(crate) const TRUSTED_GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -398,28 +400,38 @@ fn build_sandbox_process(
                 false,
                 false,
             );
-        let executable_dir = std::env::current_exe()?
-            .parent()
-            .context("local-mcp executable has no parent directory")?
-            .to_owned();
-        let executable = executable_dir.join("codex-linux-sandbox");
-        #[cfg(test)]
-        let executable = if !executable.is_file()
-            && executable_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
-        {
-            executable_dir
-                .parent()
-                .map(|debug_dir| debug_dir.join("codex-linux-sandbox"))
-                .filter(|test_helper| test_helper.is_file())
-                .unwrap_or(executable)
-        } else {
-            executable
-        };
+        let executable = std::env::current_exe()?;
+        #[cfg_attr(
+            not(test),
+            allow(unused_mut, reason = "only the test build adds a fallback candidate")
+        )]
+        let mut candidates =
+            install_contract::sibling_candidates(&executable, install_contract::LINUX_SANDBOX);
         anyhow::ensure!(
-            executable.is_file(),
-            "sandbox helper is missing: {}",
-            executable.display()
+            !candidates.is_empty(),
+            "local-mcp executable has no parent directory"
         );
+        #[cfg(test)]
+        if let Some(executable_dir) = executable.parent()
+            && executable_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
+            && !candidates.iter().any(|candidate| candidate.is_file())
+            && let Some(debug_dir) = executable_dir.parent()
+        {
+            let test_helper = debug_dir.join(install_contract::LINUX_SANDBOX);
+            if test_helper.is_file() {
+                candidates.push(test_helper);
+            }
+        }
+        let executable = install_contract::first_existing(&candidates);
+        anyhow::ensure!(
+            executable.is_some(),
+            "sandbox helper is missing: {}",
+            candidates
+                .first()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<no executable directory>".to_owned())
+        );
+        let executable = executable.expect("checked immediately above");
         let mut process = Command::new(executable);
         process.args(args);
         process

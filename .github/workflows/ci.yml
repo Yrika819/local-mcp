@@ -91,6 +91,14 @@ jobs:
           # archives so this costs no build time and needs no toolchain.
           python3 scripts/release/test_release_scripts.py
 
+      - name: Run install contract self-tests
+        run: |
+          set -euo pipefail
+          # Post-extraction layout, safe extraction, checksums, version
+          # consistency, and the Nix static contract. Still no toolchain and no
+          # network; native execution is covered by the test matrix below.
+          python3 scripts/release/test_install_contract.py
+
   # ---------------------------------------------------------------------
   # Tier 1 - PRIMARY
   # Full locked test suite, release build, CLI smoke, and architecture
@@ -120,6 +128,7 @@ jobs:
             uname: x86_64
             rust_host: x86_64-unknown-linux-gnu
             release: local-mcp
+            install_target: linux-x86_64
             bubblewrap: "true"
           - name: macos-arm64
             runner: macos-15
@@ -127,6 +136,7 @@ jobs:
             uname: arm64
             rust_host: aarch64-apple-darwin
             release: local-mcp
+            install_target: macos-aarch64
             bubblewrap: "false"
           - name: macos-intel
             runner: macos-15-intel
@@ -134,6 +144,7 @@ jobs:
             uname: x86_64
             rust_host: x86_64-apple-darwin
             release: local-mcp
+            install_target: macos-x86_64
             bubblewrap: "false"
           - name: windows-x64
             runner: windows-2025
@@ -141,6 +152,7 @@ jobs:
             uname: ""
             rust_host: x86_64-pc-windows-msvc
             release: local-mcp.exe
+            install_target: windows-x86_64
             bubblewrap: "false"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -261,6 +273,24 @@ jobs:
           binary="target/release/$RELEASE_BINARY"
           "$binary" --version
           "$binary" --help
+
+      - name: Verify native install contract
+        shell: bash
+        env:
+          INSTALL_TARGET: ${{ matrix.install_target }}
+        run: |
+          set -euo pipefail
+          # Stage the just-built release binaries as an install, then observe
+          # direct, PATH, symlink, and helper-startup behavior on this native
+          # runner. The earlier architecture step independently asserts
+          # RUNNER_OS/RUNNER_ARCH and the Rust host triple; install_contract.py
+          # still requires the override to match the OS/CPU reported locally
+          # by Python. Runner environment variables alone cannot yield a pass.
+          version=$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          test -n "$version"
+          GOALLATCH_HOST_TARGET="$INSTALL_TARGET" \
+            python3 scripts/release/install_contract.py native \
+              --version "$version" --binary-dir target/release
 
       - name: Record release binary digest
         shell: bash

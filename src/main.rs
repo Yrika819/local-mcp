@@ -20,6 +20,7 @@ mod goal_backends;
 mod goal_finalizer;
 mod goal_runner;
 mod goal_verifier;
+mod install_contract;
 mod job_registry;
 mod managed_worktree;
 mod managed_worktree_create;
@@ -72,6 +73,8 @@ mod goal_hardening_tests;
 mod goal_runner_tests;
 #[cfg(test)]
 mod goal_verifier_tests;
+#[cfg(test)]
+mod install_contract_tests;
 #[cfg(test)]
 mod longrun_stability_tests;
 #[cfg(test)]
