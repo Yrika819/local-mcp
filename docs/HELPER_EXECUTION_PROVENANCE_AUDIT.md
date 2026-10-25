@@ -1,102 +1,208 @@
-# Helper Execution Provenance Security Audit
+# Helper Execution Provenance Security Audit — V2
 
-Status: **PARTIAL; Security Closure BLOCKED**
+Status: **PARTIAL**. The final-entry mitigation is in place. A bounded
+**Mitigation Closure** is supportable only for the trusted-install assumptions
+below and after all declared platform tests pass. **Full Execution Identity
+Closure is NOT achieved.** No runtime code or OS guarantee binds the file
+metadata check to the image opened by `Command::new(path)`.
 
-This campaign is limited to runtime helper resolution and execution. It does not
-change Doctor Core, Setup Preview, release channels, sandbox policy, session
-permissions, or publication authority.
+## Scope and authority
 
-## Finding and conditions
+This audit covers `atomic-publish` on all supported runtime platforms and
+`codex-linux-sandbox` on Linux. Both production resolution paths use
+`current_exe()` and the shared Install Contract helper selector. No PATH, cwd,
+configuration, or arbitrary parent-directory fallback is permitted. The
+`#[cfg(test)]` profile-parent helper location exists only to let Cargo tests
+find built test helpers; it is not present in production.
 
-Both `atomic-publish` and (on Linux) `codex-linux-sandbox` are resolved as
-siblings of `current_exe()`; production has no PATH or cwd fallback and missing
-helpers fail closed. Before this change, `Path::is_file()` followed a final
-symlink, and the returned path was later passed to `Command::new()`. An
-attacker-controlled helper target therefore could be selected when an attacker
-can arrange a helper symlink in the executable directory. The mere presence of
-a symlink is not proof of a remotely exploitable vulnerability: impact requires
-an attacker to control or replace the installed helper entry/target, or to win a
-race in an otherwise protected directory. No exploit has been demonstrated.
+No sandbox, Session/Goal/Writer permissions, publication permissions, helper
+fallback, Doctor implementation, release artifact, or package channel changed.
+The `local-mcp` launcher symlink is distinct from a helper symlink: the OS's
+reported `current_exe()` remains the anchor; how that path is reported is
+platform-dependent and is not used to trust a helper target.
 
-| Threat | Assessment |
+## Threat model and attack conditions
+
+The ordinary OS security boundary applies: installation files and every ancestor
+must be protected from principals outside the trusted installer/runtime
+administrative domain. A malicious process able to modify the helper under the
+same effective user token is considered an attacker for helper provenance. In
+that case it can directly rewrite the helper or often the running user's other
+files; this runtime does not provide same-user malware isolation. Such a
+configuration is **NO-GO** for any helper-execution claim. An administrator/root
+or equivalent trusted package manager remains in the trust base.
+
+| Case | Preconditions and attack path | Assessment |
+| --- | --- | --- |
+| A — Trusted install | Executable and helpers plus all ancestors are protected against untrusted writes/replacement for runtime duration. | A path check followed by spawn does not by itself prevent a trusted updater from changing the entry, but an untrusted attacker cannot win that race under this precondition. No hostile TOCTOU is established in this case. A trusted updater may cause availability failure or choose a different trusted release image; authenticity/version policy belongs to that updater. |
+| B — Writable install | Attacker can write the helper entry or bytes, or replace an ancestor. | Symlink rejection is insufficient. An attacker can place an ordinary file, alter bytes in place, replace it after checking, or redirect a parent. NO-GO; current runtime does not certify directory owners/ACLs or protect writable installs. Same-token malware is included here. |
+| C — Trusted entry, untrusted symlink target | A helper entry is a symlink whose target is across a trust boundary. | Existing `symlink_metadata` final-entry policy rejects it without intentionally following the leaf. This closes the stable final-link selection case. It does not close a replace-after-check race or a link/reparse point in an ancestor. |
+| D — Concurrent trusted updater | A trusted updater atomically replaces a helper during startup or execution. | A path race can cause launch failure or start either old/new trusted content depending on OS/open timing. This is a compatibility/availability race if both images are trusted; it is not automatically malicious execution. If updater provenance is not trusted, classify it as Case B. In-place writes may expose partially updated content or fail to launch; updater atomicity is separate. |
+| E — Ancestor redirection | Any ancestor is a symlink, junction/reparse point, mount, or replaceable directory; or path identity changes. | The current selector checks only the final helper component. The candidate is resolved through ancestors. It does not validate canonical ancestry, mount identity, directory identity, or pin a directory handle. Parent redirection is not prevented. Under Case A ancestors are protected by assumption; otherwise NO-GO. |
+| Hard-link/alias | A regular helper path is a hard link to an inode also named elsewhere. | It passes the regular-file check. Hard-link count or alternate names do not prove maliciousness; file identity and bytes are only as trustworthy as all writers to that inode. No hostile hard-link attack is demonstrated. |
+
+**Severity:** High for Case B/E when an untrusted principal can modify or redirect
+the helper path: GoalLatch may run attacker-controlled code with its user
+privileges. This is conditional on actual write/replace authority, not on the
+mere existence of a symlink. In Case A, no attacker-controlled helper execution
+is established; residual trusted-updater races are primarily availability and
+release-consistency concerns. No exploit has been demonstrated.
+
+## Current runtime audit
+
+- `src/install_contract.rs` uses `symlink_metadata`, requires a regular file,
+  rejects a final symlink, and on Windows rejects the final
+  `FILE_ATTRIBUTE_REPARSE_POINT` bit.
+- `src/execution.rs` uses the shared rule for `atomic-publish` and refuses when
+  missing. Its test-only `deps` profile candidate is cfg-gated out of production.
+- Linux `src/sandbox.rs` uses the same selector for `codex-linux-sandbox`, with
+  a test-only Cargo profile helper candidate. Production does not search PATH,
+  cwd, or a different install directory.
+- macOS uses the system Seatbelt executable and has no `codex-linux-sandbox`
+  helper; publication still uses the shared helper selector.
+- Windows uses the shared publication selector; it has no Linux sandbox helper
+  and remains Experimental.
+- `first_existing` returns a pathname after metadata inspection. Both runtime
+  call sites later invoke it via `Command::new(path)`. That leaves a
+  check-to-open window and does not bind metadata identity to the launched image.
+
+No simpler portable `std::process::Command` mechanism is available to pin an
+opened file identity across launch. A native fd/handle execution layer would
+interact with Tokio process lifecycle, process-group/Job ownership, argv/env,
+error reporting, descriptor inheritance, and (Linux) the helper's sandbox
+bootstrap. Introducing such a layer is not justified without a separate strict
+platform design review and native threat-driven tests.
+
+## Platform design and guarantees
+
+| Platform | Practical trust condition | Implemented | Not guaranteed / cost of stronger approach |
+| --- | --- | --- | --- |
+| Linux | Install tree and ancestors not writable by untrusted principals; distro/package manager is trusted. | Final helper symlink rejected. Existing ProcessGroup and Bubblewrap helper launch are unchanged; Bubblewrap minimum remains 0.12.0. | No owner/mode or mount/ancestor verification. `execveat(AT_EMPTY_PATH)`/`fexecve` can execute an opened inode on Linux, but integrating it with sandbox helper argv, process-group spawn, fd semantics and error handling needs native code and review. Atomic updater rename avoids partial bytes but cannot alone guarantee which trusted generation starts. |
+| macOS | Same protected-install-tree condition; trusted package manager owns updates. | Final publication-helper symlink rejected; Seatbelt use unchanged. | No ACL/owner/ancestor verification. Descriptor-based exec variants exist but require a custom spawn lifecycle and do not solve parent-directory policy by themselves. Store symlink layouts (Nix/Homebrew Cellar links) need actual layout/runtime evidence. |
+| Windows | NTFS ACLs on the executable, helper and ancestors restrict writes to trusted installer/admin principals; `C:\tools` is trusted only if its ACLs say so. | Final helper reparse attribute rejected; Job/process containment is unchanged; Windows stays Experimental. | Runtime does not inspect ACLs, owner, parent reparse points, or directory identity. `CreateProcessW` accepts an image path; a verified handle-to-image guarantee would require separately reviewed native process creation. Replacement while loaded may fail or race; exact outcomes need native tests. |
+
+These are deployment preconditions, not properties certified by the runtime.
+A directory merely existing, being readable, or being under a conventional
+prefix is not evidence of trust. OS security controls, ACL/ownership review and
+updater design must establish the precondition.
+
+## Install and package compatibility
+
+- **v0.1.1 archive:** the archive checksum authenticates downloaded archive
+  bytes relative to the published checksum; it does not validate runtime
+  helper identity. Existing assets are unchanged. Future installation should
+  extract/copy the regular `local-mcp` and required helpers into one protected
+  directory, preserving executable modes on Unix.
+- **Direct extraction/manual copy:** supported when regular helper files remain
+  beside the path reported by `current_exe()` and the containing directory and
+  ancestors meet the trusted-install condition. Copying only the launcher or
+  helper files into a user-writable shared directory does not meet it.
+- **Launcher symlink:** allowed as an invocation pattern, but the OS-reported
+  `current_exe()` location controls sibling lookup. Do not assume every OS
+  resolves the launcher symlink identically; test the actual installed layout.
+- **Helper symlink:** deliberately rejected even if it points to a same-directory
+  or package-store file. This can break deployments that symlink helpers.
+- **Windows reparse:** final helper reparse point is rejected. Parent junctions
+  and other ancestor redirections are not rejected by current code; only protected
+  ACLs satisfy the deployment precondition.
+- **Nix flake:** static inspection shows `buildRustPackage` builds the package,
+  wraps `local-mcp` in `$out/bin`, and adds bash/curl to PATH; it does not
+  explicitly link or relocate helper binaries in `postInstall`. It appears
+  intended for sibling binaries in the same output, but wrapper/current_exe and
+  store layout behavior has not been established by a native `nix build` and
+  runtime probe. Do not infer build success, runtime compatibility, or change
+  `cargoHash` from this inspection. Nix is **unverified**.
+- **Homebrew/future managers:** no current formula was audited as an existing
+  package. A supported formula must keep regular helper siblings beside the
+  executed binary, use a protected/versioned Cellar tree and atomic trusted
+  activation, then prove behavior on each platform. Do not rely on symlinked
+  helper entries.
+
+## Negative-test matrix and evidence
+
+Pure metadata/contract tests must not be presented as proof of spawn-time image
+identity. Current tests use temporary fixtures and do not launch attacker
+payloads. The native test `current_exe` symlink probe launches only the test
+harness and observes its OS-reported executable path.
+
+| Case | Current evidence/status |
 | --- | --- |
-| Writable install directory | Critical trust-boundary failure if an attacker can replace helper files (or the host binary). Read-only/existence checks do not establish ownership or ACL trust. This patch does not validate owner, ACL, or directory write access. |
-| Helper symlink to same/external target | Final helper symlinks are rejected. This is conservative; legitimate helper symlinks may stop working. The normal `local-mcp` launcher symlink remains distinct: resolution remains anchored to OS `current_exe()`. |
-| Check-to-spawn replacement | Not solved. `Command::new(path)` reopens a path and does not bind execution to the earlier metadata result. No race exploit has been demonstrated. |
-| Windows reparse points / junctions | Final reparse entries are rejected using the reparse attribute. Parent path traversal and replacement are not pinned. Native Windows validation is still required. |
-| Hard links / aliases | Hard links are ordinary regular files and pass the check. The same inode may have names outside the install directory; path-based checks cannot establish its provenance. No hostile hard-link execution was demonstrated. |
-| Legitimate updater | An updater that replaces the helper concurrently can race the runtime. Update coordination or immutable/versioned helper directories are not implemented. |
-| Nix / package managers | Store-managed symlink layouts can be incompatible with the no-final-link policy. Compatibility has not been tested; an explicit trusted immutable-store policy would need separate design/evidence. |
+| Valid sibling helper | Pure contract test exists; Windows focused V2 run passed. |
+| Missing helper | Pure contract test exists; Windows focused V2 run passed; runtime callers fail closed. |
+| Same-directory symlink | Pure negative test exists; Windows focused V2 run passed. |
+| External-target symlink | Pure negative test exists; Windows focused V2 run passed. |
+| Broken symlink | Pure negative test exists; Windows focused V2 run passed (symlink privilege was available). |
+| Parent symlink/junction | Unix pure test records that final-entry checking still accepts an entry reached through a redirected parent; not run on Windows. Windows junction NOT RUN; no parent pinning claim. |
+| Windows final reparse | Windows focused V2 run confirmed the helper symlink fixture has `FILE_ATTRIBUTE_REPARSE_POINT` and selector rejects it. Arbitrary reparse tags remain untested. |
+| Writable parent | Unix fixture records that helper selection does not certify/reject a writable install directory; not run on Windows. |
+| Concurrent replacement | No spawn-time identity test. Unresolved; metadata-only testing cannot close it. |
+| Hard-link alias | Unix pure fixture accepts regular hard-link alias; behavior is intentional and does not attest provenance. |
+| Trusted update replacement | No updater integration test; old/new trusted-generation and availability behavior unverified. |
+| Permission denial | No dedicated native permission-denial matrix. Filesystem/ACL policy is not implemented. |
+| Native image identity | NOT RUN / NOT PROVIDED. Must be a separate native test; fake metadata runner is insufficient. |
 
-Severity: **High (provisional)** where an attacker can modify the install
-location or helper target, because the attacker may cause host-owned code to be
-executed with GoalLatch's user authority. Severity is conditional on that write
-capability; this audit does not claim a symlink alone grants it. The unresolved
-race is also security-significant, but exploitability depends on a concurrent
-writer able to replace the path or an ancestor. Severity is not a claim of
-confirmed remote exploitability.
+The focused Windows V2 run passed 7 Install Contract tests, including valid
+sibling, missing, same-directory/external/broken helper symlink, final reparse
+attribute rejection, and `current_exe()`-through-launcher-symlink observation.
+The fixture was available (no `NOT RUN` diagnostic). Unix-only parent-link,
+writable-directory and hard-link tests were not compiled/run on Windows. Full
+Rust tests (1308 passed), `cargo check`, Clippy, release scripts (19 passed),
+workflow policy (19 passed), formatting and diff checks passed on Windows.
 
-## Decision and mitigation
+Tests skipped because a host lacks symlink privilege must be reported as
+**NOT RUN**, not PASS. Linux and macOS native CI remain required; Windows results
+cannot substitute for them. No native test verifies OS spawn-time image identity.
 
-Adopted A as a mitigation: inspect the final path entry with
-`symlink_metadata`, require a regular file, reject symlinks, and on Windows
-reject any final entry carrying `FILE_ATTRIBUTE_REPARSE_POINT`. This prevents
-following an already-present final symlink/reparse entry. It does not prove
-ownership, non-writability, code signature, content identity, or race freedom.
+## Closure decisions
 
-B is not implemented. Checking that a directory exists or can be read is not a
-trust proof; reliable owner/ACL policy is platform-specific and package-manager
-specific, and the current release/install contract does not establish such a
-policy.
+### Mitigation Closure
 
-C is not implemented to closure. Linux can in principle execute an opened file
-descriptor using `execveat(AT_EMPTY_PATH)`/`fexecve`, but this requires replacing
-or extending the current Tokio/Command spawn path and preserving process-group,
-sandbox, argv, and descriptor semantics. macOS has descriptor-based exec APIs,
-but the same spawn/lifecycle integration and platform policy work is required.
-Windows `CreateProcessW` takes an image path; safely binding a verified file
-handle to the created image needs a separately reviewed native implementation
-and guarantees. No portable `std::process::Command` API pins file identity.
-Therefore this patch explicitly does **not** claim TOCTOU remediation.
+**Conditional / bounded, not a universal runtime certification.** The known
+stable final-helper symlink/reparse case is refused by code; sibling-only
+production lookup, no PATH/cwd fallback and fail-closed missing-helper behavior
+are retained. A trusted install directory/ancestor condition is now explicit.
+Mitigation closure for a supported deployment requires: all mandatory native
+negative tests available on that OS pass; privilege-dependent cases are reported
+NOT RUN; supported packages install regular siblings under ACL/mode-protected
+ancestors; Linux and macOS CI provide native results; and Doctor reports
+unverified runtime/install conditions as UNKNOWN or BLOCK without false PASS.
+Writable/attacker-controlled install trees remain **NO-GO**.
 
-D remains a separate gate: SHA-256 checks on release archives verify archive
-integrity at download/package time, not the identity of an installed helper at
-runtime.
+### Full Execution Identity Closure
 
-## Platform guarantees
+**NOT achieved.** The checked metadata and actual image opened by the OS are not
+cryptographically or kernel-handle bound. Ancestor replacement, mount changes,
+hard-link provenance, concurrent replacement and native spawn identity remain.
+No claim of TOCTOU repair is made. Full closure requires a reviewed OS-specific
+launch/installation design and identity-verifying native tests; it is not a
+prerequisite for every ordinary use if the trusted-install precondition is
+actually maintained, but any deployment that allows attacker changes stays
+NO-GO.
 
-- Linux: no-final-symlink preflight; Bubblewrap minimum remains 0.12.0. No
-  descriptor-pinned helper execution; race remains.
-- macOS: same no-final-link rule for `atomic-publish`; Seatbelt behavior is
-  unchanged. No descriptor-pinned execution; race remains.
-- Windows: final reparse-point attribute rejected for `atomic-publish.exe`;
-  Windows remains Experimental and unsandboxed. Parent redirection and race
-  remain.
+## Doctor integration readiness (no Doctor edits)
 
-No change was made to atomic publication permissions, sandbox fallback
-behavior, or Session/Goal/Writer authority. Missing helpers remain a hard error.
+Doctor Core V1's expected contract remains: helper symlink/reparse is BLOCK;
+unconfirmed runtime execution capability is UNKNOWN; Windows is Experimental;
+missing optional Codex does not BLOCK MCP; a probe not run is never PASS. Security
+V2 does not edit the protected Doctor branch or claim existing diagnostics prove
+ACL/ancestor trust or image identity.
 
-## Validation and closure gates
+After this branch is reviewed and integrated independently, Doctor integration
+must be additive and must preserve the seven user-owned files. First snapshot
+Doctor HEAD and all worktree diffs outside the worktree (no reset/stash/checkout
+over them); then manually reconcile the reviewed security commit into a fresh
+integration branch/worktree based on the then-current main, compare Doctor's
+uncommitted diff before/after byte-for-byte, and add contract tests that feed the
+same helper entry states to runtime resolution and Doctor classification.
+Required assertions: symlink/reparse => BLOCK; unknown install provenance or
+runtime identity => UNKNOWN; Windows remains Experimental; optional Codex
+absence does not block MCP; unrun probes are not PASS. Do not modify the Doctor
+worktree as part of Security V2.
 
-The install-contract tests include regular sibling, missing helper, same-directory
-and external symlinks, broken symlinks, directory symlink, and Unix hard-link
-alias behavior. Symlink fixtures may be unavailable on Windows hosts without
-symlink privilege. Parent redirection, writable-directory policy, permission
-denial, concurrent helper replacement, arbitrary reparse tags/junctions, and
-unexpected-but-regular file identity are not proven by the current fixture
-suite. A metadata-only fake runner would not prove the OS image identity; a
-race-safe native integration test must verify which image actually ran.
+## Release and publication decision
 
-Native Linux and macOS test runs are required before closure. Windows results
-alone cannot close Linux/macOS. Runtime and Doctor diagnostics have not been
-changed: no new Doctor finding is claimed, and no Doctor worktree content is
-included. Any later Doctor integration must be additive and preserve its existing
-uncommitted work.
-
-**GO/NO-GO: NO-GO.** Do not publish a draft PR as a security-closure claim. A
-reviewed race-resistant launch design, platform-native implementation and tests,
-install/update/package compatibility evidence (including Nix consideration),
-and Linux/macOS native CI are required first. Existing v0.1.1 release artifacts
-are unchanged; the runtime fix, if later accepted, applies only to a subsequent
-build/release. Do not modify or reissue the existing tag/assets as part of this
-campaign.
+The v0.1.1 release is historical and unchanged. No release, tag, push, PR or
+merge is part of this campaign. A security PR may be opened only after the
+proposed trusted-install preconditions, OS matrix results, regression tests and
+Nix/package compatibility statements are reviewed and the PR does not claim Full
+Execution Identity Closure. Do not publish a draft as if closure were complete.
