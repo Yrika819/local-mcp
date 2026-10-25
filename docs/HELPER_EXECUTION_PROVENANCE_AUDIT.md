@@ -183,9 +183,15 @@ NO-GO.
 
 Doctor Core V1's expected contract remains: helper symlink/reparse is BLOCK;
 unconfirmed runtime execution capability is UNKNOWN; Windows is Experimental;
-missing optional Codex does not BLOCK MCP; a probe not run is never PASS. Security
-V2 does not edit the protected Doctor branch or claim existing diagnostics prove
-ACL/ancestor trust or image identity.
+missing optional Codex does not BLOCK MCP; a probe not run is never PASS. The
+read-only inspection of the protected worktree found a stale row in
+`docs/DOCTOR_CORE_V1_TEST_PLAN.md` (case 21): it says Runtime follows
+regular-file helper links and calls this a mismatch, which predates the shared
+final-link rejection. Doctor's current implementation checks the sibling entry
+with `symlink_metadata`; its code was not changed. Reconcile that test-plan row
+and add a shared-input contract test during a separately authorized, additive
+Doctor integration. Do not edit the Doctor worktree in this campaign. Security
+V2 also does not claim Doctor proves ACL/ancestor trust or image identity.
 
 After this branch is reviewed and integrated independently, Doctor integration
 must be additive and must preserve the seven user-owned files. First snapshot
