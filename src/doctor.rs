@@ -3062,6 +3062,34 @@ mod tests {
     }
 
     #[test]
+    fn missing_codex_blocks_only_optional_goal_model_execution() {
+        let root = TestRoot::new();
+        let mut input = test_input(OperatingSystem::Windows, Architecture::X86_64, &root);
+        input.codex_source = CodexSource::Path;
+        input.codex_path = Some(PathBuf::from("codex"));
+        input.path_environment = None;
+        let report = build_report(input);
+        assert_eq!(
+            report.capabilities.goal_model_execution.status,
+            DiagnosticStatus::Block
+        );
+        assert_eq!(
+            report.capabilities.mcp_transport.status,
+            DiagnosticStatus::Pass
+        );
+        assert_eq!(
+            report.capabilities.session_management.status,
+            DiagnosticStatus::Pass
+        );
+        assert!(report.checks.iter().any(|check| {
+            check.reason_code == ReasonCode::CodexCliNotFound
+                && check.capability == Some(CapabilityId::GoalModelExecution)
+        }));
+        #[cfg(windows)]
+        assert_eq!(report.summary.exit_code, ExitCode::Success);
+    }
+
+    #[test]
     fn relative_codex_override_is_unknown_without_consulting_the_current_directory() {
         let root = TestRoot::new();
         let mut input = test_input(OperatingSystem::Windows, Architecture::X86_64, &root);
