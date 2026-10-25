@@ -286,46 +286,24 @@ Remaining Nix work, if pursued separately:
 This is a separate, larger task and should be its own change if it requires
 dependency or hash changes.
 
-## Doctor V1 diagnostic contract
+## Doctor Core V1 diagnostic contract
 
-Doctor V1 may reuse this contract but must not invent authority. The following
-fields are the stable diagnostics it can rely on:
+The Doctor Core V1 public CLI, capability/status aggregation, exit codes,
+privacy boundary, versioned JSON Schema, and contract-test requirements are
+specified in [Doctor Core V1 Design](DOCTOR_CORE_V1_DESIGN.md). Its normative
+machine-readable report is
+[`docs/schemas/doctor-v1.schema.json`](schemas/doctor-v1.schema.json). This
+section remains authoritative for installed helper names, package layout, and
+the `current_exe()` sibling-only resolution rule; the Doctor design consumes
+those rules and must not add a PATH search or fallback.
 
-```json
-{
-  "contract_version": 1,
-  "target": "windows-x86_64",
-  "host_target": "windows-x86_64",
-  "native": true,
-  "experimental": true,
-  "install_root": "local-mcp-v0.1.1-windows-x86_64",
-  "required_executables": ["local-mcp.exe", "atomic-publish.exe"],
-  "forbidden_executables": ["codex-linux-sandbox", "codex-linux-sandbox.exe"],
-  "helper_resolution": "current_exe-sibling",
-  "formal": "PASS",
-  "runtime": {
-    "direct": "local-mcp.exe --version = 0.1.1",
-    "path": "local-mcp.exe --version = 0.1.1",
-    "symlink": "local-mcp.exe --version = 0.1.1",
-    "atomic_publish_startup": "atomic-publish.exe starts and rejects a malformed request (exit 65)"
-  }
-}
-```
-
-Doctor V1 rules:
-
-1. Report structural and runtime results separately. Never upgrade a structural
-   PASS to a runtime PASS.
-2. A non-native target is `not-run`, never a pass.
-3. A missing helper is a failure. Do not suggest adding `PATH` search or an
-   in-process fallback.
-4. Report the observed `current_exe()` directory when explaining helper
-   resolution, especially for symlink installs.
-5. Report `not-run` for symlink checks the host cannot perform.
-6. Do not mutate the install, the user's `PATH`, or the user's data to make a
-   diagnostic pass.
-7. Treat an experimental target's success as evidence for that target only, not
-   as parity with Linux/macOS sandbox claims.
+Doctor reports local installation observations. It does not claim that an
+archive checksum/signature or release closure was verified, and a helper's
+presence is not proof that the helper was executed successfully. Formal
+contract observations and runtime evidence remain distinct; a skipped probe is
+UNKNOWN, not PASS. Doctor must not mutate an install, the user's PATH, or user
+data, and an experimental target's results do not establish sandbox parity on
+another OS or architecture.
 
 ## Running the checks
 
