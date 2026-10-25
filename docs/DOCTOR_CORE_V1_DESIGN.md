@@ -451,6 +451,7 @@ success. Initial codes:
 | `CHECK_NOT_APPLICABLE` | Check does not apply to this OS/target. |
 | `PROBE_NOT_RUN` | Optional process/runtime probe was not requested. |
 | `RUNTIME_VERIFICATION_NOT_RUN` | Runtime behavior was intentionally not exercised. |
+| `DOCTOR_STATIC_CHECK_TIMEOUT` | Static diagnostics exceeded the overall deadline; affected observations remain UNKNOWN. |
 | `HOST_TARGET_UNKNOWN` | OS/architecture evidence was insufficient. |
 | `HOST_TARGET_UNSUPPORTED` | Target is outside the verified install matrix. |
 | `PLATFORM_WINDOWS_EXPERIMENTAL` | Windows is Experimental; no Unix sandbox parity. |
@@ -458,10 +459,10 @@ success. Initial codes:
 | `PLATFORM_MACOS_AARCH64_CI_ONLY` | macOS ARM64 CI target; local release closure not established. |
 | `INSTALL_CURRENT_EXE_UNAVAILABLE` | `current_exe()` or its parent was unavailable. |
 | `INSTALL_REQUIRED_HELPER_MISSING` | Required sibling helper is absent. |
+| `INSTALL_REQUIRED_HELPER_NOT_REGULAR_FILE` | The sibling helper entry is not a regular file. |
 | `INSTALL_REQUIRED_HELPER_UNREADABLE` | Required helper is not readable. |
 | `INSTALL_REQUIRED_HELPER_NOT_EXECUTABLE` | Required helper is not executable. |
 | `INSTALL_FORBIDDEN_HELPER_PRESENT` | Platform-forbidden helper is present. |
-| `INSTALL_PATH_ONLY_HELPER_IGNORED` | Helper exists only outside the sibling candidate. |
 | `INSTALL_SYMLINK_ORIGIN_UNKNOWN` | Link-vs-target behavior was not safely established. |
 | `INSTALL_NIX_UNVERIFIED` | Nix build/run/install layout has not been validated. |
 | `CODEX_CLI_NOT_FOUND` | No selected Codex CLI file was found. |
@@ -494,7 +495,7 @@ OS. These remain UNKNOWN or explicit known limitations, not inferred PASS.
 The implementation campaign must:
 
 1. add a dedicated Doctor module/typed result model and CLI branch only;
-2. reuse the current sibling candidate helper from `install_contract.rs`;
+2. reuse the current sibling candidate helper from `install_contract.rs`; it must not search PATH to determine whether a missing sibling helper exists elsewhere. A PATH-only helper is therefore reported as a missing sibling, without claiming that it exists only on PATH;
 3. reuse the exact Codex precedence from `fallback::codex_path()` without
    exposing path values or changing it;
 4. reuse `bubblewrap_support` version parsing/minimum and existing process

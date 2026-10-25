@@ -63,7 +63,7 @@
     "status": "BLOCK",
     "required_status": "BLOCK",
     "advisory_status": "BLOCK",
-    "runtime_status": "UNKNOWN",
+    "runtime_status": "BLOCK",
     "counts": { "PASS": 4, "WARN": 0, "BLOCK": 2, "UNKNOWN": 3 },
     "checks_total": 9,
     "required_blockers": 1,

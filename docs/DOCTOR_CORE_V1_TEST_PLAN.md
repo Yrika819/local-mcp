@@ -46,7 +46,7 @@ UNKNOWN does not change the exit code.
 | 4 | Linux Bubblewrap 0.12.0+ | Explicit safe version probe with `0.12.0` and `1.0.0` fixtures. Do not run a namespace/sandbox smoke test. | Version-gate check PASS, but namespace/kernel/seccomp runtime check UNKNOWN (`BWRAP_RUNTIME_PREREQUISITES_UNKNOWN`); `sandboxed_execution` is not PASS; required UNKNOWN exit 2 unless a required BLOCK also exists. |
 | 5 | Required helper missing | Remove `atomic-publish` from a test-owned sibling fixture (second subcase: Linux `codex-linux-sandbox`). | Missing helper BLOCKs only its capability (`atomic_publication` or `sandboxed_execution`); no in-process helper or PATH fallback; required BLOCK exit 1. |
 | 6 | Helper in wrong directory | Place required helper in a child directory or parent directory, not beside observed `current_exe`. | Same result as absent sibling; candidate count remains exactly one; `INSTALL_REQUIRED_HELPER_MISSING`; no broad search; exit 1 when required capability is blocked. |
-| 7 | PATH-only helper | Place fake required helper only in PATH. | It is not a helper candidate; `INSTALL_PATH_ONLY_HELPER_IGNORED` plus required-helper BLOCK; no helper process launched; exit 1. |
+| 7 | PATH-only helper | Place fake required helper only in a test-owned PATH directory; separately keep the executable sibling candidate absent. | Production Doctor never searches PATH for helpers. Report `INSTALL_REQUIRED_HELPER_MISSING` solely from the absent sibling; do not claim that PATH-only presence was detected; no helper process launched; exit 1. |
 | 8 | Codex CLI missing | No explicit override, no macOS bundled binary, no `codex` PATH candidate. | `goal_model_execution=BLOCK`, `CODEX_CLI_NOT_FOUND`; `mcp_transport`, `session_management`, and atomic capability unchanged; optional-only BLOCK exit 0 if required baseline passes. |
 | 9 | Codex CLI override precedence | Provide all candidates in injected resolver data. Subcases: local override, generic override, macOS bundle, PATH. | Selected source is exactly the first present source in order: `LOCAL_MCP_CODEX_CLI_PATH`, `CODEX_CLI_PATH`, macOS bundle, PATH. No selected path value is serialized. |
 | 10 | Malformed Codex CLI path | Set the highest-precedence override to empty, directory, non-regular, or otherwise invalid; populate lower-priority candidates too. Separate subcase uses a relative override while Doctor cwd differs from the hypothetical Goal Session cwd. | Invalid override remains selected; no fallthrough. `CODEX_CLI_PATH_INVALID` or statically proven non-executable BLOCKs `goal_model_execution` only; relative path is UNKNOWN with `CODEX_CLI_PATH_CONTEXT_UNKNOWN`; optional-only BLOCK exit 0. Permission/metadata ambiguity is UNKNOWN, not an invented absence. |
@@ -95,6 +95,7 @@ UNKNOWN does not change the exit code.
   runtime status.
 - A report at the configured byte/check/message limits serializes whole; one
   byte/item over fails closed without partial stdout.
+- If static collection exceeds its 10-second deadline, Doctor emits a complete bounded UNKNOWN report with `DOCTOR_STATIC_CHECK_TIMEOUT`; it does not emit partial output or start an external process.
 - Paths, PATH values, environment values, raw external output, usernames,
   repository paths, and credentials do not appear in any fixture/report/message.
 

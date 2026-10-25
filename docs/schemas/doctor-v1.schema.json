@@ -61,7 +61,7 @@
       ]
     },
     "safeObserved": {
-      "description": "Bounded, redacted observation only; never a path, environment value, or raw process output.",
+      "description": "Schema validates shape and bounds only; it cannot establish that strings or object values are redacted. The Rust producer must use a fixed typed allowlist (Doctor V1 emits only null or booleans) and never serialize paths, environment values, secrets, or raw process output.",
       "anyOf": [
         { "type": "null" },
         { "type": "boolean" },
