@@ -128,6 +128,7 @@ pub fn rejection_message(support: BubblewrapSupport) -> String {
 }
 
 /// Typed result for the shared Bubblewrap version parser and security gate.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BubblewrapVersionError {
     Unsupported,
@@ -135,6 +136,7 @@ pub(crate) enum BubblewrapVersionError {
 }
 
 /// Parse a strict numeric triplet and classify it against the shared minimum.
+#[allow(dead_code)]
 pub(crate) fn classify_version(version: &str) -> Result<(), BubblewrapVersionError> {
     let parsed = parse_version(version).map_err(|_| BubblewrapVersionError::Malformed)?;
     if parsed < MINIMUM_SUPPORTED_VERSION {

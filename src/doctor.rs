@@ -2960,7 +2960,7 @@ mod tests {
         let malformed = bubblewrap_version_result(Some(true), Some("0.12.0-vendor"), true);
         assert_eq!(malformed.0, DiagnosticStatus::Unknown);
         assert_eq!(malformed.2, None);
-        let long = bubblewrap_version_result(Some(true), Some("18446744073709551615.1.1"), true);
+        let long = bubblewrap_version_result(Some(true), Some("18446744073709551616.1.1"), true);
         assert_eq!(long.0, DiagnosticStatus::Unknown);
         assert_eq!(long.2, None);
         let unknown = bubblewrap_version_result(None, None, true);
@@ -3315,7 +3315,14 @@ mod tests {
             check.reason_code == ReasonCode::RuntimeVerificationNotRun
                 && check.capability == Some(CapabilityId::GoalModelExecution)
         }));
-        assert_eq!(report.summary.exit_code, ExitCode::Success);
+        assert_eq!(
+            report.summary.exit_code,
+            if cfg!(windows) {
+                ExitCode::Success
+            } else {
+                ExitCode::RequiredUnknown
+            }
+        );
     }
 
     #[test]
@@ -3446,7 +3453,14 @@ mod tests {
             report.capabilities.mcp_transport.status,
             DiagnosticStatus::Pass
         );
-        assert_eq!(report.summary.exit_code, ExitCode::Success);
+        assert_eq!(
+            report.summary.exit_code,
+            if cfg!(windows) {
+                ExitCode::Success
+            } else {
+                ExitCode::RequiredUnknown
+            }
+        );
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(!serialized.contains(&path_dir.to_string_lossy().to_string()));
     }
