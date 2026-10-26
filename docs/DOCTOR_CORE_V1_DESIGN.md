@@ -302,14 +302,21 @@ check and is not silently ignored. A helper available only on PATH or in a
 subdirectory is still missing. This agrees with the release checker and
 runtime; do not add PATH fallback.
 
-A symlink's behavior is OS-specific. The Doctor reports exactly the path
-returned by `current_exe()` in redacted form and anchors the one helper candidate
-to it. It does not create a symlink or relaunch itself. If target-vs-link origin
-cannot be proven without such a relaunch, the symlink-origin check is UNKNOWN
-(`INSTALL_SYMLINK_ORIGIN_UNKNOWN`). A passing direct `--version` invocation is
-not proof of helper resolution. Nix's expected `$out/bin` layout/wrapper behavior
-is documented but `nix build`/`nix run` remain unverified; report
-`INSTALL_NIX_UNVERIFIED` as UNKNOWN, never PASS.
+A symlink executable's behavior is OS-specific. The Doctor reports exactly the
+path returned by `current_exe()` in redacted form and anchors the one helper
+candidate to it. It does not create a symlink or relaunch itself. If
+current-executable target-vs-link origin cannot be proven without such a
+relaunch, the symlink-origin check is UNKNOWN
+(`INSTALL_SYMLINK_ORIGIN_UNKNOWN`). Required helper regular-file status is about
+the sibling directory entry itself: symlink/reparse-point entries are not
+reported as regular helpers and BLOCK the install-contract check. This is
+intentionally conservative; the current Runtime `Path::is_file()` resolver
+follows a helper symlink to a regular target, so Doctor's check does not enforce
+Runtime containment. External helper-link targets remain a separate Runtime
+security concern and are not changed by Doctor. A passing direct `--version`
+invocation is not proof of helper resolution. Nix's expected `$out/bin`
+layout/wrapper behavior is documented but `nix build`/`nix run` remain
+unverified; report `INSTALL_NIX_UNVERIFIED` as UNKNOWN, never PASS.
 
 `install_contract_version` is the checked-in contract version (`1`), not proof
 that an archive signature, checksum, release origin, or formal archive member
@@ -329,19 +336,33 @@ this precedence:
 A present higher-priority override is authoritative. If it is empty, malformed,
 not a regular file, unreadable, or non-executable, report that selected source
 and the corresponding BLOCK/UNKNOWN; do **not** fall through to a lower-priority
-source. A relative explicit override is context-dependent: Goal model invocation
-resolves it relative to the Session working directory, which Doctor does not
-know. Report UNKNOWN with `CODEX_CLI_PATH_CONTEXT_UNKNOWN`; do not resolve it
-against Doctor's cwd or fall through. The current code returns an explicit
-override as-is and does not fall through when it is invalid. Do not display the
-value, resolved absolute path, PATH entries, or ChatGPT app path in a
-user-specific report. `PATH`-only Codex resolution is distinct from helper
-resolution; only Codex CLI uses PATH.
+source. A relative explicit override is context-dependent. The Goal model launcher passes
+no child `current_dir`; Rust resolves a path with components from the GoalLatch
+process's inherited working directory. The Session cwd is passed separately to
+Codex as `-C` and does not choose the executable path. A standalone Doctor cannot
+establish the MCP server process's working directory, so report UNKNOWN with
+`CODEX_CLI_PATH_CONTEXT_UNKNOWN`; do not resolve against Doctor's cwd or fall
+through. The current code returns an explicit override as-is and does not fall
+through when it is invalid. Do not display the value, resolved absolute path,
+PATH entries, or ChatGPT app path in a user-specific report. `PATH`-only Codex
+resolution is distinct from helper resolution; only Codex CLI uses PATH.
+
+On Windows the default bare `Command::new("codex")` resolution is wider than
+PATH: with the current Rust 1.96 toolchain it checks the executable directory,
+System directory, Windows directory, then the parent PATH, and appends `.exe`
+when the bare name has no extension. Doctor does not reproduce all those OS
+search locations, so it reports the default Windows PATH resolution as UNKNOWN
+with `RUNTIME_VERIFICATION_NOT_RUN`; a PATH-only candidate or absence is not
+proof of the executable selected by Runtime. This does not launch Codex. The
+pure PATH resolver accepts only the suffix Rust adds (`.exe`) for a bare
+Windows name and skips empty Windows PATH entries.
 
 Default Doctor mode performs only static metadata checks. It does not invoke
 Codex, check authentication, inspect login state, or make a model/API request.
-A missing or unusable Codex CLI BLOCKs `goal_model_execution` only; it does not
-block MCP transport, Session management, or atomic publication.
+A statically established missing or unusable Codex CLI BLOCKs
+`goal_model_execution` only; it does not block MCP transport, Session
+management, or atomic publication. On Windows, incomplete default `Command`
+search knowledge remains UNKNOWN rather than being reported as missing.
 
 `--probe-codex-version` is explicit user consent to request a bounded version
 probe, not proof that arbitrary `codex --version` is harmless. The only argv is

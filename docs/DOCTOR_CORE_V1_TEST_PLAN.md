@@ -47,9 +47,9 @@ UNKNOWN does not change the exit code.
 | 5 | Required helper missing | Remove `atomic-publish` from a test-owned sibling fixture (second subcase: Linux `codex-linux-sandbox`). | Missing helper BLOCKs only its capability (`atomic_publication` or `sandboxed_execution`); no in-process helper or PATH fallback; required BLOCK exit 1. |
 | 6 | Helper in wrong directory | Place required helper in a child directory or parent directory, not beside observed `current_exe`. | Same result as absent sibling; candidate count remains exactly one; `INSTALL_REQUIRED_HELPER_MISSING`; no broad search; exit 1 when required capability is blocked. |
 | 7 | PATH-only helper | Place fake required helper only in a test-owned PATH directory; separately keep the executable sibling candidate absent. | Production Doctor never searches PATH for helpers. Report `INSTALL_REQUIRED_HELPER_MISSING` solely from the absent sibling; do not claim that PATH-only presence was detected; no helper process launched; exit 1. |
-| 8 | Codex CLI missing | No explicit override, no macOS bundled binary, no `codex` PATH candidate. | `goal_model_execution=BLOCK`, `CODEX_CLI_NOT_FOUND`; `mcp_transport`, `session_management`, and atomic capability unchanged; optional-only BLOCK exit 0 if required baseline passes. |
+| 8 | Codex CLI missing | No explicit override, no macOS bundled binary, no `codex` PATH candidate. | On Linux/macOS, `goal_model_execution=BLOCK`, `CODEX_CLI_NOT_FOUND`; MCP/session/atomic capabilities unchanged; optional-only BLOCK exit 0 if required baseline passes. On Windows, default `Command::new` searches additional OS directories, so incomplete static resolution is UNKNOWN, not a guessed missing result. |
 | 9 | Codex CLI override precedence | Provide all candidates in injected resolver data. Subcases: local override, generic override, macOS bundle, PATH. | Selected source is exactly the first present source in order: `LOCAL_MCP_CODEX_CLI_PATH`, `CODEX_CLI_PATH`, macOS bundle, PATH. No selected path value is serialized. |
-| 10 | Malformed Codex CLI path | Set the highest-precedence override to empty, directory, non-regular, or otherwise invalid; populate lower-priority candidates too. Separate subcase uses a relative override while Doctor cwd differs from the hypothetical Goal Session cwd. | Invalid override remains selected; no fallthrough. `CODEX_CLI_PATH_INVALID` or statically proven non-executable BLOCKs `goal_model_execution` only; relative path is UNKNOWN with `CODEX_CLI_PATH_CONTEXT_UNKNOWN`; optional-only BLOCK exit 0. Permission/metadata ambiguity is UNKNOWN, not an invented absence. |
+| 10 | Malformed Codex CLI path | Set the highest-precedence override to empty, directory, non-regular, or otherwise invalid; populate lower-priority candidates too. Separate subcase uses a relative override while Doctor cwd differs from the GoalLatch model launcher cwd. | Invalid override remains selected; no fallthrough. `CODEX_CLI_PATH_INVALID` or statically proven non-executable BLOCKs `goal_model_execution` only; relative path is UNKNOWN with `CODEX_CLI_PATH_CONTEXT_UNKNOWN` because the standalone Doctor cannot establish the launcher process cwd (the Session cwd is passed separately as Codex `-C`); optional-only BLOCK exit 0. Permission/metadata ambiguity is UNKNOWN, not an invented absence. |
 | 11 | Version probe timeout | Explicit Codex version probe with a test process that stalls. | Per-process deadline, process-group termination and reap; output discarded; `CODEX_CLI_VERSION_TIMEOUT`, version null, check UNKNOWN. Optional capability UNKNOWN does not alter required exit 0. No retry or login/API/model command. |
 | 12 | Unsupported architecture | Inject an OS/architecture pair outside the checked install matrix. | `host_target=null`, `support_status=unsupported`, `HOST_TARGET_UNSUPPORTED`; all affected required capabilities UNKNOWN (not PASS and not guessed to another target); exit 2 absent a required BLOCK. |
 | 13 | Symlink behavior UNKNOWN | Do not create/relaunch a symlink. Inject only the platform's observed `current_exe` metadata. | Sibling resolution uses the observed executable directory only; origin check UNKNOWN with `INSTALL_SYMLINK_ORIGIN_UNKNOWN`; no symlink claim or mutation; advisory-only result does not fail required exit. |
@@ -60,6 +60,7 @@ UNKNOWN does not change the exit code.
 | 18 | Unexpected stdout contamination | Run JSON mode while injecting internal logging/warnings. | stdout contains exactly one valid JSON object plus trailing newline and nothing else; successful diagnostic stderr is empty. Logs/errors must be redirected to stderr or suppressed. Any prefix/suffix/banners fail the test. |
 | 19 | No Session/Goal creation | Use test seams that fail if Session create/load/save, approval listener, MCP serve, Goal store, Task store, or model transport is called. | `doctor`, JSON mode, and help make zero such calls; no state directory/session/goal file is created; current `start` default and `mcp` regressions still pass. |
 | 20 | No filesystem mutations | Snapshot a test-owned tree and relevant environment values before/after static Doctor; explicit external probe without verified read-only containment uses a runner that records if spawned. | No creates/writes/deletes/chmod/symlink changes; PATH/config/environment unchanged; unsafe probe is refused before spawn; output contains no project/home paths. Hash/mode/symlink snapshots are identical. |
+| 21 | Helper symlink/reparse behavior | Feed the same test-owned sibling candidates to Runtime `first_existing` and Doctor inspection for an ordinary sibling, missing file, same-directory and external regular-file symlinks/reparse points, broken link, and directory-target link. Never execute a helper. | Runtime and Doctor both accept only the ordinary regular sibling; missing/linked/non-regular entries are refused by Runtime and BLOCKed by Doctor. Runtime's check concerns only the final entry; it does not certify ancestors, install-directory trust, or spawn-time identity. Windows checks must confirm a reparse-point entry is detected without following it; fixture creation denied by the host is recorded as NOT RUN, not PASS. |
 
 ## 3. Additional contract tests
 
@@ -90,6 +91,9 @@ UNKNOWN does not change the exit code.
   or UNKNOWN never changes the required exit; it remains in the report.
 - `not_run`, timeout, malformed output, unsupported architecture, and OS N/A
   are never PASS.
+- For every fixture and producer report, capability `status`, `formal_status`,
+  `runtime_status`, requirement, and reason codes are recomputed from applicable
+  checks; schema-valid semantic mismatches fail.
 - Formal and runtime status aggregation is independent. Formal PASS with runtime
   UNKNOWN remains runtime UNKNOWN; no code path copies formal status into
   runtime status.
@@ -104,7 +108,8 @@ UNKNOWN does not change the exit code.
 - Install helper lookup calls the shared `install_contract::sibling_candidates`
   rule (or the narrow public seam extracted from it), and never uses cwd/PATH.
 - Codex resolver follows the current precedence and never falls through after a
-  selected explicit override proves invalid.
+  selected explicit override proves invalid. Windows suffix and search-path
+  tests use Rust 1.96 behavior; incomplete default OS search remains UNKNOWN.
 - Linux version parser accepts `0.12.0` and later strict numeric triplets and
   rejects below-minimum, malformed, overflow, extra components, or unsupported
   suffixes exactly as the shared support gate does. Bubblewrap nonzero exit,

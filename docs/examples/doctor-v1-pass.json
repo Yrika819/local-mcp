@@ -53,18 +53,20 @@
     }
   },
   "capabilities": {
-    "mcp_transport": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE", "RUNTIME_VERIFICATION_NOT_RUN"] },
-    "session_management": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE", "RUNTIME_VERIFICATION_NOT_RUN"] },
+    "mcp_transport": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE"] },
+    "session_management": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE"] },
     "sandboxed_execution": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "PASS", "reason_codes": ["CAPABILITY_AVAILABLE"] },
-    "atomic_publication": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE", "RUNTIME_VERIFICATION_NOT_RUN"] },
-    "goal_model_execution": { "requirement": "optional", "status": "UNKNOWN", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["RUNTIME_VERIFICATION_NOT_RUN"] }
+    "atomic_publication": { "requirement": "required", "status": "PASS", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE"] },
+    "goal_model_execution": { "requirement": "optional", "status": "UNKNOWN", "formal_status": "PASS", "runtime_status": "UNKNOWN", "reason_codes": ["CAPABILITY_AVAILABLE", "RUNTIME_VERIFICATION_NOT_RUN"] }
   },
   "checks": [
     { "id": "platform.support", "status": "PASS", "requirement": "required", "applicability": "applicable", "evidence_type": "formal_contract", "observed": "supported", "reason_code": "CAPABILITY_AVAILABLE", "message": "This target is in the supported matrix.", "capability": null },
     { "id": "installation.atomic_publish_sibling", "status": "PASS", "requirement": "required", "applicability": "applicable", "evidence_type": "static_observation", "observed": { "present": true, "regular_file": true, "readable": true, "executable": true }, "reason_code": "CAPABILITY_AVAILABLE", "message": "The required publication helper is beside the observed executable.", "capability": "atomic_publication" },
+    { "id": "installation.codex_linux_sandbox_sibling", "status": "PASS", "requirement": "required", "applicability": "applicable", "evidence_type": "static_observation", "observed": true, "reason_code": "CAPABILITY_AVAILABLE", "message": "The required sandbox helper is beside the observed executable.", "capability": "sandboxed_execution" },
     { "id": "capability.mcp_transport_contract", "status": "PASS", "requirement": "required", "applicability": "applicable", "evidence_type": "formal_contract", "observed": "declared", "reason_code": "CAPABILITY_AVAILABLE", "message": "MCP transport is included in this build contract.", "capability": "mcp_transport" },
     { "id": "capability.session_management_contract", "status": "PASS", "requirement": "required", "applicability": "applicable", "evidence_type": "formal_contract", "observed": "declared", "reason_code": "CAPABILITY_AVAILABLE", "message": "Session management is included in this build contract; no Session was created.", "capability": "session_management" },
     { "id": "sandbox.runtime_evidence", "status": "PASS", "requirement": "required", "applicability": "applicable", "evidence_type": "runtime_read_only", "observed": { "fixture_only": true, "version_gate": "0.12.0", "runtime_prerequisites": "verified_by_injected_evidence" }, "reason_code": "CAPABILITY_AVAILABLE", "message": "Synthetic contract fixture only; this is not a Doctor probe or E2E observation.", "capability": "sandboxed_execution" },
+    { "id": "goal_model.codex_cli", "status": "PASS", "requirement": "optional", "applicability": "applicable", "evidence_type": "static_observation", "observed": true, "reason_code": "CAPABILITY_AVAILABLE", "message": "A regular, readable Codex CLI candidate has static execute permission; it was not launched.", "capability": "goal_model_execution" },
     { "id": "goal_model.execution_not_run", "status": "UNKNOWN", "requirement": "optional", "applicability": "applicable", "evidence_type": "not_run", "observed": null, "reason_code": "RUNTIME_VERIFICATION_NOT_RUN", "message": "Authentication and model execution are intentionally not tested.", "capability": "goal_model_execution" },
     { "id": "installation.symlink_origin", "status": "UNKNOWN", "requirement": "optional", "applicability": "applicable", "evidence_type": "not_run", "observed": null, "reason_code": "INSTALL_SYMLINK_ORIGIN_UNKNOWN", "message": "No symlink launch was created or attempted.", "capability": null },
     { "id": "installation.nix_validation", "status": "UNKNOWN", "requirement": "optional", "applicability": "applicable", "evidence_type": "not_run", "observed": null, "reason_code": "INSTALL_NIX_UNVERIFIED", "message": "Nix build and run behavior are not verified by this fixture.", "capability": null }
@@ -74,8 +76,8 @@
     "required_status": "PASS",
     "advisory_status": "UNKNOWN",
     "runtime_status": "UNKNOWN",
-    "counts": { "PASS": 5, "WARN": 0, "BLOCK": 0, "UNKNOWN": 3 },
-    "checks_total": 8,
+    "counts": { "PASS": 7, "WARN": 0, "BLOCK": 0, "UNKNOWN": 3 },
+    "checks_total": 10,
     "required_blockers": 0,
     "required_unknowns": 0,
     "exit_code": 0

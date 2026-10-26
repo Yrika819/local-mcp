@@ -513,6 +513,68 @@ impl DoctorReport {
         {
             return Err(());
         }
+        let sandbox_requirement = if self.platform.operating_system == OperatingSystem::Windows {
+            Requirement::NotApplicable
+        } else {
+            Requirement::Required
+        };
+        if self.checks.iter().any(|check| {
+            if (check.requirement == Requirement::NotApplicable)
+                != (check.applicability == Applicability::NotApplicable)
+            {
+                return true;
+            }
+            let Some(id) = check.capability else {
+                return false;
+            };
+            let expected_requirement = match id {
+                CapabilityId::McpTransport
+                | CapabilityId::SessionManagement
+                | CapabilityId::AtomicPublication => Requirement::Required,
+                CapabilityId::SandboxedExecution => sandbox_requirement,
+                CapabilityId::GoalModelExecution => Requirement::Optional,
+            };
+            check.requirement != expected_requirement
+        }) {
+            return Err(());
+        }
+        for (actual, id, requirement) in [
+            (
+                &self.capabilities.mcp_transport,
+                CapabilityId::McpTransport,
+                Requirement::Required,
+            ),
+            (
+                &self.capabilities.session_management,
+                CapabilityId::SessionManagement,
+                Requirement::Required,
+            ),
+            (
+                &self.capabilities.sandboxed_execution,
+                CapabilityId::SandboxedExecution,
+                sandbox_requirement,
+            ),
+            (
+                &self.capabilities.atomic_publication,
+                CapabilityId::AtomicPublication,
+                Requirement::Required,
+            ),
+            (
+                &self.capabilities.goal_model_execution,
+                CapabilityId::GoalModelExecution,
+                Requirement::Optional,
+            ),
+        ] {
+            let expected = capability(&self.checks, id, requirement);
+            if actual.requirement != requirement
+                || actual.status != expected.status
+                || actual.formal_status != expected.formal_status
+                || actual.runtime_status != expected.runtime_status
+                || actual.reason_codes != expected.reason_codes
+            {
+                return Err(());
+            }
+        }
         Ok(())
     }
 }
@@ -1622,7 +1684,7 @@ fn unknown_helper(name: &'static str, required: bool) -> Helper {
 fn observe_regular_file(path: &Path) -> (Option<bool>, Option<bool>) {
     match fs::symlink_metadata(path) {
         Ok(entry) => {
-            let regular = entry.file_type().is_file();
+            let regular = crate::install_contract::is_plain_file(&entry);
             (Some(true), Some(regular))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => (Some(false), None),
@@ -2022,9 +2084,14 @@ fn codex_report(input: &DoctorInput) -> (CodexCli, Vec<DiagnosticCheck>) {
                 selected_path = None;
             }
         }
+    } else if input.codex_source == CodexSource::Path && input.host.os != OperatingSystem::Windows {
+        selected_path = resolve_codex_on_path(
+            selected_path.as_deref(),
+            input.path_environment.as_deref(),
+            input.host.os,
+        );
     } else if input.codex_source == CodexSource::Path {
-        selected_path =
-            resolve_codex_on_path(selected_path.as_deref(), input.path_environment.as_deref());
+        selected_path = None;
     }
     let observation = selected_path.as_deref().map(observe_codex_path);
     let candidate_observed = observation.is_some();
@@ -2045,7 +2112,15 @@ fn codex_report(input: &DoctorInput) -> (CodexCli, Vec<DiagnosticCheck>) {
             DiagnosticStatus::Unknown,
             DiagnosticStatus::Unknown,
             ReasonCode::CodexCliPathContextUnknown,
-            "The selected relative Codex override cannot be resolved without a Session cwd.",
+            "The selected relative Codex override depends on the launcher context, which standalone Doctor cannot establish.",
+        )
+    } else if input.codex_source == CodexSource::Path && input.host.os == OperatingSystem::Windows {
+        (
+            CodexFileStatus::Unknown,
+            DiagnosticStatus::Unknown,
+            DiagnosticStatus::Unknown,
+            ReasonCode::RuntimeVerificationNotRun,
+            "Windows process resolution also checks executable-adjacent and system directories; Doctor does not infer the selected candidate from PATH alone.",
         )
     } else if !candidate_observed {
         if explicit {
@@ -2209,16 +2284,27 @@ fn observe_codex_path(path: &Path) -> (Option<bool>, Option<bool>, Option<bool>)
     }
 }
 
-fn resolve_codex_on_path(command: Option<&Path>, path: Option<&OsStr>) -> Option<PathBuf> {
+fn codex_search_path_entries(path: &OsStr, os: OperatingSystem) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|directory| os != OperatingSystem::Windows || !directory.as_os_str().is_empty())
+        .collect()
+}
+
+fn resolve_codex_on_path(
+    command: Option<&Path>,
+    path: Option<&OsStr>,
+    os: OperatingSystem,
+) -> Option<PathBuf> {
     let command = command?;
     let name = command.file_name()?;
     let path = path?;
-    let extensions: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".com", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
-    for directory in std::env::split_paths(path) {
+    let extensions: &[&str] =
+        if os == OperatingSystem::Windows && !name.as_encoded_bytes().contains(&b'.') {
+            &[".exe"]
+        } else {
+            &[""]
+        };
+    for directory in codex_search_path_entries(path, os) {
         for extension in extensions {
             let mut candidate_name = OsString::from(name);
             candidate_name.push(extension);
@@ -3007,6 +3093,150 @@ mod tests {
     }
 
     #[test]
+    fn runtime_and_doctor_both_reject_helper_symlink_entries() {
+        let root = TestRoot::new();
+        let bin = root.path().join("bin");
+        let external = root.path().join("outside-sibling");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        let executable = bin.join(if cfg!(windows) {
+            "local-mcp.exe"
+        } else {
+            "local-mcp"
+        });
+        create_file(&executable, b"test-owned executable", true);
+        let helper_name = crate::install_contract::ATOMIC_PUBLISH;
+        let candidate = bin.join(helper_name);
+
+        create_file(&candidate, b"ordinary helper fixture", true);
+        assert!(candidate.is_file());
+        assert_eq!(
+            crate::install_contract::first_existing(std::slice::from_ref(&candidate)),
+            Some(candidate.clone())
+        );
+        let (ordinary, _, _, _) = inspect_helper(
+            Some(&executable),
+            helper_name,
+            true,
+            true,
+            HostFacts::current().os,
+        );
+        assert_eq!(ordinary.present, Some(true));
+        assert_eq!(ordinary.regular_file, Some(true));
+        fs::remove_file(&candidate).unwrap();
+        assert!(!candidate.is_file());
+        assert_eq!(
+            crate::install_contract::first_existing(std::slice::from_ref(&candidate)),
+            None
+        );
+
+        let same_directory_target = bin.join("helper-target");
+        create_file(&same_directory_target, b"same-directory target", true);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&same_directory_target, &candidate).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&same_directory_target, &candidate)
+            .expect("create a test-owned file symlink/reparse point");
+        assert!(candidate.is_file());
+        assert_eq!(
+            crate::install_contract::first_existing(std::slice::from_ref(&candidate)),
+            None
+        );
+        assert!(
+            fs::symlink_metadata(&candidate)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let (same_directory_link, same_directory_status, _, _) = inspect_helper(
+            Some(&executable),
+            helper_name,
+            true,
+            true,
+            HostFacts::current().os,
+        );
+        assert_eq!(same_directory_link.present, Some(true));
+        assert_eq!(same_directory_link.regular_file, Some(false));
+        assert_eq!(same_directory_status, DiagnosticStatus::Block);
+        fs::remove_file(&candidate).unwrap();
+
+        let outside_target = external.join("helper-target");
+        create_file(&outside_target, b"outside-sibling target", true);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_target, &candidate).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_target, &candidate)
+            .expect("create a test-owned external file symlink/reparse point");
+        assert!(candidate.is_file());
+        assert_eq!(
+            crate::install_contract::first_existing(std::slice::from_ref(&candidate)),
+            None
+        );
+        let (outside_link, outside_status, _, _) = inspect_helper(
+            Some(&executable),
+            helper_name,
+            true,
+            true,
+            HostFacts::current().os,
+        );
+        assert_eq!(outside_link.present, Some(true));
+        assert_eq!(outside_link.regular_file, Some(false));
+        assert_eq!(outside_status, DiagnosticStatus::Block);
+        fs::remove_file(&candidate).unwrap();
+
+        let broken_target = external.join("missing-helper-target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&broken_target, &candidate).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&broken_target, &candidate)
+            .expect("create a test-owned broken file symlink/reparse point");
+        assert!(!candidate.is_file());
+        assert_eq!(
+            crate::install_contract::first_existing(std::slice::from_ref(&candidate)),
+            None
+        );
+        let (broken_link, broken_status, _, _) = inspect_helper(
+            Some(&executable),
+            helper_name,
+            true,
+            true,
+            HostFacts::current().os,
+        );
+        assert_eq!(broken_link.present, Some(true));
+        assert_eq!(broken_status, DiagnosticStatus::Block);
+        fs::remove_file(&candidate).unwrap();
+
+        let directory_target = external.join("directory-target");
+        fs::create_dir(&directory_target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&directory_target, &candidate).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&directory_target, &candidate)
+            .expect("create a test-owned directory symlink/reparse point");
+        assert!(!candidate.is_file());
+        assert_eq!(
+            crate::install_contract::first_existing(std::slice::from_ref(&candidate)),
+            None
+        );
+        assert!(
+            fs::symlink_metadata(&candidate)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let (directory_link, directory_status, _, _) = inspect_helper(
+            Some(&executable),
+            helper_name,
+            true,
+            true,
+            HostFacts::current().os,
+        );
+        assert_eq!(directory_link.present, Some(true));
+        assert_eq!(directory_link.regular_file, Some(false));
+        assert_eq!(directory_status, DiagnosticStatus::Block);
+    }
+
+    #[test]
     fn forbidden_helper_presence_blocks_install_contract_integrity() {
         let root = TestRoot::new();
         let input = test_input(OperatingSystem::Windows, Architecture::X86_64, &root);
@@ -3062,9 +3292,36 @@ mod tests {
     }
 
     #[test]
-    fn missing_codex_blocks_only_optional_goal_model_execution() {
+    fn windows_default_codex_resolution_is_unknown_and_does_not_block_required_capabilities() {
         let root = TestRoot::new();
         let mut input = test_input(OperatingSystem::Windows, Architecture::X86_64, &root);
+        input.codex_source = CodexSource::Path;
+        input.codex_path = Some(PathBuf::from("codex"));
+        input.path_environment = None;
+        let report = build_report(input);
+        assert_eq!(
+            report.capabilities.goal_model_execution.status,
+            DiagnosticStatus::Unknown
+        );
+        assert_eq!(
+            report.capabilities.mcp_transport.status,
+            DiagnosticStatus::Pass
+        );
+        assert_eq!(
+            report.capabilities.session_management.status,
+            DiagnosticStatus::Pass
+        );
+        assert!(report.checks.iter().any(|check| {
+            check.reason_code == ReasonCode::RuntimeVerificationNotRun
+                && check.capability == Some(CapabilityId::GoalModelExecution)
+        }));
+        assert_eq!(report.summary.exit_code, ExitCode::Success);
+    }
+
+    #[test]
+    fn non_windows_missing_codex_blocks_only_the_optional_goal_model_capability() {
+        let root = TestRoot::new();
+        let mut input = test_input(OperatingSystem::Linux, Architecture::X86_64, &root);
         input.codex_source = CodexSource::Path;
         input.codex_path = Some(PathBuf::from("codex"));
         input.path_environment = None;
@@ -3085,8 +3342,7 @@ mod tests {
             check.reason_code == ReasonCode::CodexCliNotFound
                 && check.capability == Some(CapabilityId::GoalModelExecution)
         }));
-        #[cfg(windows)]
-        assert_eq!(report.summary.exit_code, ExitCode::Success);
+        assert_ne!(report.summary.exit_code, ExitCode::RequiredBlock);
     }
 
     #[test]
@@ -3115,14 +3371,84 @@ mod tests {
         let root = TestRoot::new();
         let codex_dir = root.path().join("codex-path");
         fs::create_dir(&codex_dir).unwrap();
-        #[cfg(windows)]
-        let codex_name = "codex.exe";
-        #[cfg(not(windows))]
-        let codex_name = "codex";
+        let (host, codex_name) = if cfg!(windows) {
+            (OperatingSystem::Windows, "codex.exe")
+        } else {
+            (HostFacts::current().os, "codex")
+        };
         let codex = codex_dir.join(codex_name);
         create_file(&codex, b"not launched", true);
-        let resolved = resolve_codex_on_path(Some(Path::new("codex")), Some(codex_dir.as_os_str()));
+        let resolved =
+            resolve_codex_on_path(Some(Path::new("codex")), Some(codex_dir.as_os_str()), host);
         assert_eq!(resolved.as_deref(), Some(codex.as_path()));
+    }
+
+    #[test]
+    fn windows_bare_codex_uses_only_exe_and_skips_empty_path_entries() {
+        let root = TestRoot::new();
+        let bin = root.path().join("codex-path");
+        fs::create_dir(&bin).unwrap();
+        for suffix in ["", ".com", ".cmd", ".bat"] {
+            let candidate = bin.join(format!("codex{suffix}"));
+            create_file(&candidate, b"not launched", true);
+            assert_eq!(
+                resolve_codex_on_path(
+                    Some(Path::new("codex")),
+                    Some(bin.as_os_str()),
+                    OperatingSystem::Windows,
+                ),
+                None,
+                "bare Command::new(\"codex\") must not infer {suffix:?}"
+            );
+            fs::remove_file(candidate).unwrap();
+        }
+        let exe = bin.join("codex.exe");
+        create_file(&exe, b"not launched", true);
+        let path_with_empty_entry = std::env::join_paths([PathBuf::new(), bin.clone()]).unwrap();
+        assert_eq!(
+            codex_search_path_entries(&path_with_empty_entry, OperatingSystem::Windows),
+            vec![bin.clone()]
+        );
+        assert_eq!(
+            resolve_codex_on_path(
+                Some(Path::new("codex")),
+                Some(path_with_empty_entry.as_os_str()),
+                OperatingSystem::Windows,
+            ),
+            Some(exe)
+        );
+    }
+
+    #[test]
+    fn windows_default_codex_path_diagnostic_is_unknown_not_a_path_only_guess() {
+        let root = TestRoot::new();
+        let mut input = test_input(OperatingSystem::Windows, Architecture::X86_64, &root);
+        let path_dir = root.path().join("fake-runtime-path");
+        fs::create_dir(&path_dir).unwrap();
+        create_file(&path_dir.join("codex.exe"), b"never launched", true);
+        input.codex_source = CodexSource::Path;
+        input.codex_path = Some(PathBuf::from("codex"));
+        input.path_environment = Some(path_dir.clone().into_os_string());
+        let report = build_report(input);
+        assert_eq!(
+            report.dependencies.codex_cli.file_status,
+            CodexFileStatus::Unknown
+        );
+        assert_eq!(
+            report.dependencies.codex_cli.executable_status,
+            DiagnosticStatus::Unknown
+        );
+        assert_eq!(
+            report.capabilities.goal_model_execution.status,
+            DiagnosticStatus::Unknown
+        );
+        assert_eq!(
+            report.capabilities.mcp_transport.status,
+            DiagnosticStatus::Pass
+        );
+        assert_eq!(report.summary.exit_code, ExitCode::Success);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains(&path_dir.to_string_lossy().to_string()));
     }
 
     #[test]
@@ -3261,6 +3587,49 @@ mod tests {
         for check in value["checks"].as_array().unwrap() {
             assert!(check["observed"].is_null() || check["observed"].is_boolean());
         }
+    }
+
+    #[test]
+    fn report_validation_rejects_capability_status_drift_from_checks() {
+        let root = TestRoot::new();
+        let mut report = build_report(test_input(
+            OperatingSystem::Windows,
+            Architecture::X86_64,
+            &root,
+        ));
+        assert!(report.validate().is_ok());
+        report.capabilities.mcp_transport.status = DiagnosticStatus::Block;
+        assert!(report.validate().is_err());
+        assert!(json_output(&report).is_err());
+    }
+
+    #[test]
+    fn report_validation_rejects_check_requirement_drift_that_hides_a_required_blocker() {
+        let root = TestRoot::new();
+        let mut report = build_report(test_input(
+            OperatingSystem::Windows,
+            Architecture::X86_64,
+            &root,
+        ));
+        let helper_check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == "installation.helper.atomic_publish")
+            .unwrap();
+        helper_check.status = DiagnosticStatus::Block;
+        helper_check.requirement = Requirement::Optional;
+        report.capabilities.atomic_publication = capability(
+            &report.checks,
+            CapabilityId::AtomicPublication,
+            Requirement::Required,
+        );
+        report.summary = summarize_checks(&report.checks);
+        assert_eq!(report.summary.exit_code, ExitCode::Success);
+        assert_eq!(
+            report.capabilities.atomic_publication.status,
+            DiagnosticStatus::Block
+        );
+        assert!(report.validate().is_err());
     }
 
     #[test]
@@ -3403,6 +3772,82 @@ mod tests {
             assert_eq!(summary["counts"]["BLOCK"], counts[2]);
             assert_eq!(summary["counts"]["UNKNOWN"], counts[3]);
             assert!(checks.len() <= MAX_CHECKS);
+
+            let sandbox_requirement = if value["platform"]["operating_system"] == "windows" {
+                "not_applicable"
+            } else {
+                "required"
+            };
+            for (capability_name, expected_requirement) in [
+                ("mcp_transport", "required"),
+                ("session_management", "required"),
+                ("sandboxed_execution", sandbox_requirement),
+                ("atomic_publication", "required"),
+                ("goal_model_execution", "optional"),
+            ] {
+                let capability = &value["capabilities"][capability_name];
+                assert_eq!(capability["requirement"], expected_requirement);
+                if expected_requirement == "not_applicable" {
+                    assert_eq!(capability["status"], "UNKNOWN");
+                    assert_eq!(capability["formal_status"], "UNKNOWN");
+                    assert_eq!(capability["runtime_status"], "UNKNOWN");
+                    assert_eq!(
+                        capability["reason_codes"],
+                        serde_json::json!(["SANDBOX_PARITY_NOT_APPLICABLE"])
+                    );
+                    continue;
+                }
+                let related: Vec<&serde_json::Value> = checks
+                    .iter()
+                    .filter(|check| {
+                        check["capability"] == capability_name
+                            && check["applicability"] == "applicable"
+                    })
+                    .collect();
+                assert_eq!(
+                    fixture_status(&capability["status"]),
+                    aggregate_status(related.iter().map(|check| fixture_status(&check["status"])))
+                );
+                assert_eq!(
+                    fixture_status(&capability["formal_status"]),
+                    aggregate_status(
+                        related
+                            .iter()
+                            .filter(|check| {
+                                matches!(
+                                    check["evidence_type"].as_str(),
+                                    Some("static_observation" | "formal_contract")
+                                )
+                            })
+                            .map(|check| fixture_status(&check["status"])),
+                    )
+                );
+                assert_eq!(
+                    fixture_status(&capability["runtime_status"]),
+                    aggregate_status(
+                        related
+                            .iter()
+                            .filter(|check| {
+                                matches!(
+                                    check["evidence_type"].as_str(),
+                                    Some("runtime_read_only" | "not_run")
+                                )
+                            })
+                            .map(|check| fixture_status(&check["status"])),
+                    )
+                );
+                let expected_reasons: BTreeSet<String> = related
+                    .iter()
+                    .map(|check| check["reason_code"].as_str().unwrap().to_owned())
+                    .collect();
+                let actual_reasons: BTreeSet<String> = capability["reason_codes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|reason| reason.as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(actual_reasons, expected_reasons);
+            }
         }
     }
 
