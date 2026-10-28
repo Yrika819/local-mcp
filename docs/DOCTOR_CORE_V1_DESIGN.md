@@ -1,12 +1,40 @@
 # GoalLatch Doctor Core V1 — Design & Contract
 
-Status: **design freeze candidate; no production command is implemented by this
-change**. This document defines a session-independent, read-only diagnostic
-surface for a future Rust implementation. The JSON contract is defined by
+Status: **implemented** as `local-mcp doctor` (Doctor Core V1). This document is
+the design and contract for a session-independent, read-only diagnostic surface.
+The JSON contract is defined by
 [`schemas/doctor-v1.schema.json`](schemas/doctor-v1.schema.json); the contract
-test matrix is in [`DOCTOR_CORE_V1_TEST_PLAN.md`](DOCTOR_CORE_V1_TEST_PLAN.md).
-The JSON files in [`examples/`](examples/) are synthetic schema fixtures, not
-observations from a running `local-mcp doctor` command.
+test matrix, including which cases are implemented and which remain open, is in
+[`DOCTOR_CORE_V1_TEST_PLAN.md`](DOCTOR_CORE_V1_TEST_PLAN.md).
+
+Two artifacts are easy to confuse:
+
+- `local-mcp doctor --json` prints one report produced by this code on this host.
+- The JSON files in [`examples/`](examples/) are **synthetic schema fixtures**.
+  They exercise the schema surface, including evidence shapes this build never
+  emits (for example an executed Bubblewrap version probe, which is always
+  `attempted: false` here). They are not captured output, not observations, and
+  not proof of runtime behaviour.
+
+## 0. Implementation status
+
+| Item | Status |
+| --- | --- |
+| `doctor`, `doctor --json`, `doctor --help`, `help doctor` | implemented |
+| Exit codes `0` (PASS/WARN), `1` (required BLOCK), `2` (required UNKNOWN) | implemented |
+| Exit code `64` (Doctor usage error), `70` (internal serialization failure) | implemented |
+| Read-only static and formal checks | implemented |
+| Version probes (`--probe-codex-version`, `--probe-bubblewrap-version`) | deliberate refusal: no process is started, the probe reports `attempted: false` and UNKNOWN |
+| JSON Schema CI conformance gate | implemented in CI (`scripts/doctor/schema-validator`) |
+| Runtime execution evidence, ACL/ancestor enforcement, image identity | not implemented by design; see the runtime audit |
+
+Because no probe runs, `dependencies.bubblewrap.minimum_version` and
+`dependencies.codex_cli.version_probe` are UNKNOWN on Linux and macOS even on a
+healthy host. When the sandbox capability is required, that UNKNOWN is a
+**required** UNKNOWN, so `doctor` exits `2` on those hosts. This is deliberate:
+an unrun probe is not evidence, and treating it as PASS would advertise a
+capability nobody observed. Use the exit code as "not established", not as
+"broken", and do not add an opt-in that turns an unrun probe into PASS.
 
 Audited base: `6f39cc871a760bdd6183353681246f53a4eac9a5` (main; PR #18 and #19
 integrated). The Doctor design must reuse the current runtime contracts, not
@@ -310,12 +338,16 @@ relaunch, the symlink-origin check is UNKNOWN
 (`INSTALL_SYMLINK_ORIGIN_UNKNOWN`). Required helper regular-file status is about
 the sibling directory entry itself: symlink/reparse-point entries are not
 reported as regular helpers and BLOCK the install-contract check. This is
-intentionally conservative; the current Runtime `Path::is_file()` resolver
-follows a helper symlink to a regular target, so Doctor's check does not enforce
-Runtime containment. External helper-link targets remain a separate Runtime
-security concern and are not changed by Doctor. A passing direct `--version`
-invocation is not proof of helper resolution. Nix's expected `$out/bin`
-layout/wrapper behavior is documented but `nix build`/`nix run` remain
+intentionally conservative and it agrees with the runtime: since Security V2 the
+runtime rejects a final helper symlink or reparse entry through the shared
+`install_contract::is_plain_file` predicate, and Doctor calls that same predicate
+(`src/doctor.rs` `inspect_helper_entry`). Both sides refuse a linked entry. What
+neither side does is bind the inspected directory entry to the image the OS opens
+later, so Doctor does not claim runtime image identity, ancestor containment, or
+ACL enforcement. External helper-link targets and replacement races remain a
+Runtime provenance concern and are not changed by Doctor. A passing direct
+`--version` invocation is not proof of helper resolution. Nix's expected
+`$out/bin` layout/wrapper behavior is documented but `nix build`/`nix run` remain
 unverified; report `INSTALL_NIX_UNVERIFIED` as UNKNOWN, never PASS.
 
 `install_contract_version` is the checked-in contract version (`1`), not proof

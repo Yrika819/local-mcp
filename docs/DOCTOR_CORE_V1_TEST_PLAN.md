@@ -1,13 +1,40 @@
 # GoalLatch Doctor Core V1 — Contract Test Plan
 
-Status: **test specification only**. Doctor is not implemented in this design
-campaign. No command-level E2E, cross-platform runtime test, or production
-behavior is claimed PASS here. The JSON files in `examples/` are synthetic
-serialization fixtures used to validate the contract, not Doctor output captured
-from a running binary.
+Status: **implemented**. `local-mcp doctor` exists and this plan is the contract
+test matrix for it. Cases marked *implemented* below are backed by a test in
+`src/doctor.rs` or `tests/doctor_cli.rs`; cases marked *open* are contract
+requirements that the current build does not exercise and that must not be
+described as passing. The JSON files in `examples/` are synthetic serialization
+fixtures, not Doctor output captured from a running binary.
 
 Normative contracts: [`DOCTOR_CORE_V1_DESIGN.md`](DOCTOR_CORE_V1_DESIGN.md) and
 [`schemas/doctor-v1.schema.json`](schemas/doctor-v1.schema.json).
+
+### Implementation status of the required cases
+
+| # | Case | Status | Evidence |
+| ---: | --- | --- | --- |
+| 1 | Windows Experimental | implemented | `windows_is_experimental_and_sandbox_parity_is_not_applicable` |
+| 2 | Linux Bubblewrap missing | implemented | `linux_bubblewrap_missing_is_a_required_sandbox_block` |
+| 3 | Bubblewrap below 0.12.0 | implemented | `bubblewrap_old_version_uses_the_shared_minimum_gate` |
+| 4 | Bubblewrap 0.12.0+ | implemented | `unprobed_bubblewrap_is_unknown_even_when_the_binary_is_present`; the version gate passes but runtime prerequisites stay UNKNOWN |
+| 5 | Required helper missing | implemented | `missing_required_helper_blocks_only_its_capability_and_path_never_falls_back` |
+| 6 | Helper in wrong directory | implemented | same test; candidate count stays exactly one |
+| 7 | PATH-only helper | implemented | `path_codex_resolution_is_distinct_from_helper_resolution` |
+| 8 | Codex CLI missing | implemented | `non_windows_missing_codex_blocks_only_the_optional_goal_model_capability`, `windows_default_codex_resolution_is_unknown_and_does_not_block_required_capabilities` |
+| 9 | Codex override precedence | implemented | `codex_resolver_precedence_is_exact_and_override_invalidity_does_not_fall_through` |
+| 10 | Malformed Codex path | implemented | `malformed_codex_path_is_blocked_without_exposing_the_path`, `nul_in_codex_override_is_malformed_and_does_not_fall_through` |
+| 11 | Version probe timeout | **open** | No probe is executed in V1, so there is no probe timeout path to test. `CODEX_CLI_VERSION_TIMEOUT` exists in the contract but is unreachable until a reviewed probe is added. |
+| 12 | Unsupported architecture | partial | Host facts are injected and an unsupported pair maps to UNKNOWN, but there is no dedicated per-pair test. Do not claim it as covered. |
+| 13 | Symlink origin UNKNOWN | implemented | `doctor_json_is_pure_redacted_bounded_and_does_not_mutate_state` plus the symlink-origin reason code |
+| 14 | Nix not verified | implemented | `installation.nix_validation` is UNKNOWN with `INSTALL_NIX_UNVERIFIED` |
+| 15 | Multiple WARN aggregation | implemented | `status_truth_table_covers_every_three_check_combination` |
+| 16 | BLOCK and UNKNOWN aggregation | implemented | `required_unknown_and_block_precedence_are_deterministic` |
+| 17 | JSON Schema invalid fields | implemented in CI | `scripts/doctor/schema-validator` (Draft 2020-12, 8 negative controls) |
+| 18 | stdout contamination | implemented | `report_json_is_single_bounded_object_with_trailing_newline`, `doctor_json_is_pure_redacted_bounded_and_does_not_mutate_state` |
+| 19 | No Session/Goal creation | implemented | `doctor_cli.rs` state snapshot before/after each command |
+| 20 | No filesystem mutations | implemented for the static path | `doctor_cli.rs` snapshot includes files, sizes, modes and symlinks |
+| 21 | Helper symlink/reparse | implemented | `runtime_and_doctor_both_reject_helper_symlink_entries`; a host that refuses the fixture records NOT RUN, not PASS |
 
 ## 1. Harness and evidence policy
 
@@ -149,20 +176,44 @@ UNKNOWN does not change the exit code.
 | `examples/doctor-v1-block.json` | BLOCK | Required sandbox dependency is below the minimum. |
 | `examples/doctor-v1-unknown.json` | UNKNOWN | Required evidence was not safely obtained. |
 
-Fixtures are schema/contract artifacts, not tests that execute Doctor. CI for a
-future implementation must separately run pure contract tests and native CLI
-checks. Doctor E2E must remain **NOT RUN / NOT IMPLEMENTED** until PR-I02B adds
-the production command; a fixture's `PASS` is not an E2E PASS.
+Fixtures are schema/contract artifacts, not observations. CI validates them with
+the Draft 2020-12 validator in `scripts/doctor/schema-validator`, and separately
+validates the JSON that `local-mcp doctor --json` actually prints on the native
+runner. A fixture's `PASS` is not an E2E PASS, and the `pass` fixture's executed
+version probe (`attempted: true`) is a shape the current producer never emits.
 
-## 5. Verification plan for PR-I02B (future)
+The three evidence classes are deliberately distinct:
 
-1. Add status/exit pure tests and schema-shaped serialization tests.
-2. Add injected resolver/probe runner tests; ensure tests cannot reach real
-   Codex, shell, network, or user files.
-3. Add CLI stream/exit/help tests and negative Session/Goal/filesystem tests.
-4. Run JSON Schema validation using an already-installed Draft 2020-12 tool;
-   do not add a validator dependency to production. If unavailable, report that
-   explicitly and still run JSON syntax plus fixture round-trip checks.
-5. Run platform-native CI. Do not equate compile success with sandbox parity.
-6. Keep the safe external-probe gate disabled until a separate review proves an
-   existing no-write/no-network boundary and tests its negative paths.
+- **Schema-valid synthetic fixtures** — exercise the schema surface, including
+  shapes the producer does not emit.
+- **Current producer-compatible JSON** — what this build prints; additionally
+  checked for the producer profile (null/boolean observations, redaction flags,
+  64 KiB bound, exit code agreement).
+- **Runtime-observed evidence** — a real probe or launch. Doctor V1 produces
+  none, so it reports UNKNOWN rather than PASS.
+
+The schema is permissive about `observed` on purpose (forward compatibility for
+additive fields). Schema validity therefore does **not** prove that strings are
+redacted or that an observation is truthful; that is enforced by the typed
+producer and checked by the producer-profile assertions above.
+
+## 5. Verification status
+
+Implemented in CI:
+
+1. Status/exit pure tests and schema-shaped serialization tests.
+2. Injected resolver/probe runner tests; no test reaches real Codex, shell,
+   network, or user files.
+3. CLI stream/exit/help tests and negative Session/Goal/filesystem tests.
+4. Draft 2020-12 schema validation of the schema document, the four fixtures,
+   corrupted fixtures (negative control) and the real producer output, using a
+   pinned validator crate with its own lock file. The runtime package gains no
+   dependency and no Python tooling.
+5. Platform-native CI. Compile success is never equated with sandbox parity.
+
+Still open, and therefore not claimed:
+
+- Case 11 (probe timeout): unreachable while no probe runs.
+- Case 12 (unsupported architecture): no dedicated per-pair test.
+- Any external probe: the safe external-probe gate stays disabled until a
+  separate review proves and tests a no-write/no-network boundary.

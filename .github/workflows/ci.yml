@@ -99,6 +99,21 @@ jobs:
           # network; native execution is covered by the test matrix below.
           python3 scripts/release/test_install_contract.py
 
+      - name: Validate the Doctor JSON schema and fixtures
+        run: |
+          set -euo pipefail
+          # Draft 2020-12 conformance for the schema document and the synthetic
+          # fixtures, plus a negative control that proves the gate actually
+          # rejects corrupted documents. The validator is a CI-only crate with
+          # its own committed lock file; the runtime package gains no
+          # dependency and no Python tooling. Producer output is validated on
+          # each native test leg below, where a real binary exists.
+          CARGO_TARGET_DIR=target/schema-validator \
+            cargo run --locked --quiet \
+            --manifest-path scripts/doctor/schema-validator/Cargo.toml -- \
+            --schema docs/schemas/doctor-v1.schema.json \
+            --fixtures docs/examples
+
   # ---------------------------------------------------------------------
   # Tier 1 - PRIMARY
   # Full locked test suite, release build, CLI smoke, and architecture
@@ -249,6 +264,22 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets
+
+      - name: Validate the emitted Doctor JSON contract
+        run: |
+          set -euo pipefail
+          # `cargo test --all-targets` builds the real binary because
+          # tests/doctor_cli.rs uses CARGO_BIN_EXE_local-mcp; the explicit build
+          # keeps this step self-sufficient if that test ever moves.
+          cargo build --locked --bin local-mcp
+          producer=target/debug/local-mcp
+          if [ "$RUNNER_OS" = Windows ]; then producer="$producer.exe"; fi
+          CARGO_TARGET_DIR=target/schema-validator \
+            cargo run --locked --quiet \
+            --manifest-path scripts/doctor/schema-validator/Cargo.toml -- \
+            --schema docs/schemas/doctor-v1.schema.json \
+            --fixtures docs/examples \
+            --producer "$producer"
 
       - name: Run native Linux restricted-network sandbox test
         if: runner.os == 'Linux'

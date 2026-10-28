@@ -497,6 +497,15 @@ impl DoctorReport {
                 return Err(());
             }
         }
+        // A check whose evidence type is `not_run` observed nothing, so it can
+        // never carry a status other than UNKNOWN. Rejecting the combination
+        // here keeps a future check from publishing "not run" as PASS or WARN
+        // even if its own construction gets it wrong.
+        if self.checks.iter().any(|check| {
+            check.evidence_type == EvidenceType::NotRun && check.status != DiagnosticStatus::Unknown
+        }) {
+            return Err(());
+        }
         let actual = summarize_checks(&self.checks);
         if actual.checks_total != self.summary.checks_total
             || actual.status != self.summary.status
@@ -3613,6 +3622,28 @@ mod tests {
         ));
         assert!(report.validate().is_ok());
         report.capabilities.mcp_transport.status = DiagnosticStatus::Block;
+        assert!(report.validate().is_err());
+        assert!(json_output(&report).is_err());
+    }
+
+    #[test]
+    fn report_validation_rejects_not_run_evidence_with_a_pass_status() {
+        let root = TestRoot::new();
+        let mut report = build_report(test_input(
+            OperatingSystem::Windows,
+            Architecture::X86_64,
+            &root,
+        ));
+        assert!(report.validate().is_ok());
+        let check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.evidence_type == EvidenceType::NotRun && check.capability.is_none())
+            .expect("the baseline report has an unrun advisory check");
+        check.status = DiagnosticStatus::Pass;
+        // Recompute every derived field so the summary is self-consistent and
+        // only the not_run rule can reject the report.
+        report.summary = summarize_checks(&report.checks);
         assert!(report.validate().is_err());
         assert!(json_output(&report).is_err());
     }
