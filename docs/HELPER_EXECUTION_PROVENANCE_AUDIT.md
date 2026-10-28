@@ -62,9 +62,13 @@ release-consistency concerns. No exploit has been demonstrated.
   helper; publication still uses the shared helper selector.
 - Windows uses the shared publication selector; it has no Linux sandbox helper
   and remains Experimental.
-- `first_existing` returns a pathname after metadata inspection. Both runtime
-  call sites later invoke it via `Command::new(path)`. That leaves a
-  check-to-open window and does not bind metadata identity to the launched image.
+- `first_existing` returns a pathname after metadata inspection. Neither call
+  site binds that inspection to the image the OS opens later. On Windows and
+  macOS the publication helper is launched directly with `Command::new(path)`.
+  On Linux the sandbox helper is also launched directly, but the `atomic-publish`
+  helper runs as the command inside that sandbox, so its pathname is re-opened
+  after the helper's Bubblewrap gate and one extra process boundary. Both shapes
+  leave a check-to-open window, and the Linux publication path has the wider one.
 
 No simpler portable `std::process::Command` mechanism is available to pin an
 opened file identity across launch. A native fd/handle execution layer would
@@ -179,36 +183,31 @@ prerequisite for every ordinary use if the trusted-install precondition is
 actually maintained, but any deployment that allows attacker changes stays
 NO-GO.
 
-## Doctor integration readiness (no Doctor edits)
+## Doctor integration contract
 
-Doctor Core V1's expected contract remains: helper symlink/reparse is BLOCK;
-unconfirmed runtime execution capability is UNKNOWN; Windows is Experimental;
-missing optional Codex does not BLOCK MCP; a probe not run is never PASS. The
-read-only inspection of the protected worktree found a stale row in
-`docs/DOCTOR_CORE_V1_TEST_PLAN.md` (case 21): it says Runtime follows
-regular-file helper links and calls this a mismatch, which predates the shared
-final-link rejection. Doctor's current implementation checks the sibling entry
-with `symlink_metadata`; its code was not changed. Reconcile that test-plan row
-and add a shared-input contract test during a separately authorized, additive
-Doctor integration. Do not edit the Doctor worktree in this campaign. Security
-V2 also does not claim Doctor proves ACL/ancestor trust or image identity.
+The Doctor implementation is not part of this change and is not present in this
+branch, so this section records the properties a Doctor integration must satisfy
+instead of observations about its code. An integrated Doctor must classify a
+helper entry that this selector refuses as BLOCK, must report unverified runtime
+execution as UNKNOWN, must keep Windows Experimental, must not BLOCK MCP when the
+optional Codex CLI is absent, and must never report an unrun probe as PASS.
+Security V2 also does not claim that Doctor proves ACL, ancestor, or image trust.
 
-After this branch is reviewed and integrated independently, Doctor integration
-must be additive and must preserve the seven user-owned files. First snapshot
-Doctor HEAD and all worktree diffs outside the worktree (no reset/stash/checkout
-over them); then manually reconcile the reviewed security commit into a fresh
-integration branch/worktree based on the then-current main, compare Doctor's
-uncommitted diff before/after byte-for-byte, and add contract tests that feed the
-same helper entry states to runtime resolution and Doctor classification.
-Required assertions: symlink/reparse => BLOCK; unknown install provenance or
-runtime identity => UNKNOWN; Windows remains Experimental; optional Codex
-absence does not block MCP; unrun probes are not PASS. Do not modify the Doctor
-worktree as part of Security V2.
+The integration must stay additive: start from the then-current `main`, feed the
+same helper entry states to runtime resolution and to Doctor classification, and
+assert that both reach the same accept/refuse decision for an ordinary sibling, a
+missing entry, a same-directory or external file symlink, a broken link, and a
+directory-target link. Any Doctor reading of an entry must not be described as
+enforcing runtime containment, because the two currently answer different
+questions: the runtime asks whether a usable regular sibling exists, and Doctor
+asks whether the directory entry itself is a regular file.
 
 ## Release and publication decision
 
-The v0.1.1 release is historical and unchanged. No release, tag, push, PR or
-merge is part of this campaign. A security PR may be opened only after the
-proposed trusted-install preconditions, OS matrix results, regression tests and
-Nix/package compatibility statements are reviewed and the PR does not claim Full
-Execution Identity Closure. Do not publish a draft as if closure were complete.
+The v0.1.1 release is historical and unchanged. This change ships no release,
+tag, or publication step and does not modify an existing release artifact. A
+build from this branch may be published only after the trusted-install
+preconditions, OS matrix results, regression tests and Nix/package compatibility
+statements in this document are reviewed, and only if the published material does
+not claim Full Execution Identity Closure. A draft must not be published as if
+closure were complete.

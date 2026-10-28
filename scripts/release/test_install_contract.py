@@ -547,6 +547,36 @@ class DocumentationTest(unittest.TestCase):
         ):
             self.assertIn(heading, text)
 
+    def test_helper_provenance_audit_is_linked_from_the_contract(self) -> None:
+        document = REPO_ROOT / "docs" / "INSTALL_CONTRACT_V1.md"
+        text = document.read_text(encoding="utf-8")
+        self.assertIn("HELPER_EXECUTION_PROVENANCE_AUDIT.md", text)
+        self.assertTrue(
+            (REPO_ROOT / "docs" / "HELPER_EXECUTION_PROVENANCE_AUDIT.md").is_file()
+        )
+
+    def test_relative_documentation_links_resolve(self) -> None:
+        # A security or contract document must not cite a file that does not
+        # exist in the tree, so a reviewer can always verify its claims.
+        documents = sorted((REPO_ROOT / "docs").rglob("*.md")) + [
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "SECURITY.md",
+            REPO_ROOT / "CONTRIBUTING.md",
+        ]
+        pattern = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+        broken: list[str] = []
+        for document in documents:
+            text = document.read_text(encoding="utf-8")
+            for match in pattern.finditer(text):
+                target = match.group(1).strip().split()[0].split("#")[0]
+                if not target or target.startswith(("http://", "https://", "mailto:")):
+                    continue
+                if not (document.parent / target).exists():
+                    broken.append(
+                        f"{document.relative_to(REPO_ROOT).as_posix()}: {target}"
+                    )
+        self.assertEqual([], broken)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
