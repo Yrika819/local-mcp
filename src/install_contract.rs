@@ -42,7 +42,7 @@ pub(crate) fn sibling_candidates(executable: &Path, helper: &str) -> Vec<PathBuf
         .unwrap_or_default()
 }
 
-fn is_plain_file(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_plain_file(metadata: &std::fs::Metadata) -> bool {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return false;
     }

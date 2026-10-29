@@ -149,6 +149,7 @@ credentials in Issues.
 - [Hands-on examples](docs/examples/README.md)
 - [Security policy and model](SECURITY.md)
 - [Installation details](docs/release/INSTALL.md)
+- [Doctor Core V1 design and diagnostic contract](docs/DOCTOR_CORE_V1_DESIGN.md)
 - [Linux sandbox requirements](docs/linux_sandbox.md)
 - [v0.1.1 release notes](docs/release/RELEASE_NOTES_v0.1.1.md)
 - [Public roadmap](docs/ROADMAP.md)

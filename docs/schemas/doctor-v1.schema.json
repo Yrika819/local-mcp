@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Yrika819/local-mcp/blob/main/docs/schemas/doctor-v1.schema.json",
+  "title": "GoalLatch Doctor Core V1 diagnostic report",
+  "description": "Bounded, privacy-minimized diagnostic contract. Unknown object properties are forward-compatible; unknown statuses must never be treated as PASS.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "diagnostic_contract_version",
+    "doctor_version",
+    "goallatch_version",
+    "platform",
+    "installation",
+    "dependencies",
+    "capabilities",
+    "checks",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "diagnostic_contract_version": { "const": 1 },
+    "doctor_version": { "$ref": "#/$defs/versionString" },
+    "goallatch_version": { "$ref": "#/$defs/versionString" },
+    "platform": { "$ref": "#/$defs/platform" },
+    "installation": { "$ref": "#/$defs/installation" },
+    "dependencies": { "$ref": "#/$defs/dependencies" },
+    "capabilities": { "$ref": "#/$defs/capabilities" },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "summary": { "$ref": "#/$defs/summary" }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "status": {
+      "type": "string",
+      "enum": ["PASS", "WARN", "BLOCK", "UNKNOWN"]
+    },
+    "requirement": {
+      "type": "string",
+      "enum": ["required", "optional", "not_applicable"]
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{1,63}$",
+      "maxLength": 64
+    },
+    "versionString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]*$"
+    },
+    "nullableVersion": {
+      "anyOf": [
+        { "$ref": "#/$defs/versionString" },
+        { "type": "null" }
+      ]
+    },
+    "safeObserved": {
+      "description": "Schema validates shape and bounds only; it cannot establish that strings or object values are redacted. The Rust producer must use a fixed typed allowlist (Doctor V1 emits only null or booleans) and never serialize paths, environment values, secrets, or raw process output.",
+      "anyOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        { "type": "number" },
+        { "type": "string", "maxLength": 512 },
+        { "type": "array", "maxItems": 32, "items": { "type": ["string", "integer", "boolean", "null"], "maxLength": 512 } },
+        { "type": "object", "maxProperties": 32, "additionalProperties": true }
+      ]
+    },
+    "platform": {
+      "type": "object",
+      "required": [
+        "operating_system",
+        "architecture",
+        "host_target",
+        "support_status",
+        "experimental",
+        "unix_sandbox_parity"
+      ],
+      "properties": {
+        "operating_system": { "type": "string", "enum": ["linux", "macos", "windows", "unknown"] },
+        "architecture": { "type": "string", "enum": ["x86_64", "aarch64", "other", "unknown"] },
+        "host_target": {
+          "anyOf": [
+            { "type": "string", "pattern": "^(linux|macos|windows)-(x86_64|aarch64)$", "maxLength": 32 },
+            { "type": "null" }
+          ]
+        },
+        "support_status": { "type": "string", "enum": ["supported", "experimental", "ci_target", "unsupported", "unknown"] },
+        "experimental": { "type": "boolean" },
+        "unix_sandbox_parity": { "type": "string", "enum": ["available", "unavailable", "not_applicable", "unknown"] }
+      },
+      "additionalProperties": true
+    },
+    "currentExe": {
+      "type": "object",
+      "required": ["observed", "path_redacted", "basename_matches_expected", "directory_observed", "resolution"],
+      "properties": {
+        "observed": { "type": "boolean" },
+        "path_redacted": { "const": true },
+        "basename_matches_expected": { "type": ["boolean", "null"] },
+        "directory_observed": { "type": "boolean" },
+        "resolution": { "type": "string", "enum": ["as_observed", "unavailable", "unknown"] }
+      },
+      "additionalProperties": true
+    },
+    "helper": {
+      "type": "object",
+      "required": ["name", "required", "present", "regular_file", "readable", "executable", "resolution", "status"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "required": { "type": "boolean" },
+        "present": { "type": ["boolean", "null"] },
+        "regular_file": { "type": ["boolean", "null"] },
+        "readable": { "type": ["boolean", "null"] },
+        "executable": { "type": ["boolean", "null"] },
+        "resolution": { "type": "string", "enum": ["current_exe_sibling", "not_applicable", "unknown"] },
+        "status": { "$ref": "#/$defs/status" }
+      },
+      "additionalProperties": true
+    },
+    "installation": {
+      "type": "object",
+      "required": ["install_contract_version", "helper_resolution", "current_exe", "required_helpers", "forbidden_helpers", "symlink_status", "nix_validation_status"],
+      "properties": {
+        "install_contract_version": { "const": 1 },
+        "helper_resolution": { "const": "current_exe_sibling" },
+        "current_exe": { "$ref": "#/$defs/currentExe" },
+        "required_helpers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/helper" }
+        },
+        "forbidden_helpers": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/helper" }
+        },
+        "symlink_status": { "$ref": "#/$defs/status" },
+        "nix_validation_status": { "$ref": "#/$defs/status" }
+      },
+      "additionalProperties": true
+    },
+    "versionProbe": {
+      "type": "object",
+      "required": ["requested", "attempted", "status", "version", "timeout_seconds", "reason_code"],
+      "properties": {
+        "requested": { "type": "boolean" },
+        "attempted": { "type": "boolean" },
+        "status": { "$ref": "#/$defs/status" },
+        "version": { "$ref": "#/$defs/nullableVersion" },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      },
+      "additionalProperties": true
+    },
+    "codexCli": {
+      "type": "object",
+      "required": ["resolution_source", "selected", "path_redacted", "file_status", "executable_status", "version_probe"],
+      "properties": {
+        "resolution_source": { "type": "string", "enum": ["local_mcp_codex_cli_path", "codex_cli_path", "macos_chatgpt_bundle", "path", "none", "unknown"] },
+        "selected": { "type": "boolean" },
+        "path_redacted": { "const": true },
+        "file_status": { "type": "string", "enum": ["present", "missing", "not_regular_file", "unreadable", "unknown", "not_applicable"] },
+        "executable_status": { "$ref": "#/$defs/status" },
+        "version_probe": { "$ref": "#/$defs/versionProbe" }
+      },
+      "additionalProperties": true
+    },
+    "bubblewrap": {
+      "type": "object",
+      "required": ["applicable", "found", "version", "minimum_version", "version_probe"],
+      "properties": {
+        "applicable": { "type": "boolean" },
+        "found": { "type": ["boolean", "null"] },
+        "version": { "$ref": "#/$defs/nullableVersion" },
+        "minimum_version": { "const": "0.12.0" },
+        "version_probe": { "$ref": "#/$defs/versionProbe" }
+      },
+      "additionalProperties": true
+    },
+    "macosSandboxExec": {
+      "type": "object",
+      "required": ["applicable", "present", "executable_status", "runtime_status"],
+      "properties": {
+        "applicable": { "type": "boolean" },
+        "present": { "type": ["boolean", "null"] },
+        "executable_status": { "$ref": "#/$defs/status" },
+        "runtime_status": { "$ref": "#/$defs/status" }
+      },
+      "additionalProperties": true
+    },
+    "dependencies": {
+      "type": "object",
+      "required": ["codex_cli", "bubblewrap", "macos_sandbox_exec"],
+      "properties": {
+        "codex_cli": { "$ref": "#/$defs/codexCli" },
+        "bubblewrap": { "$ref": "#/$defs/bubblewrap" },
+        "macos_sandbox_exec": { "$ref": "#/$defs/macosSandboxExec" }
+      },
+      "additionalProperties": true
+    },
+    "capability": {
+      "type": "object",
+      "required": ["requirement", "status", "formal_status", "runtime_status", "reason_codes"],
+      "properties": {
+        "requirement": { "$ref": "#/$defs/requirement" },
+        "status": { "$ref": "#/$defs/status" },
+        "formal_status": { "$ref": "#/$defs/status" },
+        "runtime_status": { "$ref": "#/$defs/status" },
+        "reason_codes": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/reasonCode" },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["mcp_transport", "session_management", "sandboxed_execution", "atomic_publication", "goal_model_execution"],
+      "properties": {
+        "mcp_transport": { "$ref": "#/$defs/capability" },
+        "session_management": { "$ref": "#/$defs/capability" },
+        "sandboxed_execution": { "$ref": "#/$defs/capability" },
+        "atomic_publication": { "$ref": "#/$defs/capability" },
+        "goal_model_execution": { "$ref": "#/$defs/capability" }
+      },
+      "additionalProperties": true
+    },
+    "check": {
+      "type": "object",
+      "required": ["id", "status", "requirement", "applicability", "evidence_type", "observed", "reason_code", "message", "capability"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
+        "status": { "$ref": "#/$defs/status" },
+        "requirement": { "$ref": "#/$defs/requirement" },
+        "applicability": { "type": "string", "enum": ["applicable", "not_applicable"] },
+        "evidence_type": { "type": "string", "enum": ["static_observation", "formal_contract", "runtime_read_only", "not_run"] },
+        "observed": { "$ref": "#/$defs/safeObserved" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" },
+        "message": { "type": "string", "maxLength": 512 },
+        "capability": {
+          "anyOf": [
+            { "type": "string", "enum": ["mcp_transport", "session_management", "sandboxed_execution", "atomic_publication", "goal_model_execution"] },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "counts": {
+      "type": "object",
+      "required": ["PASS", "WARN", "BLOCK", "UNKNOWN"],
+      "properties": {
+        "PASS": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "WARN": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "BLOCK": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "UNKNOWN": { "type": "integer", "minimum": 0, "maximum": 64 }
+      },
+      "additionalProperties": true
+    },
+    "summary": {
+      "type": "object",
+      "required": ["status", "required_status", "advisory_status", "runtime_status", "counts", "checks_total", "required_blockers", "required_unknowns", "exit_code"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "required_status": { "$ref": "#/$defs/status" },
+        "advisory_status": { "$ref": "#/$defs/status" },
+        "runtime_status": { "$ref": "#/$defs/status" },
+        "counts": { "$ref": "#/$defs/counts" },
+        "checks_total": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "required_blockers": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "required_unknowns": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "exit_code": { "type": "integer", "enum": [0, 1, 2, 64, 70] }
+      },
+      "additionalProperties": true
+    }
+  }
+}
