@@ -91,12 +91,17 @@ There is exactly one production candidate. The runtime does **not** search:
 - the model's output;
 - a parent directory above the install prefix.
 
-If the candidate is absent, the operation that needs it fails closed:
+If the candidate is absent, or if the entry exists but is a symlink or a Windows
+reparse point, the operation that needs it fails closed:
 
-- a missing `atomic-publish` refuses publication;
-- a missing `codex-linux-sandbox` refuses a sandboxed command.
+- a missing or linked `atomic-publish` refuses publication;
+- a missing or linked `codex-linux-sandbox` refuses a sandboxed command.
 
-No fallback lowers containment when a helper is missing.
+No fallback lowers containment when a helper is missing or refused. This refusal
+covers the final directory entry only; ancestor directories are not validated by
+the runtime. See
+[Helper Execution Provenance Security Audit](HELPER_EXECUTION_PROVENANCE_AUDIT.md)
+for the residual TOCTOU and ancestor conditions that remain outside the contract.
 
 The name is platform-specific: `atomic-publish.exe` on Windows and
 `atomic-publish` elsewhere. `codex-linux-sandbox` has no `.exe` suffix and only
@@ -110,9 +115,17 @@ exists on Linux.
 - a missing helper produces no candidate;
 - a helper in another directory or on `PATH` is never a candidate;
 - the platform-specific helper name is correct;
+- a final symlink to an existing regular file is refused instead of followed, and
+  a directory symlink or Windows reparse-point entry is refused as well;
 - launching the same test binary through a symlink observes what
   `current_exe()` actually returns, and helper resolution is anchored to that
   observed directory, never to `PATH`.
+
+Tests whose symlink fixture cannot be created on the host are reported as
+NOT RUN, never as PASS. A symlinked ancestor directory, a writable install
+directory and a hard-link alias are currently accepted rather than refused; those
+cases are recorded as unmitigated in the audit above and are not claimed by this
+contract.
 
 The symlink observation is intentionally an observation, not an assumption. The
 answer is defined by the OS and can differ between Linux, macOS, and Windows.

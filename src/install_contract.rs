@@ -9,6 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
 /// The Writer commit helper's installed name.
 pub(crate) const ATOMIC_PUBLISH: &str = if cfg!(windows) {
     "atomic-publish.exe"
@@ -39,10 +42,27 @@ pub(crate) fn sibling_candidates(executable: &Path, helper: &str) -> Vec<PathBuf
         .unwrap_or_default()
 }
 
-/// The first candidate that exists as a regular file, if any.
+fn is_plain_file(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    true
+}
+
+/// The first candidate whose final path component is a regular, non-link file.
+///
+/// This rejects a helper symlink and Windows reparse point without following the
+/// final entry. It is a fail-closed preflight only: the pathname can still be
+/// replaced, or an ancestor redirected, before the OS opens the image at spawn.
 pub(crate) fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates
         .iter()
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok_and(|m| is_plain_file(&m)))
         .cloned()
 }

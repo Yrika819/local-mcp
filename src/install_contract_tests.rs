@@ -92,6 +92,140 @@ fn same_directory_helper_is_found() {
     assert_eq!(install_contract::first_existing(&candidates), Some(helper));
 }
 
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn helper_symlinks_are_rejected_without_following_targets() {
+    let root = scratch("helper-symlinks");
+    let install = root.join("install");
+    let external = root.join("external");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+    let executable = install.join("local-mcp");
+    write_executable(&executable);
+
+    // Both an in-directory alias and an external target are untrusted as helper
+    // entries. The helper entry itself, not target location, is the policy unit.
+    let same_target = install.join("trusted-looking-file");
+    write_executable(&same_target);
+    let helper = install.join(install_contract::ATOMIC_PUBLISH);
+    if symlink(&same_target, &helper).is_err() {
+        // Windows hosts without symlink privilege cannot exercise this fixture.
+        eprintln!("NOT RUN: helper symlink fixture creation was denied");
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let attributes = std::fs::symlink_metadata(&helper)
+            .unwrap()
+            .file_attributes();
+        assert_ne!(
+            attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "Windows helper symlink fixture must be a reparse point"
+        );
+    }
+    let candidate =
+        install_contract::sibling_candidates(&executable, install_contract::ATOMIC_PUBLISH);
+    assert_eq!(install_contract::first_existing(&candidate), None);
+
+    std::fs::remove_file(&helper).unwrap();
+    let outside_target = external.join("helper");
+    write_executable(&outside_target);
+    symlink(&outside_target, &helper).unwrap();
+    assert_eq!(install_contract::first_existing(&candidate), None);
+
+    std::fs::remove_file(&helper).unwrap();
+    symlink(&install.join("missing-target"), &helper).unwrap();
+    assert_eq!(install_contract::first_existing(&candidate), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_symlink_is_rejected_as_a_helper_entry() {
+    let root = scratch("directory-symlink");
+    let install = root.join("install");
+    let target = root.join("target");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    write_executable(&install.join("local-mcp"));
+    write_executable(&target.join(install_contract::ATOMIC_PUBLISH));
+    std::os::unix::fs::symlink(&target, install.join(install_contract::ATOMIC_PUBLISH)).unwrap();
+    let candidates = install_contract::sibling_candidates(
+        &install.join("local-mcp"),
+        install_contract::ATOMIC_PUBLISH,
+    );
+    assert_eq!(install_contract::first_existing(&candidates), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_directory_symlink_is_not_pinned_by_final_entry_check() {
+    let root = scratch("parent-symlink");
+    let install = root.join("install");
+    let redirected = root.join("redirected");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&redirected).unwrap();
+    write_executable(&redirected.join(install_contract::ATOMIC_PUBLISH));
+    std::os::unix::fs::symlink(&redirected, install.join("linked-dir")).unwrap();
+
+    let executable = install.join("linked-dir").join("local-mcp");
+    let helper = executable
+        .parent()
+        .unwrap()
+        .join(install_contract::ATOMIC_PUBLISH);
+    let candidates =
+        install_contract::sibling_candidates(&executable, install_contract::ATOMIC_PUBLISH);
+    assert_eq!(install_contract::first_existing(&candidates), Some(helper));
+}
+
+#[cfg(unix)]
+#[test]
+fn writable_install_directory_is_not_certified_by_helper_resolution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = scratch("writable-install");
+    let install = root.join("install");
+    std::fs::create_dir_all(&install).unwrap();
+    write_executable(&install.join("local-mcp"));
+    let helper = install.join(install_contract::ATOMIC_PUBLISH);
+    write_executable(&helper);
+    std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let candidates = install_contract::sibling_candidates(
+        &install.join("local-mcp"),
+        install_contract::ATOMIC_PUBLISH,
+    );
+    assert_eq!(install_contract::first_existing(&candidates), Some(helper));
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_link_alias_is_not_mistaken_for_a_symlink() {
+    let root = scratch("hard-link");
+    let install = root.join("install");
+    std::fs::create_dir_all(&install).unwrap();
+    let executable = install.join("local-mcp");
+    let source = install.join("helper-source");
+    let helper = install.join(install_contract::ATOMIC_PUBLISH);
+    write_executable(&executable);
+    write_executable(&source);
+    std::fs::hard_link(&source, &helper).unwrap();
+    let candidates =
+        install_contract::sibling_candidates(&executable, install_contract::ATOMIC_PUBLISH);
+    assert_eq!(install_contract::first_existing(&candidates), Some(helper));
+}
+
 #[test]
 fn missing_helper_is_not_synthesized() {
     let root = scratch("missing");
@@ -148,7 +282,7 @@ fn symlink_launch_anchors_helper_resolution_to_current_exe() {
     let symlink_result = std::os::windows::fs::symlink_file(&real, &link);
     if symlink_result.is_err() {
         // Windows requires Developer Mode or SeCreateSymbolicLinkPrivilege.
-        // Skipping is honest: this host cannot observe the symlink case.
+        eprintln!("NOT RUN: current_exe symlink fixture creation was denied");
         return;
     }
 
