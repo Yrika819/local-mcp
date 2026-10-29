@@ -127,6 +127,25 @@ pub fn rejection_message(support: BubblewrapSupport) -> String {
     }
 }
 
+/// Typed result for the shared Bubblewrap version parser and security gate.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BubblewrapVersionError {
+    Unsupported,
+    Malformed,
+}
+
+/// Parse a strict numeric triplet and classify it against the shared minimum.
+#[allow(dead_code)]
+pub(crate) fn classify_version(version: &str) -> Result<(), BubblewrapVersionError> {
+    let parsed = parse_version(version).map_err(|_| BubblewrapVersionError::Malformed)?;
+    if parsed < MINIMUM_SUPPORTED_VERSION {
+        Err(BubblewrapVersionError::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
 /// Fail closed unless `version` is at least [`MINIMUM_SUPPORTED_VERSION`].
 pub fn require_supported_version(version: &str) -> Result<(), String> {
     let (major, minor, patch) = parse_version(version)?;
@@ -177,6 +196,15 @@ mod tests {
         assert!(require_supported_version("0.12.0").is_ok());
         assert!(require_supported_version("0.12.1").is_ok());
         assert!(require_supported_version("1.0.0").is_ok());
+        assert_eq!(
+            classify_version("0.11.9"),
+            Err(BubblewrapVersionError::Unsupported)
+        );
+        assert_eq!(classify_version("0.12.0"), Ok(()));
+        assert_eq!(
+            classify_version("0.12.0-vendor"),
+            Err(BubblewrapVersionError::Malformed)
+        );
         assert!(parse_version("0.12").is_err());
         assert!(parse_version("0.12.0-ubuntu1").is_err());
         assert!(parse_version("0.x.0").is_err());

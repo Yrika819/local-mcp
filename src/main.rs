@@ -9,6 +9,7 @@ mod atomic_publish_frame;
 #[cfg(target_os = "linux")]
 mod bubblewrap_support;
 mod config;
+mod doctor;
 mod exec_ready;
 mod execution;
 mod failure_class;
@@ -149,22 +150,47 @@ enum Command {
     },
     /// Run the session-independent MCP server over stdin/stdout.
     Mcp,
+    /// Inspect the local GoalLatch environment without starting a Session.
+    Doctor(doctor::DoctorOptions),
 }
 
 fn main() -> Result<()> {
-    #[cfg(unix)]
-    process_group::normalize_child_signal_policy()?;
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let doctor_requested = std::env::args_os()
+                .nth(1)
+                .is_some_and(|argument| argument == "doctor");
+            if doctor_requested {
+                if error.kind() == clap::error::ErrorKind::DisplayHelp {
+                    let _ = error.print();
+                    std::process::exit(0);
+                }
+                eprintln!("local-mcp doctor: invalid command-line arguments");
+                std::process::exit(doctor::ExitCode::UsageError.value().into());
+            }
+            error.exit();
+        }
+    };
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    match cli.command.unwrap_or(Command::Start { session_id: None }) {
+        Command::Doctor(options) => std::process::exit(doctor::execute(options).into()),
+        command => {
+            #[cfg(unix)]
+            process_group::normalize_child_signal_policy()?;
+
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run(command))
+        }
+    }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Start { session_id: None }) {
+async fn run(command: Command) -> Result<()> {
+    match command {
         Command::Start { session_id } => approvals::start(session_id.as_deref()).await,
         Command::Mcp => mcp::serve().await,
+        Command::Doctor(_) => unreachable!("Doctor dispatch occurs before Tokio initialization"),
     }
 }
