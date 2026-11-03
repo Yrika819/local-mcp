@@ -23,7 +23,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "local-mcp";
-            version = "0.1.1";
+            version = "0.1.2";
             src = self;
 
             cargoHash = "sha256-oOZrW9kqHT/R/fO+EFfBWOGhA9Y2dznRPQHBc5HivIg=";
