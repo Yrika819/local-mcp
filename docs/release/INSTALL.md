@@ -3,7 +3,7 @@
 GoalLatch Public v1 keeps the `local-mcp` executable and archive names for
 compatibility. This is the per-platform install guide for the Public v1 archives. For what the
 project is and what it does, see the [release
-notes](RELEASE_NOTES_v0.1.1.md). For the security model, read
+notes](RELEASE_NOTES_v0.1.2.md). For the security model, read
 [`SECURITY.md`](../../SECURITY.md) is the authoritative security reference;
 this guide focuses on archive contents, platform requirements, and installation.
 
@@ -32,12 +32,12 @@ Pick the archive that matches your platform:
 
 | Platform | Archive |
 | --- | --- |
-| Linux x86_64 | `local-mcp-v0.1.1-linux-x86_64.tar.gz` |
-| Linux aarch64 (ARM) | `local-mcp-v0.1.1-linux-aarch64.tar.gz` |
-| macOS Intel | `local-mcp-v0.1.1-macos-x86_64.tar.gz` |
-| macOS Apple Silicon | `local-mcp-v0.1.1-macos-aarch64.tar.gz` |
-| Windows x86_64 | `local-mcp-v0.1.1-windows-x86_64.zip` |
-| Windows ARM64 | `local-mcp-v0.1.1-windows-aarch64.zip` |
+| Linux x86_64 | `local-mcp-v0.1.2-linux-x86_64.tar.gz` |
+| Linux aarch64 (ARM) | `local-mcp-v0.1.2-linux-aarch64.tar.gz` |
+| macOS Intel | `local-mcp-v0.1.2-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `local-mcp-v0.1.2-macos-aarch64.tar.gz` |
+| Windows x86_64 | `local-mcp-v0.1.2-windows-x86_64.zip` |
+| Windows ARM64 | `local-mcp-v0.1.2-windows-aarch64.zip` |
 
 Each archive contains a single versioned directory with the binaries, project
 `LICENSE`, `README.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, and the
@@ -72,11 +72,11 @@ depends on. Every release archive ships it.
 ### Install
 
 ```sh
-tar -xzf local-mcp-v0.1.1-linux-x86_64.tar.gz
+tar -xzf local-mcp-v0.1.2-linux-x86_64.tar.gz
 sudo install -d /usr/local/lib/local-mcp
-sudo install -m 0755 local-mcp-v0.1.1-linux-x86_64/local-mcp \
-  local-mcp-v0.1.1-linux-x86_64/codex-linux-sandbox \
-  local-mcp-v0.1.1-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
+sudo install -m 0755 local-mcp-v0.1.2-linux-x86_64/local-mcp \
+  local-mcp-v0.1.2-linux-x86_64/codex-linux-sandbox \
+  local-mcp-v0.1.2-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
 ```
 
 All three were installed with mode `0755`; the archive preserves that. Put them on
@@ -141,9 +141,9 @@ Two executables, and **both are required**:
 ### Install
 
 ```sh
-tar -xzf local-mcp-v0.1.1-macos-aarch64.tar.gz
-install -m 0755 local-mcp-v0.1.1-macos-aarch64/local-mcp /usr/local/bin/local-mcp
-install -m 0755 local-mcp-v0.1.1-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
+tar -xzf local-mcp-v0.1.2-macos-aarch64.tar.gz
+install -m 0755 local-mcp-v0.1.2-macos-aarch64/local-mcp /usr/local/bin/local-mcp
+install -m 0755 local-mcp-v0.1.2-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
 ```
 
 The binary links to system libraries as listed by `otool -L` in the release
@@ -186,10 +186,10 @@ Extract the zip, then either add the directory to `PATH` or copy the binaries
 somewhere already on it. Both must end up in the same directory:
 
 ```powershell
-Expand-Archive -Path local-mcp-v0.1.1-windows-x86_64.zip -DestinationPath .
+Expand-Archive -Path local-mcp-v0.1.2-windows-x86_64.zip -DestinationPath .
 New-Item -ItemType Directory -Force C:\tools | Out-Null
-Copy-Item local-mcp-v0.1.1-windows-x86_64\local-mcp.exe C:\tools\
-Copy-Item local-mcp-v0.1.1-windows-x86_64\atomic-publish.exe C:\tools\
+Copy-Item local-mcp-v0.1.2-windows-x86_64\local-mcp.exe C:\tools\
+Copy-Item local-mcp-v0.1.2-windows-x86_64\atomic-publish.exe C:\tools\
 ```
 
 ```powershell
@@ -200,7 +200,7 @@ local-mcp.exe mcp
 Verify a download on Windows with:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 local-mcp-v0.1.1-windows-x86_64.zip
+Get-FileHash -Algorithm SHA256 local-mcp-v0.1.2-windows-x86_64.zip
 ```
 
 and compare against the line for that file in `SHA256SUMS`. SmartScreen may

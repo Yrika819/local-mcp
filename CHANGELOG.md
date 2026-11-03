@@ -9,6 +9,39 @@
   executable, existing release asset names, and durable compatibility identifiers.
   This branding change does not alter runtime behavior, authority, or stored state.
 
+## 0.1.2 — Security V2 and Doctor Core V1
+
+### Security
+
+- Security V2: final-helper symlink/reparse refusal. The runtime helpers
+  (`codex-linux-sandbox`, `atomic-publish`) are rejected when the final
+  executable entry is a symlink or reparse point, closing a class of
+  swap-in helper attacks.
+- Helper provenance and install-contract verification hardened; see the
+  Install Contract V1 documentation for the verification procedure.
+
+### Added
+
+- Doctor Core V1: read-only diagnostic command surface (`local-mcp doctor`)
+  with a typed PASS / WARN / BLOCK / UNKNOWN outcome contract.
+- Doctor JSON Schema V1 (`docs/schemas/doctor-v1.schema.json`) and example
+  payloads for all four outcomes.
+- Schema/producer CI verification for the Doctor schema.
+- Install Contract V1 integration with published v0.1.1 asset hashes.
+
+### Compatibility
+
+- CLI compatibility preserved; no subcommands were removed or renamed.
+- Windows remains experimental; no Unix-equivalent process sandbox is provided.
+- Nix flake is not release-closure validated in this release.
+- Known inherited dependency advisories remain disclosed; see SECURITY.md.
+
+### Known limitations
+
+- TOCTOU windows in the staged-Git / install-verification paths remain;
+  trusted-install guarantees are not claimed.
+- Doctor Core V1 is a diagnostic provider, not an install authorization.
+
 ## 0.1.1 — Stability release
 
 ### Reliability
