@@ -128,13 +128,18 @@ resolved set.**
 
 ## Verification
 
-- Test suite: see the `quality` and `test` jobs on the release commit; the
-  suite result for this candidate is recorded in the release checklist.
+- Local candidate host (Windows): `cargo fmt --all -- --check` clean;
+  `cargo check --locked --all-targets` clean;
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` clean;
+  `cargo test --locked --all-targets`: 1,367 tests passed, 0 failed
+  (1,346 main suite + 16 + 5 Doctor CLI end-to-end).
+- Release scripts: 19/19; workflow policy: 19/19; install contract: 42/42
+  (2 skipped by design).
+- Doctor schema gates (fixture validation + `doctor --json` producer
+  validation) are re-run on the release commit in CI.
 - CI: `quality`, four `test` legs (ubuntu-x64, macos-intel, macos-arm64,
-  windows-x64), and six `compat` legs, all required green for the release
-  candidate.
-- Doctor Schema CI gates (schema/fixture validation and `doctor --json`
-  producer validation) run in the quality lane.
+  windows-x64), and six `compat` legs. All 11 are required green for the
+  release candidate GO decision.
 - 6-platform release builds are exercised by the release workflow dry run;
   the dry run publishes nothing.
 
