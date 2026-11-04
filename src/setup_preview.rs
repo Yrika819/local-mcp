@@ -1752,6 +1752,30 @@ mod tests {
     }
 
     #[test]
+    fn read_file_bounded_returns_bytes_and_refuses_directories_and_oversize() {
+        let root = std::env::temp_dir().join(format!(
+            "goallatch-preview-read-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create test-owned read root");
+
+        let file = root.join("payload.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+
+        let bytes = read_file_bounded(&file, 1024).expect("small regular file reads");
+        assert_eq!(bytes, b"abc");
+
+        let oversize = read_file_bounded(&file, 2);
+        assert!(oversize.is_err(), "limit below file size must be refused");
+
+        let directory = read_file_bounded(&root, 1024);
+        assert!(directory.is_err(), "a directory is not a regular file");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hash_archive_streams_and_bounds() {
         let root = std::env::temp_dir().join(format!(
             "goallatch-preview-hash-{}-{}",

@@ -325,6 +325,30 @@ fn setup_preview_archive_mismatch_fails_closed_with_64() {
 }
 
 #[test]
+fn setup_preview_manifest_directory_fails_with_64() {
+    let root = TestRoot::new();
+    let manifest = root.path().join("manifest-dir.json");
+    fs::create_dir(&manifest).expect("create directory fixture");
+    let output = run(
+        &root,
+        &["setup", "preview", "--manifest", manifest.to_str().unwrap()],
+    );
+    assert_eq!(output.status.code(), Some(64));
+}
+
+#[test]
+fn setup_preview_archive_directory_fails_with_64() {
+    let root = TestRoot::new();
+    let archive = root.path().join("archive-dir.tar.gz");
+    fs::create_dir(&archive).expect("create directory fixture");
+    let output = run(
+        &root,
+        &["setup", "preview", "--archive", archive.to_str().unwrap()],
+    );
+    assert_eq!(output.status.code(), Some(64));
+}
+
+#[test]
 fn setup_preview_missing_archive_path_fails_with_64() {
     let root = TestRoot::new();
     let missing = root.path().join("does-not-exist.tar.gz");
