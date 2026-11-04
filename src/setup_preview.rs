@@ -1399,11 +1399,12 @@ fn execute(options: SetupPreviewOptions) -> u8 {
         }
     };
 
-    let (manifest, manifest_source, double_read_consistent) = match load_manifest(&options) {
+    let (_manifest, manifest_source, double_read_consistent) = match load_manifest(&options) {
         Ok(loaded) => loaded,
         Err(failure) => return emit_failure(failure, &options),
     };
-    let _ = manifest; // the embedded pin check already ran inside load_manifest
+    // The embedded-pin consistency check and the double-read already ran
+    // inside load_manifest; nothing from the manifest is re-read afterwards.
 
     let artifact = match verify_archive(&options, target) {
         Ok(artifact) => artifact,
