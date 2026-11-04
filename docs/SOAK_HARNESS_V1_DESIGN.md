@@ -34,8 +34,20 @@ Goals:
    reconciled at the end.
 3. **Resource bounds** — memory (working set), descriptor count, in-flight
    requests, and response size are bounded; exceeding a bound fails the run.
+   V1 design defaults (all explicit CLI flags, never implicit): in-flight
+   requests ≤ 128 (reused from the PR #15 reference shape); wire-line size cap
+   16 MiB; per-run response byte cap 1 GiB (counters retained, payload not);
+   working-set ceiling 1.5 GiB or +50 % baseline, whichever first; descriptor
+   ceiling 4,096; latency-sample retention ≤ 10,000 per scenario (reservoir
+   sampling beyond that, with the dropped-sample counter retained). The
+   defaults are validated against a maintainer-observed baseline in Slice 3;
+   if a bound is found wrong it is re-fixed there — never removed, only
+   adjusted, and never after publishing numbers. A bound that cannot be
+   evaluated at runtime makes the run NOT RUN, not PASS.
 4. **Tail latency** — p50/p95/p99 recorded per scenario over sufficient
-   samples; no claim without raw samples retained.
+   samples; no claim without raw samples retained. Percentiles are reported
+   only when ≥ 100 latency samples exist for the scenario; below that the
+   percentile fields report `NOT-MEASURED`, never an extrapolated number.
 5. **Cancellation** — a Goal/Job can be cancelled mid-flight and reaches a
    reconciled terminal state without hanging the server.
 6. **Failure injection** — malformed frames, oversized frames, client EOF,
@@ -105,7 +117,7 @@ soak.py (driver, host)
 | S2 | Session info poll | `session_info` | interleaved |
 | S3 | Goal start → status → cancel | `goal_start`, `goal_status`, `goal_cancel` | ≤ 20 concurrent goals |
 | S4 | Goal run (bounded `max_steps`, stubbed/absent Codex CLI) | `goal_run` | expect recorded failure without Codex CLI; must not hang |
-| S5 | Foreground execute (sandboxed `echo`-class command) | `execute` | Linux/macOS only; Windows: expect explicit refusal or host-native path per policy |
+| S5 | Foreground execute (sandboxed `echo`-class command) | `execute` | Linux/macOS only. Windows leg: S5 is **excluded per Experimental status** and recorded `not-applicable (platform experimental)` — Windows behaves as the documented host-native, non-sandboxed platform and is never admitted to the latency/coverage matrix; no Windows result is presented as a sandbox success |
 | S6 | Refusal path (outside roots) | any write/execute outside `permitted_directories` | must refuse; zero silent truncation |
 | S7 | Malformed frame (garbage line, wrong version, missing id) | raw stdio | must be answered or logged, never crash child |
 | S8 | Oversized frame beyond cap | raw stdio | must be refused within the 16 MiB cap |
@@ -166,9 +178,11 @@ such.** No partial summary may be published as a "soak result".
   fixture before/after).
 - FI-3 malformed frame flood (S7): child remains responsive to S1 requests
   interleaved in the same stream within the latency bound; no deadlock.
-- FI-4 EOF during 1,000 in-flight requests: driver classifies every
-  in-flight request as shutdown-recovered or shutdown-unrecovered; the
-  ledger never leaks a "lost" id.
+- FI-4 EOF during sustained in-flight traffic: exercise ≥ 1,000 **attempted**
+  requests with no more than the in-flight bound (128) outstanding at any
+  moment (§3, §2 items). Driver classifies every in-flight request as
+  shutdown-recovered or shutdown-unrecovered; the ledger never leaks a
+  "lost" id.
 - FI-5 disk-full state dir (if safely emulatable with a small quota mount):
   child fails closed; no partial Goal state is reported as committed. If the
   mount cannot be created in CI, report NOT RUN, do not simulate by
