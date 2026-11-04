@@ -47,12 +47,16 @@ for the authoritative security model and [platform-specific install notes](docs/
 
 ## Quick Start
 
-GoalLatch v0.1.1 is formally released. Download the matching archive from the
-[v0.1.1 GitHub release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.1),
+GoalLatch v0.1.2 is formally released. Download the matching archive from the
+[v0.1.2 GitHub release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.2),
 verify its checksum, and follow the platform steps in the
 [Quick Start guide](docs/QUICK_START.md). The full archive contents and install
 requirements are in [the installation guide](docs/release/INSTALL.md) and
-[Install Contract V1](docs/INSTALL_CONTRACT_V1.md).
+[Install Contract V1](docs/INSTALL_CONTRACT_V1.md). After verifying the CLI
+starts, you may optionally run `local-mcp doctor` for a read-only diagnostic
+report; `UNKNOWN` means "not established", never a pass and never a confirmed
+failure. See the [v0.1.2 release notes](docs/release/RELEASE_NOTES_v0.1.2.md)
+for what changed.
 
 For a reproducible source build (requires Rust 1.96 as specified in
 `Cargo.toml`):
@@ -137,8 +141,12 @@ credentials in Issues.
   kernel support; distro backports below the upstream version gate can be
   rejected.
 - Long-running mixed Goal/Job load and tail latency under high load are not
-  fully verified. See the v0.1.1 [release notes](docs/release/RELEASE_NOTES_v0.1.1.md)
+  fully verified. See the v0.1.2 [release notes](docs/release/RELEASE_NOTES_v0.1.2.md)
   and [known security findings](SECURITY.md).
+- Security V2 (final-entry helper symlink/reparse refusal) narrows but does not
+  close the helper check-to-open window; ancestor redirection and opened-image
+  binding remain unmitigated. See the [v0.1.2 release notes](docs/release/RELEASE_NOTES_v0.1.2.md#residual-risks)
+  and [the helper provenance audit](docs/HELPER_EXECUTION_PROVENANCE_AUDIT.md).
 - Release binaries are not code-signed/notarized. Check `SHA256SUMS` before
   running an archive.
 
@@ -151,7 +159,8 @@ credentials in Issues.
 - [Installation details](docs/release/INSTALL.md)
 - [Doctor Core V1 design and diagnostic contract](docs/DOCTOR_CORE_V1_DESIGN.md)
 - [Linux sandbox requirements](docs/linux_sandbox.md)
-- [v0.1.1 release notes](docs/release/RELEASE_NOTES_v0.1.1.md)
+- [v0.1.2 release notes](docs/release/RELEASE_NOTES_v0.1.2.md)
+- [v0.1.1 release notes (historical)](docs/release/RELEASE_NOTES_v0.1.1.md)
 - [Public roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 

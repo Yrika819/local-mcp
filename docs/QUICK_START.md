@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide installs the released GoalLatch v0.1.1 binaries and checks that they
+This guide installs the released GoalLatch v0.1.2 binaries and checks that they
 start. It does not claim that the complete interactive MCP workflow was tested
 on every listed OS. Platform status and security boundaries are in
 [SECURITY.md](../SECURITY.md); archive details are in
@@ -9,7 +9,7 @@ on every listed OS. Platform status and security boundaries are in
 ## 1. Download and verify
 
 Download the archive for your OS/architecture and `SHA256SUMS` from the
-[GoalLatch v0.1.1 release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.1).
+[GoalLatch v0.1.2 release](https://github.com/Yrika819/local-mcp/releases/tag/v0.1.2).
 Use the matching checksum command before running the binaries.
 
 Linux:
@@ -29,7 +29,7 @@ archive line in the downloaded `SHA256SUMS` file (PowerShell does not verify
 that manifest format with `Get-FileHash -c`).
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\local-mcp-v0.1.1-windows-x86_64.zip
+Get-FileHash -Algorithm SHA256 .\local-mcp-v0.1.2-windows-x86_64.zip
 Get-Content .\SHA256SUMS
 ```
 
@@ -44,10 +44,10 @@ Extract the archive and place **both** `local-mcp.exe` and
 `C:\tools`:
 
 ```powershell
-Expand-Archive -Path .\local-mcp-v0.1.1-windows-x86_64.zip -DestinationPath .
+Expand-Archive -Path .\local-mcp-v0.1.2-windows-x86_64.zip -DestinationPath .
 New-Item -ItemType Directory -Force C:\tools | Out-Null
-Copy-Item .\local-mcp-v0.1.1-windows-x86_64\local-mcp.exe C:\tools\
-Copy-Item .\local-mcp-v0.1.1-windows-x86_64\atomic-publish.exe C:\tools\
+Copy-Item .\local-mcp-v0.1.2-windows-x86_64\local-mcp.exe C:\tools\
+Copy-Item .\local-mcp-v0.1.2-windows-x86_64\atomic-publish.exe C:\tools\
 ```
 
 This is an install walkthrough based on the release install instructions; the
@@ -62,11 +62,11 @@ seccomp, and glibc providing `GLIBC_2.34` or newer. Install all three
 executables from the archive together:
 
 ```sh
-tar -xzf local-mcp-v0.1.1-linux-x86_64.tar.gz
+tar -xzf local-mcp-v0.1.2-linux-x86_64.tar.gz
 sudo install -d /usr/local/lib/local-mcp
-sudo install -m 0755 local-mcp-v0.1.1-linux-x86_64/local-mcp \
-  local-mcp-v0.1.1-linux-x86_64/codex-linux-sandbox \
-  local-mcp-v0.1.1-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
+sudo install -m 0755 local-mcp-v0.1.2-linux-x86_64/local-mcp \
+  local-mcp-v0.1.2-linux-x86_64/codex-linux-sandbox \
+  local-mcp-v0.1.2-linux-x86_64/atomic-publish /usr/local/lib/local-mcp/
 sudo ln -sf /usr/local/lib/local-mcp/local-mcp /usr/local/bin/local-mcp
 bwrap --version
 local-mcp --version
@@ -79,15 +79,15 @@ this x86_64 walkthrough.
 
 ### macOS x86_64 / ARM64
 
-The v0.1.1 archive names are `local-mcp-v0.1.1-macos-x86_64.tar.gz` and
-`local-mcp-v0.1.1-macos-aarch64.tar.gz`. Extract the matching archive and
+The v0.1.2 archive names are `local-mcp-v0.1.2-macos-x86_64.tar.gz` and
+`local-mcp-v0.1.2-macos-aarch64.tar.gz`. Extract the matching archive and
 install both `local-mcp` and `atomic-publish` together. Example for Apple
 Silicon:
 
 ```sh
-tar -xzf local-mcp-v0.1.1-macos-aarch64.tar.gz
-sudo install -m 0755 local-mcp-v0.1.1-macos-aarch64/local-mcp /usr/local/bin/local-mcp
-sudo install -m 0755 local-mcp-v0.1.1-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
+tar -xzf local-mcp-v0.1.2-macos-aarch64.tar.gz
+sudo install -m 0755 local-mcp-v0.1.2-macos-aarch64/local-mcp /usr/local/bin/local-mcp
+sudo install -m 0755 local-mcp-v0.1.2-macos-aarch64/atomic-publish /usr/local/bin/atomic-publish
 local-mcp --version
 ```
 
@@ -106,11 +106,41 @@ local-mcp --help
 ```
 
 On Windows use `local-mcp.exe` if the executable is not on `PATH`. The
-expected version is `0.1.1`. These checks prove only that the executable starts
+expected version is `0.1.2`. These checks prove only that the executable starts
 and reports its CLI; they do not prove sandbox readiness or MCP client
 compatibility.
 
-## 4. Start a project session
+## 4. Optional: run the built-in diagnostics (`local-mcp doctor`)
+
+`local-mcp doctor` is a **read-only** diagnostic that reports what the host and
+install layout can and cannot establish. It never modifies files, installs
+anything, or grants authority. It is optional; skipping it does not change what
+is installed.
+
+```sh
+local-mcp doctor
+local-mcp doctor --json
+```
+
+The report uses four outcomes:
+
+- `PASS` — the check was established. A `PASS` is a diagnostic result, **not**
+  an installation authorization and not a safety guarantee.
+- `WARN` — a non-blocking concern; read the reason codes.
+- `BLOCK` — a blocking condition for the affected capability.
+- `UNKNOWN` — the check could not be established (for example, version probes
+  are deliberately unrun). `UNKNOWN` is **not a failure** and **not a success**;
+  treat it as "not established". On Linux and macOS, when the sandbox
+  capability is required, an unrun probe makes `local-mcp doctor` exit `2`
+  even on a healthy host. Exit `2` means "not established", not "broken".
+
+Doctor's exit codes are `0` (PASS/WARN), `1` (required BLOCK), `2` (required
+UNKNOWN), `64` (usage error), `70` (internal serialization failure). Do not
+script against `0` as "safe to install". Doctor output is diagnostic content
+and must not be treated as permission to install. See
+[Doctor Core V1](DOCTOR_CORE_V1_DESIGN.md) for the contract.
+
+## 5. Start a project session
 
 Open a terminal in a disposable or otherwise appropriate project directory.
 Start the session UI there:
@@ -132,7 +162,7 @@ location where `start` ran. The UI's `permitted_directories` are the filesystem
 boundary; inspect them before letting an agent access the project. Do not paste
 a real session ID into public logs/issues.
 
-## 5. Connect your MCP client
+## 6. Connect your MCP client
 
 Run `local-mcp mcp` as the client's stdio MCP server process, while leaving
 `local-mcp start` running separately. Configure the MCP client using its own
@@ -174,13 +204,21 @@ interpret a returned error or nonterminal state as successful completion.
 
 ## What is and is not verified
 
-- v0.1.1 release artifacts and platform requirements are listed in the
+- v0.1.2 release artifacts and platform requirements are listed in the
   [installation guide](release/INSTALL.md); the version and help commands are
-  safe local smoke checks.
+  safe local smoke checks. Verify the archive against the v0.1.2 `SHA256SUMS`
+  before running it.
+- `local-mcp doctor` is read-only diagnostics, not an installation authorization;
+  its `UNKNOWN` outcomes mean "not established", not "broken" and not "pass".
+- Security V2 (final-entry helper symlink/reparse refusal) does not close the
+  helper check-to-open window or validate ancestors; a writable install root or
+  helper is a no-go. See the [v0.1.2 release notes](release/RELEASE_NOTES_v0.1.2.md#residual-risks).
 - macOS Intel has native release-closure evidence; Linux x86_64 is the
-  documented supported sandbox target when host requirements are met.
+  documented supported sandbox target when host requirements are met. Apple
+  Silicon remains a CI target and is not claimed as locally release-closure
+  validated.
 - Windows is Experimental and has no Unix-equivalent process sandbox.
 - macOS ARM64 and Linux ARM64 must not be represented as having the same local
-  validation as their x86_64 counterparts.
+  validation as their x86_64 counterparts. Linux aarch64 remains experimental.
 - This campaign's documentation checks do not constitute an end-to-end test
   with a third-party MCP client.
