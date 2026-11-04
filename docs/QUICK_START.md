@@ -212,7 +212,7 @@ interpret a returned error or nonterminal state as successful completion.
   its `UNKNOWN` outcomes mean "not established", not "broken" and not "pass".
 - Security V2 (final-entry helper symlink/reparse refusal) does not close the
   helper check-to-open window or validate ancestors; a writable install root or
-  helper is a no-go. See the [v0.1.2 release notes](RELEASE_NOTES_v0.1.2.md#residual-risks).
+  helper is a no-go. See the [v0.1.2 release notes](release/RELEASE_NOTES_v0.1.2.md#residual-risks).
 - macOS Intel has native release-closure evidence; Linux x86_64 is the
   documented supported sandbox target when host requirements are met. Apple
   Silicon remains a CI target and is not claimed as locally release-closure

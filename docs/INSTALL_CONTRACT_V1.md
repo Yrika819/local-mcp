@@ -223,7 +223,7 @@ Published archive hashes observed from the official `v0.1.2` GitHub Release
 No new local native-execution claim is made for the v0.1.2 assets by this
 document; the archive-hash observation above is metadata verification only and
 does not bind the opened image at install or run time (see the residual risks
-in the [v0.1.2 release notes](RELEASE_NOTES_v0.1.2.md#residual-risks)). The
+in the [v0.1.2 release notes](release/RELEASE_NOTES_v0.1.2.md#residual-risks)). The
 v0.1.1 table above is retained as historical evidence and is not superseded.
 
 The native Windows result also covered `atomic-publish.exe` startup (exit 65 on a
