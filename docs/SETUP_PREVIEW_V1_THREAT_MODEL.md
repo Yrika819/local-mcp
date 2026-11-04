@@ -42,7 +42,7 @@ design requires. It is a companion to `SETUP_PREVIEW_V1_DESIGN.md` and
 | T-9 | Release metadata changes between load and render (TOCTOU on operator-supplied manifest) | double-read byte comparison per Design §6.2; differing reads fail closed with "release metadata changed" | N-13 |
 | T-10 | Untrusted install root presented as OK | trust reported UNKNOWN/UNTRUSTED, never PASS; exit 0; disclaimer line mandatory | N-10 |
 | T-11 | Unsupported platform silently "best-effort" rendered | explicit unsupported-platform failure state | N-4 |
-| T-12 | Missing required helper masked by generic error | explicit missing-helper failure state naming the helper | N-5 |
+| T-12 | Missing required helper masked by generic error or silently PASS-rendered | V1 has no layout validator of its own; the helper condition is surfaced by Doctor (`installation.helper.*`) and rendered verbatim as BLOCK/UNKNOWN data (exit 0). Exit `64` is reserved for Case B input errors; any `--install`-class flag is rejected by clap | N-5 (Cases A and B) |
 | T-13 | Schema/version drift between Doctor releases | typed contract consumption; schema used only in CI; unknown schema/status → reject (exit 70) | Design §5, N-8 |
 | T-14 | Exit code misuse (scripts treat 0 as installable) | preview exit 0 documented as "rendered", not "safe"; distinct codes 64/70; 1/2 reserved for Doctor | Design §7 |
 | T-15 | Metadata-only comparison displayed as "verified" | `VERIFIED_ARCHIVE` requires hashing actual bytes in this run; metadata agreement is reported separately as `pin_consistent`; the two are never conflated | H-5, H-6, N-2, artifact-state exclusivity test |

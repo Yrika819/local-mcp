@@ -213,7 +213,26 @@ The preview MUST distinguish the following, in human and JSON output:
 | `PINNED_UNVERIFIED` | Pin is consistent, but archive bytes were **not** hashed in this run | no — first-class "unverified" state, exit `0` |
 | `VERIFIED_ARCHIVE` | The local archive at `--archive <PATH>` was hashed in this run and its SHA-256 matches the pin | no — first-class "verified bytes" state, exit `0` |
 | `ARCHIVE_MISMATCH` | The archive was hashed and its SHA-256 differs from the pin | yes — dedicated failure state, exit `64` |
-| `ARCHIVE_UNREADABLE` | `--archive` path unreadable/oversize/non-UTF-8-adjacent error | yes — dedicated failure state, exit `64` |
+| `ARCHIVE_UNREADABLE` | `--archive` path unreadable/oversize/non-regular file | yes — dedicated failure state, exit `64` |
+
+**Input-validation scope (normative).** The full V1 input surface is exactly:
+(1) flag parsing (unknown or rejected flags, e.g. `--install`-class; clap
+rejects → `64`); (2) manifest load — strict JSON parse (duplicate keys,
+trailing data, encoding), schema/version checks, exactly the six pinned
+targets, asset name/SHA-256 rules; (3) embedded-pin consistency check;
+(4) archive hashing pre-conditions (regular file, size limit) and digest
+comparison; (5) the double-read byte comparison of an operator-supplied
+manifest; (6) platform support detection; (7) output bounds.
+
+V1 implements **no dedicated layout validator**: the preview performs no
+inspection of any install target, and no `--install-root`-style argument
+exists. In particular, "required helper missing" is **not** a preview failure
+state and never yields exit `64` from the preview. A missing sibling helper is
+detected, if at all, by **Doctor**, reported verbatim in the embedded report,
+and the preview renders it as data (exit `0`; see Test Plan N-5, Case A).
+Do not document a layout check, install-root probe, or extracted-install
+validation as implemented in V1. If a future slice adds one, this section,
+Test Plan N-5, and Threat Model T-12 must be re-specified in the same PR.
 
 Rules:
 
@@ -274,9 +293,12 @@ Contract:
   `64`.
 - Exit codes:
   - `0` — the preview **rendered** (says nothing about install safety).
-  - `64` — usage/input error: unsupported platform, manifest invalid,
+  - `64` — usage/input error, limited to the V1 validation scope defined in
+    §6.1 ("Input-validation scope"): unsupported platform, manifest invalid,
     pin mismatch, archive mismatch/unreadable, release-metadata-changed,
-    bare `setup`, unknown flag, non-UTF-8 arguments.
+    bare `setup`, unknown flag, non-UTF-8 arguments. A missing required
+    helper is **not** a `64` condition — it is a Doctor outcome rendered as
+    data (see Test Plan N-5, Case A).
   - `70` — internal error: serialization failure, output bound exceeded,
     Doctor payload unparseable, renderer bug.
   - Exit `1` and `2` are not used by the preview; they remain exclusively
