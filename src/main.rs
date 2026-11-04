@@ -51,6 +51,7 @@ mod resource_limits;
 mod sandbox;
 mod scheduler;
 mod secure_fs;
+mod setup_preview;
 mod task;
 mod task_store;
 mod verifier;
@@ -152,12 +153,27 @@ enum Command {
     Mcp,
     /// Inspect the local GoalLatch environment without starting a Session.
     Doctor(doctor::DoctorOptions),
+    /// Inspect which pinned release a setup would install (read-only).
+    Setup(setup_preview::SetupArgs),
 }
 
 fn main() -> Result<()> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
+            let setup_requested = std::env::args_os()
+                .nth(1)
+                .is_some_and(|argument| argument == "setup");
+            if setup_requested {
+                if error.kind() == clap::error::ErrorKind::DisplayHelp
+                    || error.kind() == clap::error::ErrorKind::DisplayVersion
+                {
+                    let _ = error.print();
+                    std::process::exit(0);
+                }
+                eprintln!("local-mcp setup: invalid command-line arguments");
+                std::process::exit(64);
+            }
             let doctor_requested = std::env::args_os()
                 .nth(1)
                 .is_some_and(|argument| argument == "doctor");
@@ -175,6 +191,7 @@ fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Start { session_id: None }) {
         Command::Doctor(options) => std::process::exit(doctor::execute(options).into()),
+        Command::Setup(args) => std::process::exit(setup_preview::run(args).into()),
         command => {
             #[cfg(unix)]
             process_group::normalize_child_signal_policy()?;
@@ -192,5 +209,6 @@ async fn run(command: Command) -> Result<()> {
         Command::Start { session_id } => approvals::start(session_id.as_deref()).await,
         Command::Mcp => mcp::serve().await,
         Command::Doctor(_) => unreachable!("Doctor dispatch occurs before Tokio initialization"),
+        Command::Setup(_) => unreachable!("Setup dispatch occurs before Tokio initialization"),
     }
 }
