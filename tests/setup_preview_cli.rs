@@ -173,6 +173,7 @@ fn setup_preview_human_output_is_bounded_plain_and_disclaims_authorization() {
     assert!(stdout.contains("DRY RUN"));
     assert!(stdout.contains("PINNED_UNVERIFIED"));
     assert!(stdout.contains("A Doctor PASS is not an installation authorization."));
+    assert!(stdout.contains("Doctor payload authenticity is not established"));
     assert!(!stdout.contains("AKIA-SETUPPREVIEW-CANARY-0000"));
     assert!(stderr_text(&output).is_empty());
 }
@@ -208,7 +209,22 @@ fn setup_preview_json_envelope_is_semantically_consistent_with_doctor_json() {
         serde_json::Value::Null
     );
     assert_eq!(envelope["evidence"]["archive_hashed_in_run"], false);
-    assert!(envelope["residual_warnings"].is_array());
+    let expected_warnings = [
+        "A Doctor PASS is not an installation authorization.",
+        "Doctor payload authenticity is not established",
+    ];
+    let warnings: Vec<&str> = envelope["residual_warnings"]
+        .as_array()
+        .expect("residual_warnings is an array")
+        .iter()
+        .map(|entry| entry.as_str().expect("warning is a string"))
+        .collect();
+    for expected in expected_warnings {
+        assert!(
+            warnings.iter().any(|warning| warning.contains(expected)),
+            "missing mandatory residual warning: {expected}"
+        );
+    }
     assert_eq!(envelope["install_root_trust"]["status"], "UNKNOWN");
 
     // Parsed-value semantic equality with `local-mcp doctor --json`.
