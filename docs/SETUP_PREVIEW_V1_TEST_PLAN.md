@@ -89,19 +89,67 @@ platform and the supported list; exit `64`.
 **Evidence:** table-driven unit test over all non-supported triples.
 **NOT RUN:** never.
 
-### N-5 Required helper missing
-**Input:** fixture layout without `codex-linux-sandbox` (Linux) or without
-`atomic-publish` (all platforms).
-**Expected:** "required helper missing" failure state; names the missing
-helper; Doctor section (if rendered) still verbatim; exit `64`.
-**Evidence:** layout-check unit tests per platform. Note: the V1 preview
-renders install-contract expectations; a full extracted-install layout check
-is an Install Contract V1 concern exercised by its own tests. N-5 covers the
-preview's *displayed* required-helper table and any existence probe the
-preview performs on a supplied install root — it must never report PASS for an
-incomplete layout.
-**NOT RUN:** native legs that cannot emulate the platform layout must mark
-this NOT RUN, not PASS.
+### N-5 Required helper missing (Cases A and B)
+
+There are exactly two distinct cases. They are **not** interchangeable.
+
+**Case A — Doctor detects a missing (or otherwise refused) helper in the
+executable's own sibling layout.**
+The preview embeds the Doctor report verbatim; it performs no filesystem
+inspection for this condition of its own. A Doctor check such as
+`installation.helper.atomic_publish` or `installation.helper.linux_sandbox`
+with `status: BLOCK` (e.g. `INSTALL_REQUIRED_HELPER_MISSING`) renders with
+first-class placement and its reason codes; nothing is rendered as actionable
+or installable.
+**Expected (normative):** exit `0` (the preview rendered); the BLOCK appears
+verbatim in human output and in the embedded `doctor` payload; JSON
+`overall_preview_result == "DOCTOR_BLOCK"`; the mandatory disclaimer lines are
+present; no hint of installability anywhere.
+**Evidence:** golden snapshot of a synthetic Doctor payload containing the
+helper BLOCK; JSON assertion on the embedded report. An integration leg may
+additionally assert this where the test binary's sibling layout can omit the
+helper; legs that cannot emulate that layout record NOT RUN with reason and
+rely on the synthetic fixture.
+
+**Case B — Preview input validation, including paths and layout checks V1
+actually performs.**
+The complete V1 validation surface is: flag parsing (unknown/rejected flags;
+including `--install`-class flags), manifest strict-parse (JSON syntax,
+duplicate keys, trailing data, non-UTF-8), schema/version and six-target
+completeness checks, asset name/SHA-256 rules, embedded-pin comparison,
+double-read byte comparison of an operator-supplied `--manifest`, archive
+hashing pre-conditions (regular file, ≤ 256 MiB) and SHA-256 comparison,
+platform support detection, and output bounds. There is **no dedicated layout
+validator, install-root probe, or extracted-install check** in V1, and none of
+these returns `64` for a *missing helper*.
+**Expected (normative):** each of the following, when it fails, exits `64`
+with the failure state indicated: unknown/`--install`-class flag → clap usage
+error (`64`); malformed/oversize/non-UTF-8 manifest → `MANIFEST_INVALID`
+(`64`); manifest/pin disagreement → `PIN_MISMATCH` (`64`); manifest changed
+between the two reads → `METADATA_CHANGED` (`64`); archive unreadable,
+oversize, or non-regular → `ARCHIVE_UNREADABLE` (`64`); archive digest mismatch
+→ `ARCHIVE_MISMATCH` (`64`); non-target triple → `UNSUPPORTED_PLATFORM`
+(`64`).
+
+**Contract clarification:** exit `64` applies **only** to the input errors
+listed under Case B. A missing required helper is a Doctor outcome (data in the
+report), never an exit-`64` preview input error; it is never reported as PASS
+or rendered as advisable. The only exit-`64` helper-adjacent cases that exist
+are Case B input failures (e.g. bytes that cannot be hashed).
+
+**No dedicated layout validator exists; none is claimed.** If a future slice
+adds an install-root/layout validator, this section, Design §6.1, and Threat
+Model T-12 must be re-specified in the same PR. Until then, any test asserting
+"missing helper → exit `64`" for the preview is invalid and must be rewritten
+against the cases above or recorded NOT RUN with reason.
+
+**Evidence:** Case A — synthetic helper-BLOCK fixture (golden snapshot + JSON
+assertions, all legs). Case B — one failure-state test per listed input class
+(`MANIFEST_INVALID`, `PIN_MISMATCH`, `METADATA_CHANGED`, `ARCHIVE_UNREADABLE`,
+`ARCHIVE_MISMATCH`, `UNSUPPORTED_PLATFORM`, flag rejection).
+**NOT RUN:** only the optional native-layout integration leg may be NOT RUN
+(recorded with reason); Case A fixture assertions and all Case B tests run on
+every CI leg.
 
 ### N-6 Doctor UNKNOWN (required)
 **Input:** synthetic Doctor payload with required UNKNOWN (e.g.

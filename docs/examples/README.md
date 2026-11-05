@@ -11,7 +11,7 @@ files or commands.
 **Purpose:** Ask a Goal to summarize a small Rust project's layout and test
 command without changing it.
 
-**Prerequisites:** GoalLatch v0.1.1, a running `local-mcp start` session in a
+**Prerequisites:** GoalLatch v0.1.2, a running `local-mcp start` session in a
 small Rust project, and a connected stdio MCP client. Start in a clean
 throwaway repository if possible.
 

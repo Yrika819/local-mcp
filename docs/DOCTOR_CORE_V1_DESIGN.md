@@ -143,7 +143,7 @@ The authoritative schema is JSON Schema Draft 2020-12 at
   semantics. This is distinct from the install contract's version.
 - `doctor_version`: Doctor implementation version, independently versioned.
 - `goallatch_version`: package version from the build (`Cargo.toml`, currently
-  `0.1.1`), not a value inferred from a CLI path or environment override.
+  `0.1.2`), not a value inferred from a CLI path or environment override.
 - Every check has stable `id`, `status`, `requirement`, `evidence_type`,
   `observed`, `reason_code`, `message`, and `capability` fields.
 - `observed` must contain only bounded, non-secret facts. Paths and environment
