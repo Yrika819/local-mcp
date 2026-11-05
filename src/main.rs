@@ -171,7 +171,7 @@ fn main() -> Result<()> {
                     let _ = error.print();
                     std::process::exit(0);
                 }
-                eprintln!("local-mcp setup: invalid command-line arguments");
+                let _ = error.print();
                 std::process::exit(64);
             }
             let doctor_requested = std::env::args_os()

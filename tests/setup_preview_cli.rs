@@ -117,6 +117,13 @@ fn bare_setup_prints_help_to_stderr_and_exits_64() {
     let stderr = stderr_text(&output);
     assert!(stderr.contains("local-mcp setup"));
     assert!(stderr.contains("preview"));
+    assert!(
+        !stderr.contains("--version"),
+        "bare setup help must not advertise an unsupported flag"
+    );
+
+    let version = run(&root, &["setup", "--version"]);
+    assert_eq!(version.status.code(), Some(64));
 }
 
 #[test]
@@ -170,7 +177,8 @@ fn setup_preview_human_output_is_bounded_plain_and_disclaims_authorization() {
         stdout.len() <= 64 * 1024,
         "human output must stay within 64 KiB"
     );
-    assert!(stdout.contains("DRY RUN"));
+    assert!(stdout.contains("DRY RUN — no installation will be performed"));
+    assert!(stdout.contains("severity legend: PASS=established"));
     assert!(stdout.contains("PINNED_UNVERIFIED"));
     assert!(stdout.contains("A Doctor PASS is not an installation authorization."));
     assert!(stdout.contains("Doctor payload authenticity is not established"));
@@ -264,6 +272,51 @@ fn setup_preview_json_envelope_is_semantically_consistent_with_doctor_json() {
 }
 
 #[test]
+fn setup_preview_overall_result_and_block_rendering_match_doctor() {
+    let root = TestRoot::new();
+    let doctor = run(&root, &["doctor", "--json"]);
+    let doctor_value: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor --json parses");
+    let preview = run(&root, &["setup", "preview", "--json"]);
+    assert_eq!(preview.status.code(), Some(0));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&preview.stdout).expect("preview --json parses");
+
+    let blockers = doctor_value["summary"]["required_blockers"]
+        .as_u64()
+        .expect("required_blockers is a number");
+    let unknowns = doctor_value["summary"]["required_unknowns"]
+        .as_u64()
+        .expect("required_unknowns is a number");
+    let expected = if blockers > 0 {
+        "DOCTOR_BLOCK"
+    } else if unknowns > 0 {
+        "DOCTOR_REQUIRED_UNKNOWN"
+    } else {
+        // V1 cannot establish install-root trust, so it never claims verified.
+        "RENDERED_UNVERIFIED"
+    };
+    assert_eq!(envelope["overall_preview_result"], expected);
+    assert_ne!(envelope["overall_preview_result"], "RENDERED_VERIFIED");
+    assert_eq!(envelope["install_root_trust"]["status"], "UNKNOWN");
+
+    let human = run(&root, &["setup", "preview"]);
+    assert_eq!(human.status.code(), Some(0));
+    let human_out = stdout_text(&human);
+    for check in doctor_value["checks"].as_array().expect("checks array") {
+        let status = check["status"].as_str().unwrap_or_default();
+        let requirement = check["requirement"].as_str().unwrap_or_default();
+        if requirement == "required" && (status == "BLOCK" || status == "UNKNOWN") {
+            let reason = check["reason_code"].as_str().expect("reason code");
+            assert!(
+                human_out.contains(reason),
+                "required {status} reason {reason} must be rendered"
+            );
+        }
+    }
+}
+
+#[test]
 fn setup_preview_json_reports_pinned_sha256_for_this_platform() {
     let root = TestRoot::new();
     let preview = run(&root, &["setup", "preview", "--json"]);
@@ -293,6 +346,46 @@ fn setup_preview_does_not_modify_test_owned_state() {
     let _ = run(&root, &["setup"]);
     let after = snapshot(root.path());
     assert_eq!(before, after, "preview must not modify any file");
+}
+
+#[test]
+fn setup_preview_human_failure_keeps_mandatory_authorization_disclaimer() {
+    let root = TestRoot::new();
+    let missing = root.path().join("missing-archive.tar.gz");
+    let output = run(
+        &root,
+        &[
+            "setup",
+            "preview",
+            "--archive",
+            missing.to_str().expect("fixture path is UTF-8"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(64));
+    assert!(output.stdout.is_empty());
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("No installation was performed"));
+    assert!(stderr.contains("A Doctor PASS is not an installation authorization."));
+    assert!(!stderr.contains("install anyway"));
+}
+
+#[test]
+fn setup_preview_manifest_over_the_1_mib_limit_fails_with_64() {
+    let root = TestRoot::new();
+    let manifest = root.path().join("oversize.json");
+    fs::write(&manifest, vec![b' '; 1024 * 1024 + 1]).expect("write oversize fixture");
+    let output = run(
+        &root,
+        &[
+            "setup",
+            "preview",
+            "--manifest",
+            manifest.to_str().expect("fixture path is UTF-8"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(64));
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("larger than the 1048576-byte limit"));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! Setup Preview V1 窶・a read-only, presenter-only report of which pinned,
+//! Setup Preview V1 — a read-only, presenter-only report of which pinned,
 //! already-published release a later Setup would install, and what the
 //! Doctor V1 contract says about the local host.
 //!
@@ -36,6 +36,8 @@ pub(crate) const PREVIEW_SCHEMA_VERSION: &str = "1.0.0";
 pub(crate) const PREVIEW_CONTRACT_VERSION: u8 = 1;
 
 const PINNED_VERSION: &str = "0.1.2";
+const SUPPORTED_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
+const SUPPORTED_DOCTOR_CONTRACT_VERSION: u8 = 1;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const IO_BUFFER: usize = 1024 * 1024;
@@ -71,16 +73,16 @@ pub(crate) struct SetupPreviewOptions {
     #[arg(long, value_name = "PATH")]
     manifest: Option<PathBuf>,
     /// Local archive to hash for byte verification (at most 256 MiB).
-    /// Never extracted, opened, or executed.
+    /// Only hashed; never extracted or executed.
     #[arg(long, value_name = "PATH")]
     archive: Option<PathBuf>,
 }
 
-/// Entry point for `local-mcp setup 窶ｦ`. Returns the process exit code.
+/// Entry point for `local-mcp setup …`. Returns the process exit code.
 pub(crate) fn run(args: SetupArgs) -> u8 {
     match args.command {
         None => {
-            const SETUP_HELP: &str = "local-mcp setup 窶・inspect which pinned release a setup would install (read-only)\n\nUSAGE:\n    local-mcp setup <COMMAND>\n\nCOMMANDS:\n    preview    Show which pinned release a setup would install (read-only)\n\nFLAGS:\n    --help        Print the setup help text\n    --version     Print the local-mcp version\n\n'local-mcp setup' never installs anything. `local-mcp setup preview` only\nreports the pinned release, the Doctor V1 diagnostic, and what a hypothetical\nsetup would require. A Doctor PASS is not an installation authorization.\n";
+            const SETUP_HELP: &str = "local-mcp setup — inspect which pinned release a setup would install (read-only)\n\nUSAGE:\n    local-mcp setup <COMMAND>\n\nCOMMANDS:\n    preview    Show which pinned release a setup would install (read-only)\n\nFLAGS:\n    --help        Print the setup help text\n\n'local-mcp setup' never installs anything. `local-mcp setup preview` only\nreports the pinned release, the Doctor V1 diagnostic, and what a hypothetical\nsetup would require. A Doctor PASS is not an installation authorization.\n";
             let mut stderr = io::stderr().lock();
             if stderr.write_all(SETUP_HELP.as_bytes()).is_err() {
                 return ExitCode::InternalError.value();
@@ -353,10 +355,36 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Characters that can rewrite, hide, or reorder human terminal output. JSON
+/// serialization already escapes C0 controls, but the human error path must not
+/// echo raw escape or bidi/format sequences supplied by an operator manifest.
+fn is_display_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn sanitize_for_error(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if is_display_control(character) {
+            for escaped in character.escape_default() {
+                output.push(escaped);
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 fn truncate_for_error(value: &str) -> String {
-    let truncated: String = value.chars().take(MAX_ECHO_CHARS).collect();
-    if value.chars().count() > MAX_ECHO_CHARS {
-        format!("{truncated}窶ｦ (truncated)")
+    let sanitized = sanitize_for_error(value);
+    let truncated: String = sanitized.chars().take(MAX_ECHO_CHARS).collect();
+    if sanitized.chars().count() > MAX_ECHO_CHARS {
+        format!("{truncated}… (truncated)")
     } else {
         truncated
     }
@@ -554,6 +582,7 @@ pub(crate) enum FailureKind {
     ArchiveUnreadable,
     MetadataChanged,
     DoctorUnparseable,
+    DoctorUnsupported,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -636,13 +665,62 @@ impl Failure {
         }
     }
 
+    fn doctor_unsupported(check: &str, actual: &str) -> Self {
+        Self {
+            kind: FailureKind::DoctorUnsupported,
+            check: format!("doctor.{check}"),
+            expected: format!(
+                "Doctor schema {SUPPORTED_DOCTOR_SCHEMA_VERSION} / diagnostic_contract_version {SUPPORTED_DOCTOR_CONTRACT_VERSION}"
+            ),
+            actual: truncate_for_error(actual),
+            message: "The embedded Doctor report has an unsupported contract version; refusing to render."
+                .to_owned(),
+        }
+    }
+
     /// Exit code for this failure class: 64 for usage/input, 70 for internal.
     fn exit_code(&self) -> u8 {
         match self.kind {
-            FailureKind::DoctorUnparseable => 70,
+            FailureKind::DoctorUnparseable | FailureKind::DoctorUnsupported => 70,
             _ => 64,
         }
     }
+}
+
+/// The Preview consumes the typed Doctor report rather than parsing a payload,
+/// but it still refuses to embed a report whose contract version it does not
+/// know (Design §5.1 / N-8). The doctor identity strings must be present.
+fn validate_doctor_contract(
+    schema_version: &str,
+    diagnostic_contract_version: u8,
+    doctor_version: &str,
+    goallatch_version: &str,
+) -> Result<(), Failure> {
+    if schema_version != SUPPORTED_DOCTOR_SCHEMA_VERSION {
+        return Err(Failure::doctor_unsupported(
+            "schema_version",
+            schema_version,
+        ));
+    }
+    if diagnostic_contract_version != SUPPORTED_DOCTOR_CONTRACT_VERSION {
+        return Err(Failure::doctor_unsupported(
+            "diagnostic_contract_version",
+            &diagnostic_contract_version.to_string(),
+        ));
+    }
+    if doctor_version.is_empty() {
+        return Err(Failure::doctor_unsupported(
+            "doctor_version",
+            "empty doctor identity",
+        ));
+    }
+    if goallatch_version.is_empty() {
+        return Err(Failure::doctor_unsupported(
+            "goallatch_version",
+            "empty product identity",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -952,23 +1030,25 @@ fn platform_section(target: Target) -> PlatformSection {
         os,
         arch,
         target: facts.key,
-        supported: facts.classification == "supported",
+        // Every Target in this table is a known release target; the
+        // unsupported-platform case is a failure screen with no platform
+        // section. Experimental/CI-only caveats are carried separately, matching
+        // the design example (Windows: supported=true, experimental=true).
+        supported: true,
         experimental: facts.experimental,
         classification: facts.classification,
     }
 }
 
-fn overall_preview_result(
-    artifact_verified: bool,
-    doctor_report: &doctor::DoctorReport,
-) -> &'static str {
-    let summary = &doctor_report.summary;
-    if summary.required_blockers > 0 {
+/// V1 never establishes install-root trust (`PASS` is intentionally
+/// unrepresentable), so `RENDERED_VERIFIED` is not emitted even when the archive
+/// digest matched. This is the N-10 rule; the authoritative artifact fact stays
+/// in `artifact_verification.status`.
+fn overall_preview_result(required_blockers: usize, required_unknowns: usize) -> &'static str {
+    if required_blockers > 0 {
         "DOCTOR_BLOCK"
-    } else if summary.required_unknowns > 0 {
+    } else if required_unknowns > 0 {
         "DOCTOR_REQUIRED_UNKNOWN"
-    } else if artifact_verified {
-        "RENDERED_VERIFIED"
     } else {
         "RENDERED_UNVERIFIED"
     }
@@ -1010,7 +1090,7 @@ impl ArtifactOutcome {
 
 fn load_manifest(
     options: &SetupPreviewOptions,
-) -> Result<(Manifest, &'static str, Option<bool>), Failure> {
+) -> Result<(Manifest, &'static str, Option<Vec<u8>>), Failure> {
     let Some(path) = options.manifest.as_deref() else {
         // Embedded pin: all six targets, verified against the release.
         let assets = Target::ALL
@@ -1036,24 +1116,36 @@ fn load_manifest(
         ));
     };
 
-    // First read (load time).
+    // First read (load time). The bytes are retained for the pre-render
+    // byte comparison in `verify_manifest_unchanged` (Design §6.2 / N-13).
     let first = read_file_bounded(path, MAX_MANIFEST_BYTES)
         .map_err(|detail| Failure::manifest_invalid("read", &detail))?;
     let parsed = parse_json_strict(&first)
         .map_err(|()| Failure::manifest_invalid("parse", "not valid JSON (or duplicate keys)"))?;
     let manifest = manifest_from_json(parsed)?;
     check_pin(&manifest)?;
+    Ok((manifest, "operator", Some(first)))
+}
 
-    // Second read (pre-render), byte-compared per the double-read rule.
+/// Re-read an operator-supplied manifest immediately before output assembly and
+/// byte-compare it with the load-time read. The embedded pin is an immutable
+/// constant and is not re-read.
+fn verify_manifest_unchanged(
+    options: &SetupPreviewOptions,
+    first: Option<&[u8]>,
+) -> Result<Option<bool>, Failure> {
+    let (Some(path), Some(first)) = (options.manifest.as_deref(), first) else {
+        return Ok(None);
+    };
     let second = read_file_bounded(path, MAX_MANIFEST_BYTES)
         .map_err(|detail| Failure::manifest_invalid("re-read", &detail))?;
     if second != first {
         return Err(Failure::metadata_changed(
-            &sha256_hex(&first)[..16],
+            &sha256_hex(first)[..16],
             &sha256_hex(&second)[..16],
         ));
     }
-    Ok((manifest, "operator", Some(true)))
+    Ok(Some(true))
 }
 
 /// Decide the artifact verification outcome for a computed digest against the
@@ -1080,7 +1172,7 @@ fn verify_archive(
 }
 
 // ---------------------------------------------------------------------------
-// Human rendering (fixed layout; see Design ﾂｧ7.1)
+// Human rendering (fixed layout; see Design §7.1)
 // ---------------------------------------------------------------------------
 
 fn render_human(outcome: &PreviewOutcome) -> String {
@@ -1092,10 +1184,11 @@ fn render_human(outcome: &PreviewOutcome) -> String {
     let summary = &doctor_report.summary;
 
     let mut out = String::new();
-    let _ = writeln!(out, "local-mcp setup preview 窶・DRY RUN");
+    let _ = writeln!(out, "local-mcp setup preview");
+    let _ = writeln!(out, "DRY RUN — no installation will be performed");
     let _ = writeln!(
         out,
-        "No installation will be performed and no files will be modified."
+        "No files will be modified; the archive is never extracted or executed."
     );
     let _ = writeln!(out);
     let _ = writeln!(
@@ -1114,14 +1207,14 @@ fn render_human(outcome: &PreviewOutcome) -> String {
         ArtifactOutcome::VerifiedArchive { sha256 } => {
             let _ = writeln!(
                 out,
-                "  artifact verification: VERIFIED_ARCHIVE 窶・bytes hashed in this run; sha256 matches the pin"
+                "  artifact verification: VERIFIED_ARCHIVE — bytes hashed in this run; sha256 matches the pin"
             );
             let _ = writeln!(out, "  archive sha256: {sha256}");
         }
         ArtifactOutcome::PinnedUnverified => {
             let _ = writeln!(
                 out,
-                "  artifact verification: PINNED_UNVERIFIED 窶・archive bytes were NOT checked in this run"
+                "  artifact verification: PINNED_UNVERIFIED — archive bytes were NOT checked in this run"
             );
             let _ = writeln!(
                 out,
@@ -1163,11 +1256,11 @@ fn render_human(outcome: &PreviewOutcome) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Doctor (embedded; verbatim outcomes 窶・NOT an installation authorization):"
+        "Doctor (embedded; verbatim outcomes — NOT an installation authorization):"
     );
     let _ = writeln!(
         out,
-        "  outcome: {} (required: {}) ﾂｷ advisory: {} ﾂｷ exit-code implication: {}",
+        "  outcome: {} (required: {}) · advisory: {} · exit-code implication: {}",
         summary.status.as_str(),
         summary.required_status.as_str(),
         summary.advisory_status.as_str(),
@@ -1175,7 +1268,7 @@ fn render_human(outcome: &PreviewOutcome) -> String {
     );
     let _ = writeln!(
         out,
-        "  counts: PASS {} ﾂｷ WARN {} ﾂｷ BLOCK {} ﾂｷ UNKNOWN {} ({} checks)",
+        "  counts: PASS {} · WARN {} · BLOCK {} · UNKNOWN {} ({} checks)",
         summary.counts.pass,
         summary.counts.warn,
         summary.counts.block,
@@ -1184,20 +1277,28 @@ fn render_human(outcome: &PreviewOutcome) -> String {
     );
     let _ = writeln!(
         out,
-        "  required blockers: {} ﾂｷ required unknowns: {}",
+        "  required blockers: {} · required unknowns: {}",
         summary.required_blockers, summary.required_unknowns
+    );
+    let _ = writeln!(
+        out,
+        "  severity legend: PASS=established; WARN=advisory; BLOCK=required failure; UNKNOWN=not established"
     );
     let mut listed = 0usize;
     for check in &doctor_report.checks {
-        let required = check.requirement == doctor::Requirement::Required;
         let flagged = matches!(
             check.status,
             doctor::DiagnosticStatus::Block | doctor::DiagnosticStatus::Unknown
         );
-        if required && flagged {
+        if flagged {
+            let requirement = if check.requirement == doctor::Requirement::Required {
+                "required"
+            } else {
+                "advisory"
+            };
             let _ = writeln!(
                 out,
-                "  - [required] {}: {} 窶・{}",
+                "  - [{requirement}] {}: {} — {}",
                 check.id,
                 check.status.as_str(),
                 check.reason_code.as_str()
@@ -1206,7 +1307,7 @@ fn render_human(outcome: &PreviewOutcome) -> String {
         }
     }
     if listed == 0 {
-        let _ = writeln!(out, "  - no required BLOCK or UNKNOWN checks");
+        let _ = writeln!(out, "  - no BLOCK or UNKNOWN checks");
     }
     let _ = writeln!(
         out,
@@ -1331,7 +1432,7 @@ fn render_failure_human(failure: &Failure) -> String {
     use std::fmt::Write as _;
     let _ = writeln!(
         out,
-        "local-mcp setup preview 窶・FAILED (no installation performed)"
+        "local-mcp setup preview — FAILED (no installation performed)"
     );
     let _ = writeln!(out, "check: {}", failure.check);
     let _ = writeln!(out, "expected: {}", failure.expected);
@@ -1341,6 +1442,7 @@ fn render_failure_human(failure: &Failure) -> String {
         out,
         "No installation was performed and no files were modified."
     );
+    let _ = writeln!(out, "A Doctor PASS is not an installation authorization.");
     out
 }
 
@@ -1361,12 +1463,14 @@ fn emit_failure(failure: Failure, options: &SetupPreviewOptions) -> u8 {
         let envelope = build_failure_envelope(&failure, platform);
         match serde_json::to_vec_pretty(&envelope) {
             Ok(mut bytes) => {
+                bytes.push(b'\n');
                 if bytes.len() > JSON_OUTPUT_LIMIT {
                     let _ = write_stderr("preview failure envelope exceeded the output bound\n");
                     return ExitCode::InternalError.value();
                 }
-                bytes.push(b'\n');
-                let _ = write_stdout(&bytes);
+                if write_stdout(&bytes).is_err() {
+                    return ExitCode::InternalError.value();
+                }
                 return failure.exit_code();
             }
             Err(_) => {
@@ -1399,12 +1503,13 @@ fn execute(options: SetupPreviewOptions) -> u8 {
         }
     };
 
-    let (_manifest, manifest_source, double_read_consistent) = match load_manifest(&options) {
+    let (_manifest, manifest_source, manifest_first_bytes) = match load_manifest(&options) {
         Ok(loaded) => loaded,
         Err(failure) => return emit_failure(failure, &options),
     };
-    // The embedded-pin consistency check and the double-read already ran
-    // inside load_manifest; nothing from the manifest is re-read afterwards.
+    // The embedded-pin consistency check ran inside load_manifest. The
+    // operator-manifest double-read is repeated immediately before rendering
+    // below (Design §6.2 / N-13).
 
     let artifact = match verify_archive(&options, target) {
         Ok(artifact) => artifact,
@@ -1415,6 +1520,20 @@ fn execute(options: SetupPreviewOptions) -> u8 {
         Ok(report) => report,
         Err(()) => return emit_failure(Failure::doctor_unparseable(), &options),
     };
+    if let Err(failure) = validate_doctor_contract(
+        doctor_report.schema_version,
+        doctor_report.diagnostic_contract_version,
+        doctor_report.doctor_version,
+        doctor_report.goallatch_version,
+    ) {
+        return emit_failure(failure, &options);
+    }
+
+    let double_read_consistent =
+        match verify_manifest_unchanged(&options, manifest_first_bytes.as_deref()) {
+            Ok(consistent) => consistent,
+            Err(failure) => return emit_failure(failure, &options),
+        };
 
     let install_root_trust = evaluate_install_root_trust(None);
     let facts = target.facts();
@@ -1452,7 +1571,10 @@ fn execute(options: SetupPreviewOptions) -> u8 {
                 summary: "helpers must be installed together next to the executable; symlinks/reparse points are refused; no install is performed by this preview",
             },
             doctor: &doctor_report,
-            overall_preview_result: overall_preview_result(artifact_verified, &doctor_report),
+            overall_preview_result: overall_preview_result(
+                doctor_report.summary.required_blockers,
+                doctor_report.summary.required_unknowns,
+            ),
             evidence: EvidenceSection {
                 doctor_embedded: true,
                 manifest_source,
@@ -1467,11 +1589,11 @@ fn execute(options: SetupPreviewOptions) -> u8 {
         };
         match serde_json::to_vec_pretty(&envelope) {
             Ok(mut bytes) => {
+                bytes.push(b'\n');
                 if bytes.len() > JSON_OUTPUT_LIMIT {
                     let _ = write_stderr("preview JSON exceeded the 1 MiB output bound\n");
                     return ExitCode::InternalError.value();
                 }
-                bytes.push(b'\n');
                 if write_stdout(&bytes).is_err() {
                     return ExitCode::InternalError.value();
                 }
@@ -1590,6 +1712,101 @@ mod tests {
             assert_eq!(facts.asset_name, expected);
             assert!(is_sha256_hex(facts.sha256));
         }
+    }
+
+    #[test]
+    fn documented_resource_limits_match_the_closed_contract() {
+        assert_eq!(MAX_MANIFEST_BYTES, 1024 * 1024);
+        assert_eq!(MAX_ARCHIVE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(HUMAN_OUTPUT_LIMIT, 64 * 1024);
+        assert_eq!(JSON_OUTPUT_LIMIT, 1024 * 1024);
+        assert_eq!(PREVIEW_SCHEMA_VERSION, "1.0.0");
+        assert_eq!(PREVIEW_CONTRACT_VERSION, 1);
+    }
+
+    #[test]
+    fn every_known_target_is_a_supported_preview_target() {
+        for target in Target::ALL {
+            let section = platform_section(target);
+            assert!(
+                section.supported,
+                "{} must be a supported preview target",
+                target.key()
+            );
+            assert_eq!(section.experimental, target.facts().experimental);
+            assert_eq!(section.classification, target.facts().classification);
+        }
+    }
+
+    #[test]
+    fn overall_result_never_claims_verified_without_install_root_trust() {
+        assert_eq!(overall_preview_result(0, 0), "RENDERED_UNVERIFIED");
+        assert_eq!(overall_preview_result(1, 0), "DOCTOR_BLOCK");
+        assert_eq!(overall_preview_result(0, 1), "DOCTOR_REQUIRED_UNKNOWN");
+        assert_eq!(overall_preview_result(1, 1), "DOCTOR_BLOCK");
+    }
+
+    #[test]
+    fn doctor_contract_versions_are_checked() {
+        validate_doctor_contract("1.0.0", 1, "1.0.0", "0.1.2")
+            .expect("the current Doctor V1 contract is supported");
+        for (schema, contract, doctor, product) in [
+            ("99.0.0", 1, "1.0.0", "0.1.2"),
+            ("1.0.0", 2, "1.0.0", "0.1.2"),
+            ("1.0.0", 1, "", "0.1.2"),
+            ("1.0.0", 1, "1.0.0", ""),
+        ] {
+            let failure = validate_doctor_contract(schema, contract, doctor, product)
+                .expect_err("unsupported Doctor identity must be refused");
+            assert_eq!(failure.kind, FailureKind::DoctorUnsupported);
+            assert_eq!(failure.exit_code(), 70);
+        }
+    }
+
+    #[test]
+    fn error_text_escapes_terminal_and_bidi_controls() {
+        let failure = Failure::pin_mismatch(
+            "version",
+            PINNED_VERSION,
+            "0.1.2\u{1b}[2J\u{202e}FAKE\nnext",
+        );
+        let rendered = render_failure_human(&failure);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("\\u{202e}"));
+        assert!(rendered.contains("A Doctor PASS is not an installation authorization."));
+    }
+
+    #[test]
+    fn manifest_double_read_detects_changed_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "goallatch-preview-double-read-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create test-owned double-read root");
+        let path = root.join("manifest.json");
+        std::fs::write(&path, SAMPLE_MANIFEST).expect("write fixture manifest");
+
+        let options = SetupPreviewOptions {
+            json: false,
+            manifest: Some(path.clone()),
+            archive: None,
+        };
+        let first = std::fs::read(&path).expect("read fixture manifest");
+        assert_eq!(
+            verify_manifest_unchanged(&options, Some(&first)).expect("unchanged bytes pass"),
+            Some(true)
+        );
+
+        std::fs::write(&path, br#"{"changed":true}"#).expect("replace fixture manifest");
+        let error = verify_manifest_unchanged(&options, Some(&first)).unwrap_err();
+        assert_eq!(error.kind, FailureKind::MetadataChanged);
+        assert_eq!(error.exit_code(), 64);
+        assert!(error.expected.contains(&sha256_hex(&first)[..16]));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1825,6 +2042,10 @@ mod tests {
     #[test]
     fn failure_exit_codes_are_partitioned() {
         assert_eq!(Failure::doctor_unparseable().exit_code(), 70);
+        assert_eq!(
+            Failure::doctor_unsupported("schema_version", "99.0.0").exit_code(),
+            70
+        );
         assert_eq!(Failure::manifest_invalid("x", "y").exit_code(), 64);
         assert_eq!(
             Failure::unsupported_platform("riscv64/linux", "linux-x86_64").exit_code(),
