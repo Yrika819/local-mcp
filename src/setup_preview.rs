@@ -1820,15 +1820,11 @@ mod tests {
     fn non_utf8_manifest_and_archive_paths_are_rejected() {
         use std::os::unix::ffi::OsStrExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "goallatch-preview-non-utf8-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).expect("create test-owned non-UTF-8 root");
-
-        let manifest = root.join(std::ffi::OsStr::from_bytes(b"manifest-\xff.json"));
-        std::fs::write(&manifest, SAMPLE_MANIFEST).expect("write non-UTF-8 path fixture");
+        // Build the invalid path in memory. Some filesystems (notably APFS)
+        // refuse to create such a filename, but the preview must still reject
+        // the argument before attempting any read.
+        let manifest =
+            std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"manifest-\xff.json"));
         let options = SetupPreviewOptions {
             json: false,
             manifest: Some(manifest),
@@ -1838,12 +1834,10 @@ mod tests {
         assert_eq!(error.kind, FailureKind::ManifestInvalid);
         assert!(error.actual.contains("UTF-8"));
 
-        let archive = root.join(std::ffi::OsStr::from_bytes(b"archive-\xff.zip"));
+        let archive = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"archive-\xff.zip"));
         let error = hash_archive_with_limit(&archive, 1024).unwrap_err();
         assert_eq!(error.kind, FailureKind::ArchiveUnreadable);
         assert!(error.actual.contains("UTF-8"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
