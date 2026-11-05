@@ -776,6 +776,9 @@ fn hash_archive(path: &std::path::Path) -> Result<String, Failure> {
 /// Bounded variant of [`hash_archive`]; the limit parameter exists so tests
 /// can exercise the cap without allocating 256 MiB fixtures.
 fn hash_archive_with_limit(path: &std::path::Path, limit: u64) -> Result<String, Failure> {
+    if path.to_str().is_none() {
+        return Err(Failure::archive_unreadable("path is not valid UTF-8"));
+    }
     let metadata = fs::metadata(path)
         .map_err(|error| Failure::archive_unreadable(&error.kind().to_string()))?;
     if !metadata.is_file() {
@@ -1115,6 +1118,9 @@ fn load_manifest(
             None,
         ));
     };
+    if path.to_str().is_none() {
+        return Err(Failure::manifest_invalid("path", "path is not valid UTF-8"));
+    }
 
     // First read (load time). The bytes are retained for the pre-render
     // byte comparison in `verify_manifest_unchanged` (Design §6.2 / N-13).
@@ -1805,6 +1811,37 @@ mod tests {
         assert_eq!(error.kind, FailureKind::MetadataChanged);
         assert_eq!(error.exit_code(), 64);
         assert!(error.expected.contains(&sha256_hex(&first)[..16]));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_manifest_and_archive_paths_are_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "goallatch-preview-non-utf8-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create test-owned non-UTF-8 root");
+
+        let manifest = root.join(std::ffi::OsStr::from_bytes(b"manifest-\xff.json"));
+        std::fs::write(&manifest, SAMPLE_MANIFEST).expect("write non-UTF-8 path fixture");
+        let options = SetupPreviewOptions {
+            json: false,
+            manifest: Some(manifest),
+            archive: None,
+        };
+        let error = load_manifest(&options).unwrap_err();
+        assert_eq!(error.kind, FailureKind::ManifestInvalid);
+        assert!(error.actual.contains("UTF-8"));
+
+        let archive = root.join(std::ffi::OsStr::from_bytes(b"archive-\xff.zip"));
+        let error = hash_archive_with_limit(&archive, 1024).unwrap_err();
+        assert_eq!(error.kind, FailureKind::ArchiveUnreadable);
+        assert!(error.actual.contains("UTF-8"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
