@@ -235,12 +235,28 @@ impl GoalModelAgent {
         if prompt.len() > MODEL_PROMPT_LIMIT {
             return Err(AgentError::InvalidConfiguration);
         }
-        self.transport.invoke(&ModelInvocation::new(
+        let prompt_bytes = prompt.len();
+        let started = std::time::Instant::now();
+        let result = self.transport.invoke(&ModelInvocation::new(
             self.session_id.clone(),
             cwd,
             role,
             prompt,
-        ))
+        ));
+        // E2 model accounting: observation only, never authoritative. The
+        // prompt-limit rejection above never reached a transport and is not a
+        // call.
+        crate::model_accounting::record_invocation(
+            role,
+            prompt_bytes,
+            started.elapsed(),
+            &result,
+            result
+                .as_ref()
+                .map(|output| output.stdout.len())
+                .unwrap_or(0),
+        );
+        result
     }
 
     pub(crate) fn invoke_at_session_cwd(
@@ -304,6 +320,9 @@ fn joined_model_invocation(request: &ModelInvocation) -> Result<ModelInvocationO
             Err(_) => return Err(AgentError::Timeout),
         }
 
+        // E2 model accounting: a Codex process launch that passed the approval
+        // gate is the literal spawn the zero-spawn guarantee counts.
+        crate::model_accounting::record_codex_spawn();
         run_bounded_process(&command, request.prompt().as_bytes(), None, deadline)
     })();
 
