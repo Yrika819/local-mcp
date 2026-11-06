@@ -24,6 +24,15 @@ completing the checklist. Companion: `docs/SOAK_HARNESS_V1_DESIGN.md`
 - **Success means "worked for this participant on this platform", nothing
   more.** No beta result can upgrade Windows from Experimental, certify
   Apple Silicon local validation, or clear Security V2 residual risks.
+- **Which build this checklist targets.** Every item below refers to the
+  published v0.1.2 release archives only. The development `main` branch
+  contains features that are **not** part of the v0.1.2 release — notably
+  Setup Preview V1 (merged to `main` after the release, not present in the
+  v0.1.2 archives) and design documents for future security work.
+  Participants must not exercise or report `main`-only functionality under
+  this v0.1.2 checklist; validating development builds is a separate
+  activity with its own record, and its results must never be reported as
+  v0.1.2 results.
 
 ## 1. Invitation text (ready to adapt)
 

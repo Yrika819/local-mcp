@@ -5,7 +5,11 @@ independent, new-main-based harness for long-running stability testing of the
 GoalLatch MCP stdio server. It does not modify, extend, or integrate PR #15,
 and it does not authorize merging it. No code is included here.
 
-Base: `main` at `ea50127e13dc0d24e3b7bc3057690c5f8cca12c1`.
+Base: `main` at
+`e6950fdc3bab72982285888a81cce822743fbba5` (re-synced from the original
+`ea50127e13dc0d24e3b7bc3057690c5f8cca12c1` v0.1.2 base; the design is
+unchanged by the re-sync — `main` gains Setup Preview V1 and test
+stabilization, none of which this harness depends on or exercises).
 Companion: `docs/BETA_READINESS_V0.1.2.md` (functional beta), PR #15
 (verification-only integration record — read-only reference, never input to
 this design's correctness).
