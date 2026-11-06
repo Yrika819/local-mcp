@@ -1891,4 +1891,83 @@ mod tests {
         let parsed: Message = serde_json::from_str(activity).unwrap();
         assert!(matches!(parsed, Message::Activity { .. }));
     }
+
+    /// G0-A: a session that accepts the request and then disconnects without
+    /// answering must fail closed. A transport-level EOF is never an approval.
+    #[tokio::test]
+    async fn request_fails_closed_when_session_disconnects_without_responding() -> Result<()> {
+        let id = format!("approval-disconnect-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        let cwd =
+            std::env::temp_dir().join(format!("local-mcp-approval-disconnect-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd)?;
+
+        let mut listener = bind_listener(&path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert!(serde_json::from_str::<Message>(&line).is_ok());
+            // Drop the connection without writing any response.
+            drop(stream);
+        });
+        let outcome = request(&id, "test-op", "detail".into(), cwd.clone()).await;
+        assert!(
+            outcome.is_err(),
+            "a session disconnect must fail closed, never allow"
+        );
+        server.await?;
+        let _ = std::fs::remove_dir_all(&cwd);
+        Ok(())
+    }
+
+    /// G0-A: only the exact `allow` reply (after trim) approves. Case variants,
+    /// extra words, and empty replies all fail closed; surrounding whitespace
+    /// is tolerated because the reply is trimmed before matching.
+    #[tokio::test]
+    async fn request_allow_is_exact_after_trim() -> Result<()> {
+        for reply in ["ALLOW\n", "allow me\n", "yes\n", "\n"] {
+            let id = format!("approval-exact-{}", Uuid::new_v4());
+            let path = config::socket_path(&id)?;
+            let cwd =
+                std::env::temp_dir().join(format!("local-mcp-approval-exact-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&cwd)?;
+            let mut listener = bind_listener(&path)?;
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut stream)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let outcome = request(&id, "test-op", "detail".into(), cwd.clone()).await;
+            assert!(outcome.is_err(), "reply {reply:?} must fail closed");
+            server.await?;
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        let id = format!("approval-trim-{}", Uuid::new_v4());
+        let path = config::socket_path(&id)?;
+        let cwd = std::env::temp_dir().join(format!("local-mcp-approval-trim-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd)?;
+        let mut listener = bind_listener(&path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            stream.write_all(b" allow \n").await.unwrap();
+        });
+        assert!(request(&id, "test-op", "detail".into(), cwd.clone()).await?);
+        server.await?;
+        let _ = std::fs::remove_dir_all(&cwd);
+        Ok(())
+    }
 }
