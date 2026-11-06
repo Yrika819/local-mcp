@@ -392,6 +392,10 @@ pub(crate) struct GoalResultView {
     status: GoalStatus,
     terminal: bool,
     result_state: &'static str,
+    /// Additive outcome discriminator: COMPLETED / FAILED / CANCELLED /
+    /// BLOCKED / NONTERMINAL. `result_state` keeps its frozen
+    /// TERMINAL/NOT_TERMINAL contract.
+    result_kind: &'static str,
     objective: String,
     revision: u64,
     plan_revision: u32,
@@ -1606,6 +1610,22 @@ fn status_view(goal: &Goal) -> GoalStatusView {
     }
 }
 
+/// Additive outcome discriminator for `goal_result`.
+///
+/// The frozen `result_state` field keeps its TERMINAL/NOT_TERMINAL contract;
+/// this mapping adds the five-way distinction (COMPLETED / FAILED / CANCELLED /
+/// BLOCKED / NONTERMINAL) that External Agent Backend consumers need without
+/// changing any existing field.
+pub(crate) fn result_kind_for_status(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Completed => "COMPLETED",
+        GoalStatus::Failed => "FAILED",
+        GoalStatus::Cancelled => "CANCELLED",
+        GoalStatus::Blocked => "BLOCKED",
+        _ => "NONTERMINAL",
+    }
+}
+
 fn result_view(goal: &Goal) -> GoalResultView {
     // TaskStore loads validate the durable evidence against this Goal. Absence
     // never implies a verified snapshot, even if a managed record exists.
@@ -1660,6 +1680,7 @@ fn result_view(goal: &Goal) -> GoalResultView {
         } else {
             "NOT_TERMINAL"
         },
+        result_kind: result_kind_for_status(goal.status()),
         objective: goal.objective().to_owned(),
         revision: goal.revision(),
         plan_revision: goal.plan_revision(),

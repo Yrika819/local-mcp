@@ -72,6 +72,8 @@ mod goal_finalizer_tests;
 #[cfg(test)]
 mod goal_hardening_tests;
 #[cfg(test)]
+mod goal_orchestration_regression_tests;
+#[cfg(test)]
 mod goal_runner_tests;
 #[cfg(test)]
 mod goal_verifier_tests;
