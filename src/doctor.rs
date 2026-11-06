@@ -132,7 +132,7 @@ pub(crate) enum ReasonCode {
 }
 
 impl ReasonCode {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CapabilityAvailable => "CAPABILITY_AVAILABLE",
             Self::CheckNotApplicable => "CHECK_NOT_APPLICABLE",
@@ -211,13 +211,13 @@ impl SafeObserved {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct DiagnosticCheck {
-    id: String,
-    status: DiagnosticStatus,
-    requirement: Requirement,
+    pub(crate) id: String,
+    pub(crate) status: DiagnosticStatus,
+    pub(crate) requirement: Requirement,
     applicability: Applicability,
     evidence_type: EvidenceType,
     observed: SafeObserved,
-    reason_code: ReasonCode,
+    pub(crate) reason_code: ReasonCode,
     message: String,
     capability: Option<CapabilityId>,
 }
@@ -425,6 +425,17 @@ impl ExitCode {
     }
 }
 
+impl DiagnosticStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Block => "BLOCK",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
 impl Serialize for ExitCode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -435,42 +446,42 @@ impl Serialize for ExitCode {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct DiagnosticCounts {
+pub(crate) struct DiagnosticCounts {
     #[serde(rename = "PASS")]
-    pass: u8,
+    pub(crate) pass: u8,
     #[serde(rename = "WARN")]
-    warn: u8,
+    pub(crate) warn: u8,
     #[serde(rename = "BLOCK")]
-    block: u8,
+    pub(crate) block: u8,
     #[serde(rename = "UNKNOWN")]
-    unknown: u8,
+    pub(crate) unknown: u8,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct DiagnosticSummary {
-    status: DiagnosticStatus,
-    required_status: DiagnosticStatus,
-    advisory_status: DiagnosticStatus,
-    runtime_status: DiagnosticStatus,
-    counts: DiagnosticCounts,
-    checks_total: usize,
-    required_blockers: usize,
-    required_unknowns: usize,
-    exit_code: ExitCode,
+    pub(crate) status: DiagnosticStatus,
+    pub(crate) required_status: DiagnosticStatus,
+    pub(crate) advisory_status: DiagnosticStatus,
+    pub(crate) runtime_status: DiagnosticStatus,
+    pub(crate) counts: DiagnosticCounts,
+    pub(crate) checks_total: usize,
+    pub(crate) required_blockers: usize,
+    pub(crate) required_unknowns: usize,
+    pub(crate) exit_code: ExitCode,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct DoctorReport {
-    schema_version: &'static str,
-    diagnostic_contract_version: u8,
-    doctor_version: &'static str,
-    goallatch_version: &'static str,
+    pub(crate) schema_version: &'static str,
+    pub(crate) diagnostic_contract_version: u8,
+    pub(crate) doctor_version: &'static str,
+    pub(crate) goallatch_version: &'static str,
     platform: PlatformDiagnostic,
     installation: Installation,
     dependencies: Dependencies,
     capabilities: Capabilities,
-    checks: Vec<DiagnosticCheck>,
-    summary: DiagnosticSummary,
+    pub(crate) checks: Vec<DiagnosticCheck>,
+    pub(crate) summary: DiagnosticSummary,
 }
 
 impl DoctorReport {
@@ -753,16 +764,32 @@ fn choose_codex_source(
     }
 }
 
-pub(crate) fn execute(options: DoctorOptions) -> u8 {
+/// Collect the Doctor report for reuse by other read-only surfaces (Setup
+/// Preview). Returns `Err(())` when the diagnostic worker is unavailable or
+/// fails; callers map that to their own internal-error exit code. The
+/// deadline fallback (a fully `UNKNOWN` timeout report) is folded in here so
+/// every caller gets the same report `local-mcp doctor` would render.
+pub(crate) fn collect_report(options: DoctorOptions) -> Result<DoctorReport, ()> {
     let host = HostFacts::current();
-    let report = match run_with_deadline(STATIC_CHECK_TIMEOUT, move || {
+    match run_with_deadline(STATIC_CHECK_TIMEOUT, move || {
         build_report(process_input(options))
     }) {
+        Ok(report) => Ok(report),
+        Err(DeadlineFailure::TimedOut) => Ok(timeout_report(host, options)),
+        Err(DeadlineFailure::WorkerUnavailable | DeadlineFailure::WorkerFailed) => Err(()),
+    }
+}
+
+/// Options for a headless, read-only Doctor pass with all probes refused;
+/// used by surfaces that embed the Doctor report.
+pub(crate) fn headless_options() -> DoctorOptions {
+    DoctorOptions::default()
+}
+
+pub(crate) fn execute(options: DoctorOptions) -> u8 {
+    let report = match collect_report(options) {
         Ok(report) => report,
-        Err(DeadlineFailure::TimedOut) => timeout_report(host, options),
-        Err(DeadlineFailure::WorkerUnavailable | DeadlineFailure::WorkerFailed) => {
-            return internal_error();
-        }
+        Err(()) => return internal_error(),
     };
     let output = if options.json {
         match json_output(&report) {

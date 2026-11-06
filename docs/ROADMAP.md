@@ -6,8 +6,11 @@ work that has landed and been verified should be described as complete.
 
 ## Current public baseline
 
-- GoalLatch v0.1.1 is released; `local-mcp` remains the compatibility package
-  and executable name.
+- GoalLatch v0.1.2 is released; `local-mcp` remains the compatibility package
+  and executable name. v0.1.2 adds Install Contract V1 enforcement, Doctor
+  Core V1 diagnostics, and Security V2 final-entry helper refusal; see the
+  [v0.1.2 release notes](release/RELEASE_NOTES_v0.1.2.md). The v0.1.1 release
+  remains the prior public baseline.
 - Linux x86_64 and macOS Intel have documented supported release boundaries;
   Linux aarch64 and Windows remain Experimental, and Apple Silicon is not
   locally release-closure validated. See [SECURITY.md](../SECURITY.md).
