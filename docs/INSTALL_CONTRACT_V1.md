@@ -208,6 +208,24 @@ Published archive hashes observed from the official `v0.1.1` GitHub Release:
 | `local-mcp-v0.1.1-windows-x86_64.zip` | `73f8296c7ec10e9543c5db6438c569378840dcf65dfd1215d44e77d8a5cd8a4b` |
 | `local-mcp-v0.1.1-windows-aarch64.zip` | `248581dd4e27aacef284198ddd696e5610543873ca3815101687c420bb23a37c` |
 
+Published archive hashes observed from the official `v0.1.2` GitHub Release
+(`SHA256SUMS` downloaded from the release and read verbatim on 2026-11-04):
+
+| Archive | SHA-256 |
+| --- | --- |
+| `local-mcp-v0.1.2-linux-x86_64.tar.gz` | `34bfccf8a6bc1a258b3d841234d445f6e7db9db0fc9a5895dddffa95affe43e6` |
+| `local-mcp-v0.1.2-linux-aarch64.tar.gz` | `f048eddfd17b9fe9bdccaee7d05418d31282d5642c2a709c27738fba58c9ece0` |
+| `local-mcp-v0.1.2-macos-x86_64.tar.gz` | `12d24cb82501153527422f54639e3f5332c7d84b741dbdbb4b9a5a7dd6c8d9a8` |
+| `local-mcp-v0.1.2-macos-aarch64.tar.gz` | `21400b2fb61e865484055e470ca78f3d289882fda335ed6e5e4cbc37eef8a787` |
+| `local-mcp-v0.1.2-windows-x86_64.zip` | `f5d2e3e20242956ca34b1fe2d9de479ca1a38fad84b99ddb619204cf0cd4342a` |
+| `local-mcp-v0.1.2-windows-aarch64.zip` | `4288ba681bd47fdfc8c08d923c5870bd1693c2dadac17f975d661024b522841c` |
+
+No new local native-execution claim is made for the v0.1.2 assets by this
+document; the archive-hash observation above is metadata verification only and
+does not bind the opened image at install or run time (see the residual risks
+in the [v0.1.2 release notes](release/RELEASE_NOTES_v0.1.2.md#residual-risks)). The
+v0.1.1 table above is retained as historical evidence and is not superseded.
+
 The native Windows result also covered `atomic-publish.exe` startup (exit 65 on a
 malformed frame). `codex-linux-sandbox` was not executed: this host is Windows,
 and the helper is not part of a Windows install.
@@ -229,7 +247,8 @@ isolated temporary fixture; no existing session, Goal, project, or install is
 modified.
 
 Archive/download resource caps are intentionally much larger than the published
-v0.1.1 assets (3.2–5.8 MB compressed): 256 MiB per archive, 256 MiB per
+v0.1.1 assets (3.2–5.8 MB compressed); the v0.1.2 assets are the same order of
+magnitude: 256 MiB per archive, 256 MiB per
 member, 512 MiB total declared uncompressed content, at most 256 members, and a
 maximum declared expansion ratio of 1000:1. Downloads are streamed in 1 MiB
 chunks with the same 256 MiB cap; the checksum manifest is limited to 1 MiB.
@@ -329,16 +348,16 @@ python3 scripts/release/install_contract.py contract
 
 # Verify a locally built archive and its extracted install
 python3 scripts/release/install_contract.py archive \
-  --target linux-x86_64 --version 0.1.1 \
-  --archive dist/local-mcp-v0.1.1-linux-x86_64.tar.gz
+  --target linux-x86_64 --version 0.1.2 \
+  --archive dist/local-mcp-v0.1.2-linux-x86_64.tar.gz
 
 # Stage target/release binaries and observe the native install
 python3 scripts/release/install_contract.py native \
-  --version 0.1.1 --binary-dir target/release
+  --version 0.1.2 --binary-dir target/release
 
 # Verify the real published artifact (downloads from the official release URL)
 python3 scripts/release/install_contract.py published \
-  --target windows-x86_64 --version 0.1.1
+  --target windows-x86_64 --version 0.1.2
 ```
 
 `archive` defaults to structural verification only and does not execute an
