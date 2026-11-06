@@ -31,17 +31,18 @@ Global rules:
 | ID | Fixture | Expected (strict mode) | NOT RUN condition |
 | --- | --- | --- | --- |
 | N-V3-1 | Final entry is a symlink/junction/reparse to a regular file | helper refused; verdict BLOCK; unchanged behavior vs V2 | none |
-| N-V3-2 | Helper replaced *after* open, before exec (rename-over) | pinned inode executes or exec fails; swapped bytes never run | non-fd-exec平台はstrict claim不可 → residual documented instead |
+| N-V3-2 | Helper replaced *after* open, before exec (rename-over) | pinned inode executes or exec fails; swapped bytes never run | on non-fd-exec platforms (Windows; macOS pre-spike) a strict-mode claim is impossible → residual documented instead |
 | N-V3-3 | Final filename replaced to point to attacker payload after open | pinned object executes; payload not reached | see N-V3-2 |
 | N-V3-4 | Ancestor replaced/redirected: root renamed + recreated, junction flipped, mount stacked | walk fails (dev/inode mismatch); no exec; BLOCK/UNKNOWN | junction ops on Windows require symlink privilege; convert to NOT RUN otherwise |
 | N-V3-5 | In-place byte edit of pinned helper pre-exec | deterministic behavior: the pinned inode's bytes at exec time run; document that byte freshness is NOT asserted; record observation | none |
 | N-V3-6 | Doctor/validator given V3-refusable layout | shared verdict = BLOCK; Doctor reports context as diagnostic content only; no surface allows exec | none |
-| N-V3-7 | Windows DACL unparsable (denied read on DACL) | UNKNOWN; no exec; never allow-by-default | ACL denial fixture requires elevated rights; NOT RUN with reason otherwise |
+| N-V3-7 | Windows DACL/owner unparsable or denied (read denied on DACL or owner SID; missing security descriptor) | UNKNOWN; no exec; never allow-by-default | ACL/owner denial fixture requires elevated rights; NOT RUN with reason otherwise |
 | N-V3-8 | Verdict matrix: runtime vs validator vs Doctor disagreement injected via fixture | parity test fails; merge blocked | none |
 | N-V3-9 | Windows path re-parse race (file swapped between recheck and `CreateProcessW`) | detected by re-check comparison (best-effort) or residual hit; behavior is documented, never an integrity claim | cannot deterministically force the race on demand; test asserts detection of *content/identity* change via re-check, else NOT RUN |
 | N-V3-10 | Helper fd inherited into unrelated child | child holds no unexpected fd; `O_CLOEXEC` asserted | none |
 | N-V3-11 | Verdict function branch exhaustion | every branch fails closed; compiler-enforced exhaustiveness; each branch has a dedicated test | none |
-| N-V3-12 | Perf: per-spawn overhead on the reference host | measured ≤ agreed budget (Design §8) or default-on is blocked | hardware variance: report medians over ≥ 1k spawns |
+| N-V3-12 | Perf: per-spawn overhead on the release-leg CI runner class | measured ≤ agreed budget (Design §6/§8) or default-on is blocked | hardware variance: report medians over ≥ 1k spawns; the budget applies per host class and must be re-agreed before extension |
+| N-V3-13 | Windows owner SID outside policy (owner = attacker-controlled principal with a "clean" DACL) | verdict UNKNOWN/BLOCK; no exec; owner and DACL are independent gates | none (fixture creatable with standard user rights) |
 
 ## 3. Linux-specific acceptance tests
 
@@ -62,20 +63,42 @@ Global rules:
 ## 4. macOS-specific acceptance tests
 
 - A-M1 (spike gate): `/dev/fd/N` exec works on Intel and Apple Silicon CI
-  runners with the codesigned fixture helper; result recorded with exact
+  runners with the codesigned fixture helper; the spike must distinguish
+  "the kernel executes the fd's file" (identity binding) from "the kernel
+  re-resolves `/dev/fd/N`" (no binding); result recorded with exact
   commands and runner versions.
-- A-M2: ancestor walk with `O_NOFOLLOW` + dev/inode stability across the
-  full matrix of N-V3-4.
+- A-M2: ancestor walk with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` per level,
+  verification exclusively via `fstat` of the opened fds (never path
+  re-stat), device/inode stability across the full matrix of N-V3-4.
 - A-M3: if spike fails: docs/Doctor messaging residual wording test (grep
   gate in CI for forbidden phrases like "spawn-time identity verified").
 - A-M4: SIP-enabled host notes: verification remains possible; exec claim
   follows the spike result.
+- A-M5 (macOS ACL matrix — blocking for any macOS strict-mode claim):
+  exercised with `ACL_TYPE_EXTENDED` retrieval on APFS test-owned fixtures;
+  every row records PASS/FAIL/NOT RUN with reason:
+  | Fixture | Expected verdict |
+  | --- | --- |
+  | ACL `allow` write for a non-root/non-installer principal, POSIX mode clean | BLOCK |
+  | Inherited ACL `allow` write from a rejected ancestor | BLOCK |
+  | Inherited ACL from a fully-passing trusted ancestor, read-only | PASS (per policy) |
+  | Group/`everyone` write via ACL (mode clean) | BLOCK |
+  | Explicit ACL `deny` contradicting policy | verdict honors the deny; BLOCK where it grants attacker advantage |
+  | ACL present and fully trusted alongside POSIX `0755` | PASS (combined evaluation) |
+  | ACL retrieval fails / unsupported filesystem | UNKNOWN, fail-closed |
+  Until native macOS evidence exists, every A-M5 row is **NOT VERIFIED**,
+  not PASS, and macOS strict mode stays disabled (D-V3-7).
 
 ## 5. Windows-specific acceptance tests
 
 - A-W1: DACL parser: allow-by-Admins/SYSTEM subprocess helper passes;
   Users-writable ancestor fails; Deny-Users entries honored; unparsable
   DACL → UNKNOWN (fail closed).
+- A-W6: owner-SID matrix (independent of DACL): owner = Administrators →
+  allowed (subject to DACL); owner = attacker-created local user with a
+  policy-clean DACL → UNKNOWN/BLOCK (implicit owner `READ_CONTROL`/
+  `WRITE_DAC` makes the DACL untrustworthy); owner SID unresolvable →
+  UNKNOWN; inherited-ACE chain traced to a rejected parent → BLOCK.
 - A-W2: final reparse point rejected (existing); parent junction detected
   and rejected in strict mode (detection, not elimination claim).
 - A-W3: residual wording presence test: docs and Doctor-facing strings
@@ -94,7 +117,8 @@ Global rules:
 - P-2: Doctor, when extended, reports the same verdict; a fixture agreeing
   with runtime but not validator (or vice versa) fails P-1.
 - P-3: Install Contract V1 decision table is a subset (all V1 accepts
-  remain accepts in V2 mode with same file classes) unless a
+  remain accepts in default mode — i.e. the pre-V3, V2-era behavior — with
+  the same file classes) unless a
   contract-major note is explicitly issued; any tightening requires the
   major-note gate.
 - P-4: existing Windows/Linux/macOS CI legs remain green; no leg is
@@ -119,5 +143,8 @@ Every CI run for a V3 PR must publish (as artifacts or job summary):
 - OS, runner, kernel/OS build, and privilege notes (symlink privilege on
   Windows);
 - per-test result ∈ {PASS, FAIL, NOT RUN + reason};
+- for Windows: owner-SID source and DACL retrieval method; for macOS: ACL
+  retrieval status (`ACL_TYPE_EXTENDED` supported/not) — retrieval failures
+  are evidence, not noise;
 - the strict-mode flag state and kernel support matrix;
 - perf measurements (if applicable), raw, not summarized away.

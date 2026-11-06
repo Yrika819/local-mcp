@@ -6,7 +6,11 @@ by Security V2. It authorizes no runtime changes. Any implementation requires
 the Owner approvals listed in §12 and must land as contract-compatible,
 fail-closed slices behind the existing Install Contract V1 selector.
 
-Base: `main` at `ea50127e13dc0d24e3b7bc3057690c5f8cca12c1` (v0.1.2).
+Base: `main` at
+`e6950fdc3bab72982285888a81cce822743fbba5` (re-synced from the original
+`ea50127e13dc0d24e3b7bc3057690c5f8cca12c1` v0.1.2 base; the re-sync brings in
+Setup Preview V1 and test stabilization, none of which this design depends
+on or modifies).
 Companion documents: `docs/SECURITY_V3_THREAT_MODEL.md`,
 `docs/SECURITY_V3_TEST_PLAN.md`.
 
@@ -71,7 +75,7 @@ Non-goals (this document authorizes none of these):
 | dirfd-relative component walk with `O_NOFOLLOW`/`O_DIRECTORY` | Yes | Yes | Partial via `CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS)` for detection only; pinning a directory identity does not pin a later path resolution by the OS |
 | `fexecve` | Yes (glibc) | No fexecve; `/dev/fd` fallback | No |
 | hash-at-open (streamed digest of the fd) | Yes, but this authenticates the *content read this run*, not the mapping used by exec; acceptable only combined with fd-pinned exec | Same | Same; and exec itself remains path-based |
-| ACL/ownership enforcement at install time | mode/ownership per POSIX | mode/ownership per POSIX + ACL via `osx-acl`/`listxattr` (optional) | DACL parsing via `windows-sys` (dependency already present) |
+| ACL/ownership enforcement at install time | mode/ownership per POSIX | POSIX mode + **mandatory** NFSv4-style ACL evaluation via the documented `ACL_TYPE_EXTENDED` API family (native behavior NOT VERIFIED until the D-V3-7 spike; fail-closed on retrieval failure) | DACL + owner-SID evaluation via `windows-sys` (dependency already present) |
 | Atomic updater rename | rename(2) within install fs | same | MoveFileEx within same volume |
 | Job containment of spawned helper | n/a (authority model) | n/a | unchanged; Windows host-native, no sandbox claim |
 
@@ -86,71 +90,182 @@ enforcement, and honest residuals instead.
 ### D-V3-1 — Open-then-exec is the only identity model
 The launch path must:
 
-1. open the install root and each ancestor with `O_DIRECTORY` (Unix) /
-   `FILE_FLAG_OPEN_REPARSE_POINT` (Windows), verifying at each level:
-   regular/directory type, no reparse/symlink where policy forbids it,
-   mount identity (`st_dev`) stable, ownership/mode within the trusted-root
-   policy (§D-V3-4);
+1. open the install root and each ancestor level with
+   `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` (Unix) /
+   `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` (Windows),
+   verifying at each level from the **fd itself** (`fstat`/handle metadata —
+   never a path re-stat): regular/directory type, no reparse/symlink where
+   policy forbids it, device and inode identical to the values observed when
+   the level was opened (crossing a *legitimate* mount boundary is handled by
+   treating each mount as a new level with its own trusted-root evaluation,
+   not by accepting an `EXDEV` silently), filesystem type via `fstatfs`
+   (unrecognized or network filesystem → UNKNOWN, see §D-V3-4),
+   ownership/mode within the trusted-root policy (§D-V3-4);
 2. open the helper **relative to the pinned root dirfd** with
-   `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS, O_PATH)` (Linux),
-   `openat(O_NOFOLLOW | O_PATH)` (macOS), or `CreateFileW` with
-   `FILE_FLAG_OPEN_REPARSE_POINT` (Windows, detection-only);
+   `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+   O_PATH | O_CLOEXEC)` (Linux), `openat(O_RDONLY | O_NOFOLLOW |
+   O_CLOEXEC)` (macOS — a **readable** fd is required because the `/dev/fd`
+   exec path reads the file; `O_PATH` does not exist on macOS, and
+   `O_SYMLINK` is a different bit with different semantics and is **not**
+   used), or `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` (Windows,
+   detection-only);
 3. `fstat` the resulting fd/handle: regular file, expected owner, expected
    mode, single-link or recorded inode;
 4. optional content digest **over the fd** (install-time only; never the
    per-spawn path unless policy demands it);
 5. spawn from the pinned object: `execveat(dirfd_or_empty, "", ...)` with
-   `AT_EMPTY_PATH` (Linux), `execve("/dev/fd/<n>", ...)` (macOS, post-spike),
-   or `CreateProcessW(escaped_path)` (Windows — no identity binding; see
-   D-V3-6);
+   `AT_EMPTY_PATH` (Linux, native binary — see the scope note below),
+   `execve("/dev/fd/<n>", ...)` (macOS, **NOT VERIFIED** — gated on the
+   D-V3-7 spike; strict mode must not be enabled on macOS before the spike
+   passes), or, on Windows, `CreateProcessW` with `lpApplicationName` set to
+   the **absolute verified path** (so the child parse cannot split or
+   reinterpret the executable token), `lpCommandLine` built with the
+   standard Windows quoting convention for the verified path plus
+   arguments, `bInheritHandles` pinned to an explicit caller-chosen value
+   (default FALSE), and explicit `dwCreationFlags` (documented `CREATE_*`
+   set only; no flag that would relax the verification context). Windows
+   spawn is path-based and claims no identity binding (D-V3-6);
 6. if any step fails, or the OS refuses fd-exec (SELinux, LSM, binfmt), the
    helper does not run; the failure is explicit (Doctor: BLOCK/UNKNOWN).
 
 An inode pinned by an fd cannot be swapped by renaming. In-place writes to a
 pinned inode still change its bytes — that is unavoidable and is stated, not
-hidden (threat T-V3-4). The guarantee is precisely: *the image executed is the
-inodular object verified*, not "the bytes are authenticated forever".
+hidden (threat T-V3-4). The guarantee is precisely: *on Linux, the native
+binary executed is the verified inode* (via `execveat(AT_EMPTY_PATH)`), not
+"the bytes are authenticated forever". The claim is scoped to fd-pinned
+platforms and to executables the kernel runs directly from the pinned fd:
+**script files are out of closure scope** — an interpreter re-opens the
+script by path (shebang re-resolution), so a script helper carries a
+path-based residual even on Linux and must never be claimed as
+fd-pinned. Windows is exempt entirely (`CreateProcessW` is path-based).
+macOS: verification and execution remain two separate steps (verify the
+opened fd, then `execve("/dev/fd/N")`) — this does **not** by itself close
+the TOCTOU window; closure is only claimable after the D-V3-7 spike proves
+`/dev/fd/N` exec semantics natively, and until then macOS carries the
+documented residual, never a strict-mode claim.
+
+Two related honest boundaries: (a) a *separate verification fd* plus a
+*separate execution open* is a double-open, not an atomic identity bind —
+the macOS model must either prove the single-fd `/dev/fd` exec path or carry
+the residual; (b) verification of the fd and use of the fd by the kernel
+must be distinguished in every platform claim: only Linux currently achieves
+"the kernel executes the very fd that was verified".
 
 ### D-V3-2 — Parent-directory pinning beats final-entry checks
 The ancestor walk (D-V3-1 step 1) is the control for redirection attacks.
 Replacing the root directory, an intermediate directory, or the mount makes
-the walk fail closed (`st_dev` change, `EXDEV`, pipe-to-moved-mount, inode
-change). Final-entry symlink rejection remains, as defense in depth, but
+the walk fail closed (device/inode mismatch between `fstat(fd)` at open time
+and `fstat(fd)` of the same open fd after each subsequent level, `EXDEV` at
+the next `openat` relative to a pinned dirfd, `fstatfs` type mismatch,
+inode change). Legitimate mount boundaries (e.g., the install tree crossing
+into a local bind/data mount) are supported only as *newly evaluated levels*
+under the same trusted-root policy; there is no blanket `EXDEV` bypass.
+Final-entry symlink rejection remains, as defense in depth, but
 moves from "the control" to "one control among several".
 
-### D-V3-3 — Runtime and Validator share one decision function
-`is_plain_file`/`first_existing` stay the only shared rules; V3 wraps them in
-a single `verify_helper_chain(...) -> HelperTrust` verdict consumed by:
+### D-V3-3 — Runtime and Validator share one decision table
+`is_plain_file`/`first_existing` stay the only shared rules; V3 re-specifies
+the shared decision as a **single normative decision table** (verdict per
+observation row, defined in this document and the Test Plan) with **two
+independent implementations** — the Rust runtime side and the Python
+Install Contract validator side — plus a planned third consumer (Doctor,
+NOT IMPLEMENTED and excluded from parity claims until it exists). The
+wording "one shared function" is intentionally retired: there is no single
+function across Rust and Python, and pretending otherwise would over-claim
+parity.
+
+The parity claim is bounded:
+
+- parity tests assert decision identity between the Rust and Python
+  implementations over the **shared deterministic fixture matrix** (Test
+  Plan §4/§6);
+- kernel/capability branches (e.g., `openat2` availability, SELinux refusal,
+  Windows privilege holders) are **outside** the parity claim — they are
+  platform facts, reported per leg;
+- Doctor is marked NOT IMPLEMENTED and is excluded from the parity claim
+  until its V3 probes exist (D-V3-5);
+- any divergence on the shared matrix is a BLOCK, and the decision is
+  fail-closed by construction: unknown capability → BLOCK/UNKNOWN, never
+  PASS.
+
+Consumers of the verdict:
 
 - the runtime selector (execution path),
 - the Install Contract validator (`scripts/release/install_contract.py`
   parity tests),
-- Doctor (classification only; Doctor never enforces),
+- Doctor (classification only; Doctor never enforces; NOT IMPLEMENTED),
 - future Setup (install-time gate).
-
-Any divergence between these four is a BLOCK, and a parity test asserts
-identity of decisions over the shared matrix (Test Plan §4). The decision is
-fail-closed by construction: unknown capability → BLOCK/UNKNOWN, never PASS.
 
 ### D-V3-4 — Trusted install root is a policy, evaluated per OS
 A path is trusted for helper execution only if:
 
-- **Linux/macOS**: every ancestor from the filesystem boundary to the install
+- **Linux**: every ancestor from the filesystem boundary to the install
   directory is owned by root (or the documented installer uid) with mode
   `0755` or stricter, and no group/other write bit; the install directory
   itself is owned by root/installer, `0755` or stricter; no ancestor is a
-  symlink/junction/remount-to-untrusted-fs; network filesystems require an
-  explicit Owner attestation.
-- **Windows**: every ancestor and the install directory carry a DACL whose
-  allow-set contains only the installer/Administrators/SYSTEM (plus
-  read/execute for Users), with no deny entries that contradict policy and no
-  write ACE for Users/Everyone; no ancestor is a reparse point except where
-  policy explicitly allows (e.g., Nix); volume is local or attested.
+  symlink/remount-to-untrusted-fs; filesystem type is on an explicit
+  allowlist (`fstatfs`), and unrecognized or network filesystems are UNKNOWN
+  unless an explicit Owner attestation is recorded.
+- **macOS**: the same POSIX ownership/mode rules as Linux, **plus** an
+  evaluation of NFSv4-style extended ACLs (Apple `ACL_TYPE_EXTENDED`,
+  retrieved with the documented `acl_get_file`/`acl_get_entry` API family)
+  on every ancestor and the install directory. POSIX mode bits do not
+  reflect ACL `allow` entries: a directory whose group bits look clean can
+  still grant write access through an inherited ACL entry. The policy is:
+  - an ACL `allow` entry granting write to a principal other than
+    root/installer → BLOCK;
+  - inherited ACL entries are evaluated as their own findings (an inherited
+    allow from a trusted ancestor may be accepted only if the ancestor
+    itself passed the same policy);
+  - Group/Everyone/`everyone`/`group` write capability, whether from mode or
+    ACL → BLOCK;
+  - parent-directory ACLs are part of the walk and evaluated identically;
+  - if ACLs cannot be retrieved or parsed (unsupported filesystem, API
+    error) → UNKNOWN, fail-closed — never a silent POSIX-only downgrade;
+  - if native validation of the ACL API behavior on the target filesystems
+    has not been performed, the entire macOS ACL evaluation is recorded as
+    **NOT VERIFIED** and strict mode must not be enabled on macOS (see
+    D-V3-7 and Test Plan A-M5). The Owner may explicitly accept the
+    remaining risk of an unevaluated-ACL environment in writing; that
+    acceptance is recorded next to this paragraph, never implied.
+- **Windows**: every ancestor and the install directory must pass BOTH an
+  owner check AND a DACL check; either alone is insufficient. Evaluation is
+  via `GetSecurityInfo`/`GetNamedSecurityInfo` (`OWNER_INFORMATION`,
+  `DACL_SECURITY_INFORMATION`), with `GetSecurityDescriptorOwner`/
+  `GetSecurityDescriptorDacl` on the resulting descriptor:
+  - **Owner SID** must resolve to a member of { Administrators, SYSTEM,
+    documented installer SID }. Rationale: a Windows object owner holds
+    implicit `READ_CONTROL`/`WRITE_DAC` on the object regardless of the
+    DACL contents, so a "clean-looking" DACL owned by an attacker-controlled
+    principal is bypassable; owner and DACL are independent gates and both
+    must pass;
+  - **DACL** allow-set must contain only installer/Administrators/SYSTEM
+    (plus read/execute for Users), evaluated over inherited AND explicit
+    ACEs (inherited ACEs must be traced to trusted parents — an inherited
+    allow from a rejected parent is a finding); any explicit Deny that
+    contradicts policy → BLOCK; any write-capable ACE for
+    Users/Everyone/Authenticated Users → BLOCK;
+  - the effective writability of every directory is evaluated as "which
+    principals could modify entries or files", combining owner rights, ACE
+    rights, and integrity-level considerations; if that combination cannot
+    be computed confidently → UNKNOWN;
+  - no ancestor is a reparse point (junction/symlink mount) except where
+    policy explicitly allows (e.g., Nix); any reparse ancestor → BLOCK
+    (or UNKNOWN if the reparse data cannot be read);
+  - if the security descriptor is missing, unparsable, or retrieval is
+    denied → **UNKNOWN**, fail-closed — never allow-by-default;
+  - volume must be local or explicitly attested; unknown filesystems are
+    UNKNOWN.
+  Windows remains **Experimental** with no Unix-equivalent sandbox or
+  identity guarantee; these checks are trusted-root *preconditions*, not a
+  claim of spawn-time identity (D-V3-6).
 
 Feasibility: Unix ownership/mode checks are directly implementable. Windows
-DACL parsing is implementable with `windows-sys` (already a dependency) but
-must be bounded and fail-closed on parse ambiguity. Where evaluation is
-impossible at runtime (e.g., network mounts without attestation), the verdict
+DACL/owner parsing is implementable with `windows-sys` (already a dependency)
+but must be bounded and fail-closed on parse ambiguity. macOS ACL evaluation
+requires the native spike (D-V3-7) before its behavior is trusted. Where
+evaluation is impossible at runtime (e.g., network mounts without
+attestation, unparsable descriptors), the verdict
 is UNKNOWN → blocks install authorization, allows nothing silently.
 
 ### D-V3-5 — Doctor reporting contract (future slices, designed now)
@@ -168,7 +283,8 @@ If/when Doctor gains V3 checks, the contract is:
 Windows has no stable public API to create a process from an image handle.
 V3 therefore specifies for Windows:
 
-- DACL/ancestor/reparse *detection* at verify time (D-V3-1 steps 1–3),
+- DACL/owner/ancestor/reparse *detection* at verify time (D-V3-1 steps 1–3;
+  owner-SID and DACL evaluation per D-V3-4),
 - immediate pre-spawn re-verification as a race *detector* (never as an
   authorization),
 - Job Object containment (existing behavior, unchanged),
@@ -188,15 +304,28 @@ residual and revisiting after AppContainer broker design exists.
 ### D-V3-7 — macOS spike is mandatory before closure claims
 `execve("/dev/fd/N")` on macOS:
 
-- historically works for regular files open for reading;
+- historically works for regular files open for reading; the design models
+  the macOS launch as `openat(O_RDONLY | O_NOFOLLOW | O_CLOEXEC)` → `fstat`
+  verification → `execve("/dev/fd/N")`, i.e. a readable fd (no `O_PATH` —
+  it does not exist on macOS; `O_SYMLINK` is a different bit and is not
+  used);
 - must be validated natively on Apple Silicon and Intel runners, including
-  interaction with SIP, code signature validation, and notarization stubs;
+  interaction with SIP, code signature validation, and notarization stubs,
+  and specifically including whether the kernel executes the very file the
+  fd refers to (identity binding) or re-opens `/dev/fd/N` by a mechanism
+  that can race — the spike must distinguish these two behaviors, because
+  only the first closes the TOCTOU window;
+- the spike scope additionally covers the D-V3-4 macOS ACL evaluation
+  (`ACL_TYPE_EXTENDED` retrieval and semantics on APFS, including inherited
+  entries) and the POSIX-mode interaction — **NOT VERIFIED** until then;
 - if the spike passes, macOS reaches Linux-equivalent closure for the exec
   step (with ancestor verification identical);
 - if not, macOS ships with the D-V3-6-style residual (detection + trusted
   root) and the limitation is documented, never silently.
 
 No closure statement for macOS is valid without the spike's native evidence.
+Absent native evidence, every macOS-specific guarantee in this design is
+recorded **NOT VERIFIED** and strict mode stays disabled on macOS.
 
 ### D-V3-8 — Install-time sealing is part of the design, not an add-on
 Installers (and the future Setup) must, in the same transaction that places
@@ -232,15 +361,19 @@ A V3 implementation may claim closure per platform only when all apply:
 
 **Linux**
 - AC-L1: native CI demonstrates fd-pinned exec refuses or binds under
-  ancestor-swap, final-name-swap, and in-place-mtime-change fixtures.
+  ancestor-swap, final-name-swap, and in-place byte-edit fixtures
+  (N-V3-5 shape; mtime is never treated as identity evidence).
 - AC-L2: in-place byte modification between open and exec executes the
   *pinned inode*; test proves no path-based re-resolution occurs (fault
   injection via a wrapper path whose target changes after open).
 - AC-L3: `openat2` absence (older kernels/libcs) yields explicit, documented
   refusal or Owner-accepted fallback — never silent weakening.
 - AC-L4: performance: no measurable regression beyond a per-spawn overhead
-  budget agreed by the Owner (proposal: ≤ 1 ms median on the reference
-  hardware; measure, never assert blindly).
+  budget agreed by the Owner (proposal: ≤ 1 ms median on the *release-leg
+  CI runner class* — the concrete runner image used for release
+  verification, medians over ≥ 1,000 spawns per N-V3-12; the budget must be
+  re-agreed for any other host class before a claim is extended to it;
+  measure, never assert blindly).
 - AC-L5: Bubblewrap gate compatibility: helpers spawned inside the sandbox
   derive from the same pinned objects; no descriptor leaks another helper's
   fd into the child without intent.
@@ -290,8 +423,12 @@ the flag; no slice removes an existing check.
   to be < 0.5 ms; measured per AC-L4/X4 before default-on.
 - No per-spawn hashing; digest verification occurs at install time and in
   audit tooling only (hash-at-exec would not bind the image anyway).
-- Windows: DACL evaluation per verify (cached per directory with explicit
-  invalidation), not per spawn on hot path.
+- Windows: DACL/owner evaluation per verify (not per spawn on hot path).
+  If an evaluation cache is introduced, it is valid **only** for the
+  verify-then-spawn window of the current launch: max-age 0 (single use) or
+  invalidation by a change notification for the exact directory, whichever
+  is implemented; a cache that cannot prove invalidation is forbidden, and
+  any cache miss or expiry → UNKNOWN, never a stale PASS.
 - No background threads, no persistent fds.
 
 ## 9. Failure semantics summary
@@ -301,10 +438,15 @@ the flag; no slice removes an existing check.
 | ancestor not a directory | BLOCK | no exec |
 | ancestor dev change during walk | BLOCK | no exec |
 | ancestor reparse/symlink (Windows) | BLOCK (or UNKNOWN if unparsable) | no exec |
+| ancestor symlink where `O_NOFOLLOW` forbids (Unix) | BLOCK | no exec |
+| ancestor ownership/mode/ACL out of policy (Unix) | BLOCK | no exec |
+| Unix ancestor ACL unparsable (macOS) | UNKNOWN | no exec |
 | helper missing | BLOCK (existing) | no exec |
 | helper not regular / link | BLOCK (existing) | no exec |
 | fd-exec unsupported | UNKNOWN (strict) | no exec |
 | DACL unparsable | UNKNOWN | no exec |
+| Windows owner SID outside policy or unresolvable | UNKNOWN | no exec |
+| Windows security descriptor missing/unreadable | UNKNOWN | no exec |
 | TOCTOU re-check mismatch (Windows) | UNKNOWN | no exec |
 
 ## 10. Limitations (explicit)
@@ -315,8 +457,12 @@ the flag; no slice removes an existing check.
   prevent an authorized writer from modifying what they may write. It binds
   *identity*, not *immutability*. Immutability is the trusted-root policy's
   job.
-- Atomic updater races (Case D) become deterministic at exec time with
-  fd-pinning: the pinned image runs or the launch fails. Which generation
+- Atomic updater races (Case D) become deterministic at exec time **on
+  fd-pinned platforms (Linux; macOS only if the D-V3-7 spike passes)**: the
+  pinned image runs or the launch fails. Windows has no fd-pinned exec, so
+  no determinism is claimed there — the only real control is the
+  trusted-install-root precondition (D-V3-4/D-V3-6), and the re-parse
+  residual stands. Which generation
   wins is still updater-policy, not security; see Threat Model T-V3-7.
 - Network filesystems and user-writable ancestors are NO-GO unless attested.
 - This document does not certify any deployment. Deployments are trusted by
