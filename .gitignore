@@ -1,5 +1,8 @@
 /target
 
+# Soak Harness run outputs (reports are published as CI artifacts, not repo content)
+scripts/soak/runs/
+
 # Local machine state and editor metadata
 .DS_Store
 .local/
@@ -9,3 +12,7 @@
 .vscode/
 .idea/
 .zed/
+
+# Python bytecode
+__pycache__/
+*.pyc
