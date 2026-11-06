@@ -41,7 +41,11 @@ Goals:
    V1 design defaults (all explicit CLI flags, never implicit): in-flight
    requests ≤ 128 (reused from the PR #15 reference shape); wire-line size cap
    16 MiB; per-run response byte cap 1 GiB (counters retained, payload not);
-   working-set ceiling 1.5 GiB or +50 % baseline, whichever first; descriptor
+   working-set ceiling 1.5 GiB absolute cap with a growth allowance of
+   +50 % of baseline **subject to a 256 MiB absolute floor** (Slice-3
+   adjustment: the pure-percentage bound alone was hair-trigger against a
+   ~13 MB Windows baseline working set; see the implementation record in
+   `scripts/soak/README.md`, PR #29); descriptor
    ceiling 4,096; latency-sample retention ≤ 10,000 per scenario (reservoir
    sampling beyond that, with the dropped-sample counter retained). The
    defaults are validated against a maintainer-observed baseline in Slice 3;
@@ -111,7 +115,9 @@ soak.py (driver, host)
   commit under test (`git rev-parse HEAD` of a supplied checkout), OS, and
   runner.
 - The child is spawned with a test-owned state directory (`XDG_*`/`TEMP`
-  redirected), never the operator's state.
+  redirected; Windows: the profile root — the product resolves its state
+  from `<USERPROFILE>/AppData/Local`, verified against the v0.1.2 binary —
+  never the operator's state).
 
 ### Scenarios (weighted, seeded mix)
 
@@ -119,12 +125,12 @@ soak.py (driver, host)
 | --- | --- | --- | --- |
 | S1 | Read file / list directory (small fixture tree) | `read_file`, `list_directory` | ≤ 5k req/min |
 | S2 | Session info poll | `session_info` | interleaved |
-| S3 | Goal start → status → cancel | `goal_start`, `goal_status`, `goal_cancel` | ≤ 20 concurrent goals |
+| S3 | Goal start → status → cancel | `goal_start`, `goal_status`, `goal_cancel` | product V1 rule: **one non-terminal durable Goal per session** — the engine rotates a single Goal; `goal_start` refusals (e.g. the durable creation-attempt cap) are classified expected refusals, never unexpected errors (reconciled with the implementation, PR #29; the earlier "≤ 20 concurrent goals" bound predates the V1 durable-Goal rule) |
 | S4 | Goal run (bounded `max_steps`, stubbed/absent Codex CLI) | `goal_run` | expect recorded failure without Codex CLI; must not hang |
 | S5 | Foreground execute (sandboxed `echo`-class command) | `execute` | Linux/macOS only. Windows leg: S5 is **excluded per Experimental status** and recorded `not-applicable (platform experimental)` — Windows behaves as the documented host-native, non-sandboxed platform and is never admitted to the latency/coverage matrix; no Windows result is presented as a sandbox success |
 | S6 | Refusal path (outside roots) | any write/execute outside `permitted_directories` | must refuse; zero silent truncation |
 | S7 | Malformed frame (garbage line, wrong version, missing id) | raw stdio | must be answered or logged, never crash child |
-| S8 | Oversized frame beyond cap | raw stdio | must be refused within the 16 MiB cap |
+| S8 | Oversized frame beyond cap | raw stdio | must be refused within the request-frame cap. Product fact (verified against v0.1.2): request frames are capped at **8 MiB** (`MAX_MCP_REQUEST_FRAME_BYTES`) and an oversized frame is **discarded without parsing**, answered with an `id: null` resource-limit error while the connection stays on frame boundaries; the harness records that refusal against the probe id. The 16 MiB figure above is the *response*-frame cap and the harness's own inbound line bound |
 | S9 | Client EOF (driver half-closes stdin) | raw stdio | child exits or reports; driver classifies |
 | S10 | Child kill at adversarial moments (SIGTERM/SIGKILL between request phases) | process control | recovery section asserts durable-state readability after restart |
 
