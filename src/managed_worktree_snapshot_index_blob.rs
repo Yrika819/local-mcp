@@ -449,6 +449,8 @@ fn digest_hex(digest: Sha256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::path::PathBuf;
 
     #[test]
     fn production_argv_is_the_closed_hardened_batch_command() {
@@ -748,12 +750,28 @@ mod tests {
     }
 
     #[cfg(windows)]
+    struct WitnessMarkerGuard(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for WitnessMarkerGuard {
+        fn drop(&mut self) {
+            // Best effort: the job-contained tree is torn down by the session's
+            // ProcessGroup drop; here we only owe the caller its witness file.
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn windows_timeout_terminates_job_contained_child_tree() {
+        const WITNESS_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+        const WITNESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
         let oid = "d".repeat(40);
         let entry = entry(oid, SnapshotIndexMode::Regular { executable: false });
         let marker =
             std::env::temp_dir().join(format!("snapshot-2c-child-{}.pid", uuid::Uuid::new_v4()));
+        let _marker_guard = WitnessMarkerGuard(marker.clone());
         let script = "$child=Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 60') -PassThru; [IO.File]::WriteAllText($env:WITNESS,[string]$child.Id); Start-Sleep -Seconds 60";
         let mut command = Command::new("powershell.exe");
         command
@@ -769,14 +787,46 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let session = fake_session(command);
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !marker.exists() {
-                tokio::task::yield_now().await;
+        // Bounded poll: existence alone is not a handshake. The witness is only
+        // accepted once it parses as a non-zero PID, which also tolerates a
+        // concurrent reader observing a half-written file. If the job empties
+        // before any witness appears, the leader died during startup and we
+        // fail fast with diagnostics instead of waiting out the deadline.
+        let witness_deadline = Instant::now() + WITNESS_WAIT_TIMEOUT;
+        let mut last_read_error: Option<String> = None;
+        let child_pid = loop {
+            match std::fs::read_to_string(&marker) {
+                Ok(contents) => match contents.trim().parse::<u32>() {
+                    Ok(pid) if pid > 0 => break pid,
+                    Ok(_) => {
+                        last_read_error =
+                            Some(format!("witness parsed to a zero PID: {contents:?}"));
+                    }
+                    Err(parse_error) => {
+                        last_read_error = Some(format!("witness not yet parseable: {parse_error}"));
+                    }
+                },
+                Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(read_error) => {
+                    last_read_error = Some(format!("witness read failed: {read_error}"));
+                }
             }
-        })
-        .await
-        .expect("PowerShell child published its PID witness");
-        let child_pid = std::fs::read_to_string(&marker).unwrap();
+            if let Ok(0) = session.group.active_processes_for_test() {
+                panic!(
+                    "PowerShell child tree exited before publishing its PID witness (marker_present={}, last_read_error={last_read_error:?})",
+                    marker.exists()
+                );
+            }
+            if Instant::now() >= witness_deadline {
+                let job_active = session.group.active_processes_for_test().ok();
+                panic!(
+                    "PowerShell child did not publish a valid PID witness within {WITNESS_WAIT_TIMEOUT:?} (marker_present={}, job_active_processes={job_active:?}, last_read_error={last_read_error:?})",
+                    marker.exists()
+                );
+            }
+            tokio::time::sleep(WITNESS_POLL_INTERVAL).await;
+        };
+        let child_pid = child_pid.to_string();
         let mut budget = SnapshotHashBudget::new();
         let result = session
             .read_entry_with_test_timeout(&entry, &mut budget, Duration::from_millis(50))
@@ -803,7 +853,7 @@ mod tests {
         })
         .await
         .expect("Job-contained descendant stopped after session timeout");
-        std::fs::remove_file(marker).unwrap();
+        drop(_marker_guard);
     }
 
     #[cfg(unix)]
