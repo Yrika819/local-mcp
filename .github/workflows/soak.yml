@@ -1,0 +1,104 @@
+name: soak
+
+# Soak Harness V1 CI (docs/SOAK_HARNESS_V1_DESIGN.md §9).
+#
+# Per-PR: only the harness's own unit tests run (fast, stdlib-only) so PR CI
+# is not occupied by long-running work.
+# Nightly / manual: a bounded 15-minute soak on Linux with a 3-seed matrix.
+# The 8-hour acceptance runs (design §10) are manual-dispatch only and are
+# NOT exercised by routine CI.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/soak/**"
+      - ".github/workflows/soak.yml"
+  pull_request:
+    paths:
+      - "scripts/soak/**"
+      - ".github/workflows/soak.yml"
+  schedule:
+    # 02:17 UTC daily (nightly soak; bounded, not an 8-hour run)
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Soak duration in seconds (long runs are manual, explicitly timed)"
+        required: false
+        default: "900"
+
+concurrency:
+  group: soak-longrun-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  soak-unit-tests:
+    # Per-PR regression gate: harness unit tests only.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run soak harness unit tests
+        working-directory: scripts/soak
+        run: python test_soak_v1.py -v
+
+  soak-nightly:
+    # Bounded nightly soak: builds the release binary of the commit under
+    # test and runs 15 minutes per seed (3 seeds) with explicit timeouts.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Harness unit tests (preflight)
+        working-directory: scripts/soak
+        run: python test_soak_v1.py
+      - name: Run seeded soak matrix
+        working-directory: scripts/soak
+        env:
+          SEEDS: "1 2 3"
+        run: |
+          set -eu
+          duration="${{ github.event.inputs.duration_seconds }}"
+          [ -n "$duration" ] || duration=900
+          status=0
+          for seed in $SEEDS; do
+            echo "::group::soak seed $seed"
+            python -m soak_v1 \
+              --server-cmd "$GITHUB_WORKSPACE/target/release/local-mcp mcp" \
+              --duration "$duration" --seed "$seed" \
+              --out "runs/nightly-seed$seed" \
+              --failure-injection \
+              --commit-sha "$(git rev-parse HEAD)" \
+              || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+      - name: Upload soak reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-reports-${{ github.sha }}
+          path: |
+            scripts/soak/runs/**/soak-report-*.json
+            scripts/soak/runs/**/soak-report-*.md
+            scripts/soak/runs/**/soak-run.jsonl
+          if-no-files-found: warn
+          retention-days: 30
