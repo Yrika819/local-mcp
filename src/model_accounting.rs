@@ -28,6 +28,12 @@
 //!   invocation of the same role failed. This is a transport-level retry proxy;
 //!   scheduler-driven Task retries each produce their own invocation and are
 //!   visible as such.
+//!
+//! Test isolation: the process-wide registry is the production surface. In test
+//! builds every recording is additionally mirrored into a thread-local
+//! registry, and the tests assert against that mirror only, so they stay
+//! deterministic while unrelated tests record into the shared registry in
+//! parallel.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -109,7 +115,7 @@ impl Registry {
     }
 }
 
-/// Lock the registry with poison recovery.
+/// Lock the process-wide registry with poison recovery.
 ///
 /// Recording is observation only: a panic between two counters must not
 /// permanently disable accounting, and must never propagate into the authority
@@ -120,19 +126,23 @@ fn lock_registry() -> MutexGuard<'static, Registry> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Record one completed model invocation.
-///
-/// Never panics and never returns an error: accounting must not be able to
-/// fail, approve, or deny anything.
-pub(crate) fn record_invocation(
+#[cfg(test)]
+std::thread_local! {
+    // Per-test-thread mirror of the registry. Tests assert against this and
+    // stay deterministic while unrelated tests record into `REGISTRY` in
+    // parallel.
+    static TEST_REGISTRY: std::cell::RefCell<Registry> =
+        std::cell::RefCell::new(Registry::default());
+}
+
+fn accumulate(
+    registry: &mut Registry,
     role: ModelRole,
     request_bytes: usize,
     duration: Duration,
-    result: &Result<ModelInvocationOutput, AgentError>,
+    outcome: CallOutcome,
     response_bytes: usize,
 ) {
-    let outcome = CallOutcome::classify(result);
-    let mut registry = lock_registry();
     let is_retry = registry
         .last_call_failed
         .get(role.as_str())
@@ -165,9 +175,59 @@ pub(crate) fn record_invocation(
         .insert(role.as_str(), outcome != CallOutcome::Success);
 }
 
+fn count_spawn(registry: &mut Registry) {
+    registry.codex_spawn_count += 1;
+}
+
+fn snapshot_of(registry: &Registry) -> ModelAccountingSnapshot {
+    ModelAccountingSnapshot {
+        codex_spawn_count: registry.codex_spawn_count,
+        roles: registry
+            .roles
+            .iter()
+            .map(|(role, metrics)| ((*role).to_owned(), metrics.clone()))
+            .collect(),
+    }
+}
+
+/// Record one completed model invocation.
+///
+/// Never panics and never returns an error: accounting must not be able to
+/// fail, approve, or deny anything.
+pub(crate) fn record_invocation(
+    role: ModelRole,
+    request_bytes: usize,
+    duration: Duration,
+    result: &Result<ModelInvocationOutput, AgentError>,
+    response_bytes: usize,
+) {
+    let outcome = CallOutcome::classify(result);
+    accumulate(
+        &mut lock_registry(),
+        role,
+        request_bytes,
+        duration,
+        outcome,
+        response_bytes,
+    );
+    #[cfg(test)]
+    TEST_REGISTRY.with(|registry| {
+        accumulate(
+            &mut registry.borrow_mut(),
+            role,
+            request_bytes,
+            duration,
+            outcome,
+            response_bytes,
+        )
+    });
+}
+
 /// Record one Codex process launch that passed the approval gate.
 pub(crate) fn record_codex_spawn() {
-    lock_registry().codex_spawn_count += 1;
+    count_spawn(&mut lock_registry());
+    #[cfg(test)]
+    TEST_REGISTRY.with(|registry| count_spawn(&mut registry.borrow_mut()));
 }
 
 /// A stable, secret-free view for tests, future `goal_status` integration, or
@@ -180,22 +240,20 @@ pub(crate) fn record_codex_spawn() {
     )
 )]
 pub(crate) fn snapshot() -> ModelAccountingSnapshot {
-    let registry = lock_registry();
-    ModelAccountingSnapshot {
-        codex_spawn_count: registry.codex_spawn_count,
-        roles: registry
-            .roles
-            .iter()
-            .map(|(role, metrics)| ((*role).to_owned(), metrics.clone()))
-            .collect(),
-    }
+    snapshot_of(&lock_registry())
 }
 
-/// Reset all counters. Test-only observation support.
+/// The deterministic per-test-thread view. Tests assert against this mirror so
+/// unrelated tests recording into the shared registry cannot race them.
+#[cfg(test)]
+pub(crate) fn snapshot_for_test() -> ModelAccountingSnapshot {
+    TEST_REGISTRY.with(|registry| snapshot_of(&registry.borrow()))
+}
+
+/// Reset the per-test-thread mirror. Test-only observation support.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
-    let mut registry = lock_registry();
-    *registry = Registry::default();
+    TEST_REGISTRY.with(|registry| *registry.borrow_mut() = Registry::default());
 }
 
 #[cfg(test)]
@@ -213,7 +271,7 @@ mod tests {
     /// Serialize-inspect helper: the snapshot must never contain prompt or
     /// response content.
     fn serialized_snapshot() -> String {
-        serde_json::to_string(&snapshot()).unwrap()
+        serde_json::to_string(&snapshot_for_test()).unwrap()
     }
 
     #[test]
@@ -226,7 +284,7 @@ mod tests {
             &Ok(ok_output()),
             2,
         );
-        let snapshot = snapshot();
+        let snapshot = snapshot_for_test();
         assert_eq!(snapshot.codex_spawn_count, 0);
         let planner = &snapshot.roles["PLANNER"];
         assert_eq!(planner.calls, 1);
@@ -261,7 +319,7 @@ mod tests {
             &Err(AgentError::NonZeroExit),
             0,
         );
-        let readonly = &snapshot().roles["READONLY"];
+        let readonly = &snapshot_for_test().roles["READONLY"];
         assert_eq!(readonly.calls, 3);
         assert_eq!(readonly.failures, 3);
         assert_eq!(readonly.timeouts, 1);
@@ -293,7 +351,7 @@ mod tests {
             &Ok(ok_output()),
             2,
         );
-        let writer = &snapshot().roles["WRITER"];
+        let writer = &snapshot_for_test().roles["WRITER"];
         assert_eq!(writer.calls, 3);
         assert_eq!(
             writer.retries, 1,
@@ -313,7 +371,7 @@ mod tests {
             &Ok(ok_output()),
             1,
         );
-        let snapshot = snapshot();
+        let snapshot = snapshot_for_test();
         assert_eq!(snapshot.codex_spawn_count, 2);
         assert_eq!(snapshot.roles["REVIEWER"].calls, 1);
     }
@@ -344,7 +402,7 @@ mod tests {
     #[test]
     fn poisoned_registry_still_records_and_never_fails_the_authority_path() {
         reset_for_test();
-        // Poison the lock: a panic between two counters.
+        // Poison the process-wide lock: a panic between two counters.
         let _ = std::panic::catch_unwind(|| {
             let _guard = lock_registry();
             panic!("poison the accounting registry on purpose");
@@ -358,7 +416,9 @@ mod tests {
             0,
         );
         record_codex_spawn();
-        let snapshot = snapshot();
+        // The process-wide snapshot stays readable too (poison recovered).
+        let _ = snapshot();
+        let snapshot = snapshot_for_test();
         assert_eq!(snapshot.roles["PLANNER"].approval_denied, 1);
         assert_eq!(snapshot.codex_spawn_count, 1);
     }
@@ -400,7 +460,7 @@ mod tests {
                 .invoke_at_session_cwd(ModelRole::Writer, "prompt".to_owned())
                 .is_err()
         );
-        let snapshot = snapshot();
+        let snapshot = snapshot_for_test();
         assert_eq!(snapshot.roles["PLANNER"].successes, 1);
         assert_eq!(
             snapshot.roles["PLANNER"].request_bytes,
