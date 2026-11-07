@@ -713,3 +713,64 @@ fn receipt_decisions_are_bounded_and_never_carry_a_committed_revision_early() {
     assert!(!document.contains(MARKER));
     assert!(!document.contains("SECRET"));
 }
+
+#[test]
+fn goal_submit_refuses_malformed_request_boundaries() {
+    let f = fixture("malformed-request");
+    let goal_id = start_external(&f.session, &f.store);
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    let work = next["model_work"].clone();
+
+    // A response that is not JSON at all arrives as a JSON *string*, so it is
+    // refused by the bounded object check instead of being parsed as a document.
+    let args = submit_args(
+        &f.session,
+        &goal_id,
+        &work,
+        &Uuid::new_v4().to_string(),
+        json!("{\"goal_id\": not-json"),
+    );
+    assert_eq!(
+        submit_outcome(&f.session, &f.store, &args).unwrap(),
+        "REJECTED_SCHEMA"
+    );
+
+    // A missing response field is a malformed request and is refused before any
+    // durable read, so it consumes no budget and writes nothing.
+    let mut missing = args.clone();
+    missing.as_object_mut().unwrap().remove("response");
+    assert_eq!(
+        submit_outcome(&f.session, &f.store, &missing).unwrap_err(),
+        "INVALID_ARGUMENT"
+    );
+
+    // An unknown request field is refused rather than ignored, so a caller can
+    // not smuggle authority-bearing keys past `deny_unknown_fields`.
+    let mut unknown = submit_args(
+        &f.session,
+        &goal_id,
+        &work,
+        &Uuid::new_v4().to_string(),
+        valid_proposal(&work),
+    );
+    unknown["role"] = json!("PLANNER");
+    assert_eq!(
+        submit_outcome(&f.session, &f.store, &unknown).unwrap_err(),
+        "INVALID_ARGUMENT"
+    );
+
+    // Only the bounded response refusal was recorded; neither malformed request
+    // reached durable state at all.
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let state = external_state(&goal).unwrap();
+    assert_eq!(
+        state.receipts().len(),
+        1,
+        "only the bounded response refusal is recorded"
+    );
+    assert_eq!(
+        state.receipts()[0].decision(),
+        SubmissionDecision::RejectedSchema
+    );
+    assert!(state.active_work().is_none());
+}
