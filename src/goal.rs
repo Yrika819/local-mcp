@@ -8,11 +8,13 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config;
+use crate::external_model_work::ExternalModelState;
 use crate::failure_class::FailureClass;
 use crate::fallback::SideEffectState;
 use crate::managed_worktree::{
     ManagedWorktreeCreationIntent, ManagedWorktreeRecord, WorkspaceMode, WorktreeId,
 };
+use crate::model_backend::ModelBackend;
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -1401,6 +1403,26 @@ pub(crate) struct Goal {
     managed_worktree: Option<ManagedWorktreeRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_worktree_creation_intent: Option<ManagedWorktreeCreationIntent>,
+    /// External Agent Backend V1 backend policy (ADR-01).
+    ///
+    /// This is a creation-time, immutable host policy. Omitted means `CODEX`,
+    /// which keeps every Goal written before E3 byte-identical and readable by
+    /// binaries that predate the field.
+    ///
+    /// A `CODEX` Goal serializes this field away entirely, so an older binary
+    /// can still read and rewrite a `CODEX` Goal. An `EXTERNAL` Goal states it
+    /// explicitly; a binary that does not know the field refuses the whole
+    /// document through `deny_unknown_fields`. That is the required fail-closed
+    /// downgrade (B-04): stale code must not silently discard durable external
+    /// state and then rewrite the Goal without it.
+    #[serde(default, skip_serializing_if = "ModelBackend::is_default")]
+    model_backend: ModelBackend,
+    /// Durable External Agent Backend state. `None` for every `CODEX` Goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Boxed deliberately: the aggregate is large and absent for every CODEX
+    /// Goal, so keeping it out of line avoids inflating every `Goal` value that
+    /// the existing orchestration clones and moves on the stack.
+    external_model: Option<Box<ExternalModelState>>,
     /// Post-verification managed-workspace snapshot evidence (freeze note J7).
     ///
     /// Absent means "no evidence has been assembled yet", which is the correct
@@ -1573,6 +1595,8 @@ impl Goal {
             },
             managed_worktree,
             managed_worktree_creation_intent: None,
+            model_backend: ModelBackend::Codex,
+            external_model: None,
             managed_workspace_verification_evidence: None,
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
@@ -1581,6 +1605,34 @@ impl Goal {
         };
         goal.validate()?;
         Ok(goal)
+    }
+
+    /// Apply the creation-time backend policy.
+    ///
+    /// Only `goal_start` may call this, and only before the Goal is persisted:
+    /// the mode is immutable for the lifetime of the Goal (ADR-01/ADR-11), so
+    /// there is deliberately no setter that a running Goal could reach.
+    pub(crate) fn with_creation_backend(mut self, backend: ModelBackend) -> Self {
+        self.model_backend = backend;
+        if backend.is_external() {
+            self.external_model = Some(Box::new(ExternalModelState::new()));
+        } else {
+            self.external_model = None;
+        }
+        self
+    }
+
+    /// The host-owned backend policy for this Goal.
+    pub(crate) fn model_backend(&self) -> ModelBackend {
+        self.model_backend
+    }
+
+    pub(crate) fn external_model(&self) -> Option<&ExternalModelState> {
+        self.external_model.as_deref()
+    }
+
+    pub(crate) fn external_model_mut(&mut self) -> Option<&mut ExternalModelState> {
+        self.external_model.as_deref_mut()
     }
 
     pub(crate) fn id(&self) -> &GoalId {
@@ -4143,6 +4195,27 @@ impl Goal {
         }
     }
 
+    /// Validate the additive External Agent Backend fields.
+    ///
+    /// The pairing is the invariant: `EXTERNAL` requires durable external state
+    /// and `CODEX` must not carry any. A partially written external record fails
+    /// the Goal load instead of silently decoding as "no pending work".
+    fn validate_model_backend_state(&self) -> Result<(), OrchestratorError> {
+        match (
+            self.model_backend.is_external(),
+            self.external_model.as_deref(),
+        ) {
+            (true, Some(state)) => state.validate_for_goal(self.id.as_str(), &self.session_id),
+            (true, None) => Err(OrchestratorError::CorruptGoal(
+                "EXTERNAL goal requires durable external model state".to_owned(),
+            )),
+            (false, Some(_)) => Err(OrchestratorError::CorruptGoal(
+                "CODEX goal must not carry durable external model state".to_owned(),
+            )),
+            (false, None) => Ok(()),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), OrchestratorError> {
         if self.store_format != GOAL_STORE_FORMAT {
             return Err(OrchestratorError::CorruptGoal(
@@ -4177,6 +4250,7 @@ impl Goal {
             ));
         }
         self.validate_managed_workspace_state()?;
+        self.validate_model_backend_state()?;
         let mut criterion_ids = BTreeSet::new();
         for criterion in &self.completion_criteria {
             criterion.id.validate()?;

@@ -23,6 +23,7 @@ use crate::managed_worktree_snapshot_coherence::{
 };
 use crate::managed_worktree_snapshot_manifest::assemble_workspace_snapshot_manifest;
 use crate::managed_worktree_writer_paths::derive_writer_mutated_paths;
+use crate::model_backend::ModelBackend;
 use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -228,6 +229,16 @@ struct GoalStartRequest {
     /// host configuration.
     #[serde(default)]
     workspace_mode: WorkspaceMode,
+    /// Additive External Agent Backend V1 opt-in (ADR-01).
+    ///
+    /// `None` (or `"CODEX"`) keeps the existing Codex path. `"EXTERNAL"` selects
+    /// the MCP client-driven `goal_next`/`goal_submit` path. `"HYBRID"` and any
+    /// unknown spelling are refused rather than downgraded, so a caller can
+    /// never be handed Codex while believing it asked for another backend.
+    ///
+    /// This is host policy, decided once at creation and immutable afterwards.
+    #[serde(default)]
+    model_backend: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +317,8 @@ pub(crate) struct GoalStartView {
     revision: u64,
     created_at: String,
     idempotent_replay: bool,
+    /// Additive host-owned backend policy. Existing fields are unchanged.
+    model_backend: ModelBackend,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -494,6 +507,7 @@ pub(crate) fn goal_start_with_managed_root(
     let request: GoalStartRequest = parse_request(args)?;
     validate_session_binding(&request.session_id, session)?;
     validate_start_request(&request)?;
+    let backend = requested_backend(&request)?;
 
     let deterministic_id = request
         .idempotency_key
@@ -563,6 +577,8 @@ pub(crate) fn goal_start_with_managed_root(
         )
         .map_err(GoalApiError::from_orchestrator)?
     };
+    // The backend policy is applied once, here, before the first durable write.
+    let goal = goal.with_creation_backend(backend);
 
     if let Err(error) = store.create_goal(&goal) {
         if matches!(error, OrchestratorError::ActiveGoalAlreadyExists)
@@ -1097,6 +1113,7 @@ fn validate_start_request(request: &GoalStartRequest) -> Result<(), GoalApiError
     if let Some(key) = request.idempotency_key.as_deref() {
         ensure_max_chars("idempotency_key", key, 128)?;
     }
+    requested_backend(request)?;
     Ok(())
 }
 
@@ -1563,6 +1580,7 @@ fn start_view(goal: &Goal, idempotent_replay: bool) -> GoalStartView {
         revision: goal.revision(),
         created_at: goal.created_at().to_owned(),
         idempotent_replay,
+        model_backend: goal.model_backend(),
     }
 }
 
@@ -1857,6 +1875,28 @@ fn same_start_payload(goal: &Goal, request: &GoalStartRequest) -> bool {
         // reusing one idempotency key across modes must not silently replay the
         // other mode's Goal.
         && goal.workspace_mode() == request.workspace_mode
+        // The backend is host policy and part of the request identity for the
+        // same reason: a replay must never hand back a Codex Goal when the
+        // caller asked for the External backend (or the reverse).
+        && requested_backend(request)
+            .map(|backend| goal.model_backend() == backend)
+            .unwrap_or(false)
+}
+
+/// Resolve the caller's requested backend spelling.
+///
+/// Validated in `validate_start_request` before any durable work; this second
+/// call is the single place that turns the request into the typed policy so
+/// validation and identity cannot drift.
+fn requested_backend(request: &GoalStartRequest) -> Result<ModelBackend, GoalApiError> {
+    match request.model_backend.as_deref() {
+        None => Ok(ModelBackend::default()),
+        Some(value) => ModelBackend::parse_requested(value).map_err(|error| GoalApiError {
+            code: error.code(),
+            message: error.message(),
+            active_goal: None,
+        }),
+    }
 }
 
 /// A managed `goal_start` that cannot derive host state fails closed and creates
