@@ -12,6 +12,8 @@ mod config;
 mod doctor;
 mod exec_ready;
 mod execution;
+mod external_model_store;
+mod external_model_work;
 mod failure_class;
 mod fallback;
 mod git_command_class;
@@ -36,6 +38,7 @@ mod managed_worktree_snapshot_observe;
 mod managed_worktree_writer_paths;
 mod mcp;
 mod model_accounting;
+mod model_backend;
 mod mutation;
 mod mutation_recovery;
 mod orchestrator_error;
@@ -72,6 +75,8 @@ mod goal_backends_tests;
 mod goal_finalizer_tests;
 #[cfg(test)]
 mod goal_hardening_tests;
+#[cfg(test)]
+mod external_goal_tests;
 #[cfg(test)]
 mod goal_orchestration_regression_tests;
 #[cfg(test)]
