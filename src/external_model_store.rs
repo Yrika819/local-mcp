@@ -22,11 +22,14 @@
     reason = "E3-A durable write boundary; E3-B driver consumes it and removes this attribute"
 )]
 
+use crate::config;
 use crate::external_model_work::{
-    ExternalModelState, ExternalStop, ModelWorkItem, SubmissionReceipt,
+    ExternalModelState, ExternalStop, ModelWorkItem, SubmissionDecision, SubmissionId,
+    SubmissionReceipt, WorkId, WorkItemState,
 };
 use crate::goal::{Goal, GoalId};
 use crate::orchestrator_error::OrchestratorError;
+use crate::planner;
 use crate::task_store::TaskStore;
 
 /// Borrow the external state of an EXTERNAL Goal.
@@ -177,6 +180,151 @@ pub(crate) fn commit_cancel_active_work(
         },
     )?;
     Ok(goal)
+}
+
+/// Outcome of one atomic Planner submission.
+///
+/// Every variant was decided against a single durable snapshot, and every
+/// variant except `Refused` describes durable state that this call committed
+/// (or that already existed for a replay).
+#[derive(Debug)]
+pub(crate) enum PlannerSubmissionOutcome {
+    /// The validated plan and its receipt were committed together, and the
+    /// WorkItem moved to COMMITTED. Not a Goal completion.
+    Committed {
+        goal: Goal,
+        receipt: SubmissionReceipt,
+    },
+    /// The host refused the proposal. The refusal receipt and the WorkItem's
+    /// REJECTED transition are the same durable commit, exactly as in E3.
+    Rejected {
+        goal: Goal,
+        receipt: SubmissionReceipt,
+    },
+    /// Nothing was written: the Goal moved on between validation and commit, or
+    /// the WorkItem binding no longer holds.
+    Refused { code: &'static str },
+}
+
+/// Atomically validate and apply one external Planner submission (H1-2).
+///
+/// One `TaskStore` mutation closure performs the whole sequence, so the durable
+/// document can never contain a Task DAG without a receipt, a receipt without
+/// its DAG, or a second copy of either:
+///
+/// 1. re-check the Session/Goal/WorkItem/revision binding against the snapshot
+///    the commit will actually persist,
+/// 2. validate the untrusted proposal with the same validator the Codex path
+///    uses,
+/// 3. materialize the Task DAG and the criterion bindings,
+/// 4. advance the plan revision,
+/// 5. finalize the receipt with the revision this commit produces,
+/// 6. move the WorkItem to COMMITTED.
+///
+/// The lock is taken exactly once. Model inference already happened in the
+/// client, so no lock is ever held across model work.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Goal, work identity, digest, and untrusted payload are independent authority channels."
+)]
+pub(crate) fn commit_planner_submission(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    expected_revision: u64,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+    response: &[u8],
+) -> Result<PlannerSubmissionOutcome, OrchestratorError> {
+    let mut verdict: Option<(bool, SubmissionReceipt)> = None;
+    let mut refused: Option<&'static str> = None;
+    let committed =
+        store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
+            // Re-bind on the snapshot that will be persisted. The API layer
+            // already refused a foreign or stale request; this second check is
+            // what makes the commit itself authoritative. The borrow ends before
+            // the plan is applied, so no two exclusive borrows of `goal` overlap.
+            let pending = matches!(
+                external_state(goal)?.active_work(),
+                Some(active)
+                    if active.work_id() == work_id
+                        && active.goal_id() == goal_id.as_str()
+                        && active.state() == WorkItemState::Pending
+                        && active.goal_revision() == goal.revision()
+                        && active.plan_revision() == goal.plan_revision()
+            );
+            if !pending {
+                refused = Some("WORK_ITEM_NOT_PENDING");
+                return Ok(());
+            }
+
+            let goal_root = planner::execution_root_for_goal(goal, session).map_err(|error| {
+                OrchestratorError::InvalidDag(format!(
+                    "planner execution-root gate refused: {}",
+                    planner::planner_failure_code(&error)
+                ))
+            })?;
+
+            match planner::validate_plan_output_for_apply(response, goal, &goal_root) {
+                Ok(plan) => {
+                    planner::apply_validated_plan_to_goal(goal, plan, now)?;
+                    let committed_revision = goal.revision().checked_add(1).ok_or_else(|| {
+                        OrchestratorError::CorruptGoal("goal revision overflow".to_owned())
+                    })?;
+                    let receipt = SubmissionReceipt::new(
+                        work_id.clone(),
+                        submission_id.clone(),
+                        payload_sha256.to_owned(),
+                        SubmissionDecision::Committed,
+                        Some(committed_revision),
+                        "PLAN_APPLIED",
+                        None,
+                        now,
+                    );
+                    external_state_mut(goal)?.record_submission(receipt.clone(), now)?;
+                    verdict = Some((true, receipt));
+                    Ok(())
+                }
+                Err(refusal) => {
+                    let receipt = SubmissionReceipt::new(
+                        work_id.clone(),
+                        submission_id.clone(),
+                        payload_sha256.to_owned(),
+                        SubmissionDecision::RejectedSchema,
+                        None,
+                        refusal.code(),
+                        Some(refusal.detail().to_owned()),
+                        now,
+                    );
+                    external_state_mut(goal)?.record_submission(receipt.clone(), now)?;
+                    verdict = Some((false, receipt));
+                    Ok(())
+                }
+            }
+        });
+
+    match committed {
+        Ok(goal) => {
+            if let Some(code) = refused {
+                return Ok(PlannerSubmissionOutcome::Refused { code });
+            }
+            let (applied, receipt) = verdict.ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "planner submission committed without a verdict".to_owned(),
+                )
+            })?;
+            if applied {
+                Ok(PlannerSubmissionOutcome::Committed { goal, receipt })
+            } else {
+                Ok(PlannerSubmissionOutcome::Rejected { goal, receipt })
+            }
+        }
+        Err(OrchestratorError::RevisionConflict { .. }) => Ok(PlannerSubmissionOutcome::Refused {
+            code: "GOAL_REVISION_STALE",
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 /// Invalidate the active WorkItem during a host-owned cancellation.

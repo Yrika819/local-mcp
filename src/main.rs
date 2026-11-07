@@ -72,6 +72,8 @@ mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
 #[cfg(test)]
+mod external_flow_tests;
+#[cfg(test)]
 mod external_goal_api_tests;
 #[cfg(test)]
 mod external_goal_recovery_tests;

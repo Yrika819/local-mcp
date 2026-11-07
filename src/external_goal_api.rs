@@ -24,14 +24,15 @@ use serde_json::Value;
 use crate::config;
 use crate::external_goal_driver as driver;
 use crate::external_goal_driver::{DriverError, DriverOutcome, DriverRefusal, DriverReport};
-use crate::external_model_store::{commit_submission, external_state};
+use crate::external_model_store::{
+    PlannerSubmissionOutcome, commit_planner_submission, commit_submission, external_state,
+};
 use crate::external_model_work::{
     MAX_HOST_STEPS_PER_CALL, ModelWorkItem, SubmissionDecision, SubmissionId, SubmissionReceipt,
     WorkId, WorkItemState, WorkRole, check_response_bounds, payload_digest,
 };
-use crate::goal::{Goal, GoalStatus};
+use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_api::{self, GoalApiError};
-use crate::planner;
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
 /// The minimum top-level fields a V1 Planner submission must carry.
@@ -176,7 +177,8 @@ pub(crate) struct ExternalGoalSubmitView {
     /// The closed decision vocabulary from B-02, plus the derived replay
     /// verdicts and `BUDGET_EXHAUSTED`.
     outcome: &'static str,
-    code: &'static str,
+    /// Borrowed from a durable receipt when one exists, so it is owned here.
+    code: String,
     goal_id: String,
     session_id: String,
     work_id: String,
@@ -384,16 +386,12 @@ fn driver_view(goal: &Goal, report: DriverReport, max_host_steps: u32) -> Extern
             }]);
             builder.build()
         }
-        DriverOutcome::Refused(DriverRefusal::AwaitingHostApplication { work_id, role }) => {
-            let mut builder = base_next_view(goal, "NO_ACTION_WITH_REASON", steps, max_host_steps);
-            builder.no_action_reason = Some("EXTERNAL_ROLE_APPLICATION_NOT_WIRED");
+        DriverOutcome::Refused(DriverRefusal::UnrecoverableSubmitted { work_id }) => {
+            let mut builder = base_next_view(goal, "BLOCKED", steps, max_host_steps);
             builder.pending_work_id = Some(work_id.as_str().to_owned());
             builder.blockers = Some(vec![ExternalBlockerView {
-                code: "EXTERNAL_ROLE_APPLICATION_NOT_WIRED".to_owned(),
-                detail: format!(
-                    "the accepted {} response awaits the host application phase, which V1 does not implement (E4/E5)",
-                    role.as_str()
-                ),
+                code: "EXTERNAL_SUBMITTED_RECOVERY_UNSAFE".to_owned(),
+                detail: "an accepted pre-E4 submission has no durable model artifact, so the host cannot apply it; the stored receipts are preserved and the Goal needs owner recovery".to_owned(),
                 mandatory: true,
             }]);
             builder.build()
@@ -535,7 +533,25 @@ pub(crate) fn goal_submit(
 
     // Idempotency first: a replay must not re-validate, re-apply, or consume
     // budget, and a conflicting duplicate must never replace the first verdict.
+    //
+    // The lookup key is `(work_id, submission_id, payload_sha256)`, not
+    // `submission_id` alone. A receipt only ever describes the WorkItem it was
+    // recorded against, so a submission_id that was already used by a different
+    // WorkItem of the same Goal must not be accepted as a replay: returning the
+    // old receipt there would let a client claim a verdict for work the host
+    // never received. The refusal is a fixed code with no detail, so it cannot
+    // become an oracle for another Goal or session.
     if let Some(stored) = state.find_receipt(&submission_id) {
+        if stored.work_id() != &work_id {
+            return Ok(rejected_view(
+                &goal,
+                &request,
+                "REJECTED_AUTHORITY",
+                "SUBMISSION_WORK_ID_MISMATCH",
+                &payload_sha256,
+                "STOP_AND_RECONCILE",
+            ));
+        }
         let outcome = if stored.payload_sha256() == payload_sha256 {
             "REPLAY_OF_ACCEPTED_SUBMISSION"
         } else {
@@ -616,8 +632,19 @@ pub(crate) fn goal_submit(
         ));
     }
 
-    let (decision, code, detail) = role_verdict(session, &goal, active, &request.response)?;
-    let outcome = decision.as_str();
+    if let Err(violation) = check_response_bounds(&request.response) {
+        return submit_bounded_refusal(
+            store,
+            &goal,
+            &goal_id,
+            &request,
+            &work_id,
+            &submission_id,
+            &payload_sha256,
+            violation.code(),
+            violation.detail(),
+        );
+    }
 
     if !state.receipt_capacity_available() {
         return Ok(rejected_view(
@@ -629,6 +656,25 @@ pub(crate) fn goal_submit(
             "STOP_AND_RECONCILE",
         ));
     }
+
+    // The Planner is the first role whose response has a host effect (H1-2 /
+    // E4-A): validation, Task DAG application, plan revision, receipt, and the
+    // WorkItem's COMMITTED transition are one durable commit.
+    if active.role() == WorkRole::Planner {
+        return submit_planner_response(
+            store,
+            session,
+            &goal,
+            &goal_id,
+            &request,
+            &work_id,
+            &submission_id,
+            &payload_sha256,
+        );
+    }
+
+    let (decision, code, detail) = role_verdict(&goal, active, &request.response)?;
+    let outcome = decision.as_str();
 
     let receipt = SubmissionReceipt::new(
         work_id,
@@ -673,56 +719,143 @@ fn unknown_work_id_view(
     )
 }
 
+/// Record one schema refusal that needs no role validator (bounded response).
+///
+/// The receipt and the WorkItem's REJECTED transition are one commit, exactly
+/// like a validator refusal, so a refused WorkItem never stays active.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The durable refusal keeps goal, work identity, digest, and verdict channels explicit."
+)]
+fn submit_bounded_refusal(
+    store: &TaskStore,
+    goal: &Goal,
+    goal_id: &GoalId,
+    request: &GoalSubmitRequest,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+    code: &'static str,
+    detail: String,
+) -> Result<ExternalGoalSubmitView, GoalApiError> {
+    let receipt = SubmissionReceipt::new(
+        work_id.clone(),
+        submission_id.clone(),
+        payload_sha256.to_owned(),
+        SubmissionDecision::RejectedSchema,
+        None,
+        code,
+        Some(detail),
+        utc_now_rfc3339(),
+    );
+    let committed = commit_submission(store, goal.session_id(), goal_id, goal.revision(), receipt)
+        .map_err(GoalApiError::from_orchestrator)?;
+    let stored = external_state(&committed)
+        .map_err(GoalApiError::from_orchestrator)?
+        .find_receipt(submission_id)
+        .map(receipt_view);
+    Ok(submit_view(
+        &committed,
+        request,
+        "REJECTED_SCHEMA",
+        code,
+        stored,
+        None,
+        payload_sha256,
+        next_action_for_outcome("REJECTED_SCHEMA"),
+    ))
+}
+
+/// Validate and apply one external Planner submission atomically (E4-A).
+///
+/// The whole Planner effect — proposal validation, Task DAG materialization,
+/// criterion binding, plan revision, receipt, and the WorkItem transition — is
+/// a single `TaskStore` commit, so the failure modes H1-2 names are
+/// unrepresentable: there is no durable state in which the plan is applied
+/// without its receipt, or its receipt without the plan.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Goal, work identity, digest, and the untrusted payload are independent authority channels."
+)]
+fn submit_planner_response(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    goal_id: &GoalId,
+    request: &GoalSubmitRequest,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+) -> Result<ExternalGoalSubmitView, GoalApiError> {
+    let bytes = serde_json::to_vec(&request.response).map_err(|_| {
+        GoalApiError::external(
+            "INVALID_ARGUMENT",
+            "the submitted response could not be serialized for host validation",
+        )
+    })?;
+    let outcome = commit_planner_submission(
+        store,
+        session,
+        goal_id,
+        goal.revision(),
+        work_id,
+        submission_id,
+        payload_sha256,
+        &bytes,
+    )
+    .map_err(GoalApiError::from_orchestrator)?;
+
+    match outcome {
+        PlannerSubmissionOutcome::Committed { goal, receipt } => Ok(submit_view(
+            &goal,
+            request,
+            "COMMITTED",
+            "PLAN_APPLIED",
+            Some(receipt_view(&receipt)),
+            None,
+            payload_sha256,
+            next_action_for_outcome("COMMITTED"),
+        )),
+        PlannerSubmissionOutcome::Rejected { goal, receipt } => Ok(submit_view(
+            &goal,
+            request,
+            "REJECTED_SCHEMA",
+            receipt.code(),
+            Some(receipt_view(&receipt)),
+            receipt.redacted_detail().map(str::to_owned),
+            payload_sha256,
+            next_action_for_outcome("REJECTED_SCHEMA"),
+        )),
+        PlannerSubmissionOutcome::Refused { code } => Ok(rejected_view(
+            goal,
+            request,
+            "REJECTED_STALE_REVISION",
+            code,
+            payload_sha256,
+            "CALL_GOAL_NEXT",
+        )),
+    }
+}
+
 /// Validate one untrusted response with the host's existing role validator.
 ///
 /// A role that V1 does not wire is refused as `ROLE_NOT_WIRED_EXTERNAL_V1`
 /// instead of being accepted, so an unimplemented role can never be reported as
 /// a success.
 fn role_verdict(
-    session: &config::Session,
     goal: &Goal,
     item: &ModelWorkItem,
     response: &Value,
 ) -> Result<(SubmissionDecision, &'static str, Option<String>), GoalApiError> {
-    if let Err(violation) = check_response_bounds(response) {
-        return Ok((
-            SubmissionDecision::RejectedSchema,
-            violation.code(),
-            Some(violation.detail().to_owned()),
-        ));
-    }
-    match item.role() {
-        WorkRole::Planner => {
-            let bytes = serde_json::to_vec(response).map_err(|_| {
-                GoalApiError::external(
-                    "INVALID_ARGUMENT",
-                    "the submitted response could not be serialized for host validation",
-                )
-            })?;
-            let goal_root = planner::execution_root_for_goal(goal, session).map_err(|error| {
-                GoalApiError::external(
-                    planner::planner_failure_code(&error),
-                    "the host could not derive the Goal execution root for validation",
-                )
-            })?;
-            match planner::validate_initial_plan_proposal_output(&bytes, goal, &goal_root) {
-                Ok(()) => Ok((SubmissionDecision::AcceptedForHostProcessing, "OK", None)),
-                Err(refusal) => Ok((
-                    SubmissionDecision::RejectedSchema,
-                    refusal.code(),
-                    Some(refusal.detail().to_owned()),
-                )),
-            }
-        }
-        other => Ok((
-            SubmissionDecision::RejectedSchema,
-            "ROLE_NOT_WIRED_EXTERNAL_V1",
-            Some(format!(
-                "external {} responses are not wired to the host validators in V1 (E4/E5)",
-                other.as_str()
-            )),
+    let _ = (goal, response);
+    Ok((
+        SubmissionDecision::RejectedSchema,
+        "ROLE_NOT_WIRED_EXTERNAL_V1",
+        Some(format!(
+            "external {} responses are not wired to the host validators in V1 (E4/E5)",
+            item.role().as_str()
         )),
-    }
+    ))
 }
 
 fn parse_work_id(value: &str) -> Result<WorkId, GoalApiError> {
@@ -751,7 +884,7 @@ fn submit_view(
     goal: &Goal,
     request: &GoalSubmitRequest,
     outcome: &'static str,
-    code: &'static str,
+    code: &str,
     receipt: Option<ReceiptView>,
     detail: Option<String>,
     payload_sha256: &str,
@@ -759,7 +892,7 @@ fn submit_view(
 ) -> ExternalGoalSubmitView {
     ExternalGoalSubmitView {
         outcome,
-        code,
+        code: code.to_owned(),
         goal_id: goal.id().as_str().to_owned(),
         session_id: goal.session_id().to_owned(),
         work_id: request.work_id.clone(),
@@ -828,6 +961,7 @@ fn result_state_name(goal: &Goal) -> &'static str {
 fn next_action_for_outcome(outcome: &'static str) -> &'static str {
     match outcome {
         "ACCEPTED_FOR_HOST_PROCESSING"
+        | "COMMITTED"
         | "REJECTED_SCHEMA"
         | "REPLAY_OF_ACCEPTED_SUBMISSION"
         | "REJECTED_STALE_REVISION"

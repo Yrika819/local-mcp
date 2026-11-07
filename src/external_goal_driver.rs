@@ -65,9 +65,10 @@ pub(crate) enum DriverRefusal {
     RoleNotWired { stage: &'static str },
     /// A host budget refused the new WorkItem. Budget is not consumed.
     Budget(IssueBlock),
-    /// A response was already accepted and now waits for the host application
-    /// phase, which V1 does not implement.
-    AwaitingHostApplication { work_id: WorkId, role: WorkRole },
+    /// A WorkItem accepted by a pre-E4 host is still active. E3 recorded the
+    /// verdict without the model artifact, so the host can neither apply it nor
+    /// honestly claim it. Reported as a mandatory blocker and never guessed at.
+    UnrecoverableSubmitted { work_id: WorkId },
 }
 
 /// A driver result plus how many host steps it consumed.
@@ -182,10 +183,12 @@ pub(crate) fn next_external_step(
                 }));
             }
             WorkItemState::Submitted => {
+                // Pre-E4 acceptance has no durable artifact, so it can never be
+                // applied. Refuse loudly instead of guessing or discarding the
+                // stored receipt.
                 return Ok(DriverReport::reused(DriverOutcome::Refused(
-                    DriverRefusal::AwaitingHostApplication {
+                    DriverRefusal::UnrecoverableSubmitted {
                         work_id: active.work_id().clone(),
-                        role: active.role(),
                     },
                 )));
             }

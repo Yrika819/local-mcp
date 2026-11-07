@@ -82,6 +82,9 @@ pub(crate) const EXTERNAL_MODEL_SCHEMA_VERSION: u32 = 1;
 /// Output contract for the Planner role in V1.
 pub(crate) const OUTPUT_CONTRACT_PLANNER_V1: &str = "planner-proposal-v1";
 
+/// Output contract for the Readonly role in V1.
+pub(crate) const OUTPUT_CONTRACT_READONLY_V1: &str = "readonly-investigation-v1";
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct WorkId(String);
@@ -222,6 +225,10 @@ impl WorkItemState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum SubmissionDecision {
     AcceptedForHostProcessing,
+    /// The host validated the response *and* applied its effect in the same
+    /// durable commit (E4). This is the only decision that carries a
+    /// `committed_revision`, and it still never means "Goal completed".
+    Committed,
     RejectedSchema,
     RejectedStaleRevision,
     RejectedAuthority,
@@ -236,6 +243,7 @@ impl SubmissionDecision {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AcceptedForHostProcessing => "ACCEPTED_FOR_HOST_PROCESSING",
+            Self::Committed => "COMMITTED",
             Self::RejectedSchema => "REJECTED_SCHEMA",
             Self::RejectedStaleRevision => "REJECTED_STALE_REVISION",
             Self::RejectedAuthority => "REJECTED_AUTHORITY",
@@ -489,6 +497,14 @@ impl ModelWorkItem {
     /// PENDING -> REJECTED (terminal).
     fn mark_rejected(&mut self, code: &str) {
         self.transition(WorkItemState::Rejected, code);
+    }
+
+    /// PENDING -> COMMITTED. The host finished its own application phase in the
+    /// same durable commit that recorded this transition.
+    fn mark_committed(&mut self, now: &str) {
+        self.state = WorkItemState::Committed;
+        self.submitted_at = Some(now.to_owned());
+        self.terminal_code = None;
     }
 
     /// PENDING/SUBMITTED -> CANCELLED (terminal).
@@ -745,6 +761,18 @@ impl ExternalModelState {
         self.last_stop.as_ref()
     }
 
+    /// Whether the active slot holds a pre-E4 accepted-but-unapplied WorkItem.
+    ///
+    /// E3 recorded `ACCEPTED_FOR_HOST_PROCESSING` without persisting the model
+    /// artifact, so such a WorkItem cannot be applied later: the response is
+    /// gone by design. The host must report that honestly instead of guessing or
+    /// discarding the receipt.
+    pub(crate) fn active_work_awaits_unrecoverable_application(&self) -> Option<&ModelWorkItem> {
+        self.pending_work
+            .as_ref()
+            .filter(|item| item.state == WorkItemState::Submitted)
+    }
+
     pub(crate) fn find_receipt(&self, submission_id: &SubmissionId) -> Option<&SubmissionReceipt> {
         self.receipts
             .iter()
@@ -873,6 +901,18 @@ impl ExternalModelState {
         match receipt.decision {
             SubmissionDecision::AcceptedForHostProcessing => {
                 item.mark_submitted(now);
+                self.receipts.push(receipt);
+            }
+            SubmissionDecision::Committed => {
+                if receipt.committed_revision.is_none() {
+                    return Err(OrchestratorError::CorruptGoal(
+                        "a committed submission receipt must carry the revision it committed"
+                            .to_owned(),
+                    ));
+                }
+                item.mark_committed(now);
+                self.work_history.push(item.summary());
+                self.pending_work = None;
                 self.receipts.push(receipt);
             }
             SubmissionDecision::RejectedSchema
