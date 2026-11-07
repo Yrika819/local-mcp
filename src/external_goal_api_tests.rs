@@ -76,11 +76,19 @@ fn next_args(session: &config::Session, goal_id: &GoalId) -> Value {
     json!({"session_id": session.id, "goal_id": goal_id.as_str()})
 }
 
+/// `goal_next` is async because its host steps await host observations
+/// (Task Verifier, Goal Verifier, Goal Finalizer).
+fn goal_next_call(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+) -> Result<external_goal_api::ExternalGoalNextView, goal_api::GoalApiError> {
+    external_goal_api::goal_next(args, session, store)
+}
+
 fn goal_next(session: &config::Session, store: &TaskStore, goal_id: &GoalId) -> Value {
-    serde_json::to_value(
-        external_goal_api::goal_next(&next_args(session, goal_id), session, store).unwrap(),
-    )
-    .unwrap()
+    let args = next_args(session, goal_id);
+    serde_json::to_value(goal_next_call(&args, session, store).unwrap()).unwrap()
 }
 
 fn submit_args(
@@ -240,18 +248,18 @@ fn goal_next_bounds_the_host_step_budget() {
     let goal_id = goal_id_of(&start_goal(&f.session, &f.store, Some("EXTERNAL")));
     let mut args = next_args(&f.session, &goal_id);
     args["max_host_steps"] = Value::from(0);
-    let error = external_goal_api::goal_next(&args, &f.session, &f.store).unwrap_err();
+    let error = goal_next_call(&args, &f.session, &f.store).unwrap_err();
     assert_eq!(error.code(), "INVALID_ARGUMENT");
 
     let mut args = next_args(&f.session, &goal_id);
     args["max_host_steps"] = Value::from(MAX_HOST_STEPS_PER_CALL + 1);
-    let error = external_goal_api::goal_next(&args, &f.session, &f.store).unwrap_err();
+    let error = goal_next_call(&args, &f.session, &f.store).unwrap_err();
     assert_eq!(error.code(), "HOST_STEP_BUDGET_EXCEEDED");
 
     // An unknown field is refused rather than ignored.
     let mut args = next_args(&f.session, &goal_id);
     args["role"] = Value::from("PLANNER");
-    let error = external_goal_api::goal_next(&args, &f.session, &f.store).unwrap_err();
+    let error = goal_next_call(&args, &f.session, &f.store).unwrap_err();
     assert_eq!(error.code(), "INVALID_ARGUMENT");
 }
 
@@ -292,7 +300,7 @@ fn goal_next_on_a_cancelled_goal_reports_terminal_without_a_model_request() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn goal_submit_accepts_a_host_valid_planner_proposal() {
+fn goal_submit_accepts_a_host_valid_planner_proposal_and_commits_it() {
     let f = fixture("accept");
     let goal_id = goal_id_of(&start_goal(&f.session, &f.store, Some("EXTERNAL")));
     let next = goal_next(&f.session, &f.store, &goal_id);
@@ -306,24 +314,32 @@ fn goal_submit_accepts_a_host_valid_planner_proposal() {
         &submit_args(&f.session, &goal_id, work, &submission, proposal),
     )
     .unwrap();
-    assert_eq!(view["outcome"], "ACCEPTED_FOR_HOST_PROCESSING");
-    assert_eq!(view["code"], "OK");
-    assert_eq!(view["receipt"]["decision"], "ACCEPTED_FOR_HOST_PROCESSING");
-    assert!(view["receipt"]["committed_revision"].is_null());
+    // H1-2 / E4-A: validation, Task DAG application, and the receipt are one
+    // durable commit, so the verdict is COMMITTED rather than merely accepted.
+    assert_eq!(view["outcome"], "COMMITTED");
+    assert_eq!(view["code"], "PLAN_APPLIED");
+    assert_eq!(view["receipt"]["decision"], "COMMITTED");
+    assert!(view["receipt"]["committed_revision"].is_number());
     assert_eq!(view["goal_state"]["result_kind"], "NONTERMINAL");
-    assert_eq!(
-        view["goal_state"]["execution_wait"],
-        "WAITING_FOR_HOST_APPLICATION"
-    );
+    assert_eq!(view["goal_state"]["execution_wait"], "NONE");
 
     let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
     let state = external_state(&goal).unwrap();
-    // Accepted is not applied: no plan, no tasks, no completion.
-    assert_eq!(goal.plan_revision(), 0);
-    assert!(goal.tasks().is_empty());
+    // Committed is applied, and still not completed.
+    assert_eq!(goal.plan_revision(), 1);
+    assert_eq!(goal.tasks().len(), 1);
     assert!(!goal.status().is_terminal());
     assert_eq!(state.receipts().len(), 1);
-    assert_eq!(state.active_work().unwrap().state().as_str(), "SUBMITTED");
+    assert!(state.active_work().is_none());
+    assert_eq!(
+        state.work_history()[0].state().as_str(),
+        "COMMITTED",
+        "the WorkItem is committed, not left active"
+    );
+    assert_eq!(
+        view["receipt"]["committed_revision"].as_u64(),
+        Some(goal.revision())
+    );
 }
 
 #[test]
@@ -468,7 +484,7 @@ fn goal_submit_conflicting_duplicate_never_replaces_the_first_verdict() {
         ),
     )
     .unwrap();
-    assert_eq!(first["outcome"], "ACCEPTED_FOR_HOST_PROCESSING");
+    assert_eq!(first["outcome"], "COMMITTED");
 
     let second = goal_submit(
         &f.session,
@@ -638,12 +654,12 @@ fn goal_submit_on_a_codex_goal_is_refused() {
 }
 
 #[test]
-fn goal_next_after_acceptance_reports_the_unwired_host_phase() {
+fn goal_next_after_a_committed_plan_reports_the_unwired_readonly_role() {
     let f = fixture("await-host");
     let goal_id = goal_id_of(&start_goal(&f.session, &f.store, Some("EXTERNAL")));
     let next = goal_next(&f.session, &f.store, &goal_id);
     let work = &next["model_work"];
-    goal_submit(
+    let committed = goal_submit(
         &f.session,
         &f.store,
         &submit_args(
@@ -655,18 +671,15 @@ fn goal_next_after_acceptance_reports_the_unwired_host_phase() {
         ),
     )
     .unwrap();
+    assert_eq!(committed["outcome"], "COMMITTED");
 
+    // E4-B is not wired on this branch: the Scheduler selects the READY
+    // readonly Task, and the host reports the role as unwired instead of
+    // faking progress or completion.
     let after = goal_next(&f.session, &f.store, &goal_id);
     assert_eq!(after["outcome"], "NO_ACTION_WITH_REASON");
-    assert_eq!(
-        after["no_action_reason"],
-        "EXTERNAL_ROLE_APPLICATION_NOT_WIRED"
-    );
-    assert_eq!(after["execution_wait"], "WAITING_FOR_HOST_APPLICATION");
-    assert_eq!(after["pending_work_id"], work["work_id"]);
+    assert_eq!(after["no_action_reason"], "EXTERNAL_ROLE_NOT_WIRED");
     assert!(after["model_work"].is_null());
-    // It must never be reported as progress or success.
-    assert_eq!(after["host_steps_executed"], 0);
     assert_ne!(after["result_kind"], "COMPLETED");
 }
 

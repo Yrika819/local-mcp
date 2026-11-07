@@ -215,7 +215,7 @@ pub(crate) struct TaskScopeProposal {
 }
 
 #[derive(Clone, Debug)]
-struct ValidatedPlan {
+pub(crate) struct ValidatedPlan {
     tasks: Vec<ValidatedTask>,
     criterion_bindings: Vec<(CompletionCriterionId, Vec<String>)>,
 }
@@ -444,29 +444,54 @@ impl ProposalValidationRefusal {
     }
 }
 
-/// Validate one untrusted external Planner response without persisting it.
+/// Validate one external Planner output and hand back the normalized plan the
+/// host is willing to apply.
 ///
-/// This deliberately reuses [`parse_and_validate_proposal`], the same validator
-/// the Codex planner path uses, so the external loop cannot accept a proposal
-/// the host would reject: unknown criterion IDs, unsupported worker kinds,
-/// authority-violating scope, and revision mismatches are all refused here.
-pub(crate) fn validate_initial_plan_proposal_output(
+/// The returned [`ValidatedPlan`] is opaque: it carries only host-normalized
+/// values (canonical paths, bounded text, re-derived attempt budgets), so the
+/// caller can apply exactly the plan it validated. That is what makes a
+/// single-transaction application possible — one validation pass in the Codex
+/// path and the external path alike, and no second parse (which could disagree
+/// with the first) at commit time.
+pub(crate) fn validate_plan_output_for_apply(
     output: &[u8],
     goal: &Goal,
     goal_root: &Path,
-) -> Result<(), ProposalValidationRefusal> {
+) -> Result<ValidatedPlan, ProposalValidationRefusal> {
     if output.len() > MAX_PLAN_PROPOSAL_BYTES {
         return Err(ProposalValidationRefusal {
             code: "PROPOSAL_TOO_LARGE",
             detail: "the proposal exceeds the 256 KiB host limit",
         });
     }
-    parse_and_validate_proposal(output, goal, goal_root)
-        .map(|_| ())
-        .map_err(|error| ProposalValidationRefusal {
+    parse_and_validate_proposal(output, goal, goal_root).map_err(|error| {
+        ProposalValidationRefusal {
             code: planner_failure_code(&error),
             detail: "the host rejected the external proposal during schema validation",
-        })
+        }
+    })
+}
+
+/// Apply a validated initial plan inside a caller-owned durable mutation.
+///
+/// The planning preconditions are re-checked against the *current* durable
+/// snapshot, so a plan that was validated earlier can be applied at most once
+/// even if two writers race: the second either loses the `TaskStore` revision
+/// CAS or observes `plan_revision` 1 and is refused here. Neither outcome can
+/// produce a second Task DAG, a plan without its receipt, or a receipt without
+/// its plan.
+pub(crate) fn apply_validated_plan_to_goal(
+    goal: &mut Goal,
+    plan: ValidatedPlan,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    ensure_initial_planning_state(goal).map_err(|_| {
+        OrchestratorError::InvalidDag(
+            "initial plan application requires a PLANNING Goal with plan_revision 0 and no Tasks"
+                .to_owned(),
+        )
+    })?;
+    materialize_validated_plan(goal, plan, now)
 }
 
 /// Bounded failure code for a [`PlannerError`]. Never carries error text.

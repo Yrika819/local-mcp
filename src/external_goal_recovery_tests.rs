@@ -79,16 +79,20 @@ fn start_external(session: &config::Session, store: &TaskStore) -> GoalId {
     GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap()
 }
 
+/// `goal_next` is async because its host steps await host observations
+/// (Task Verifier, Goal Verifier, Goal Finalizer). Tests drive it on a
+/// current-thread runtime, exactly like the production MCP handler does.
+fn goal_next_call(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+) -> Result<external_goal_api::ExternalGoalNextView, goal_api::GoalApiError> {
+    external_goal_api::goal_next(args, session, store)
+}
+
 fn goal_next(session: &config::Session, store: &TaskStore, goal_id: &GoalId) -> Value {
-    serde_json::to_value(
-        external_goal_api::goal_next(
-            &json!({"session_id": session.id, "goal_id": goal_id.as_str()}),
-            session,
-            store,
-        )
-        .unwrap(),
-    )
-    .unwrap()
+    let args = json!({"session_id": session.id, "goal_id": goal_id.as_str()});
+    serde_json::to_value(goal_next_call(&args, session, store).unwrap()).unwrap()
 }
 
 fn valid_proposal(work: &Value) -> Value {
@@ -184,7 +188,7 @@ fn a_failed_issuance_commit_reports_no_work_item_and_leaves_the_goal_intact() {
     let before = serde_json::to_value(f.store.load_goal(&f.session.id, &goal_id).unwrap()).unwrap();
 
     let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplace);
-    let error = external_goal_api::goal_next(
+    let error = goal_next_call(
         &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
         &f.session,
         &failing,
@@ -232,9 +236,9 @@ fn a_failed_receipt_commit_keeps_the_work_item_pending_and_the_retry_succeeds() 
     assert_eq!(state.receipts().len(), 0);
     assert_eq!(state.active_work().unwrap().state(), WorkItemState::Pending);
 
-    // The submission was never accepted, so retrying it is not a replay.
+    // The submission was never recorded, so retrying it is not a replay.
     let outcome = submit_outcome(&f.session, &clean, &args).unwrap();
-    assert_eq!(outcome, "ACCEPTED_FOR_HOST_PROCESSING");
+    assert_eq!(outcome, "COMMITTED");
     let goal = clean.load_goal(&f.session.id, &goal_id).unwrap();
     assert_eq!(external_state(&goal).unwrap().receipts().len(), 1);
 }
@@ -255,7 +259,7 @@ fn a_committed_receipt_survives_a_restart_and_replays_without_new_effects() {
     );
     assert_eq!(
         submit_outcome(&f.session, &f.store, &args).unwrap(),
-        "ACCEPTED_FOR_HOST_PROCESSING"
+        "COMMITTED"
     );
 
     let restarted = TaskStore::with_state_root(f.root.join("state"));
@@ -326,7 +330,7 @@ fn concurrent_submissions_serialize_to_exactly_one_accepted_receipt() {
         .collect();
     let accepted = outcomes
         .iter()
-        .filter(|outcome| outcome.as_str() == "ACCEPTED_FOR_HOST_PROCESSING")
+        .filter(|outcome| outcome.as_str() == "COMMITTED")
         .count();
     assert_eq!(accepted, 1, "outcomes were {outcomes:?}");
     for outcome in &outcomes {
@@ -394,6 +398,8 @@ fn a_superseded_work_item_is_invalidated_instead_of_dead_ending_the_goal() {
     )
     .unwrap();
 
+    // The invalidation itself is one bounded host step; the fresh WorkItem is
+    // issued on the next call.
     let progress = goal_next(&f.session, &f.store, &goal_id);
     assert_eq!(progress["outcome"], "HOST_PROGRESS");
     assert_eq!(
@@ -513,7 +519,7 @@ fn goal_submit_never_mutates_the_workspace() {
         ),
     )
     .unwrap();
-    assert_eq!(outcome, "ACCEPTED_FOR_HOST_PROCESSING");
+    assert_eq!(outcome, "COMMITTED");
     assert_eq!(tree_digest(&f.session.cwd), before);
 }
 
@@ -582,13 +588,13 @@ fn a_cross_session_goal_reference_is_indistinguishable_from_a_missing_goal() {
         cwd: a.session.cwd.clone(),
         permitted_directories: a.session.permitted_directories.clone(),
     };
-    let foreign = external_goal_api::goal_next(
+    let foreign = goal_next_call(
         &json!({"session_id": b.id, "goal_id": goal_id.as_str()}),
         &b,
         &a.store,
     )
     .unwrap_err();
-    let missing = external_goal_api::goal_next(
+    let missing = goal_next_call(
         &json!({"session_id": b.id, "goal_id": Uuid::new_v4().to_string()}),
         &b,
         &a.store,
@@ -660,11 +666,12 @@ fn an_accepted_submission_is_never_reported_as_a_completed_goal() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(view["outcome"], "ACCEPTED_FOR_HOST_PROCESSING");
+    // E4: the plan is applied and committed, which is still not completion.
+    assert_eq!(view["outcome"], "COMMITTED");
     assert_eq!(view["goal_state"]["result_state"], "NOT_TERMINAL");
     assert_eq!(view["goal_state"]["result_kind"], "NONTERMINAL");
     assert_ne!(view["goal_state"]["status"], "COMPLETED");
-    assert!(view["receipt"]["committed_revision"].is_null());
+    assert!(view["receipt"]["committed_revision"].is_number());
 
     let result = serde_json::to_value(
         goal_api::goal_result(
@@ -677,7 +684,9 @@ fn an_accepted_submission_is_never_reported_as_a_completed_goal() {
     .unwrap();
     assert_eq!(result["result_state"], "NOT_TERMINAL");
     assert_eq!(result["result_kind"], "NONTERMINAL");
-    assert_eq!(result["execution_wait"], "WAITING_FOR_HOST_APPLICATION");
+    // No WorkItem is pending, so the Goal is waiting for the next host step,
+    // not for a host application of an accepted response.
+    assert_eq!(result["execution_wait"], "NONE");
 }
 
 #[test]
