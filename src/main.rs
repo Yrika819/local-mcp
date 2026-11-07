@@ -128,6 +128,8 @@ mod secure_fs_tests;
 #[cfg(test)]
 mod verifier_tests;
 #[cfg(test)]
+mod windows_authority_audit_tests;
+#[cfg(test)]
 mod workspace_snapshot_tests;
 #[cfg(test)]
 mod writer_stress_tests;
