@@ -26,10 +26,15 @@ use crate::external_model_work::{
     IssueBlock, MAX_REQUEST_PAYLOAD_BYTES, ModelWorkItem, OUTPUT_CONTRACT_PLANNER_V1, WorkId,
     WorkItemState, WorkRole, sha256_hex,
 };
-use crate::goal::{Goal, GoalStatus};
+use crate::goal::Goal;
+use crate::goal_finalizer::{self, GoalFinalizationOutcome};
+use crate::goal_verifier;
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner;
+use crate::scheduler::{self, SchedulerDecision, SchedulerNoActionReason};
+use crate::task::WorkerKind;
 use crate::task_store::{TaskStore, utc_now_rfc3339};
+use crate::verifier;
 
 /// The single host step the driver took (or reused).
 ///
@@ -69,6 +74,15 @@ pub(crate) enum DriverRefusal {
     /// verdict without the model artifact, so the host can neither apply it nor
     /// honestly claim it. Reported as a mandatory blocker and never guessed at.
     UnrecoverableSubmitted { work_id: WorkId },
+    /// A host-owned step was attempted and refused by its own validator
+    /// (Task Verifier, Goal Verifier, finalizer). Reported, never retried
+    /// blindly and never reported as success.
+    HostStepRefused {
+        code: &'static str,
+        detail: &'static str,
+    },
+    /// The Scheduler selected no host action for this durable state.
+    NoAction { code: &'static str },
 }
 
 /// A driver result plus how many host steps it consumed.
@@ -136,21 +150,24 @@ impl DriverError {
     }
 }
 
-/// Which role this Goal state needs next, if the host can name one.
+/// Advance one EXTERNAL Goal by at most one host step.
 ///
-/// Only initial planning is wired in V1. Every other state reports
-/// `RoleNotWired` rather than guessing a role or marking progress.
-pub(crate) fn required_role(goal: &Goal) -> Option<WorkRole> {
-    if goal.status() == GoalStatus::Planning && goal.plan_revision() == 0 && goal.tasks().is_empty()
-    {
-        Some(WorkRole::Planner)
-    } else {
-        None
-    }
-}
-
-/// Decide and, when a model is needed, durably issue the next bounded WorkItem.
-pub(crate) fn next_external_step(
+/// The step is chosen by the existing Scheduler (`select_scheduler_action`) from
+/// durable state only, so the external loop cannot invent an order the Codex
+/// path would not use. Four kinds of step exist:
+///
+/// * a **model step** — issue one bounded `ModelWorkItem` (Planner, Readonly),
+/// * a **host verification step** — the existing Task Verifier, Goal Verifier,
+///   or Goal Finalizer,
+/// * a **host policy step** — re-arm one RETRYABLE readonly Task under the
+///   existing retry gate,
+/// * a **refusal** — a role V1 does not wire, a budget, an unrecoverable
+///   pre-E4 acceptance, or a validator refusal.
+///
+/// The function performs exactly one step. The API layer applies the caller's
+/// `max_host_steps` budget, so a single call can never loop unbounded, and no
+/// Session lock is held across model work (the client owns inference).
+pub(crate) async fn advance_external_step(
     store: &TaskStore,
     session: &config::Session,
     goal: &Goal,
@@ -200,14 +217,146 @@ pub(crate) fn next_external_step(
         }
     }
 
-    let Some(role) = required_role(goal) else {
-        return Ok(DriverReport::reused(DriverOutcome::Refused(
+    let selection = scheduler::select_scheduler_action(goal).map_err(|_| {
+        DriverError::Persistence(OrchestratorError::CorruptGoal(
+            "the scheduler rejected the durable external Goal state".to_owned(),
+        ))
+    })?;
+    let revision = goal.revision();
+    match selection.decision().clone() {
+        SchedulerDecision::PlanInitial => issue_planner_work_item(store, session, goal),
+        SchedulerDecision::RunReadonly { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::RoleNotWired {
-                stage: goal_status_stage(goal.status()),
+                stage: WorkRole::Readonly.as_str(),
             },
-        )));
-    };
+        ))),
+        SchedulerDecision::VerifyTask { task_id } => {
+            match verifier::verify_task(store, session, goal.id(), &task_id, revision).await {
+                Ok(_) => Ok(DriverReport::advanced(DriverOutcome::Progress {
+                    code: "TASK_VERIFIED",
+                    detail: "the host Task Verifier recorded one verification result",
+                })),
+                Err(error) => Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::HostStepRefused {
+                        code: verifier_failure_code(&error),
+                        detail: "the host Task Verifier refused to verify this Task",
+                    },
+                ))),
+            }
+        }
+        SchedulerDecision::VerifyGoal => {
+            match goal_verifier::verify_goal(store, &session.id, goal.id(), revision) {
+                Ok(result) => {
+                    let code = match result.decision().outcome() {
+                        crate::task::VerificationOutcome::Passed => "GOAL_VERIFICATION_PASSED",
+                        _ => "GOAL_VERIFICATION_NOT_PASSED",
+                    };
+                    Ok(DriverReport::advanced(DriverOutcome::Progress {
+                        code,
+                        detail: "the host Goal Verifier evaluated the Goal final-verification contract",
+                    }))
+                }
+                Err(error) => Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::HostStepRefused {
+                        code: goal_verifier_failure_code(&error),
+                        detail: "the host Goal Verifier refused to evaluate this Goal",
+                    },
+                ))),
+            }
+        }
+        SchedulerDecision::Replan { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::RoleNotWired {
+                stage: WorkRole::Replanner.as_str(),
+            },
+        ))),
+        SchedulerDecision::RunWriter { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::RoleNotWired {
+                stage: WorkRole::Writer.as_str(),
+            },
+        ))),
+        SchedulerDecision::RunReviewer { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::RoleNotWired {
+                stage: WorkRole::Reviewer.as_str(),
+            },
+        ))),
+        SchedulerDecision::UnsupportedWorker { worker, .. } => Ok(DriverReport::reused(
+            DriverOutcome::Refused(DriverRefusal::RoleNotWired {
+                stage: worker_capability_stage(worker),
+            }),
+        )),
+        SchedulerDecision::NoAction { reason } => {
+            no_action_step(store, session, goal, reason).await
+        }
+    }
+}
 
+/// Handle one Scheduler "no action" selection.
+///
+/// Only two of these are host steps the external loop may take: the Goal
+/// Finalizer (a Goal that already passed host Goal verification) and the
+/// retry-policy step (re-arming a RETRYABLE readonly Task under the existing
+/// gate). Everything else is reported, never invented.
+async fn no_action_step(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    reason: SchedulerNoActionReason,
+) -> Result<DriverReport, DriverError> {
+    match reason {
+        SchedulerNoActionReason::GoalFinalizationRequired => {
+            match goal_finalizer::finalize_goal_at_revision_with_session(
+                store,
+                session,
+                goal.id(),
+                goal.revision(),
+            )
+            .await
+            {
+                Ok(result) => match result.decision().outcome() {
+                    GoalFinalizationOutcome::ReadyToComplete
+                    | GoalFinalizationOutcome::AlreadyCompleted => {
+                        Ok(DriverReport::advanced(DriverOutcome::Progress {
+                            code: "GOAL_FINALIZED",
+                            detail: "the host Goal Finalizer completed the Goal on host-owned evidence",
+                        }))
+                    }
+                    GoalFinalizationOutcome::NotReady => Ok(DriverReport::reused(
+                        DriverOutcome::Refused(DriverRefusal::NoAction {
+                            code: "GOAL_FINALIZATION_NOT_READY",
+                        }),
+                    )),
+                    GoalFinalizationOutcome::Blocked | GoalFinalizationOutcome::Failed => {
+                        Ok(DriverReport::reused(DriverOutcome::Refused(
+                            DriverRefusal::HostStepRefused {
+                                code: "GOAL_FINALIZATION_BLOCKED",
+                                detail: "the host Goal Finalizer refused to complete this Goal",
+                            },
+                        )))
+                    }
+                },
+                Err(_) => Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::HostStepRefused {
+                        code: "GOAL_FINALIZATION_FAILED",
+                        detail: "the host Goal Finalizer refused to complete this Goal",
+                    },
+                ))),
+            }
+        }
+        other => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::NoAction {
+                code: no_action_code(&other),
+            },
+        ))),
+    }
+}
+
+fn issue_planner_work_item(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+) -> Result<DriverReport, DriverError> {
+    let state = external_state(goal).map_err(DriverError::Persistence)?;
+    let role = WorkRole::Planner;
     if let Err(block) = state.check_issue_budget(role) {
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::Budget(block),
@@ -224,18 +373,7 @@ pub(crate) fn next_external_step(
             "goal revision overflow".to_owned(),
         ))
     })?;
-
-    let (payload, output_contract) = match role {
-        WorkRole::Planner => build_planner_request(goal, session, bound_revision)?,
-        other => {
-            return Ok(DriverReport::reused(DriverOutcome::Refused(
-                DriverRefusal::RoleNotWired {
-                    stage: other.as_str(),
-                },
-            )));
-        }
-    };
-
+    let (payload, output_contract) = build_planner_request(goal, session, bound_revision)?;
     let issue_counter = state.issue_counter().checked_add(1).ok_or_else(|| {
         DriverError::Persistence(OrchestratorError::CorruptGoal(
             "external work item counter overflow".to_owned(),
@@ -299,6 +437,61 @@ pub(crate) fn next_external_step(
     }
 }
 
+fn verifier_failure_code(error: &verifier::VerifierError) -> &'static str {
+    match error {
+        verifier::VerifierError::Store(OrchestratorError::RevisionConflict { .. }) => {
+            "REVISION_CONFLICT"
+        }
+        verifier::VerifierError::Store(_) => "TASK_VERIFICATION_STORE_ERROR",
+        verifier::VerifierError::InvalidState(_) => "TASK_VERIFICATION_STATE_REJECTED",
+        verifier::VerifierError::Observation(_) => "TASK_VERIFICATION_OBSERVATION_FAILED",
+    }
+}
+
+fn goal_verifier_failure_code(error: &goal_verifier::GoalVerifierError) -> &'static str {
+    match error {
+        goal_verifier::GoalVerifierError::Store(OrchestratorError::RevisionConflict { .. }) => {
+            "REVISION_CONFLICT"
+        }
+        goal_verifier::GoalVerifierError::Store(_) => "GOAL_VERIFICATION_STORE_ERROR",
+        goal_verifier::GoalVerifierError::NotApplicable(_) => "GOAL_VERIFICATION_NOT_APPLICABLE",
+        goal_verifier::GoalVerifierError::InvalidDurableState(_) => {
+            "GOAL_VERIFICATION_STATE_REJECTED"
+        }
+        goal_verifier::GoalVerifierError::StaleEvaluation(_) => "GOAL_VERIFICATION_STALE",
+    }
+}
+
+fn worker_capability_stage(worker: WorkerKind) -> &'static str {
+    match worker {
+        WorkerKind::CodexReadonly => WorkRole::Readonly.as_str(),
+        WorkerKind::CodexWriter => WorkRole::Writer.as_str(),
+        WorkerKind::CodexReviewer => WorkRole::Reviewer.as_str(),
+        WorkerKind::Verifier => "VERIFIER",
+        WorkerKind::LocalOperation => "LOCAL_OPERATION",
+    }
+}
+
+fn no_action_code(reason: &SchedulerNoActionReason) -> &'static str {
+    match reason {
+        SchedulerNoActionReason::Pausing => "PAUSING",
+        SchedulerNoActionReason::Paused => "PAUSED",
+        SchedulerNoActionReason::Cancelling => "CANCELLING",
+        SchedulerNoActionReason::TerminalGoal(_) => "TERMINAL_GOAL",
+        SchedulerNoActionReason::GoalBlocked => "GOAL_BLOCKED",
+        SchedulerNoActionReason::GoalFinalizationRequired => "GOAL_FINALIZATION_REQUIRED",
+        SchedulerNoActionReason::ReplanningWithoutTrigger => "REPLANNING_WITHOUT_TRIGGER",
+        SchedulerNoActionReason::ActiveWork => "ACTIVE_WORK",
+        SchedulerNoActionReason::WaitingForDependencies => "WAITING_FOR_DEPENDENCIES",
+        SchedulerNoActionReason::ReadinessPropagationDeferred => "READINESS_PROPAGATION_DEFERRED",
+        SchedulerNoActionReason::RetryPolicyDeferred => "RETRY_POLICY_DEFERRED",
+        SchedulerNoActionReason::BlockedTasks => "BLOCKED_TASKS",
+        SchedulerNoActionReason::FailedTasks => "FAILED_TASKS",
+        SchedulerNoActionReason::WriterLeaseHeld { .. } => "WRITER_LEASE_HELD",
+        SchedulerNoActionReason::NoEligibleAction => "NO_ELIGIBLE_ACTION",
+    }
+}
+
 /// Build the host-authored Planner request payload, bounded before it is
 /// persisted.
 ///
@@ -342,20 +535,4 @@ fn build_planner_request(
         });
     }
     Ok((payload, OUTPUT_CONTRACT_PLANNER_V1))
-}
-
-fn goal_status_stage(status: GoalStatus) -> &'static str {
-    match status {
-        GoalStatus::Planning => "PLANNING",
-        GoalStatus::Running => "RUNNING",
-        GoalStatus::Replanning => "REPLANNING",
-        GoalStatus::Pausing => "PAUSING",
-        GoalStatus::Paused => "PAUSED",
-        GoalStatus::Blocked => "BLOCKED",
-        GoalStatus::Verifying => "VERIFYING",
-        GoalStatus::Cancelling => "CANCELLING",
-        GoalStatus::Completed => "COMPLETED",
-        GoalStatus::Failed => "FAILED",
-        GoalStatus::Cancelled => "CANCELLED",
-    }
 }

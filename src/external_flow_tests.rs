@@ -90,7 +90,11 @@ fn goal_next_call(
     session: &config::Session,
     store: &TaskStore,
 ) -> Result<external_goal_api::ExternalGoalNextView, goal_api::GoalApiError> {
-    external_goal_api::goal_next(args, session, store)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(external_goal_api::goal_next(args, session, store))
 }
 
 fn next_args(session: &config::Session, goal_id: &GoalId) -> Value {

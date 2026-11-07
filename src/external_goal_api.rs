@@ -48,6 +48,21 @@ pub(crate) const PLANNER_OUTPUT_REQUIRED_FIELDS: &[&str] = &[
     "criterion_bindings",
 ];
 
+/// The minimum top-level fields a V1 Readonly submission must carry.
+///
+/// The identity fields are host-issued values the client must echo back, which
+/// is how the host refuses an answer aimed at a superseded Attempt.
+pub(crate) const READONLY_OUTPUT_REQUIRED_FIELDS: &[&str] = &[
+    "goal_id",
+    "task_id",
+    "attempt_id",
+    "goal_revision",
+    "plan_revision",
+    "status",
+    "summary",
+    "evidence",
+];
+
 // ---------------------------------------------------------------------------
 // Request shapes.
 // ---------------------------------------------------------------------------
@@ -175,7 +190,7 @@ pub(crate) struct ExternalGoalStateView {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ExternalGoalSubmitView {
     /// The closed decision vocabulary from B-02, plus the derived replay
-    /// verdicts and `BUDGET_EXHAUSTED`.
+    /// verdicts, `COMMITTED`, and `BUDGET_EXHAUSTED`.
     outcome: &'static str,
     /// Borrowed from a durable receipt when one exists, so it is owned here.
     code: String,
@@ -256,7 +271,14 @@ pub(crate) fn external_goal_run_outcome(goal: &Goal) -> String {
 // goal_next.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn goal_next(
+/// Advance an EXTERNAL Goal by at most `max_host_steps` host steps (E4-B).
+///
+/// One call performs as many *host-owned* steps as the caller's budget allows
+/// and stops the moment a step needs external inference, refuses, or reports a
+/// typed no-action. The loop is bounded twice: by `max_host_steps` and by the
+/// observation that every ``Progress`` step must commit a new Goal revision, so
+/// a step that reports progress without advancing is never repeated.
+pub(crate) async fn goal_next(
     args: &Value,
     session: &config::Session,
     store: &TaskStore,
@@ -311,12 +333,44 @@ pub(crate) fn goal_next(
         _ => {}
     }
 
-    let report = driver::next_external_step(store, session, &goal).map_err(driver_error)?;
-    // Re-read so the reported revision and budget describe the committed state.
-    let current = store
-        .load_goal(&session.id, goal.id())
+    let mut current = goal;
+    let mut steps = 0u32;
+    let report = loop {
+        let report = driver::advance_external_step(store, session, &current)
+            .await
+            .map_err(driver_error)?;
+        steps = steps.saturating_add(report.host_steps_executed);
+        if !matches!(report.outcome, DriverOutcome::Progress { .. }) {
+            break report;
+        }
+        // A progress step must have committed a new revision. Re-read so the
+        // reported revision, budget, and any terminal status describe the
+        // committed state, and refuse to loop if nothing advanced.
+        let reloaded = store
+            .load_goal(&session.id, current.id())
+            .map_err(GoalApiError::from_orchestrator)?;
+        if reloaded.revision() == current.revision() {
+            break DriverReport {
+                outcome: DriverOutcome::Progress {
+                    code: "HOST_STEP_DEFERRED",
+                    detail: "the host step made no durable progress; call goal_next again",
+                },
+                host_steps_executed: 0,
+            };
+        }
+        let terminal = reloaded.status().is_terminal();
+        current = reloaded;
+        if terminal || steps >= max_host_steps {
+            break report;
+        }
+    };
+    // Always report the persisted snapshot: an issuance commits a new revision,
+    // so the pre-step snapshot would understate the Goal's revision and hide the
+    // active WorkItem (`execution_wait`) the client must answer.
+    let final_goal = store
+        .load_goal(&session.id, current.id())
         .map_err(GoalApiError::from_orchestrator)?;
-    Ok(driver_view(&current, report, max_host_steps))
+    Ok(driver_view(&final_goal, report, steps, max_host_steps))
 }
 
 fn driver_error(error: DriverError) -> GoalApiError {
@@ -350,8 +404,12 @@ fn blocked_view(
     builder.build()
 }
 
-fn driver_view(goal: &Goal, report: DriverReport, max_host_steps: u32) -> ExternalGoalNextView {
-    let steps = report.host_steps_executed;
+fn driver_view(
+    goal: &Goal,
+    report: DriverReport,
+    steps: u32,
+    max_host_steps: u32,
+) -> ExternalGoalNextView {
     match report.outcome {
         DriverOutcome::ModelRequired(item) => {
             let mut builder = base_next_view(goal, "MODEL_REQUIRED", steps, max_host_steps);
@@ -362,7 +420,11 @@ fn driver_view(goal: &Goal, report: DriverReport, max_host_steps: u32) -> Extern
         DriverOutcome::Progress { code, detail } => {
             let mut builder = base_next_view(goal, "HOST_PROGRESS", steps, max_host_steps);
             builder.progress = Some(ExternalProgressView { code, detail });
-            builder.next_action = Some("CALL_GOAL_NEXT");
+            builder.next_action = Some(if goal.status().is_terminal() {
+                "OBSERVE_TERMINAL_STATE"
+            } else {
+                "CALL_GOAL_NEXT"
+            });
             builder.build()
         }
         DriverOutcome::Refused(DriverRefusal::RoleNotWired { stage }) => {
@@ -396,10 +458,28 @@ fn driver_view(goal: &Goal, report: DriverReport, max_host_steps: u32) -> Extern
             }]);
             builder.build()
         }
+        DriverOutcome::Refused(DriverRefusal::HostStepRefused { code, detail }) => {
+            let mut builder = base_next_view(goal, "BLOCKED", steps, max_host_steps);
+            builder.blockers = Some(vec![ExternalBlockerView {
+                code: code.to_owned(),
+                detail: detail.to_owned(),
+                mandatory: true,
+            }]);
+            builder.build()
+        }
+        DriverOutcome::Refused(DriverRefusal::NoAction { code }) => {
+            let mut builder = base_next_view(goal, "NO_ACTION_WITH_REASON", steps, max_host_steps);
+            builder.no_action_reason = Some(code);
+            builder.build()
+        }
     }
 }
 
 fn model_work_view(item: ModelWorkItem) -> ModelWorkView {
+    let required_fields = match item.role() {
+        WorkRole::Readonly => READONLY_OUTPUT_REQUIRED_FIELDS,
+        _ => PLANNER_OUTPUT_REQUIRED_FIELDS,
+    };
     let request = serde_json::from_str(item.request_payload()).unwrap_or(Value::Null);
     ModelWorkView {
         work_id: item.work_id().as_str().to_owned(),
@@ -413,7 +493,7 @@ fn model_work_view(item: ModelWorkItem) -> ModelWorkView {
         request_digest: item.request_digest().to_owned(),
         request,
         output_contract: item.output_contract().to_owned(),
-        response_required_fields: PLANNER_OUTPUT_REQUIRED_FIELDS.to_vec(),
+        response_required_fields: required_fields.to_vec(),
         state: item.state().as_str(),
         issue_counter: item.issue_counter(),
         created_at: item.created_at().to_owned(),

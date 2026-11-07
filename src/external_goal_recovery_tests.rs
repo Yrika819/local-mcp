@@ -87,7 +87,11 @@ fn goal_next_call(
     session: &config::Session,
     store: &TaskStore,
 ) -> Result<external_goal_api::ExternalGoalNextView, goal_api::GoalApiError> {
-    external_goal_api::goal_next(args, session, store)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(external_goal_api::goal_next(args, session, store))
 }
 
 fn goal_next(session: &config::Session, store: &TaskStore, goal_id: &GoalId) -> Value {
@@ -398,16 +402,8 @@ fn a_superseded_work_item_is_invalidated_instead_of_dead_ending_the_goal() {
     )
     .unwrap();
 
-    // The invalidation itself is one bounded host step; the fresh WorkItem is
-    // issued on the next call.
-    let progress = goal_next(&f.session, &f.store, &goal_id);
-    assert_eq!(progress["outcome"], "HOST_PROGRESS");
-    assert_eq!(
-        progress["progress"]["code"],
-        "WORK_ITEM_REVISION_INVALIDATED"
-    );
-    assert!(progress["model_work"].is_null());
-
+    // One bounded `goal_next` invalidation step is followed by the re-issuance
+    // step, so the caller gets the fresh WorkItem in the same call.
     let fresh = goal_next(&f.session, &f.store, &goal_id);
     assert_eq!(fresh["outcome"], "MODEL_REQUIRED");
     assert_ne!(
