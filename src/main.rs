@@ -74,6 +74,8 @@ mod atomic_publish_tests;
 #[cfg(test)]
 mod external_goal_api_tests;
 #[cfg(test)]
+mod external_goal_recovery_tests;
+#[cfg(test)]
 mod external_goal_tests;
 #[cfg(test)]
 mod goal_backends_tests;
