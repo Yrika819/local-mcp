@@ -658,7 +658,7 @@ fn goal_submit_on_a_codex_goal_is_refused() {
 }
 
 #[test]
-fn goal_next_after_a_committed_plan_reports_the_unwired_readonly_role() {
+fn goal_next_after_a_committed_plan_issues_the_readonly_work_item() {
     let f = fixture("await-host");
     let goal_id = goal_id_of(&start_goal(&f.session, &f.store, Some("EXTERNAL")));
     let next = goal_next(&f.session, &f.store, &goal_id);
@@ -677,13 +677,16 @@ fn goal_next_after_a_committed_plan_reports_the_unwired_readonly_role() {
     .unwrap();
     assert_eq!(committed["outcome"], "COMMITTED");
 
-    // E4-B is not wired on this branch: the Scheduler selects the READY
-    // readonly Task, and the host reports the role as unwired instead of
-    // faking progress or completion.
+    // E4-B: the Scheduler now selects the READY readonly Task and the host
+    // issues one bounded WorkItem carrying the host-owned scope and evidence
+    // requirements.
     let after = goal_next(&f.session, &f.store, &goal_id);
-    assert_eq!(after["outcome"], "NO_ACTION_WITH_REASON");
-    assert_eq!(after["no_action_reason"], "EXTERNAL_ROLE_NOT_WIRED");
-    assert!(after["model_work"].is_null());
+    assert_eq!(after["outcome"], "MODEL_REQUIRED");
+    assert_eq!(after["execution_wait"], "WAITING_FOR_EXTERNAL_MODEL");
+    assert_eq!(after["model_work"]["role"], "READONLY");
+    assert_eq!(after["host_steps_executed"], 1);
+    assert_ne!(after["model_work"]["work_id"], work["work_id"]);
+    assert!(after["model_work"]["task_id"].is_string());
     assert_ne!(after["result_kind"], "COMPLETED");
 }
 

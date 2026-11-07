@@ -43,15 +43,17 @@ begin (session lock + optimistic revision check)
   1. session 認可 / Goal 所有照合 / WorkItem 照合
   2. expected_goal_revision + request_digest 照合
   3. Role 別 strict validator（planner/readonly/writer/reviewer/replanner）
-  4. SubmissionReceipt の作成（decision = ACCEPTED_FOR_HOST_PROCESSING 等）
-  5. host-owned 状態遷移（WorkItem: PENDING → SUBMITTED、Role 応じた Task/Goal 状態）
+  4. SubmissionReceipt の作成（decision = COMMITTED / REJECTED_SCHEMA 等）
+  5. host-owned 状態遷移（WorkItem: PENDING → COMMITTED/REJECTED、Role 応じた Task/Goal 状態）
   6. 1 durable commit（既存 TaskStore の snapshot + journal + revision 方式）
 end
 ```
 
-- **commit の外**に出すのは長時間副作用のみ（Owner 承認待ち、Writer の実ファイル適用、Host Verifier の実行）。それらは receipt（SUBMITTED）を起点に**別 phase** で実行し、完了時に WorkItem を COMMITTED へ遷移。
-- クラッシュ時は receipt の状態が再適用の防止材になる（SUBMITTED で止まった適用は既存 Writer reconciliation に従い、UNKNOWN を勝手に再実行しない）。
-- `decision` の閉じた集合: `ACCEPTED_FOR_HOST_PROCESSING` / `REJECTED_SCHEMA` / `REJECTED_STALE_REVISION` / `REJECTED_AUTHORITY` / `REJECTED_PREIMAGE` / `REPLAY_OF_ACCEPTED_SUBMISSION` / `CONFLICTING_DUPLICATE` / `CANCELLED_STALE` / `BUDGET_EXHAUSTED`。
+- **E4 確定:** Planner と Readonly の「検証 → 適用 → Receipt 確定 → WorkItem 遷移」は上記 6 段を**同一 commit** で行う（H1-2）。`ACCEPTED_FOR_HOST_PROCESSING`（受理のみ）は E3 の後方互換として残るが、E4 のホストは受理だけの状態を作らない。
+- **commit の外**に出すのは長時間副作用のみ（Owner 承認待ち、Writer の実ファイル適用、Host Verifier の実行）。Host Verifier は commit 後に `goal_next` の host step として実行する。
+- クラッシュ時は receipt の状態が再適用の防止材になる（SUBMITTED で止まった適用は既存 Writer reconciliation に従い、UNKNOWN を勝手に再実行しない）。**E4 追記:** 旧 E3 が残した `SUBMITTED` WorkItem はモデル成果物を永続化していないため適用不能であり、`goal_next` は `EXTERNAL_SUBMITTED_RECOVERY_UNSAFE` の mandatory blocker を返して止まる（推測適用も Receipt 破棄もしない）。
+- **冪等キーは `(work_id, submission_id, payload_sha256)` の 3 組**（H1-1）。`submission_id` 単独一致では replay を返さない。`work_id` が一致しない再送は `REJECTED_AUTHORITY / SUBMISSION_WORK_ID_MISMATCH` として fixed code のみを返し、別 Goal・別 Session の情報を漏らさない。
+- `decision` の閉じた集合: `ACCEPTED_FOR_HOST_PROCESSING` / `COMMITTED` / `REJECTED_SCHEMA` / `REJECTED_STALE_REVISION` / `REJECTED_AUTHORITY` / `REJECTED_PREIMAGE` / `REPLAY_OF_ACCEPTED_SUBMISSION` / `CONFLICTING_DUPLICATE` / `CANCELLED_STALE` / `BUDGET_EXHAUSTED`。`COMMITTED` は `committed_revision` を必ず伴う。
 
 **固定事項:** 受理 ≠ 成功。`goal_submit` は決して `SUCCESS`/`COMPLETED` を返さない。完了は Host Verifier 達成後の `goal_result` でのみ確定。
 
@@ -219,3 +221,41 @@ SubmissionReceipt (durable, append-only 相当)
 4. `outcome` 集合の最終確定と `goal_advance` 分割の要否（B-01）。
 5. canonical JSON（`request_digest` の正規化）の定義。
 6. `decision` コード名の最終確定（本文書の名称は草案）。
+
+---
+
+## E4 実装追記（H1-2 / E4-A / E4-B で確定した事項）
+
+> 追記日時: 2026-11-07 / 対象: `feat/external-e3-hardening-v1` 以降の stacked PR
+
+### 1. goal_submit の role 別適用
+
+| role | 検証 | 同一 commit で行う適用 | 成功時の outcome / decision |
+|---|---|---|---|
+| PLANNER | 既存 Phase 4 strict validator（criterion ID・worker kind・scope・revision・DAG 循環・writer 順序） | Task DAG materialization + Criterion Binding + plan revision 更新 | `COMMITTED` / `COMMITTED`（code `PLAN_APPLIED`） |
+| READONLY | 既存 readonly parser（identity・revision・schema・evidence 上限） | Attempt への evidence/worker report 記録 + Candidate Complete / Blocked / NeedsReplan / Failed の Task 遷移 | `COMMITTED` / `COMMITTED`（code は `READONLY_*`） |
+| WRITER / REVIEWER / REPLANNER | 未接続（E5） | なし | `REJECTED_SCHEMA` / `REJECTED_SCHEMA`（code `ROLE_NOT_WIRED_EXTERNAL_V1`） |
+
+- 適用は **モデルの成功宣言ではなくホストの状態表**で決まる。`candidate_complete` は `VERIFYING` への遷移要求にすぎず、Task 完了は既存 Task Verifier の Pass のみ。
+- 外部 readonly の evidence は `source = EXTERNAL_READONLY_AGENT` として保存され、Codex readonly の `CODEX_READONLY` と区別できる（監査用）。
+
+### 2. goal_next の host step
+
+1 呼び出しは最大 `max_host_steps`（既定・上限 8）の host step を実行し、次のいずれかで停止する。
+
+| 停止理由 | outcome |
+|---|---|
+| モデル推論が必要（Planner / Readonly WorkItem 発行） | `MODEL_REQUIRED` |
+| Task Verifier / Goal Verifier / Goal Finalizer / retry re-arm を実行 | `HOST_PROGRESS`（terminal 到達時は `next_action: OBSERVE_TERMINAL_STATE`） |
+| role 未接続（Writer/Reviewer/Replanner） | `NO_ACTION_WITH_REASON` + `EXTERNAL_ROLE_NOT_WIRED` |
+| 予算・validator 拒否・旧 SUBMITTED | `BLOCKED` + mandatory blocker |
+| それ以外の Scheduler `NoAction` | `NO_ACTION_WITH_REASON` + 型付き理由 |
+
+- step は毎回 1 durable commit で前進し、`Progress` を返したのに revision が変わらない場合は同一状態を繰り返さず停止する。
+- モデル推論待ちの間、Session Lock は保持しない（推論はクライアント側）。
+
+### 3. 既知の未接続（E5 以降）
+
+- WRITER / REVIEWER / REPLANNER の外部適用。
+- 依存 Task の READY 伝播（`READINESS_PROPAGATION_DEFERRED`）。E4 の確定テストは単一 Task 計画で検証している。
+- Writer の実ファイル適用に伴う preimage / side-effect 管理。
