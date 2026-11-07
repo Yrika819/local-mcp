@@ -12,7 +12,6 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -24,8 +23,8 @@ use crate::external_model_store::{
 use crate::external_model_work::{
     ExternalModelState, MAX_ACTIVE_WORK_ITEMS_PER_GOAL, MAX_MODEL_WORK_ITEMS_PER_GOAL,
     MAX_REQUEST_PAYLOAD_BYTES, ModelWorkItem, OUTPUT_CONTRACT_PLANNER_V1, SubmissionDecision,
-    SubmissionId, SubmissionReceipt, WorkId, WorkItemState, WorkRole, canonical_json, payload_digest,
-    sha256_hex,
+    SubmissionId, SubmissionReceipt, WorkId, WorkItemState, WorkRole, canonical_json,
+    payload_digest, sha256_hex,
 };
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_api;
@@ -178,7 +177,12 @@ fn hybrid_and_unknown_backends_are_refused_and_create_nothing() {
     });
     let error = goal_api::goal_start(&args, &f.session, &f.store).unwrap_err();
     assert_eq!(error.code(), "UNKNOWN_MODEL_BACKEND");
-    assert!(f.store.list_goals_for_session(&f.session.id).unwrap().is_empty());
+    assert!(
+        f.store
+            .list_goals_for_session(&f.session.id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -190,10 +194,8 @@ fn idempotency_replay_is_refused_across_backend_modes() {
         "objective": "Same key, different backend",
         "idempotency_key": key,
     });
-    let view = serde_json::to_value(
-        goal_api::goal_start(&codex, &f.session, &f.store).unwrap(),
-    )
-    .unwrap();
+    let view =
+        serde_json::to_value(goal_api::goal_start(&codex, &f.session, &f.store).unwrap()).unwrap();
     assert_eq!(view["idempotent_replay"], false);
 
     let external = json!({
@@ -206,10 +208,8 @@ fn idempotency_replay_is_refused_across_backend_modes() {
     assert_eq!(error.code(), "IDEMPOTENCY_CONFLICT");
 
     // The original Codex goal is unchanged and replaying it stays a replay.
-    let replay = serde_json::to_value(
-        goal_api::goal_start(&codex, &f.session, &f.store).unwrap(),
-    )
-    .unwrap();
+    let replay =
+        serde_json::to_value(goal_api::goal_start(&codex, &f.session, &f.store).unwrap()).unwrap();
     assert_eq!(replay["idempotent_replay"], true);
     assert_eq!(replay["model_backend"], "CODEX");
 }
@@ -227,14 +227,8 @@ fn issued_work_item_is_durable_and_reloaded_by_a_fresh_store() {
     let item = planner_work_item(&goal, &now);
     let work_id = item.work_id().clone();
     let digest = item.request_digest().to_owned();
-    let committed = commit_issued_work_item(
-        &f.store,
-        &f.session.id,
-        goal.id(),
-        goal.revision(),
-        item,
-    )
-    .unwrap();
+    let committed =
+        commit_issued_work_item(&f.store, &f.session.id, goal.id(), goal.revision(), item).unwrap();
     assert_eq!(committed.revision(), goal.revision() + 1);
 
     // A completely fresh store on the same state root is the restart case: the
@@ -261,14 +255,9 @@ fn a_second_active_work_item_is_refused_and_the_budget_is_not_consumed() {
     f.store.create_goal(&goal).unwrap();
     let first = planner_work_item(&goal, &now);
     let first_id = first.work_id().clone();
-    let after_first = commit_issued_work_item(
-        &f.store,
-        &f.session.id,
-        goal.id(),
-        goal.revision(),
-        first,
-    )
-    .unwrap();
+    let after_first =
+        commit_issued_work_item(&f.store, &f.session.id, goal.id(), goal.revision(), first)
+            .unwrap();
 
     let second = planner_work_item_with_counter(&after_first, &now, 2);
     let error = mutate_external(
@@ -305,7 +294,10 @@ fn stale_expected_revision_is_refused_without_a_partial_write() {
     .unwrap_err();
     assert!(matches!(
         error,
-        OrchestratorError::RevisionConflict { expected: 8, actual: 1 }
+        OrchestratorError::RevisionConflict {
+            expected: 8,
+            actual: 1
+        }
     ));
     let reloaded = f.store.load_goal(&f.session.id, goal.id()).unwrap();
     assert_eq!(reloaded.revision(), 1);
@@ -397,14 +389,9 @@ fn a_work_item_bound_to_another_goal_is_refused_by_goal_validation() {
         &now,
     )
     .unwrap();
-    let error = commit_issued_work_item(
-        &f.store,
-        &f.session.id,
-        goal.id(),
-        goal.revision(),
-        foreign,
-    )
-    .unwrap_err();
+    let error =
+        commit_issued_work_item(&f.store, &f.session.id, goal.id(), goal.revision(), foreign)
+            .unwrap_err();
     assert!(matches!(error, OrchestratorError::CorruptGoal(_)));
     let reloaded = f.store.load_goal(&f.session.id, goal.id()).unwrap();
     assert!(external_state(&reloaded).unwrap().active_work().is_none());
@@ -430,11 +417,11 @@ fn codex_goals_cannot_carry_external_state() {
     // validation rather than decode as a weaker-but-valid record.
     let mut smuggled = serde_json::to_value(&goal).unwrap();
     smuggled["external_model"] = serde_json::to_value(ExternalModelState::new()).unwrap();
-    let decoded: Result<Goal, _> = serde_json::from_value(smuggled);
-    match decoded {
-        Ok(goal) => assert!(goal.validate().is_err()),
-        Err(_) => {}
-    }
+    let decoded: Goal = serde_json::from_value(smuggled).unwrap();
+    assert!(
+        decoded.validate().is_err(),
+        "a CODEX Goal must never decode as valid while carrying external state"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -449,14 +436,8 @@ fn cancellation_invalidates_the_active_work_item_in_the_same_commit() {
     f.store.create_goal(&goal).unwrap();
     let item = planner_work_item(&goal, &now);
     let work_id = item.work_id().clone();
-    let after_issue = commit_issued_work_item(
-        &f.store,
-        &f.session.id,
-        goal.id(),
-        goal.revision(),
-        item,
-    )
-    .unwrap();
+    let after_issue =
+        commit_issued_work_item(&f.store, &f.session.id, goal.id(), goal.revision(), item).unwrap();
     let cancelled = f
         .store
         .mutate_goal_snapshot(
@@ -488,13 +469,7 @@ fn a_failed_commit_leaves_no_issued_work_item() {
 
     let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplace);
     let item = planner_work_item(&goal, &now);
-    let result = commit_issued_work_item(
-        &failing,
-        &f.session.id,
-        goal.id(),
-        goal.revision(),
-        item,
-    );
+    let result = commit_issued_work_item(&failing, &f.session.id, goal.id(), goal.revision(), item);
     assert!(
         result.is_err(),
         "a commit that cannot replace the Goal document must fail"
@@ -535,14 +510,8 @@ fn submission_receipts_are_durable_and_replayable_from_a_fresh_store() {
     f.store.create_goal(&goal).unwrap();
     let item = planner_work_item(&goal, &now);
     let work_id = item.work_id().clone();
-    let after_issue = commit_issued_work_item(
-        &f.store,
-        &f.session.id,
-        goal.id(),
-        goal.revision(),
-        item,
-    )
-    .unwrap();
+    let after_issue =
+        commit_issued_work_item(&f.store, &f.session.id, goal.id(), goal.revision(), item).unwrap();
     let submission = SubmissionId::parse(&Uuid::new_v4().to_string()).unwrap();
     let payload = payload_digest(&json!({ "summary": "accepted shape" }));
     let receipt = SubmissionReceipt::new(
@@ -568,25 +537,24 @@ fn submission_receipts_are_durable_and_replayable_from_a_fresh_store() {
     let restarted = TaskStore::with_state_root(f.root.join("state"));
     let reloaded = restarted.load_goal(&f.session.id, goal.id()).unwrap();
     let state = external_state(&reloaded).unwrap();
-    let stored = state.find_receipt(&submission).expect("receipt survives restart");
+    let stored = state
+        .find_receipt(&submission)
+        .expect("receipt survives restart");
     assert_eq!(stored.payload_sha256(), payload);
-    assert_eq!(stored.decision(), SubmissionDecision::AcceptedForHostProcessing);
+    assert_eq!(
+        stored.decision(),
+        SubmissionDecision::AcceptedForHostProcessing
+    );
     assert_eq!(stored.committed_revision(), None);
-    assert_eq!(state.active_work().unwrap().state(), WorkItemState::Submitted);
+    assert_eq!(
+        state.active_work().unwrap().state(),
+        WorkItemState::Submitted
+    );
 }
 
 // ---------------------------------------------------------------------------
 // GoalStore compatibility: additive read, fail-closed downgrade.
 // ---------------------------------------------------------------------------
-
-/// A minimal stand-in for a pre-E3 reader: a strict struct that does not know
-/// the two additive fields.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PreE3GoalReader {
-    store_format: String,
-    schema_version: u32,
-}
 
 #[test]
 fn a_pre_e3_reader_can_read_codex_goals_and_refuses_external_goals() {
@@ -602,17 +570,46 @@ fn a_pre_e3_reader_can_read_codex_goals_and_refuses_external_goals() {
         &now,
     )
     .unwrap();
-    let codex_document = serde_json::to_vec(&codex).unwrap();
-    let decoded: PreE3GoalReader = serde_json::from_slice(&codex_document).unwrap();
-    assert_eq!(decoded.schema_version, crate::goal::GOAL_SCHEMA_VERSION);
-
+    let codex_document = serde_json::to_value(&codex).unwrap();
     let external = codex.with_creation_backend(ModelBackend::External);
-    let external_document = serde_json::to_vec(&external).unwrap();
-    let error = serde_json::from_slice::<PreE3GoalReader>(&external_document).unwrap_err();
+    let external_document = serde_json::to_value(&external).unwrap();
+
+    // 1. A CODEX document carries no key a pre-E3 reader would not know, so an
+    //    older binary can still read and rewrite it unchanged.
+    let codex_object = codex_document.as_object().unwrap();
+    let external_object = external_document.as_object().unwrap();
+    let mut added: Vec<&str> = external_object
+        .keys()
+        .filter(|key| !codex_object.contains_key(*key))
+        .map(String::as_str)
+        .collect();
+    added.sort_unstable();
+    assert_eq!(added, vec!["external_model", "model_backend"]);
+    let reparsed: Goal = serde_json::from_value(codex_document.clone()).unwrap();
+    assert_eq!(reparsed.model_backend(), ModelBackend::Codex);
+
+    // 2. The durable shape is strict (`deny_unknown_fields`). That is exactly how
+    //    a reader that does not declare the two additive fields treats them, so
+    //    a downgrade refuses an EXTERNAL document instead of silently dropping
+    //    its durable state. The probe key stands in for any field such a reader
+    //    does not know.
+    let mut unknown = codex_document.clone();
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("pre_e3_unknown_probe".to_owned(), Value::Bool(true));
+    let strict_error = serde_json::from_value::<Goal>(unknown).unwrap_err();
     assert!(
-        error.to_string().contains("model_backend"),
-        "the downgrade refusal must name the unknown authoritative field: {error}"
+        strict_error.to_string().contains("unknown field"),
+        "the durable shape must refuse an unmodelled authoritative field: {strict_error}"
     );
+
+    // 3. A lossy downgrade that drops only the mode key must not yield a valid
+    //    CODEX Goal, because the external record would then be orphaned.
+    let mut stripped = external_document;
+    stripped.as_object_mut().unwrap().remove("model_backend");
+    let stripped_goal: Goal = serde_json::from_value(stripped).unwrap();
+    assert!(stripped_goal.validate().is_err());
 }
 
 #[test]

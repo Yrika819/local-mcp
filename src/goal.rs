@@ -4198,7 +4198,10 @@ impl Goal {
     /// and `CODEX` must not carry any. A partially written external record fails
     /// the Goal load instead of silently decoding as "no pending work".
     fn validate_model_backend_state(&self) -> Result<(), OrchestratorError> {
-        match (self.model_backend.is_external(), self.external_model.as_ref()) {
+        match (
+            self.model_backend.is_external(),
+            self.external_model.as_ref(),
+        ) {
             (true, Some(state)) => state.validate_for_goal(self.id.as_str(), &self.session_id),
             (true, None) => Err(OrchestratorError::CorruptGoal(
                 "EXTERNAL goal requires durable external model state".to_owned(),

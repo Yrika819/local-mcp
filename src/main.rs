@@ -70,13 +70,13 @@ mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
 #[cfg(test)]
+mod external_goal_tests;
+#[cfg(test)]
 mod goal_backends_tests;
 #[cfg(test)]
 mod goal_finalizer_tests;
 #[cfg(test)]
 mod goal_hardening_tests;
-#[cfg(test)]
-mod external_goal_tests;
 #[cfg(test)]
 mod goal_orchestration_regression_tests;
 #[cfg(test)]

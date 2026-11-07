@@ -27,6 +27,15 @@
 //! 5. Accepting a submission is not success: the receipt's decision is at most
 //!    `ACCEPTED_FOR_HOST_PROCESSING` and never a Goal transition (ADR-07).
 
+// E3-A lands this durable contract before the `goal_next` / `goal_submit` API
+// layer (E3-B) consumes it. Until that layer exists the surface is reachable only
+// from the E3-A tests, so the attribute is scoped to this module and removed by
+// E3-B rather than leaving a permanent blanket silence.
+#![allow(
+    dead_code,
+    reason = "E3-A durable contract surface; E3-B consumes it and removes this attribute"
+)]
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -109,7 +118,9 @@ impl SubmissionId {
         let uuid = Uuid::parse_str(value)
             .map_err(|_| OrchestratorError::UnsafeIdentifier("SubmissionId".to_owned()))?;
         if uuid.to_string() != value {
-            return Err(OrchestratorError::UnsafeIdentifier("SubmissionId".to_owned()));
+            return Err(OrchestratorError::UnsafeIdentifier(
+                "SubmissionId".to_owned(),
+            ));
         }
         Ok(Self(value.to_owned()))
     }
@@ -262,9 +273,7 @@ impl IssueBlock {
             Self::LifetimeWorkItemBudgetExhausted => {
                 "the Goal reached its lifetime host-issued ModelWorkItem budget"
             }
-            Self::RoleAttemptBudgetExhausted => {
-                "the role reached its attempt budget for this Goal"
-            }
+            Self::RoleAttemptBudgetExhausted => "the role reached its attempt budget for this Goal",
         }
     }
 }
@@ -353,7 +362,10 @@ impl ModelWorkItem {
             ));
         }
         if self.request_digest.len() != 64
-            || !self.request_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self
+                .request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(OrchestratorError::CorruptGoal(
                 "external work item request digest is not a SHA-256 hex digest".to_owned(),
@@ -611,7 +623,10 @@ impl SubmissionReceipt {
         self.work_id.validate()?;
         self.submission_id.validate()?;
         if self.payload_sha256.len() != 64
-            || !self.payload_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self
+                .payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(OrchestratorError::CorruptGoal(
                 "submission receipt payload digest is not a SHA-256 hex digest".to_owned(),
@@ -719,10 +734,7 @@ impl ExternalModelState {
     }
 
     pub(crate) fn role_attempts(&self, role: WorkRole) -> u32 {
-        self.role_attempts
-            .get(role.as_str())
-            .copied()
-            .unwrap_or(0)
+        self.role_attempts.get(role.as_str()).copied().unwrap_or(0)
     }
 
     pub(crate) fn last_stop(&self) -> Option<&ExternalStop> {
@@ -744,7 +756,11 @@ impl ExternalModelState {
     /// All three limits are checked before any state change, so a refusal never
     /// consumes budget.
     pub(crate) fn check_issue_budget(&self, role: WorkRole) -> Result<(), IssueBlock> {
-        if self.pending_work.as_ref().is_some_and(|item| item.state.is_active()) {
+        if self
+            .pending_work
+            .as_ref()
+            .is_some_and(|item| item.state.is_active())
+        {
             return Err(IssueBlock::PendingWorkItemExists);
         }
         if self.issue_counter >= MAX_MODEL_WORK_ITEMS_PER_GOAL {
@@ -820,26 +836,36 @@ impl ExternalModelState {
             ));
         }
         receipt.validate()?;
-        let item = self.pending_work.as_mut().ok_or_else(|| {
-            OrchestratorError::CorruptGoal(
-                "a submission cannot be recorded without an active external work item".to_owned(),
-            )
-        })?;
-        if item.work_id != receipt.work_id {
-            return Err(OrchestratorError::CorruptGoal(
-                "submission receipt is bound to a different external work item".to_owned(),
-            ));
-        }
-        if item.state != WorkItemState::Pending {
-            return Err(OrchestratorError::CorruptGoal(
-                "a submission requires a PENDING external work item".to_owned(),
-            ));
+        // All read-only preconditions are checked before the mutable borrow so a
+        // refusal can never leave the slot partially transitioned.
+        {
+            let pending = self.pending_work.as_ref().ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "a submission cannot be recorded without an active external work item"
+                        .to_owned(),
+                )
+            })?;
+            if pending.work_id != receipt.work_id {
+                return Err(OrchestratorError::CorruptGoal(
+                    "submission receipt is bound to a different external work item".to_owned(),
+                ));
+            }
+            if pending.state != WorkItemState::Pending {
+                return Err(OrchestratorError::CorruptGoal(
+                    "a submission requires a PENDING external work item".to_owned(),
+                ));
+            }
         }
         if self.find_receipt(&receipt.submission_id).is_some() {
             return Err(OrchestratorError::CorruptGoal(
                 "submission receipt identifiers must be unique per Goal".to_owned(),
             ));
         }
+        let item = self.pending_work.as_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "a submission cannot be recorded without an active external work item".to_owned(),
+            )
+        })?;
         match receipt.decision {
             SubmissionDecision::AcceptedForHostProcessing => {
                 item.mark_submitted(now);
@@ -895,9 +921,9 @@ impl ExternalModelState {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         if self.schema_version != EXTERNAL_MODEL_SCHEMA_VERSION {
-            return Err(OrchestratorError::UnsupportedSchema(
-                u64::from(self.schema_version),
-            ));
+            return Err(OrchestratorError::UnsupportedSchema(u64::from(
+                self.schema_version,
+            )));
         }
         if self.issue_counter > MAX_MODEL_WORK_ITEMS_PER_GOAL {
             return Err(OrchestratorError::CorruptGoal(
@@ -919,7 +945,10 @@ impl ExternalModelState {
         for summary in &self.work_history {
             summary.work_id.validate()?;
             if summary.request_digest.len() != 64
-                || !summary.request_digest.bytes().all(|b| b.is_ascii_hexdigit())
+                || !summary
+                    .request_digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
             {
                 return Err(OrchestratorError::CorruptGoal(
                     "external work history carries an invalid request digest".to_owned(),
@@ -1150,8 +1179,7 @@ mod tests {
 
     #[test]
     fn canonical_digest_is_independent_of_key_order() {
-        let left: serde_json::Value =
-            serde_json::from_str(r#"{"b":1,"a":{"d":2,"c":3}}"#).unwrap();
+        let left: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":{"d":2,"c":3}}"#).unwrap();
         let right: serde_json::Value =
             serde_json::from_str(r#"{"a":{"c":3,"d":2},"b":1}"#).unwrap();
         assert_eq!(payload_digest(&left), payload_digest(&right));
@@ -1284,8 +1312,7 @@ mod tests {
         let work_id = item.work_id().clone();
         state.record_issued(item).unwrap();
         for index in 0..MAX_SUBMISSION_RECEIPTS {
-            let submission =
-                SubmissionId::parse(&Uuid::new_v4().to_string()).unwrap();
+            let submission = SubmissionId::parse(&Uuid::new_v4().to_string()).unwrap();
             let decision = if index == 0 {
                 SubmissionDecision::AcceptedForHostProcessing
             } else {
@@ -1312,11 +1339,9 @@ mod tests {
             }
         }
         assert!(!state.receipt_capacity_available());
-        state.validate_for_goal(
-            "11111111-1111-4111-8111-111111111111",
-            "session-under-test",
-        )
-        .unwrap();
+        state
+            .validate_for_goal("11111111-1111-4111-8111-111111111111", "session-under-test")
+            .unwrap();
     }
 
     #[test]
@@ -1324,25 +1349,16 @@ mod tests {
         let mut state = ExternalModelState::new();
         state.record_issued(item(1, WorkRole::Planner)).unwrap();
         state
-            .validate_for_goal(
-                "11111111-1111-4111-8111-111111111111",
-                "session-under-test",
-            )
+            .validate_for_goal("11111111-1111-4111-8111-111111111111", "session-under-test")
             .unwrap();
         assert!(
             state
-                .validate_for_goal(
-                    "11111111-1111-4111-8111-111111111111",
-                    "another-session"
-                )
+                .validate_for_goal("11111111-1111-4111-8111-111111111111", "another-session")
                 .is_err()
         );
         assert!(
             state
-                .validate_for_goal(
-                    "99999999-9999-4999-8999-999999999999",
-                    "session-under-test"
-                )
+                .validate_for_goal("99999999-9999-4999-8999-999999999999", "session-under-test")
                 .is_err()
         );
     }
@@ -1385,7 +1401,10 @@ mod tests {
         let item = item(1, WorkRole::Planner);
         let submission = SubmissionId::parse(&Uuid::new_v4().to_string()).unwrap();
         let receipt = accepted_receipt(&item, &submission);
-        assert_eq!(receipt.decision(), SubmissionDecision::AcceptedForHostProcessing);
+        assert_eq!(
+            receipt.decision(),
+            SubmissionDecision::AcceptedForHostProcessing
+        );
         assert_eq!(receipt.committed_revision(), None);
         assert_eq!(receipt.work_id(), item.work_id());
     }

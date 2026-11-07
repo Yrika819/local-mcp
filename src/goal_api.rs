@@ -1891,13 +1891,11 @@ fn same_start_payload(goal: &Goal, request: &GoalStartRequest) -> bool {
 fn requested_backend(request: &GoalStartRequest) -> Result<ModelBackend, GoalApiError> {
     match request.model_backend.as_deref() {
         None => Ok(ModelBackend::default()),
-        Some(value) => {
-            ModelBackend::parse_requested(value).map_err(|error| GoalApiError {
-                code: error.code(),
-                message: error.message(),
-                active_goal: None,
-            })
-        }
+        Some(value) => ModelBackend::parse_requested(value).map_err(|error| GoalApiError {
+            code: error.code(),
+            message: error.message(),
+            active_goal: None,
+        }),
     }
 }
 
