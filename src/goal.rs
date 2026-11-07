@@ -1419,7 +1419,10 @@ pub(crate) struct Goal {
     model_backend: ModelBackend,
     /// Durable External Agent Backend state. `None` for every `CODEX` Goal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    external_model: Option<ExternalModelState>,
+    /// Boxed deliberately: the aggregate is large and absent for every CODEX
+    /// Goal, so keeping it out of line avoids inflating every `Goal` value that
+    /// the existing orchestration clones and moves on the stack.
+    external_model: Option<Box<ExternalModelState>>,
     /// Post-verification managed-workspace snapshot evidence (freeze note J7).
     ///
     /// Absent means "no evidence has been assembled yet", which is the correct
@@ -1612,7 +1615,7 @@ impl Goal {
     pub(crate) fn with_creation_backend(mut self, backend: ModelBackend) -> Self {
         self.model_backend = backend;
         if backend.is_external() {
-            self.external_model = Some(ExternalModelState::new());
+            self.external_model = Some(Box::new(ExternalModelState::new()));
         } else {
             self.external_model = None;
         }
@@ -1625,11 +1628,11 @@ impl Goal {
     }
 
     pub(crate) fn external_model(&self) -> Option<&ExternalModelState> {
-        self.external_model.as_ref()
+        self.external_model.as_deref()
     }
 
     pub(crate) fn external_model_mut(&mut self) -> Option<&mut ExternalModelState> {
-        self.external_model.as_mut()
+        self.external_model.as_deref_mut()
     }
 
     pub(crate) fn id(&self) -> &GoalId {
@@ -4200,7 +4203,7 @@ impl Goal {
     fn validate_model_backend_state(&self) -> Result<(), OrchestratorError> {
         match (
             self.model_backend.is_external(),
-            self.external_model.as_ref(),
+            self.external_model.as_deref(),
         ) {
             (true, Some(state)) => state.validate_for_goal(self.id.as_str(), &self.session_id),
             (true, None) => Err(OrchestratorError::CorruptGoal(
