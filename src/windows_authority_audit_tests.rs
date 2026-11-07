@@ -20,10 +20,12 @@
 
 use std::path::PathBuf;
 
+#[cfg(windows)]
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::config::{self, PathIntent, Session};
+#[cfg(windows)]
 use crate::execution;
 use crate::fallback::{
     self, Budget, FailureClass, LifecycleEvidence, SideEffectClass, SideEffectState,
