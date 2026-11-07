@@ -31,8 +31,9 @@ use crate::goal_finalizer::{self, GoalFinalizationOutcome};
 use crate::goal_verifier;
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner;
+use crate::readonly_worker::{self, ReadonlyIssueOutcome};
 use crate::scheduler::{self, SchedulerDecision, SchedulerNoActionReason};
-use crate::task::WorkerKind;
+use crate::task::{TaskId, TaskStatus, WorkerKind};
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 use crate::verifier;
 
@@ -225,11 +226,9 @@ pub(crate) async fn advance_external_step(
     let revision = goal.revision();
     match selection.decision().clone() {
         SchedulerDecision::PlanInitial => issue_planner_work_item(store, session, goal),
-        SchedulerDecision::RunReadonly { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
-            DriverRefusal::RoleNotWired {
-                stage: WorkRole::Readonly.as_str(),
-            },
-        ))),
+        SchedulerDecision::RunReadonly { task_id } => {
+            issue_readonly_work_item(store, session, goal, &task_id)
+        }
         SchedulerDecision::VerifyTask { task_id } => {
             match verifier::verify_task(store, session, goal.id(), &task_id, revision).await {
                 Ok(_) => Ok(DriverReport::advanced(DriverOutcome::Progress {
@@ -342,12 +341,55 @@ async fn no_action_step(
                 ))),
             }
         }
+        SchedulerNoActionReason::RetryPolicyDeferred => {
+            let Some(task_id) = retryable_readonly_task(goal) else {
+                return Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::NoAction {
+                        code: "RETRY_POLICY_DEFERRED",
+                    },
+                )));
+            };
+            match readonly_worker::rearm_retryable_readonly_task(
+                store,
+                session,
+                goal.id(),
+                goal.revision(),
+                &task_id,
+            ) {
+                Ok(_) => Ok(DriverReport::advanced(DriverOutcome::Progress {
+                    code: "READONLY_RETRY_REARMED",
+                    detail: "the host retry policy re-armed one RETRYABLE readonly Task",
+                })),
+                Err(_) => Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::NoAction {
+                        code: "RETRY_POLICY_DEFERRED",
+                    },
+                ))),
+            }
+        }
         other => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::NoAction {
                 code: no_action_code(&other),
             },
         ))),
     }
+}
+
+/// Deterministic selection of the single RETRYABLE readonly Task to re-arm.
+///
+/// Ordered by `(created_plan_revision, TaskId)` so the choice never depends on
+/// hash order or wall-clock races.
+fn retryable_readonly_task(goal: &Goal) -> Option<TaskId> {
+    goal.tasks()
+        .iter()
+        .filter(|(_, task)| {
+            task.status() == TaskStatus::Retryable
+                && task.worker() == WorkerKind::CodexReadonly
+                && task.verification_retry_allowed()
+                && task.unchanged_retry_permitted()
+        })
+        .min_by_key(|(task_id, task)| (task.created_plan_revision(), (*task_id).clone()))
+        .map(|(task_id, _)| task_id.clone())
 }
 
 fn issue_planner_work_item(
@@ -434,6 +476,30 @@ fn issue_planner_work_item(
             }
         }
         Err(other) => Err(DriverError::Persistence(other)),
+    }
+}
+
+/// Begin one readonly Attempt and issue its WorkItem, atomically (E4-B).
+fn issue_readonly_work_item(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    task_id: &TaskId,
+) -> Result<DriverReport, DriverError> {
+    match readonly_worker::issue_external_readonly_work_item(
+        store,
+        session,
+        goal.id(),
+        task_id,
+        goal.revision(),
+    ) {
+        Ok(ReadonlyIssueOutcome::Issued { item }) => {
+            Ok(DriverReport::advanced(DriverOutcome::ModelRequired(item)))
+        }
+        Ok(ReadonlyIssueOutcome::Refused(block)) => Ok(DriverReport::reused(
+            DriverOutcome::Refused(DriverRefusal::Budget(block)),
+        )),
+        Err(error) => Err(DriverError::Persistence(error)),
     }
 }
 

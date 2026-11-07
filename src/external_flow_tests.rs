@@ -31,7 +31,7 @@ use crate::external_model_work::{
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_api;
 use crate::model_accounting;
-use crate::task::TaskStatus;
+use crate::task::{TaskEvidence, TaskStatus};
 use crate::task_store::{FaultPoint, TaskStore, utc_now_rfc3339};
 
 struct Fixture {
@@ -162,12 +162,57 @@ fn valid_planner_proposal(work: &Value) -> Value {
     })
 }
 
+/// The readonly answer for the host-issued readonly WorkItem.
+fn readonly_response(work: &Value, evidence_kind: &str, status: &str) -> Value {
+    let request = &work["request"];
+    json!({
+        "goal_id": request["goal_id"],
+        "task_id": request["task_id"],
+        "attempt_id": request["attempt_id"],
+        "goal_revision": request["goal_revision"],
+        "plan_revision": request["plan_revision"],
+        "status": status,
+        "summary": "Inspected tracked.txt read-only",
+        "evidence": [{
+            "kind": evidence_kind,
+            "value": "tracked.txt contains the goal-latch readonly dogfood marker"
+        }]
+    })
+}
+
 fn fresh_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
 fn goal_of(session: &config::Session, store: &TaskStore, goal_id: &GoalId) -> Goal {
     store.load_goal(&session.id, goal_id).unwrap()
+}
+
+fn tree_digest(root: &std::path::Path) -> String {
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let name = String::from(relative.to_string_lossy());
+            entries.push((name, std::fs::read(&path).unwrap()));
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = String::new();
+    for (name, bytes) in entries {
+        digest.push_str(&name);
+        digest.push(':');
+        digest.push_str(&crate::external_model_work::sha256_hex(&bytes));
+        digest.push('\n');
+    }
+    digest
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +610,325 @@ fn an_invented_criterion_or_forbidden_worker_is_refused_without_a_plan() {
     .unwrap();
     assert_eq!(view["outcome"], "REJECTED_SCHEMA");
     assert_eq!(goal_of(&f.session, &f.store, &goal_id).plan_revision(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// E4-B — External Readonly integration and host Goal completion.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_external_loop_reaches_host_goal_completion_without_codex() {
+    let f = fixture("e4b-flow");
+    model_accounting::reset_for_test();
+    let before = tree_digest(&f.session.cwd);
+    let goal_id = start_external(&f.session, &f.store);
+
+    // Planner.
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    let planned = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            &fresh_uuid(),
+            valid_planner_proposal(&planner_work),
+        ),
+    )
+    .unwrap();
+    assert_eq!(planned["outcome"], "COMMITTED");
+
+    // Scheduler issues the readonly WorkItem with host-owned scope and evidence.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "MODEL_REQUIRED");
+    let readonly_work = next["model_work"].clone();
+    assert_eq!(readonly_work["role"], "READONLY");
+    assert_eq!(
+        readonly_work["output_contract"],
+        "readonly-investigation-v1"
+    );
+    assert!(readonly_work["task_id"].is_string());
+    assert!(readonly_work["attempt_id"].is_string());
+    assert_eq!(
+        readonly_work["goal_revision"],
+        json!(goal_of(&f.session, &f.store, &goal_id).revision())
+    );
+    assert!(readonly_work["request"]["allowed_paths"].is_array());
+    assert_eq!(
+        readonly_work["response_required_fields"],
+        json!([
+            "goal_id",
+            "task_id",
+            "attempt_id",
+            "goal_revision",
+            "plan_revision",
+            "status",
+            "summary",
+            "evidence"
+        ])
+    );
+
+    // Readonly answer.
+    let inspected = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &readonly_work,
+            &fresh_uuid(),
+            readonly_response(&readonly_work, "evidence-1", "candidate_complete"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(inspected["outcome"], "COMMITTED");
+    assert_eq!(inspected["code"], "READONLY_CANDIDATE_COMPLETE");
+    let goal = goal_of(&f.session, &f.store, &goal_id);
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Verifying);
+    assert!(task.evidence().iter().any(|evidence| matches!(
+        evidence,
+        TaskEvidence::StructuredObservation { source, .. }
+            if source == crate::readonly_worker::EXTERNAL_READONLY_SOURCE
+    )));
+
+    // Host verification and finalization: Task Verifier -> Goal Verifier ->
+    // Goal Finalizer, driven by the same bounded `goal_next` call.
+    let finished = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(finished["outcome"], "HOST_PROGRESS");
+    assert_eq!(finished["status"], "COMPLETED");
+    assert_eq!(finished["result_kind"], "COMPLETED");
+    assert_eq!(finished["next_action"], "OBSERVE_TERMINAL_STATE");
+    assert_eq!(finished["model_work"], Value::Null);
+    assert!(finished["host_steps_executed"].as_u64().unwrap() >= 1);
+
+    let goal = goal_of(&f.session, &f.store, &goal_id);
+    assert_eq!(goal.status(), GoalStatus::Completed);
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Completed);
+    assert_eq!(
+        task.verification_results()
+            .last()
+            .map(|result| result.outcome()),
+        Some(crate::task::VerificationOutcome::Passed)
+    );
+
+    // Durable accounting: both roles committed, nothing pending, no Codex.
+    let state = external_state(&goal).unwrap();
+    assert!(state.active_work().is_none());
+    assert_eq!(state.work_history().len(), 2);
+    assert_eq!(state.receipts().len(), 2);
+    assert!(state.receipts().iter().all(|receipt| {
+        receipt.decision() == SubmissionDecision::Committed
+            && receipt.committed_revision().is_some()
+    }));
+    assert_eq!(model_accounting::snapshot_for_test().codex_spawn_count, 0);
+    assert_eq!(tree_digest(&f.session.cwd), before);
+
+    // The result surface agrees with the durable Goal.
+    let result = serde_json::to_value(
+        goal_api::goal_result(
+            &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+            &f.session,
+            &f.store,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["result_kind"], "COMPLETED");
+}
+
+#[test]
+fn a_readonly_answer_that_misses_required_evidence_cannot_pass_verification() {
+    let f = fixture("e4b-missing-evidence");
+    let goal_id = start_external(&f.session, &f.store);
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            &fresh_uuid(),
+            valid_planner_proposal(&planner_work),
+        ),
+    )
+    .unwrap();
+    let readonly_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+
+    // The model claims completion but supplies an unrelated evidence kind.
+    let view = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &readonly_work,
+            &fresh_uuid(),
+            readonly_response(&readonly_work, "not-the-requirement", "candidate_complete"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(view["outcome"], "COMMITTED");
+
+    let after = goal_next(&f.session, &f.store, &goal_id);
+    assert_ne!(after["status"], "COMPLETED");
+    assert_eq!(after["result_kind"], "NONTERMINAL");
+    let goal = goal_of(&f.session, &f.store, &goal_id);
+    assert_eq!(goal.status(), GoalStatus::Running);
+    let task = goal.tasks().values().next().unwrap();
+    assert_ne!(task.status(), TaskStatus::Completed);
+    assert_ne!(
+        task.verification_results()
+            .last()
+            .map(|result| result.outcome()),
+        Some(crate::task::VerificationOutcome::Passed)
+    );
+}
+
+#[test]
+fn a_tampered_readonly_identity_is_refused_before_any_task_effect() {
+    // One fixture per probe: a readonly Task has a two-attempt host budget, so a
+    // single Goal cannot absorb three refusals. Each probe is the first attempt
+    // of its own Goal.
+    for label in ["attempt", "task", "revision"] {
+        let f = fixture(&format!("e4b-identity-{label}"));
+        let goal_id = start_external(&f.session, &f.store);
+        let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+        submit(
+            &f.session,
+            &f.store,
+            &submit_args(
+                &f.session,
+                &goal_id,
+                &planner_work,
+                &fresh_uuid(),
+                valid_planner_proposal(&planner_work),
+            ),
+        )
+        .unwrap();
+        let next = goal_next(&f.session, &f.store, &goal_id);
+        assert_eq!(next["outcome"], "MODEL_REQUIRED", "{label}");
+        let readonly_work = next["model_work"].clone();
+        assert_eq!(readonly_work["role"], "READONLY", "{label}");
+        let task_id = readonly_work["task_id"].clone();
+
+        let mut response = readonly_response(&readonly_work, "evidence-1", "candidate_complete");
+        match label {
+            "attempt" => response["attempt_id"] = json!(fresh_uuid()),
+            "task" => response["task_id"] = json!(fresh_uuid()),
+            _ => response["goal_revision"] = json!(1),
+        }
+        let view = submit(
+            &f.session,
+            &f.store,
+            &submit_args(
+                &f.session,
+                &goal_id,
+                &readonly_work,
+                &fresh_uuid(),
+                response,
+            ),
+        )
+        .unwrap();
+        assert_eq!(view["outcome"], "REJECTED_SCHEMA", "{label} mismatch");
+        let code = view["code"].as_str().unwrap();
+        assert!(
+            code == "READONLY_IDENTITY_MISMATCH" || code == "READONLY_ATTEMPT_STALE",
+            "{label} refusal code was {code}"
+        );
+        assert!(view["receipt"].is_object(), "{label}");
+        assert!(view["receipt"]["committed_revision"].is_null(), "{label}");
+
+        let goal = goal_of(&f.session, &f.store, &goal_id);
+        let task = goal.tasks().values().next().unwrap();
+        assert_eq!(task.id().as_str(), task_id.as_str().unwrap(), "{label}");
+        assert!(
+            !matches!(task.status(), TaskStatus::Verifying | TaskStatus::Completed),
+            "{label} must not verify or complete the Task"
+        );
+        assert_ne!(goal.status(), GoalStatus::Completed, "{label}");
+    }
+}
+
+#[test]
+fn a_readonly_submission_cannot_revive_a_cancelled_goal() {
+    let f = fixture("e4b-cancel");
+    let goal_id = start_external(&f.session, &f.store);
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            &fresh_uuid(),
+            valid_planner_proposal(&planner_work),
+        ),
+    )
+    .unwrap();
+    let readonly_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    goal_api::goal_cancel(
+        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+        &f.session,
+        &f.store,
+    )
+    .unwrap();
+
+    let view = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &readonly_work,
+            &fresh_uuid(),
+            readonly_response(&readonly_work, "evidence-1", "candidate_complete"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(view["outcome"], "CANCELLED_STALE");
+    assert!(view["receipt"].is_null());
+    let goal = goal_of(&f.session, &f.store, &goal_id);
+    assert!(
+        matches!(
+            goal.status(),
+            GoalStatus::Cancelling | GoalStatus::Cancelled
+        ),
+        "a cancelled Goal must not return to an active state: {:?}",
+        goal.status()
+    );
+    assert!(external_state(&goal).unwrap().active_work().is_none());
+    assert_eq!(external_state(&goal).unwrap().receipts().len(), 1);
+}
+
+#[test]
+fn the_external_readonly_path_never_reaches_the_writer_or_approval_boundary() {
+    // Source-level guard for E4-B: wiring the external loop must not hand it the
+    // mutation or approval boundary, and must not let it spawn a Codex process.
+    for path in [
+        "src/external_goal_api.rs",
+        "src/external_goal_driver.rs",
+        "src/external_model_store.rs",
+    ] {
+        let source = std::fs::read_to_string(path).unwrap();
+        for needle in [
+            "workspace_publish",
+            "WriteBoundary",
+            "approvals::",
+            "without_sandbox",
+            "ProductionModelTransport",
+            "GoalModelAgent",
+        ] {
+            assert!(
+                !source.contains(needle),
+                "{path} must not reach {needle} from the external loop"
+            );
+        }
+    }
 }
 
 #[test]

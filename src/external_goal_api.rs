@@ -33,6 +33,8 @@ use crate::external_model_work::{
 };
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_api::{self, GoalApiError};
+use crate::readonly_worker::{self, ReadonlyApplyOutcome};
+use crate::task::TaskId;
 use crate::task_store::{TaskStore, utc_now_rfc3339};
 
 /// The minimum top-level fields a V1 Planner submission must carry.
@@ -753,6 +755,23 @@ pub(crate) fn goal_submit(
         );
     }
 
+    // The Readonly role (E4-B) applies the answer through the existing readonly
+    // parser and the existing Task state table, in one commit with its receipt.
+    // The final Task verdict is still the host Task Verifier's, not the model's.
+    if active.role() == WorkRole::Readonly {
+        return submit_readonly_response(
+            store,
+            session,
+            &goal,
+            &goal_id,
+            &request,
+            &work_id,
+            &submission_id,
+            &payload_sha256,
+            active,
+        );
+    }
+
     let (decision, code, detail) = role_verdict(&goal, active, &request.response)?;
     let outcome = decision.as_str();
 
@@ -907,6 +926,105 @@ fn submit_planner_response(
             next_action_for_outcome("REJECTED_SCHEMA"),
         )),
         PlannerSubmissionOutcome::Refused { code } => Ok(rejected_view(
+            goal,
+            request,
+            "REJECTED_STALE_REVISION",
+            code,
+            payload_sha256,
+            "CALL_GOAL_NEXT",
+        )),
+    }
+}
+
+/// Validate and apply one external Readonly submission (E4-B).
+///
+/// The response is untrusted data: it is parsed by the existing readonly parser,
+/// checked for identity/revision/schema/evidence bounds, and then applied to the
+/// durable Task through the same state table the Codex readonly path uses. A
+/// model that claims success only reaches `VERIFYING`; the host Task Verifier
+/// decides whether the Task passed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Goal, work identity, digest, and the untrusted payload are independent authority channels."
+)]
+fn submit_readonly_response(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    goal_id: &GoalId,
+    request: &GoalSubmitRequest,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+    active: &ModelWorkItem,
+) -> Result<ExternalGoalSubmitView, GoalApiError> {
+    let Some(task_id) = active.task_id().and_then(|value| TaskId::parse(value).ok()) else {
+        return Ok(unknown_work_id_view(goal, request, payload_sha256));
+    };
+    let Some(attempt_id) = active.attempt_id() else {
+        return Ok(unknown_work_id_view(goal, request, payload_sha256));
+    };
+    let raw = serde_json::to_vec(&request.response).map_err(|_| {
+        GoalApiError::external(
+            "INVALID_ARGUMENT",
+            "the submitted response could not be serialized for host validation",
+        )
+    })?;
+
+    let revision = goal.revision();
+    let outcome = match readonly_worker::validate_external_readonly_output(
+        goal, session, &task_id, attempt_id, &raw,
+    ) {
+        Ok(output) => readonly_worker::commit_external_readonly_result(
+            store,
+            session,
+            goal_id,
+            revision,
+            work_id,
+            submission_id,
+            payload_sha256,
+            output,
+        )
+        .map_err(GoalApiError::from_orchestrator)?,
+        Err(refusal) => readonly_worker::commit_external_readonly_refusal(
+            store,
+            session,
+            goal_id,
+            revision,
+            work_id,
+            submission_id,
+            payload_sha256,
+            refusal.code(),
+            refusal.detail(),
+        )
+        .map_err(GoalApiError::from_orchestrator)?,
+    };
+
+    match outcome {
+        ReadonlyApplyOutcome::Committed { goal, receipt } => {
+            let code = receipt.code().to_owned();
+            Ok(submit_view(
+                &goal,
+                request,
+                "COMMITTED",
+                &code,
+                Some(receipt_view(&receipt)),
+                None,
+                payload_sha256,
+                next_action_for_outcome("COMMITTED"),
+            ))
+        }
+        ReadonlyApplyOutcome::Rejected { goal, receipt } => Ok(submit_view(
+            &goal,
+            request,
+            "REJECTED_SCHEMA",
+            receipt.code(),
+            Some(receipt_view(&receipt)),
+            receipt.redacted_detail().map(str::to_owned),
+            payload_sha256,
+            next_action_for_outcome("REJECTED_SCHEMA"),
+        )),
+        ReadonlyApplyOutcome::Refused { code } => Ok(rejected_view(
             goal,
             request,
             "REJECTED_STALE_REVISION",
