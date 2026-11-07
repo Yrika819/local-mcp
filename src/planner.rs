@@ -422,6 +422,67 @@ fn ensure_initial_planning_state(goal: &Goal) -> Result<(), PlannerError> {
     Ok(())
 }
 
+/// Bounded, redacted outcome of validating one untrusted external Planner
+/// response against the existing Phase 4 proposal validator.
+///
+/// The underlying [`PlannerError`] text can quote model-authored content (a
+/// rejected field value, for example), so the external path never propagates it.
+/// A code plus a fixed detail string is all a receipt may carry (B-07 / TM-10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProposalValidationRefusal {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ProposalValidationRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        self.detail
+    }
+}
+
+/// Validate one untrusted external Planner response without persisting it.
+///
+/// This deliberately reuses [`parse_and_validate_proposal`], the same validator
+/// the Codex planner path uses, so the external loop cannot accept a proposal
+/// the host would reject: unknown criterion IDs, unsupported worker kinds,
+/// authority-violating scope, and revision mismatches are all refused here.
+pub(crate) fn validate_initial_plan_proposal_output(
+    output: &[u8],
+    goal: &Goal,
+    goal_root: &Path,
+) -> Result<(), ProposalValidationRefusal> {
+    if output.len() > MAX_PLAN_PROPOSAL_BYTES {
+        return Err(ProposalValidationRefusal {
+            code: "PROPOSAL_TOO_LARGE",
+            detail: "the proposal exceeds the 256 KiB host limit",
+        });
+    }
+    parse_and_validate_proposal(output, goal, goal_root)
+        .map(|_| ())
+        .map_err(|error| ProposalValidationRefusal {
+            code: planner_failure_code(&error),
+            detail: "the host rejected the external proposal during schema validation",
+        })
+}
+
+/// Bounded failure code for a [`PlannerError`]. Never carries error text.
+pub(crate) fn planner_failure_code(error: &PlannerError) -> &'static str {
+    match error {
+        PlannerError::PlannerUnavailable => "PLANNER_UNAVAILABLE",
+        PlannerError::Model(_) => "PLANNER_MODEL_FAILED",
+        PlannerError::PlannerOutputInvalid(_) => "PROPOSAL_INVALID_JSON",
+        PlannerError::PlannerSchemaViolation(_) => "PROPOSAL_SCHEMA_VIOLATION",
+        PlannerError::PlanConflict { .. } => "PROPOSAL_REVISION_CONFLICT",
+        PlannerError::PlanNotApplicable(_) => "PROPOSAL_NOT_APPLICABLE",
+        PlannerError::PlanAuthorityViolation(_) => "PROPOSAL_AUTHORITY_VIOLATION",
+        PlannerError::Store(_) => "PROPOSAL_HOST_FAILURE",
+    }
+}
+
 /// Managed execution-root derivation is separate from primary Session identity.
 pub(crate) fn execution_root_for_goal(
     goal: &Goal,

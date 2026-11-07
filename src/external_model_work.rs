@@ -676,6 +676,10 @@ impl ExternalStop {
     pub(crate) fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
     }
+
+    pub(crate) fn at(&self) -> &str {
+        &self.at
+    }
 }
 
 /// The durable External Agent Backend state of one Goal.

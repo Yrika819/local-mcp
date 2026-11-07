@@ -137,6 +137,19 @@ impl GoalApiError {
         }
     }
 
+    /// Host-side contract refusal that is not an orchestrator state error.
+    ///
+    /// Used by the External Agent Backend API surface (`goal_next` /
+    /// `goal_submit`) for bounded argument, backend, and budget refusals. The
+    /// message must be host-authored and bounded: it never carries model text.
+    pub(crate) fn external(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            active_goal: None,
+        }
+    }
+
     pub(crate) fn from_orchestrator(error: OrchestratorError) -> Self {
         Self::from_orchestrator_with_active(error, None)
     }
@@ -396,6 +409,16 @@ pub(crate) struct GoalStatusView {
     blockers: Vec<BlockerView>,
     verification: VerificationSummaryView,
     latest_checkpoint: Option<CheckpointSummaryView>,
+    /// Additive External Agent Backend projection. Always present (`CODEX`
+    /// stays the default and keeps every previous field identical).
+    model_backend: &'static str,
+    execution_wait: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_work_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_budget: Option<ExternalBudgetView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_external_stop: Option<ExternalStopView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -421,6 +444,10 @@ pub(crate) struct GoalResultView {
     latest_checkpoint: Option<CheckpointSummaryView>,
     created_at: String,
     completed_at: Option<String>,
+    /// Additive External Agent Backend projection; never changes
+    /// `result_state` or `result_kind`.
+    model_backend: &'static str,
+    execution_wait: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1081,7 +1108,7 @@ fn parse_request<T: DeserializeOwned>(args: &Value) -> Result<T, GoalApiError> {
         .map_err(|error| GoalApiError::invalid(format!("invalid goal tool arguments: {error}")))
 }
 
-fn validate_session_binding(
+pub(crate) fn validate_session_binding(
     request_session_id: &str,
     session: &config::Session,
 ) -> Result<(), GoalApiError> {
@@ -1150,7 +1177,7 @@ fn validate_string_list(
     Ok(())
 }
 
-fn parse_goal_id(value: &str) -> Result<GoalId, GoalApiError> {
+pub(crate) fn parse_goal_id(value: &str) -> Result<GoalId, GoalApiError> {
     let parsed = GoalId::parse(value).map_err(GoalApiError::from_orchestrator)?;
     if parsed.as_str() != value {
         return Err(GoalApiError::invalid(
@@ -1160,7 +1187,7 @@ fn parse_goal_id(value: &str) -> Result<GoalId, GoalApiError> {
     Ok(parsed)
 }
 
-fn resolve_goal(
+pub(crate) fn resolve_goal(
     store: &TaskStore,
     session_id: &str,
     goal_id: Option<&str>,
@@ -1568,6 +1595,10 @@ fn cancel_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     } else if !goal.has_active_tasks() {
         goal.transition_to(GoalStatus::Cancelled, now)?;
     }
+    // Invariant 10: cancellation and external WorkItem invalidation are one
+    // durable commit. A cancelled Goal can never be revived by a delayed
+    // submission, and no outstanding request survives the cancellation.
+    crate::external_model_store::cancel_active_work_in_place(goal, "GOAL_CANCELLED");
     Ok(())
 }
 
@@ -1625,6 +1656,11 @@ fn status_view(goal: &Goal) -> GoalStatusView {
         blockers: blocker_views(goal),
         verification: verification_summary(goal),
         latest_checkpoint: latest_checkpoint(goal),
+        model_backend: goal.model_backend().as_str(),
+        execution_wait: execution_wait_for(goal),
+        pending_work_id: pending_work_id_for(goal),
+        external_budget: budget_view_for(goal),
+        last_external_stop: last_stop_view_for(goal),
     }
 }
 
@@ -1642,6 +1678,86 @@ pub(crate) fn result_kind_for_status(status: GoalStatus) -> &'static str {
         GoalStatus::Blocked => "BLOCKED",
         _ => "NONTERMINAL",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Additive External Agent Backend projection (B-01 / ADR-06).
+//
+// These helpers are read-only. They never change `GoalStatus`, and they return
+// `NONE`/`None` for a CODEX Goal so every existing response stays byte-for-byte
+// identical apart from the additive keys.
+// ---------------------------------------------------------------------------
+
+/// Additive `execution_wait` projection of the durable external WorkItem state.
+pub(crate) fn execution_wait_for(goal: &Goal) -> &'static str {
+    use crate::external_model_work::WorkItemState;
+
+    if !goal.model_backend().is_external() {
+        return "NONE";
+    }
+    match goal.external_model().and_then(|state| state.active_work()) {
+        Some(item) => match item.state() {
+            WorkItemState::Pending => "WAITING_FOR_EXTERNAL_MODEL",
+            WorkItemState::Submitted => "WAITING_FOR_HOST_APPLICATION",
+            _ => "NONE",
+        },
+        None => "NONE",
+    }
+}
+
+pub(crate) fn pending_work_id_for(goal: &Goal) -> Option<String> {
+    goal.external_model()
+        .and_then(|state| state.active_work())
+        .map(|item| item.work_id().as_str().to_owned())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ExternalBudgetView {
+    pending_work_items: usize,
+    max_pending_work_items: usize,
+    issued_work_items: u32,
+    max_work_items: u32,
+    role_attempts: u32,
+    max_role_attempts: u32,
+    submission_receipts: usize,
+    max_submission_receipts: usize,
+}
+
+pub(crate) fn budget_view_for(goal: &Goal) -> Option<ExternalBudgetView> {
+    use crate::external_model_work::{
+        MAX_ACTIVE_WORK_ITEMS_PER_GOAL, MAX_MODEL_WORK_ITEMS_PER_GOAL, MAX_ROLE_ATTEMPTS,
+        MAX_SUBMISSION_RECEIPTS, WorkRole,
+    };
+
+    let state = goal.external_model()?;
+    Some(ExternalBudgetView {
+        pending_work_items: usize::from(state.active_work().is_some()),
+        max_pending_work_items: MAX_ACTIVE_WORK_ITEMS_PER_GOAL,
+        issued_work_items: state.issue_counter(),
+        max_work_items: MAX_MODEL_WORK_ITEMS_PER_GOAL,
+        role_attempts: state.role_attempts(WorkRole::Planner),
+        max_role_attempts: MAX_ROLE_ATTEMPTS,
+        submission_receipts: state.receipts().len(),
+        max_submission_receipts: MAX_SUBMISSION_RECEIPTS,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ExternalStopView {
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    at: String,
+}
+
+pub(crate) fn last_stop_view_for(goal: &Goal) -> Option<ExternalStopView> {
+    goal.external_model()
+        .and_then(|state| state.last_stop())
+        .map(|stop| ExternalStopView {
+            code: stop.code().to_owned(),
+            detail: stop.detail().map(str::to_owned),
+            at: stop.at().to_owned(),
+        })
 }
 
 fn result_view(goal: &Goal) -> GoalResultView {
@@ -1710,6 +1826,8 @@ fn result_view(goal: &Goal) -> GoalResultView {
         latest_checkpoint: latest_checkpoint(goal),
         created_at: goal.created_at().to_owned(),
         completed_at: goal.completed_at().map(str::to_owned),
+        model_backend: goal.model_backend().as_str(),
+        execution_wait: execution_wait_for(goal),
     }
 }
 
@@ -1930,7 +2048,7 @@ fn idempotent_goal_id(session_id: &str, key: &str) -> GoalId {
     GoalId::parse(&Uuid::from_bytes(bytes).to_string()).expect("generated UUID is canonical")
 }
 
-fn goal_status_name(status: GoalStatus) -> &'static str {
+pub(crate) fn goal_status_name(status: GoalStatus) -> &'static str {
     match status {
         GoalStatus::Planning => "PLANNING",
         GoalStatus::Running => "RUNNING",

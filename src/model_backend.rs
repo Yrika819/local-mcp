@@ -18,14 +18,8 @@
 //! a Goal's runtime state and it is never changed after the Goal exists: the
 //! external-agent architecture forbids an implicit backend change
 //! (ADR-01 / ADR-11). `Goal::with_creation_backend` is the only writer, and the
-//! only caller is `goal_start`.
-
-// E3-A staging: `is_codex` is consumed by the E3-B `goal_next` / `goal_submit`
-// layer, which removes this attribute.
-#![allow(
-    dead_code,
-    reason = "E3-A backend policy surface; E3-B consumes the remaining accessor"
-)]
+//! only caller is `goal_start`, and the E3-B API layer is the only reader of the
+//! accessors.
 
 use std::fmt;
 
