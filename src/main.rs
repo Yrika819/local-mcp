@@ -12,6 +12,8 @@ mod config;
 mod doctor;
 mod exec_ready;
 mod execution;
+mod external_goal_api;
+mod external_goal_driver;
 mod external_model_store;
 mod external_model_work;
 mod failure_class;
@@ -69,6 +71,8 @@ mod writer;
 mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
+#[cfg(test)]
+mod external_goal_api_tests;
 #[cfg(test)]
 mod external_goal_tests;
 #[cfg(test)]
