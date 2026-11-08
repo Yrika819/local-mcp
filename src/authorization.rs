@@ -66,6 +66,28 @@ pub(crate) const MAX_DENY_REASON_BYTES: usize = 256;
 pub(crate) const AUTHORIZATION_FENCE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+/// Characters that may not reach the Owner console or a display-bound name.
+///
+/// Covers C0/C1/DEL (`char::is_control`), the Unicode bidi controls (including
+/// ALM/LRM/RLM, embeddings/overrides, isolates and deprecated formatting
+/// characters), the line/paragraph separators, the BOM, and the tag block.
+pub(crate) fn is_console_unsafe(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{206a}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
 /// The only write operation kind V1 can grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -156,21 +178,7 @@ impl GrantPathRule {
         // The Owner reads this spelling on the console before approving it, so a
         // control character or a bidi override is an approval-UI injection
         // primitive, not merely a strange filename.
-        if self.path.chars().any(|character| {
-            character.is_control()
-                || matches!(
-                    character,
-                    '\u{202a}'
-                        | '\u{202b}'
-                        | '\u{202c}'
-                        | '\u{202d}'
-                        | '\u{202e}'
-                        | '\u{2066}'
-                        | '\u{2067}'
-                        | '\u{2068}'
-                        | '\u{2069}'
-                )
-        }) {
+        if self.path.chars().any(is_console_unsafe) {
             return Err(GrantError::InvalidRequest(
                 "path rule contains a control or bidi character",
             ));
@@ -1056,10 +1064,12 @@ impl AuthorizationAnchor {
     }
 
     pub(crate) fn record_grant(&mut self, grant_id: &str, epoch: u64) {
-        if epoch > self.highest_epoch {
+        // A stale-generation issuance must never displace a newer generation
+        // the Goal has already observed.
+        if epoch >= self.highest_epoch {
             self.highest_epoch = epoch;
+            self.last_grant_id = Some(grant_id.to_owned());
         }
-        self.last_grant_id = Some(grant_id.to_owned());
     }
 
     pub(crate) fn usage_operations(&self) -> u32 {
@@ -1814,9 +1824,11 @@ pub(crate) enum GrantError {
     Revoked,
     BudgetExhausted,
     StateMismatch(&'static str),
-    /// The per-Goal fence could not be acquired within its bound. Revocation is
-    /// deferred; it is **not** reported as revoked.
+    /// The per-Goal fence could not be acquired within its bound.
     FenceTimeout,
+    /// A revocation could not take the fence. It is deferred; it is **not**
+    /// reported as revoked.
+    RevocationDeferred,
     Io,
 }
 
@@ -1837,7 +1849,8 @@ impl GrantError {
             Self::Revoked => "WRITE_AUTHORIZATION_REVOKED",
             Self::BudgetExhausted => "WRITE_BUDGET_EXHAUSTED",
             Self::StateMismatch(_) => "AUTHORIZATION_STATE_MISMATCH",
-            Self::FenceTimeout => "REVOCATION_DEFERRED",
+            Self::FenceTimeout => "AUTHORIZATION_FENCE_BUSY",
+            Self::RevocationDeferred => "REVOCATION_DEFERRED",
             Self::Io => "AUTHORIZATION_STATE_IO",
         }
     }
@@ -1852,6 +1865,9 @@ impl std::fmt::Display for GrantError {
             Self::StateMismatch(detail) => formatter.write_str(detail),
             Self::FenceTimeout => formatter
                 .write_str("the authorization fence is busy; the operation was not changed"),
+            Self::RevocationDeferred => formatter.write_str(
+                "the revocation fence is busy; the grant was not changed and is still active",
+            ),
             Self::Io => formatter.write_str("authorization state I/O failed"),
             other => formatter.write_str(other.code()),
         }
@@ -2042,7 +2058,7 @@ pub(crate) fn relative_workspace_path(
 /// every existing id validator accepts it.
 pub(crate) fn deterministic_grant_id(request_id: &str, epoch: u64) -> String {
     let mut framed = Vec::new();
-    framed.extend_from_slice(b"local-mcp/grant-id/v1 ");
+    framed.extend_from_slice(b"local-mcp/grant-id/v1\0");
     push_framed(&mut framed, request_id.as_bytes());
     push_framed(&mut framed, &epoch.to_le_bytes());
     let digest = Sha256::digest(&framed);

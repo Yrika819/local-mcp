@@ -143,6 +143,51 @@ pub(crate) fn published_intent_awaiting_completion(
     Some(intent.operation_id().to_owned())
 }
 
+/// Durably block a Writer Task whose issuance was refused for authorization or
+/// budget reasons.
+///
+/// Without this, the Scheduler selects the same READY Writer on every
+/// `goal_next`, the grant refuses it, and no durable state changes: the Goal
+/// spins forever and independent READY read-only Tasks never run. Blocking is
+/// the same fail-closed recovery the Writer path already uses for a refused
+/// mutation; a later Owner grant does not silently revive the Task.
+pub(crate) fn record_writer_authorization_block(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    code: &'static str,
+) -> Result<Option<Goal>, OrchestratorError> {
+    let goal = store.load_goal(&session.id, goal_id)?;
+    let Some(task) = goal.tasks().get(task_id) else {
+        return Ok(None);
+    };
+    if task.status() != TaskStatus::Ready || task.worker() != crate::task::WorkerKind::CodexWriter {
+        return Ok(None);
+    }
+    if external_state(&goal)?.active_work().is_some() {
+        // Issuance refused before starting an Attempt, so there should be no
+        // active item; if one exists, do not touch the Task.
+        return Ok(None);
+    }
+    let committed =
+        store.mutate_goal_snapshot(&session.id, goal_id, goal.revision(), |goal, now| {
+            // READY has no direct BLOCKED edge in the V1 table. A Writer that
+            // was never issued cannot be resumed without a new plan, so
+            // cancelling the READY Task is the existing fail-closed terminal
+            // stop; the blocker records why, and independent READY Tasks remain
+            // selectable.
+            goal.task_add_blocker(task_id, crate::task::TaskBlocker::new(code, code, true))?;
+            goal.transition_task(
+                task_id,
+                TaskStatus::Cancelled,
+                TaskTransitionContext::default(),
+                now,
+            )
+        })?;
+    Ok(Some(committed))
+}
+
 /// The exact authority state a publication operation must observe at the moment
 /// it begins.
 ///
@@ -347,11 +392,36 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         // the Goal revision. Bind `BeginOperation` to the revision the fence
         // produced, not the pre-fence snapshot.
         revision = fence.goal_revision();
+        let mut already_advanced = false;
         let begun = store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
             // Re-check Goal status and the live WorkItem binding inside the
             // same CAS as BeginOperation: a cancellation or WorkItem
             // replacement after the fence was acquired must still win.
             ensure_writer_publishable(goal, task_id, &attempt_id, &binding)?;
+            // Distinguish "another publisher already advanced this operation"
+            // from genuine durable corruption. Only the former is a conflict.
+            let advanced = goal
+                .tasks()
+                .get(task_id)
+                .and_then(|task| task.latest_attempt())
+                .and_then(|attempt| attempt.mutation_intent())
+                .is_none_or(|intent| {
+                    // A multi-operation intent is legitimately APPLYING between
+                    // operations; only this operation's own progress matters.
+                    intent
+                        .operations()
+                        .iter()
+                        .find(|operation| operation.index() == index_u32)
+                        .is_none_or(|operation| {
+                            operation.state() != crate::mutation::MutationOperationState::Prepared
+                        })
+                });
+            if advanced {
+                already_advanced = true;
+                return Err(OrchestratorError::InvalidDag(
+                    "the operation already progressed".to_owned(),
+                ));
+            }
             goal.task_advance_latest_mutation_intent(
                 task_id,
                 &operation_id,
@@ -362,24 +432,24 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
             Ok(committed) => revision = committed.revision(),
             // A concurrent client won the same operation, or the Task/WorkItem
             // moved on. This is a typed refusal, not a persistence failure.
-            Err(OrchestratorError::RevisionConflict { .. }) => {
-                return Ok(PublishOutcome::Refused {
-                    code: "WRITER_PUBLICATION_CONFLICT",
-                });
+            Err(error @ OrchestratorError::RevisionConflict { .. }) => {
+                if already_advanced {
+                    return Ok(PublishOutcome::Refused {
+                        code: "WRITER_PUBLICATION_CONFLICT",
+                    });
+                }
+                return Err(error);
             }
             Err(OrchestratorError::InvalidDag(_)) => {
                 return Ok(PublishOutcome::Refused {
-                    code: "WRITER_PUBLICATION_NOT_AUTHORIZED",
+                    code: if already_advanced {
+                        "WRITER_PUBLICATION_CONFLICT"
+                    } else {
+                        "WRITER_PUBLICATION_NOT_AUTHORIZED"
+                    },
                 });
             }
-            // Another publisher may already have advanced this operation
-            // between our initial Prepared check and this CAS. That is a typed
-            // publication conflict, not durable-state corruption.
-            Err(OrchestratorError::CorruptGoal(_)) => {
-                return Ok(PublishOutcome::Refused {
-                    code: "WRITER_PUBLICATION_CONFLICT",
-                });
-            }
+            // Genuine durable corruption is never relabelled as a conflict.
             Err(error) => return Err(error),
         }
         let output = match boundary

@@ -448,7 +448,13 @@ pub(crate) fn revoke_active(
     });
     let parsed_goal = GoalId::parse(goal_id)
         .map_err(|_| GrantError::Corrupt("authorization goal id is malformed"))?;
-    let guard = acquire_ledger_lock(store, session_id, goal_id)?;
+    let guard = acquire_ledger_lock(store, session_id, goal_id).map_err(|error| {
+        if error == GrantError::FenceTimeout {
+            GrantError::RevocationDeferred
+        } else {
+            error
+        }
+    })?;
     let mut ledger =
         load_with_lock(store, session_id, goal_id, &guard)?.ok_or(GrantError::UnknownGrant)?;
     let grant_id = ledger

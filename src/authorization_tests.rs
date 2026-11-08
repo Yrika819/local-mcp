@@ -982,3 +982,60 @@ fn at_gw_013c_reanchoring_the_same_grant_preserves_spent_budget() {
         1
     );
 }
+
+#[test]
+fn at_gw_026_codex_goals_are_unaffected_by_authorization() {
+    let f = fixture("codex-unaffected");
+    // write_scope is EXTERNAL-only.
+    let error = goal_api::goal_start(
+        &json!({
+            "session_id": f.session.id,
+            "objective": "codex must not gain a write scope",
+            "model_backend": "CODEX",
+            "write_scope": {
+                "allowed_paths": ["src/**"],
+                "allowed_operations": ["WRITE_UTF8"],
+                "max_operations": 1,
+                "max_bytes": 100,
+                "expires_in_seconds": 300
+            }
+        }),
+        &f.session,
+        &f.store,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "INVALID_ARGUMENT");
+}
+
+#[test]
+fn at_gw_009d_console_safety_covers_all_bidi_and_separator_controls() {
+    for rejected in [
+        "src/\u{061c}alm",
+        "src/\u{200e}lrm",
+        "src/\u{200f}rlm",
+        "src/\u{2028}line",
+        "src/\u{2029}para",
+        "src/\u{feff}bom",
+        "src/\u{e0041}tag",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must be refused"
+        );
+    }
+    assert!(crate::authorization::is_console_unsafe('\u{200e}'));
+    assert!(crate::authorization::is_console_unsafe('\u{2028}'));
+    assert!(!crate::authorization::is_console_unsafe('a'));
+}
+
+#[test]
+fn at_gw_021e_a_stale_grant_cannot_displace_the_anchor_last_grant() {
+    let mut anchor = AuthorizationAnchor::default();
+    anchor.record_grant("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 2);
+    anchor.record_grant("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 1);
+    assert_eq!(
+        anchor.last_grant_id(),
+        Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    );
+    assert_eq!(anchor.highest_epoch(), 2);
+}

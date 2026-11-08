@@ -2119,3 +2119,50 @@ fn at_gw_013d_goal_next_resumes_an_already_charged_operation_at_the_ceiling() {
         content
     );
 }
+
+#[test]
+fn at_gw_013e_a_budget_refused_writer_is_durably_blocked_instead_of_reselected() {
+    let f = fixture("writer-block");
+    let goal_id = start_external(&f.session, &f.store);
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            writer_plan(&planner_work, &["code.txt"], Value::Null),
+        ),
+    )
+    .unwrap();
+    let goal = goal_of(&f, &goal_id);
+    let task_id = goal
+        .tasks()
+        .keys()
+        .next()
+        .expect("planned writer task")
+        .clone();
+    assert_eq!(goal.tasks()[&task_id].status(), TaskStatus::Ready);
+
+    let blocked = crate::external_publish::record_writer_authorization_block(
+        &f.store,
+        &f.session,
+        &goal_id,
+        &task_id,
+        "WRITE_BUDGET_EXHAUSTED",
+    )
+    .unwrap();
+    assert!(blocked.is_some());
+    assert_eq!(
+        goal_of(&f, &goal_id).tasks()[&task_id].status(),
+        TaskStatus::Cancelled
+    );
+
+    // The Scheduler must not hand back the same Writer WorkItem forever.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "a blocked writer must not be reissued: {next}"
+    );
+}

@@ -608,6 +608,22 @@ Round 3 reviewed `35ad119` and found one High, two Medium and two Low issues.
 `AUTHORIZATION_STATE_IO`, matching §6.4. It still never reports `REVOKED`.
 
 
+### 11.4 Round-4 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R4-M1 | A READY Writer refused at issuance stayed READY, so the Scheduler re-selected it forever and later READY read-only Tasks never ran | The driver now durably cancels the never-issued READY Writer with a mandatory blocker (`record_writer_authorization_block`); READY has no direct BLOCKED edge. AT-GW-013e. |
+| R4-L1 | A maximum-length tree rule could lose its `/**` suffix at the display cap | The display bound reserves the rendered suffix; the console bound test checks a 4,095-byte path + `/**`. |
+| R4-L2 | Any `CorruptGoal` from the Begin CAS was labelled a publication conflict | Only an already-advanced journal/operation is a typed `WRITER_PUBLICATION_CONFLICT`; genuine durable corruption propagates. |
+| R4-L3 | The sanitizer's bidi coverage was narrower than Unicode `Bidi_Control` | One shared `is_console_unsafe` covers C0/C1, ALM/LRM/RLM, embeddings/overrides/isolates, U+206A–F, Zl/Zp, BOM and tag characters; used by both the path-rule validator and the console sanitizer. AT-GW-009d. |
+| R4-L4 | A stale-generation issuance could overwrite the anchor's `last_grant_id` and disable a newer grant | `record_grant` only advances for `epoch >= highest_epoch`; AT-GW-021e. |
+| I-2 | No named CODEX regression test | `at_gw_026_codex_goals_are_unaffected_by_authorization`. |
+| I-3 | A raw NUL byte in a source literal made `authorization.rs` look binary to grep | Replaced with the ` ` escape. |
+| I-5 | `REVOCATION_DEFERRED` was also emitted for a publication fence timeout | Split into `AUTHORIZATION_FENCE_BUSY` (publication) and `REVOCATION_DEFERRED` (revocation). |
+
+`I-6` (no 30-second fence-timeout test) remains a test-coverage gap; the timeout
+is exercised indirectly by the in-flight fence test, not by waiting 30 s.
+
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.
 

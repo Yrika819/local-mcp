@@ -839,12 +839,26 @@ fn issue_writer_work_item(
         Ok(WriterIssueOutcome::Refused(block)) => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::Budget(block),
         ))),
-        Ok(WriterIssueOutcome::Unauthorized { code, detail }) => Ok(DriverReport::reused(
-            DriverOutcome::Refused(DriverRefusal::HostStepRefused {
-                code,
-                detail: detail.to_owned(),
-            }),
-        )),
+        Ok(WriterIssueOutcome::Unauthorized { code, detail }) => {
+            // A budget or authorization refusal must change durable state, or
+            // the Scheduler would select the same READY Writer forever and
+            // independent read-only Tasks would never run.
+            if code.starts_with("WRITE_AUTHORIZATION_") || code == "WRITE_BUDGET_EXHAUSTED" {
+                let _ = external_publish::record_writer_authorization_block(
+                    store,
+                    session,
+                    goal.id(),
+                    task_id,
+                    code,
+                );
+            }
+            Ok(DriverReport::reused(DriverOutcome::Refused(
+                DriverRefusal::HostStepRefused {
+                    code,
+                    detail: detail.to_owned(),
+                },
+            )))
+        }
         Err(error) => Err(DriverError::Persistence(error)),
     }
 }

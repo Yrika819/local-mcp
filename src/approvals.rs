@@ -232,20 +232,7 @@ fn sanitize_console_field(value: &str, max_bytes: usize) -> String {
             rendered.push('…');
             break;
         }
-        if character.is_control()
-            || matches!(
-                character,
-                '\u{202a}'
-                    | '\u{202b}'
-                    | '\u{202c}'
-                    | '\u{202d}'
-                    | '\u{202e}'
-                    | '\u{2066}'
-                    | '\u{2067}'
-                    | '\u{2068}'
-                    | '\u{2069}'
-            )
-        {
+        if crate::authorization::is_console_unsafe(character) {
             rendered.push('?');
         } else {
             rendered.push(character);
@@ -1050,7 +1037,12 @@ fn show_grant_request(request: &PendingGrantRequestV1, nonce: &str) {
             crate::authorization::GrantPathKind::Tree => format!("{}/**", rule.path()),
             crate::authorization::GrantPathKind::File => rule.path().to_owned(),
         };
-        eprintln!("    {}", sanitize_console_field(&rendered, 4096));
+        // Reserve room for the rendered `/**` suffix so a maximum-length path
+        // is never truncated before the Owner sees its rule kind.
+        eprintln!(
+            "    {}",
+            sanitize_console_field(&rendered, crate::authorization::MAX_GRANT_PATH_BYTES + 8)
+        );
     }
     eprintln!(
         "  Owner nonce: {nonce}
@@ -2613,5 +2605,22 @@ mod console_sanitizer_tests {
         assert_eq!(sanitize_console_field("\u{2066}isolate", 100), "?isolate");
         let long = "a".repeat(100);
         assert!(sanitize_console_field(&long, 10).ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod console_bound_tests {
+    use super::*;
+
+    #[test]
+    fn a_maximum_length_tree_rule_keeps_its_subtree_suffix() {
+        let path = "a".repeat(crate::authorization::MAX_GRANT_PATH_BYTES - 1);
+        let rendered = format!("{path}/**");
+        assert!(rendered.len() > crate::authorization::MAX_GRANT_PATH_BYTES);
+        assert_eq!(
+            sanitize_console_field(&rendered, crate::authorization::MAX_GRANT_PATH_BYTES + 8),
+            rendered,
+            "the Owner must see the subtree marker"
+        );
     }
 }
