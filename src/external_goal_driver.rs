@@ -202,32 +202,40 @@ pub(crate) async fn advance_external_step(
                 // generic branch would cancel only the WorkItem and leave its
                 // RUNNING Task holding the mutation lease.
                 if active.role() == WorkRole::Writer {
-                    match crate::authorization_store::usable_grant(store, goal) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            let code = error.code();
-                            let detail = error.detail();
-                            return match external_publish::record_authorization_refusal(
-                                store,
-                                session,
-                                goal.id(),
-                                code,
-                            ) {
-                                Ok(Some(_)) => {
-                                    Ok(DriverReport::advanced(DriverOutcome::Progress {
-                                        code: "WRITE_AUTHORIZATION_SLOT_RELEASED",
-                                        detail: "a Writer WorkItem issued under a lapsed grant was cancelled and its Task blocked",
-                                    }))
-                                }
-                                Ok(None) => Ok(DriverReport::reused(DriverOutcome::Refused(
-                                    DriverRefusal::HostStepRefused {
-                                        code,
-                                        detail: detail.to_owned(),
-                                    },
-                                ))),
-                                Err(error) => Err(DriverError::Persistence(error)),
-                            };
+                    let resolved = crate::authorization_store::usable_grant(store, goal);
+                    let stale: Option<(&'static str, &'static str)> = match &resolved {
+                        Ok(grant) => {
+                            let current = crate::authorization::GrantBinding::from_grant(grant);
+                            if active.authorization() == Some(&current) {
+                                None
+                            } else {
+                                Some((
+                                    "WRITE_AUTHORIZATION_REISSUED",
+                                    "the Writer WorkItem belongs to a superseded grant generation",
+                                ))
+                            }
                         }
+                        Err(error) => Some((error.code(), error.detail())),
+                    };
+                    if let Some((code, detail)) = stale {
+                        return match external_publish::record_authorization_refusal(
+                            store,
+                            session,
+                            goal.id(),
+                            code,
+                        ) {
+                            Ok(Some(_)) => Ok(DriverReport::advanced(DriverOutcome::Progress {
+                                code: "WRITE_AUTHORIZATION_SLOT_RELEASED",
+                                detail: "a Writer WorkItem issued under a lapsed or superseded grant was cancelled and its Task blocked",
+                            })),
+                            Ok(None) => Ok(DriverReport::reused(DriverOutcome::Refused(
+                                DriverRefusal::HostStepRefused {
+                                    code,
+                                    detail: detail.to_owned(),
+                                },
+                            ))),
+                            Err(error) => Err(DriverError::Persistence(error)),
+                        };
                     }
                 }
                 if active.goal_revision() == goal.revision()

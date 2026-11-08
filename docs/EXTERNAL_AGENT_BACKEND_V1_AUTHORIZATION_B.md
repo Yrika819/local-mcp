@@ -651,6 +651,16 @@ is exercised indirectly by the in-flight fence test, not by waiting 30 s.
 
 `R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps.
 
+### 11.8 Round-8 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R8-M1 | If the Owner revoked G1 and approved G2 before `goal_next`, the pending Writer's G1 binding was not compared with the resolved G2 grant, so the generic revision branch cancelled only the WorkItem and left its Task RUNNING with the mutation lease | The pending-Writer check now compares the WorkItem's grant binding with the resolved grant. A mismatch goes through the prepared-only cleanup with `WRITE_AUTHORIZATION_REISSUED`. AT-GW-025e asserts BLOCKED, no active WorkItem and no held lease. |
+
+The final R8-M1 fix is covered by the named regression but was not included in
+an independent review round; rounds 1–8 found no unresolved Critical/High code
+defect after each round's remediation.
+
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.
 
