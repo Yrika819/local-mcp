@@ -31,7 +31,7 @@ PR #46 branch.
 |---|---|
 | `src/external_publish.rs` | + `published_intent_awaiting_completion`: the recovery predicate for the crash window between the last publication commit and the host's WorkItem completion. |
 | `src/external_goal_driver.rs` | Submitted-Writer recovery branch that completes an already-published WorkItem instead of dead-ending; removed an unconditional `eprintln!("DEBUG publish error: …")`. |
-| `src/external_h3_reliability_tests.rs` | New deterministic suite (9 tests). |
+| `src/external_h3_reliability_tests.rs` | New deterministic suite (11 tests). |
 | `src/main.rs` | Registers the new test module behind `#[cfg(test)]`. |
 | `scripts/e5-h3-dogfood/driver_h3_writer.py` | Real stdio-MCP Scenario B reproducer (isolated Git repo, separate process, new session). |
 | `docs/EXTERNAL_AGENT_BACKEND_V1_E5_H3_RELIABILITY.md` | This record. |
@@ -253,12 +253,12 @@ case is marked `GAP` — numbers alone are never used as evidence.
 | 047 | reviewer WorkItem bound to the same Task/Attempt | `at_e5_040_…`, `at_e5_053_…` | PASS |
 | 048 | passing review is not a completion | `at_e5_028_to_034_…` (Task `VERIFYING`), new `at_e5_056_…` | PASS |
 | 049 | too many blocking findings | `external_writer_tests::at_e5_029_a_review_gate_failure_blocks_the_writer_task` (**mis-numbered**: content is AT-049) | PASS |
-| 050 | forged ReviewFileEvidence | authority is structurally absent from the reviewer dialect (the host rebuilds the request from durable state); no explicit forged-field test | GAP (low) |
+| 050 | forged ReviewFileEvidence | `ReviewerResult` derives `deny_unknown_fields` and has no file-evidence field, so a model cannot declare what it reviewed; new `at_e5_050_a_reviewer_cannot_supply_its_own_file_evidence` submits forged `files` digests and asserts `REVIEWER_OUTPUT_INVALID`, no persisted forged digest, no `ReviewResult`, Task `BLOCKED` | PASS |
 | 051 | file modified after Writer | `at_e5_031_a_changed_postimage_stops_the_review`, `at_e5_055_…` | PASS |
 | 052 | reviewer crash after issuance | `at_e5_052_a_…`, new `at_e5_052_…` (state matrix), new `at_e5_052c` | PASS |
 | 053 | duplicate reviewer submission | `at_e5_053_a_…`, new `at_e5_056_…` | PASS |
 | 054 | rejected reviewer output | `at_e5_054_a_…` | PASS |
-| 055 | reviewer summary injection / bounded storage | `parse_and_validate_reviewer_result` bounds the summary to 8 KiB and the payload to 128 KiB; no reviewer-specific sentinel test | PARTIAL |
+| 055 | reviewer summary injection / bounded storage | new `at_e5_055_a_reviewer_summary_is_stored_once_bounded_and_out_of_the_receipt`: the sentinel appears exactly once in the durable document (the `ReviewResult` evidence), never in a receipt detail (bounded to 512 bytes) and never in the work history; `parse_and_validate_reviewer_result` bounds the summary to 8 KiB and the payload to 128 KiB | PASS |
 | 056 | only the host Task Verifier completes | new `at_e5_056_…`, `at_e5_028_to_034_…` | PASS |
 
 Test-name drift found and left in place (renaming adds churn without evidence):
@@ -323,9 +323,9 @@ Distinctions kept explicit:
 | `cargo fmt --all -- --check` | clean |
 | `cargo check --locked --all-targets` | clean (via the build below) |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | clean |
-| `cargo test --locked` | 16 + 0 + 1573 + 5 + 21 = **1615 passed, 0 failed** |
-| `cargo test --locked --bin local-mcp external_` | 162 passed, 0 failed (includes the 9 new tests) |
-| `cargo test --locked --bin local-mcp external_h3_reliability` | 9 passed, 0 failed |
+| `cargo test --locked` | 16 + 0 + 1575 + 5 + 21 = **1617 passed, 0 failed** |
+| `cargo test --locked --bin local-mcp external_` | 164 passed, 0 failed (includes the 11 new tests) |
+| `cargo test --locked --bin local-mcp external_h3_reliability` | 11 passed, 0 failed |
 | Real-MCP dogfooding (§6) | Scenario B complete |
 
 Linux/macOS execution was **not** performed on this machine; only CI can supply
@@ -377,6 +377,3 @@ that evidence.
   `TaskStore` over the same state root, which exercises the durable boundary but not
   a torn write.
 * Approval semantics (AT-029/030) — see §2.5.
-* Reviewer forged-evidence (AT-050) has no explicit test; the field does not exist in
-  the dialect.
-* Reviewer summary secret-sentinel redaction (AT-055) beyond the byte bound.

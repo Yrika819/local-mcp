@@ -1018,6 +1018,133 @@ fn reviewer_answer(work: &Value) -> Value {
     })
 }
 
+/// Drive publication and hand back the durable Reviewer WorkItem.
+fn reach_reviewer_work_item(f: &Fixture) -> (GoalId, TaskId, Value) {
+    let (goal_id, task_id, operation_id) = prepared_two_file_writer(f);
+    let published = run_publication(f, &goal_id, &task_id, &operation_id, &RealBoundary);
+    assert!(matches!(published, Ok(PublishOutcome::Published { .. })));
+    let mut view = goal_next(&f.session, &f.store, &goal_id);
+    let mut guard = 0;
+    while view["outcome"] == "HOST_PROGRESS" && guard < 6 {
+        view = goal_next(&f.session, &f.store, &goal_id);
+        guard += 1;
+    }
+    assert_eq!(view["outcome"], "MODEL_REQUIRED", "{view}");
+    assert_eq!(view["model_work"]["role"], "REVIEWER", "{view}");
+    (goal_id, task_id, view["model_work"].clone())
+}
+
+#[test]
+fn at_e5_050_a_reviewer_cannot_supply_its_own_file_evidence() {
+    // AT-050: the reviewer dialect has no file-evidence field at all and unknown
+    // fields are rejected, so a model cannot declare which postimage it reviewed.
+    let f = fixture("reviewer-forged");
+    let (goal_id, task_id, work) = reach_reviewer_work_item(&f);
+    let request = &work["request"];
+    let forged = json!({
+        "goal_id": request["goal_id"],
+        "task_id": request["task_id"],
+        "attempt_id": request["attempt_id"],
+        "goal_revision": request["goal_revision"],
+        "plan_revision": request["plan_revision"],
+        "summary": "reviewed a file the host never published",
+        "blocking_findings": 0,
+        "evidence": [{"kind": "review", "value": "change reviewed"}],
+        "files": [
+            {"path": "a.txt", "after_sha256": sha256_hex("forged postimage
+    "), "size": 1},
+            {"path": "b.txt", "after_sha256": sha256_hex("forged postimage
+    "), "size": 1}
+        ]
+    });
+    let refused = submit(
+        &f.session,
+        &f.store,
+        &submit_args(&f.session, &goal_id, &work, forged),
+    )
+    .unwrap();
+    assert_eq!(refused["outcome"], "REJECTED_SCHEMA", "{refused}");
+    assert_eq!(refused["code"], "REVIEWER_OUTPUT_INVALID", "{refused}");
+
+    // Nothing about the forged claim reached the durable Goal.
+    let goal = goal_of(&f, &goal_id);
+    let document = serde_json::to_string(&goal).unwrap();
+    assert!(
+        !document.contains(&sha256_hex(
+            "forged postimage
+"
+        )),
+        "the forged postimage digest must never be persisted"
+    );
+    let task = &goal.tasks()[&task_id];
+    assert_eq!(task.status(), TaskStatus::Blocked);
+    assert!(
+        task.evidence()
+            .iter()
+            .all(|evidence| !matches!(evidence, crate::task::TaskEvidence::ReviewResult { .. }))
+    );
+    assert_ne!(goal.status(), GoalStatus::Completed);
+    assert_eq!(read(&f, "a.txt"), A_NEW);
+    assert_eq!(read(&f, "b.txt"), B_NEW);
+}
+
+#[test]
+fn at_e5_055_a_reviewer_summary_is_stored_once_bounded_and_out_of_the_receipt() {
+    let f = fixture("reviewer-summary");
+    let (goal_id, task_id, work) = reach_reviewer_work_item(&f);
+    let sentinel = "SENTINEL_REVIEWER_SUMMARY_E5H3";
+    let mut answer = reviewer_answer(&work);
+    answer["summary"] = json!(format!("{sentinel} reviewed both files"));
+    let verdict = submit(
+        &f.session,
+        &f.store,
+        &submit_args(&f.session, &goal_id, &work, answer),
+    )
+    .unwrap();
+    assert_eq!(verdict["outcome"], "COMMITTED", "{verdict}");
+
+    let goal = goal_of(&f, &goal_id);
+    let document = serde_json::to_string(&goal).unwrap();
+    assert_eq!(
+        document.matches(sentinel).count(),
+        1,
+        "the reviewer summary is stored once, as the review evidence"
+    );
+    let state = external_state(&goal).unwrap();
+    for receipt in state.receipts() {
+        let detail = receipt.redacted_detail().unwrap_or_default();
+        assert!(
+            !detail.contains(sentinel),
+            "receipts never echo model prose"
+        );
+        assert!(
+            detail.len() <= crate::external_model_work::MAX_RECEIPT_DETAIL_BYTES,
+            "receipt details stay bounded"
+        );
+    }
+    for item in state.work_history() {
+        assert!(
+            !serde_json::to_string(item).unwrap().contains(sentinel),
+            "work history never echoes model prose"
+        );
+    }
+    let review = goal.tasks()[&task_id]
+        .evidence()
+        .iter()
+        .find_map(|evidence| match evidence {
+            crate::task::TaskEvidence::ReviewResult { summary, .. } => Some(summary.clone()),
+            _ => None,
+        })
+        .expect("one ReviewResult");
+    assert!(review.starts_with(sentinel));
+    assert!(
+        review.len() <= 8 * 1024,
+        "the stored summary respects the host bound"
+    );
+    assert_eq!(goal.tasks()[&task_id].status(), TaskStatus::Verifying);
+    assert_ne!(goal.status(), GoalStatus::Completed);
+}
+
 #[test]
 fn at_e5_056_only_the_host_verifier_completes_after_a_reviewer_restart() {
     let f = fixture("reviewer-restart");
