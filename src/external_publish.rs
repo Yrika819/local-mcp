@@ -104,6 +104,43 @@ pub(crate) fn reviewer_pending(goal: &Goal) -> Option<(TaskId, String, bool)> {
     None
 }
 
+/// Whether this active WorkItem's Writer intent is already fully published.
+///
+/// This is the recovery predicate for the window between the last publication
+/// commit and the host's `commit_complete_active_work`: both are separate commits
+/// on purpose (the WorkItem completion must never be implied by a filesystem
+/// write), so a crash in between leaves an active `SUBMITTED` Writer WorkItem
+/// whose journal already proves the whole intent was applied. Returning the
+/// operation id lets the driver finish the bookkeeping instead of dead-ending the
+/// Goal with `WRITER_INTENT_NOT_PREPARED`.
+///
+/// It never authorises a second write: the caller only completes the WorkItem.
+pub(crate) fn published_intent_awaiting_completion(
+    goal: &Goal,
+    active: &ModelWorkItem,
+    task_id: &TaskId,
+) -> Option<String> {
+    if active.role() != WorkRole::Writer || active.state() != WorkItemState::Submitted {
+        return None;
+    }
+    if active.task_id() != Some(task_id.as_str()) {
+        return None;
+    }
+    let task = goal.tasks().get(task_id)?;
+    let attempt = task.latest_attempt()?;
+    if active.attempt_id() != Some(attempt.id().as_str()) {
+        return None;
+    }
+    let intent = attempt.mutation_intent()?;
+    if !matches!(
+        intent.state(),
+        MutationIntentState::Applied | MutationIntentState::ReconciledPerformed
+    ) {
+        return None;
+    }
+    Some(intent.operation_id().to_owned())
+}
+
 /// Publish one prepared external writer intent through the existing host write
 /// boundary.
 pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(

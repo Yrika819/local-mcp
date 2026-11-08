@@ -569,6 +569,26 @@ async fn publish_submitted_writer_work(
         )));
     };
     let Some(operation_id) = external_writer::pending_prepared_intent(goal, &task_id) else {
+        // Crash recovery (AT-E5-040): the journal already proves every operation of
+        // this WorkItem's Writer intent was applied, but the host stopped before it
+        // completed the active WorkItem. Completing it here is pure bookkeeping — no
+        // file is touched, no operation is reissued — and it is what lets the
+        // reviewer leg resume instead of dead-ending the Goal forever.
+        if external_publish::published_intent_awaiting_completion(goal, active, &task_id).is_some()
+        {
+            commit_complete_active_work(
+                store,
+                &session.id,
+                goal.id(),
+                goal.revision(),
+                external_publish::WRITER_PUBLISHED,
+            )
+            .map_err(DriverError::Persistence)?;
+            return Ok(DriverReport::advanced(DriverOutcome::Progress {
+                code: WRITER_PUBLICATION_RECOVERED,
+                detail: "the host recorded an already-published writer work item and will resume the reviewer leg",
+            }));
+        }
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code: "WRITER_INTENT_NOT_PREPARED",
@@ -627,12 +647,13 @@ async fn publish_submitted_writer_work(
                 detail: "the host refused to publish the prepared writer intent",
             },
         ))),
-        Err(error) => {
-            eprintln!("DEBUG publish error: {error}");
-            Err(DriverError::Persistence(error))
-        }
+        Err(error) => Err(DriverError::Persistence(error)),
     }
 }
+
+/// Progress code: the host completed a Writer WorkItem whose intent was already
+/// fully published before the previous process stopped.
+pub(crate) const WRITER_PUBLICATION_RECOVERED: &str = "WRITER_PUBLICATION_RECOVERED";
 
 /// Issue the Replanner WorkItem for a durable trigger (E5-C).
 fn issue_replanner_work_item(
