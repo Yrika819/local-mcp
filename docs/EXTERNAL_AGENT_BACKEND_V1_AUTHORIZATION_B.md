@@ -595,15 +595,58 @@ The reviewer's CODEX regression check was static only; the full local suite
 
 ## 12. Campaign checkpoint
 
-| Phase | Base | Head | Draft PR | State |
+| Phase | Branch | Base | Head | Draft PR |
 |---|---|---|---|---|
-| A0 design | PR #47 `08f3edf` | `3320dcd` | #48 | docs reviewed against code |
-| A1+A2+A3 implementation | `3320dcd` | `2f574ce` + this commit | #49 | local tests + full suite green; CI pending |
-| D0–D1 managed routing | `327b461` | same PR as A3? no: D branch | stacked on #49 | driver routes an unprepared EXTERNAL managed Goal through the existing `prepare_managed_workspace`; dirty primary refuses |
-| D2–D4 integration | D branch | — | stacked on #49 | Writer → Reviewer → Task Verifier → Goal Verifier → managed evidence → Finalizer E2E green; primary untouched; no auto-commit/merge |
-| Independent security review | — | — | — | pending |
+| A0 design | `feat/goal-write-grant-a0` | PR #47 `08f3edf` | `3320dcd` | #48 |
+| A1 + A2 + A3 | `feat/goal-write-grant-a1` | `3320dcd` | `327b461` | #49 |
+| D0–D4 + security remediation | `feat/goal-write-grant-d` | `327b461` | see PR #50 head | #50 |
 
-## 13. Open Owner decisions
+* `main` remains `e6950fdc3bab72982285888a81cce822743fbba5`.
+* PRs #42–#47 are untouched. No merge, un-draft, tag, or release was performed.
+* PR #49 Required CI: **22/22 success** on `327b461` (push and pull_request runs).
+* PR #50 Required CI: see the PR checks at its final head.
+* Local Windows verification on the final head: `cargo fmt --all -- --check`,
+  `cargo check --locked --all-targets`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
+  `cargo test --locked` (**1616 unit + 16 + 5 + 21 integration, 0 failed**,
+  including **37 AT-GW tests**).
+
+### 12.1 Acceptance mapping (executed, fixed-JSON fixtures)
+
+This campaign's evidence is deterministic host fixtures. It is **not** real-model
+dogfooding, and the two are not conflated.
+
+| Requirement | Test evidence (all run in the full suite) |
+|---|---|
+| AT-E5-072 PRIMARY binding | `external_writer_tests::at_e5_028_to_034_publication_and_review_reach_host_goal_completion` (primary root) |
+| AT-E5-073 managed clean creation | `external_writer_tests::at_e5_073_the_external_driver_prepares_a_clean_managed_goal` (Unix; Windows creation gate is covered by the existing approval-gated managed suite) |
+| AT-E5-074 dirty primary refused | `external_writer_tests::at_e5_074_a_dirty_primary_refuses_external_managed_preparation` |
+| AT-E5-075 forged worktree root | `managed_worktree_creation_tests` (host-derived root; no model/client field) + `ManagedRootSource::Host` |
+| AT-E5-076 stale worktree identity | `managed_worktree_*` execution-root/reconciliation suites + `authorization_tests::at_gw_008` |
+| AT-E5-077 writer in managed workspace | `external_writer_tests::at_e5_072_082_external_managed_writer_reaches_host_evidence_without_touching_primary` |
+| AT-E5-078 snapshot evidence | same test (`managed_workspace_verification_evidence`, `goal_result` re-observation) |
+| AT-E5-079 finalization blocked | `managed_workspace_verification_evidence_tests` + `goal_finalizer_tests` (missing/mismatched evidence never COMPLETED) |
+| AT-E5-080 concurrent primary advance | `managed_worktree_creation_tests` base-advanced/reconciliation cases |
+| AT-E5-081 crash during evidence persistence | `managed_workspace_verification_evidence_tests` + `managed_worktree_*` fault cases |
+| AT-E5-082 no auto-merge/push | `at_e5_072_082` asserts primary HEAD/status unchanged, managed HEAD at base, no ref change |
+| Scenario A (readonly DAG) | `external_dag_tests::at_e5_001..007` (linear, diamond, multi-ready, blocked, failed, superseded) |
+| Scenario B (Writer→Reviewer→Verifier) | `external_writer_tests::at_e5_028_to_034...` and the managed E2E |
+| Scenario C (Replanner→DAG→Verifier) | `external_replanner_tests::at_e5_057`, `at_e5_066_070...` |
+| Scenario D (crash/resume/reconcile) | `external_goal_recovery_tests`, `external_h3_reliability_tests`, `external_writer_failure_tests`, and AT-GW-017/018/019/021/023/024 |
+
+### 12.2 Not verified in this campaign
+
+* Real external-model dogfooding (E5-E): **NOT RUN**. All scenarios above use
+  fixed JSON fixtures; no claim of real-model behaviour is made.
+* Native Windows junction/ADS race execution against the grant gate: the
+  existing session-authority tests cover junctions/ADS; the new
+  grant-rule-escape test is Unix-only.
+* A hard publication-helper execution deadline (R2-M3): accepted availability
+  residual.
+* Same-UID process impersonation resistance (R-1/C3): **NOT VERIFIED** by
+  design.
+
+## 13. Open Owner decisions## 13. Open Owner decisions
 
 1. **R-1 acceptance.** Is the deployment assumption "the agent cannot use the
    OCS console or the state directory outside GoalLatch" acceptable for V1 Beta,
