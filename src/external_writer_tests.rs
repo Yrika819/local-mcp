@@ -918,49 +918,415 @@ fn at_e5_027_the_stage_is_private_bounded_and_hash_verified() {
     assert_eq!(error.code(), "WRITER_STAGE_INTEGRITY_MISMATCH");
 }
 
+/// A writer plan whose Task also asserts the exact postimage and a review gate.
+fn reviewed_writer_plan(work: &Value, content: &str) -> Value {
+    let criterion_id = work["request"]["completion_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap();
+    json!({
+        "goal_id": work["goal_id"],
+        "goal_revision": work["goal_revision"],
+        "summary": "apply one reviewed scoped edit",
+        "tasks": [{
+            "proposal_id": "edit",
+            "title": "Update the target file",
+            "objective": "Apply the requested scoped edit",
+            "mandatory": true,
+            "worker": "CODEX_WRITER",
+            "dependencies": [],
+            "scope": {
+                "allowed_paths": ["code.txt"],
+                "forbidden_paths": [],
+                "operation_kind": "LOCAL_MUTATION",
+                "replay_safety": "VERIFY_BEFORE_RETRY"
+            },
+            "verification": [
+                {"kind": "FILE_DIGEST", "path": "code.txt", "expected_sha256": sha256_hex(content)},
+                {"kind": "REVIEW_GATE", "max_blocking_findings": 0}
+            ]
+        }],
+        "criterion_bindings": [{"criterion_id": criterion_id, "task_refs": ["edit"]}]
+    })
+}
+
+fn reviewer_answer(work: &Value, blocking_findings: u32) -> Value {
+    let request = &work["request"];
+    json!({
+        "goal_id": request["goal_id"],
+        "task_id": request["task_id"],
+        "attempt_id": request["attempt_id"],
+        "goal_revision": request["goal_revision"],
+        "plan_revision": request["plan_revision"],
+        "summary": "reviewed the applied change",
+        "blocking_findings": blocking_findings,
+        "evidence": [{"kind": "review-evidence", "value": "change reviewed"}]
+    })
+}
+
 #[test]
-fn at_e5_027b_goal_next_stops_with_the_publication_not_enabled_code() {
-    let f = fixture("publication-stop");
+fn at_e5_028_to_034_publication_and_review_reach_host_goal_completion() {
+    let f = fixture("publication-e2e");
+    crate::model_accounting::reset_for_test();
     let goal_id = start_external(&f.session, &f.store);
-    let work = plan_writer_goal(
-        &f,
-        &goal_id,
-        writer_plan(
-            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
-            &["code.txt"],
-            Value::Null,
+    let content = "fn main() { println!(\"e5\"); }\n";
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    let planned = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, content),
         ),
+    )
+    .unwrap();
+    assert_eq!(planned["outcome"], "COMMITTED", "{planned}");
+
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    assert_eq!(writer_work["role"], "WRITER");
+    let staged = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
+            writer_answer(
+                &writer_work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        staged["outcome"], "ACCEPTED_FOR_HOST_PROCESSING",
+        "{staged}"
     );
+
+    // One bounded goal_next publishes the prepared intent, begins the reviewer
+    // invocation, and hands back the reviewer WorkItem.
+    let reviewed = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(reviewed["outcome"], "MODEL_REQUIRED", "{reviewed}");
+    assert_eq!(reviewed["model_work"]["role"], "REVIEWER", "{reviewed}");
+    assert_eq!(
+        reviewed["model_work"]["output_contract"],
+        "reviewer-verdict-v1"
+    );
+    let reviewer_work = reviewed["model_work"].clone();
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        content,
+        "the host published the exact staged bytes"
+    );
+
+    let verdict = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &reviewer_work,
+            reviewer_answer(&reviewer_work, 0),
+        ),
+    )
+    .unwrap();
+    assert_eq!(verdict["outcome"], "COMMITTED", "{verdict}");
+    let goal = goal_of(&f, &goal_id);
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(
+        task.status(),
+        TaskStatus::Verifying,
+        "review never completes a Task"
+    );
+
+    let finished = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(finished["status"], "COMPLETED", "{finished}");
+    let goal = goal_of(&f, &goal_id);
+    assert_eq!(goal.status(), GoalStatus::Completed);
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Completed);
+    assert!(
+        task.latest_attempt()
+            .unwrap()
+            .mutation_intent()
+            .is_some_and(|intent| {
+                intent.state() == crate::mutation::MutationIntentState::Applied
+                    && intent.reviewer_state()
+                        == crate::mutation::ReviewerInvocationState::Persisted
+            })
+    );
+    assert_eq!(
+        crate::model_accounting::snapshot_for_test().codex_spawn_count,
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        content
+    );
+    // A second goal_next never republishes.
+    let terminal = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(terminal["outcome"], "TERMINAL", "{terminal}");
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn at_e5_029_a_review_gate_failure_blocks_the_writer_task() {
+    let f = fixture("review-gate");
+    let goal_id = start_external(&f.session, &f.store);
+    let content = "fn main() { println!(\"gate\"); }\n";
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
     submit(
         &f.session,
         &f.store,
         &submit_args(
             &f.session,
             &goal_id,
-            &work,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, content),
+        ),
+    )
+    .unwrap();
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
             writer_answer(
-                &work,
+                &writer_work,
                 "code.txt",
-                "would-be applied\n",
+                content,
                 json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
             ),
         ),
     )
     .unwrap();
-    let view = goal_next(&f.session, &f.store, &goal_id);
-    assert_eq!(view["outcome"], "BLOCKED", "{view}");
-    assert_eq!(
-        view["blockers"][0]["code"],
-        "WRITER_PUBLICATION_NOT_ENABLED"
-    );
-    assert_eq!(view["blockers"][0]["mandatory"], true);
-    assert!(view["model_work"].is_null());
-    assert_eq!(
-        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
-        "fn main() {}\n"
-    );
+    let reviewer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    assert_eq!(reviewer_work["role"], "REVIEWER");
+    let verdict = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &reviewer_work,
+            reviewer_answer(&reviewer_work, 3),
+        ),
+    )
+    .unwrap();
+    assert_eq!(verdict["outcome"], "REJECTED_SCHEMA", "{verdict}");
+    assert_eq!(verdict["code"], "REVIEW_GATE_BLOCKED");
+    let goal = goal_of(&f, &goal_id);
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Blocked);
+    assert_ne!(goal.status(), GoalStatus::Completed);
+}
+
+#[test]
+fn at_e5_031_a_changed_postimage_stops_the_review() {
+    let f = fixture("stale-postimage");
+    let goal_id = start_external(&f.session, &f.store);
+    let content = "fn main() { println!(\"stale\"); }\n";
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, content),
+        ),
+    )
+    .unwrap();
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
+            writer_answer(
+                &writer_work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    let reviewer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    assert_eq!(reviewer_work["role"], "REVIEWER");
+    // An external edit after publication invalidates the review request.
+    std::fs::write(f.session.cwd.join("code.txt"), b"changed by someone else\n").unwrap();
+    let verdict = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &reviewer_work,
+            reviewer_answer(&reviewer_work, 0),
+        ),
+    )
+    .unwrap();
+    assert_eq!(verdict["outcome"], "REJECTED_SCHEMA", "{verdict}");
+    assert_eq!(verdict["code"], "REVIEWER_STALE_POSTIMAGE");
     let goal = goal_of(&f, &goal_id);
     assert_ne!(goal.status(), GoalStatus::Completed);
+}
+
+#[test]
+fn at_e5_030_a_preimage_that_changed_after_staging_blocks_publication() {
+    let f = fixture("preimage-changed");
+    let goal_id = start_external(&f.session, &f.store);
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, "new content\n"),
+        ),
+    )
+    .unwrap();
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
+            writer_answer(
+                &writer_work,
+                "code.txt",
+                "new content\n",
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    // A concurrent edit between staging and publication must stop the host.
+    std::fs::write(f.session.cwd.join("code.txt"), b"edited after staging\n").unwrap();
+    let view = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(view["outcome"], "BLOCKED", "{view}");
+    assert_eq!(view["blockers"][0]["code"], "WRITER_PREIMAGE_CHANGED");
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        "edited after staging\n",
+        "a stale preimage is never overwritten"
+    );
+    let goal = goal_of(&f, &goal_id);
+    let task = goal.tasks().values().next().unwrap();
+    // Nothing was begun for the operation, so the journal still proves no write.
+    assert!(
+        task.latest_attempt()
+            .unwrap()
+            .mutation_intent()
+            .unwrap()
+            .operations()
+            .iter()
+            .all(|operation| operation.state() == MutationOperationState::Prepared)
+    );
+}
+
+#[test]
+fn at_e5_044_two_clients_publish_exactly_once() {
+    let f = fixture("two-clients");
+    let goal_id = start_external(&f.session, &f.store);
+    let content = "fn main() { println!(\"once\"); }\n";
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, content),
+        ),
+    )
+    .unwrap();
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
+            writer_answer(
+                &writer_work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let session = f.session.clone();
+        let store = f.store.clone();
+        let args = json!({"session_id": f.session.id, "goal_id": goal_id.as_str()});
+        handles.push(std::thread::spawn(move || {
+            goal_next_call(&args, &session, &store)
+                .map(|view| {
+                    serde_json::to_value(view).unwrap()["outcome"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .unwrap_or_else(|error| error.code().to_owned())
+        }));
+    }
+    let outcomes: Vec<String> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert!(
+        outcomes.iter().any(|outcome| outcome == "MODEL_REQUIRED"),
+        "{outcomes:?}"
+    );
+    for outcome in &outcomes {
+        assert!(
+            !outcome.starts_with("GOAL_PERSISTENCE") && outcome != "GOAL_STATE_CORRUPT",
+            "{outcomes:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        content
+    );
+    // Exactly one publication: the journal has one Applied operation.
+    let goal = goal_of(&f, &goal_id);
+    let intent = goal
+        .tasks()
+        .values()
+        .next()
+        .unwrap()
+        .latest_attempt()
+        .unwrap()
+        .mutation_intent()
+        .unwrap();
+    assert_eq!(intent.operations().len(), 1);
+    assert_eq!(
+        intent.operations()[0].state(),
+        MutationOperationState::Applied
+    );
 }
 
 #[test]

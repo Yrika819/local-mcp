@@ -16,11 +16,9 @@
 //!   and one commit records the prepared `MutationIntent`, the accepted receipt,
 //!   and the WorkItem's `SUBMITTED` transition. Still no workspace write.
 //!
-//! Publication (W2) is *not* enabled in this module: it returns the typed
-//! `WRITER_PUBLICATION_NOT_ENABLED` stop rather than performing or faking a
-//! mutation. That keeps this PR's authority claim exactly as strong as its
-//! evidence: an external Writer proposal can be validated and durably prepared,
-//! and cannot yet touch a file.
+//! Publication (W2) lives in `external_publish`: this module only validates,
+//! seals, and durably prepares. Keeping the two apart is what makes each phase's
+//! authority claim exactly as strong as its evidence.
 //!
 //! Authority rules pinned here:
 //!
@@ -50,10 +48,6 @@ use crate::task::{TaskId, TaskStatus, TaskTransitionContext};
 use crate::task_store::TaskStore;
 use crate::writer::{self, WriterError, WriterRequest, WriterStatus};
 use crate::writer_stage::{self, StageError, StageIdentity, WriteStage};
-
-/// Typed stop code: the proposal is validated and staged, but host publication
-/// is not enabled on this build.
-pub(crate) const WRITER_PUBLICATION_NOT_ENABLED: &str = "WRITER_PUBLICATION_NOT_ENABLED";
 
 /// Progress code: a validated Writer proposal is durably prepared.
 pub(crate) const WRITE_INTENT_PREPARED: &str = "WRITE_INTENT_PREPARED";
@@ -876,11 +870,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_published_stop_and_progress_codes_are_stable() {
-        assert_eq!(
-            WRITER_PUBLICATION_NOT_ENABLED,
-            "WRITER_PUBLICATION_NOT_ENABLED"
-        );
+    fn the_prepared_progress_code_is_stable() {
         assert_eq!(WRITE_INTENT_PREPARED, "WRITE_INTENT_PREPARED");
     }
 }

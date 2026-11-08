@@ -20,12 +20,13 @@
 
 use crate::config;
 use crate::external_model_store::{
-    commit_cancel_active_work, commit_issued_work_item, external_state,
+    commit_cancel_active_work, commit_complete_active_work, commit_issued_work_item, external_state,
 };
 use crate::external_model_work::{
     IssueBlock, MAX_REQUEST_PAYLOAD_BYTES, ModelWorkItem, OUTPUT_CONTRACT_PLANNER_V1, WorkId,
     WorkItemState, WorkRole, sha256_hex,
 };
+use crate::external_publish::{self, PublishOutcome};
 use crate::external_writer::{self, WriterIssueOutcome};
 use crate::goal::Goal;
 use crate::goal_finalizer::{self, GoalFinalizationOutcome};
@@ -213,42 +214,8 @@ pub(crate) async fn advance_external_step(
                 // host step. Every other role in SUBMITTED state is a pre-E4
                 // acceptance that has no durable artifact and can never be
                 // applied.
-                if active.role() == WorkRole::Writer
-                    && let Some(task_id) =
-                        active.task_id().and_then(|value| TaskId::parse(value).ok())
-                {
-                    let Some(operation_id) =
-                        external_writer::pending_prepared_intent(goal, &task_id)
-                    else {
-                        return Ok(DriverReport::reused(DriverOutcome::Refused(
-                            DriverRefusal::HostStepRefused {
-                                code: "WRITER_INTENT_NOT_PREPARED",
-                                detail: "the accepted writer submission has no prepared intent",
-                            },
-                        )));
-                    };
-                    if external_writer::verify_prepared_stage(
-                        store,
-                        session,
-                        goal,
-                        &task_id,
-                        &operation_id,
-                    )
-                    .is_err()
-                    {
-                        return Ok(DriverReport::reused(DriverOutcome::Refused(
-                            DriverRefusal::HostStepRefused {
-                                code: "WRITER_STAGE_UNUSABLE",
-                                detail: "the sealed writer stage cannot be verified against the durable intent",
-                            },
-                        )));
-                    }
-                    return Ok(DriverReport::reused(DriverOutcome::Refused(
-                        DriverRefusal::HostStepRefused {
-                            code: external_writer::WRITER_PUBLICATION_NOT_ENABLED,
-                            detail: "the writer intent is durably prepared and verified; host publication is not enabled on this build",
-                        },
-                    )));
+                if active.role() == WorkRole::Writer {
+                    return publish_submitted_writer_work(store, session, goal, active).await;
                 }
                 return Ok(DriverReport::reused(DriverOutcome::Refused(
                     DriverRefusal::UnrecoverableSubmitted {
@@ -262,6 +229,30 @@ pub(crate) async fn advance_external_step(
                 )));
             }
         }
+    }
+
+    // E5-B: a published writer intent must begin its reviewer invocation before
+    // the Scheduler can select RunReviewer.
+    if let Some((task_id, operation_id, invoked)) = external_publish::reviewer_pending(goal) {
+        if !invoked {
+            match external_publish::begin_reviewer_invocation(
+                store,
+                session,
+                goal.id(),
+                &task_id,
+                &operation_id,
+                goal.revision(),
+            ) {
+                Ok(_) => {
+                    return Ok(DriverReport::advanced(DriverOutcome::Progress {
+                        code: external_publish::REVIEWER_INVOCATION_STARTED,
+                        detail: "the host recorded the reviewer invocation for the published writer intent",
+                    }));
+                }
+                Err(error) => return Err(DriverError::Persistence(error)),
+            }
+        }
+        return issue_reviewer_work_item(store, session, goal, &task_id);
     }
 
     // E5-0: a pending host-only readiness transition is resolved before any new
@@ -334,9 +325,13 @@ pub(crate) async fn advance_external_step(
         SchedulerDecision::RunWriter { task_id } => {
             issue_writer_work_item(store, session, goal, &task_id)
         }
+        // The external reviewer leg is driven by the explicit host step above, so a
+        // Scheduler RunReviewer here means the durable reviewer state is not the one
+        // the external loop advanced. Reported, never guessed at.
         SchedulerDecision::RunReviewer { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
-            DriverRefusal::RoleNotWired {
-                stage: WorkRole::Reviewer.as_str(),
+            DriverRefusal::HostStepRefused {
+                code: "REVIEWER_RECOVERY_DEFERRED",
+                detail: "the external reviewer leg is not resumable from this durable state",
             },
         ))),
         SchedulerDecision::UnsupportedWorker { worker, .. } => Ok(DriverReport::reused(
@@ -550,6 +545,126 @@ fn issue_planner_work_item(
             }
         }
         Err(other) => Err(DriverError::Persistence(other)),
+    }
+}
+
+/// Publish the prepared Writer intent of a SUBMITTED WorkItem, then mark it
+/// COMMITTED (E5-A2).
+///
+/// The publication itself is multi-commit by design (per-operation journal); the
+/// WorkItem transitions to COMMITTED only after every operation was published and
+/// postimage-verified. A refusal leaves the WorkItem SUBMITTED so the next host
+/// step can retry the *host* step (never the model) or stop with a typed reason.
+async fn publish_submitted_writer_work(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    active: &crate::external_model_work::ModelWorkItem,
+) -> Result<DriverReport, DriverError> {
+    let Some(task_id) = active.task_id().and_then(|value| TaskId::parse(value).ok()) else {
+        return Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code: "WRITER_TASK_INVALID",
+                detail: "the accepted writer submission names no Task",
+            },
+        )));
+    };
+    let Some(operation_id) = external_writer::pending_prepared_intent(goal, &task_id) else {
+        return Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code: "WRITER_INTENT_NOT_PREPARED",
+                detail: "the accepted writer submission has no prepared intent",
+            },
+        )));
+    };
+    let stage = match external_writer::verify_prepared_stage(
+        store,
+        session,
+        goal,
+        &task_id,
+        &operation_id,
+    ) {
+        Ok(stage) => stage,
+        Err(_) => {
+            return Ok(DriverReport::reused(DriverOutcome::Refused(
+                DriverRefusal::HostStepRefused {
+                    code: "WRITER_STAGE_UNUSABLE",
+                    detail: "the sealed writer stage cannot be verified against the durable intent",
+                },
+            )));
+        }
+    };
+    let boundary = crate::writer::ExecutionWriteBoundary;
+    match external_publish::publish_prepared_writer_intent(
+        store,
+        session,
+        goal.id(),
+        &task_id,
+        &operation_id,
+        &stage,
+        &boundary,
+    )
+    .await
+    {
+        Ok(PublishOutcome::Published {
+            goal: published, ..
+        }) => {
+            commit_complete_active_work(
+                store,
+                &session.id,
+                goal.id(),
+                published.revision(),
+                external_publish::WRITER_PUBLISHED,
+            )
+            .map_err(DriverError::Persistence)?;
+            Ok(DriverReport::advanced(DriverOutcome::Progress {
+                code: external_publish::WRITER_PUBLISHED,
+                detail: "every prepared writer operation was published and journaled by the host",
+            }))
+        }
+        Ok(PublishOutcome::Refused { code }) => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code,
+                detail: "the host refused to publish the prepared writer intent",
+            },
+        ))),
+        Err(error) => {
+            eprintln!("DEBUG publish error: {error}");
+            Err(DriverError::Persistence(error))
+        }
+    }
+}
+
+/// Issue the Reviewer WorkItem for a published writer intent (E5-B).
+fn issue_reviewer_work_item(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    task_id: &TaskId,
+) -> Result<DriverReport, DriverError> {
+    if let Some(code) = external_publish::reviewer_unavailable_reason(goal, task_id) {
+        return Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code,
+                detail: "the writer Task cannot request a reviewer in its current state",
+            },
+        )));
+    }
+    match external_publish::issue_external_reviewer_work_item(
+        store,
+        session,
+        goal.id(),
+        task_id,
+        goal.revision(),
+    ) {
+        Ok(Some(item)) => Ok(DriverReport::advanced(DriverOutcome::ModelRequired(item))),
+        Ok(None) => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code: "REVIEWER_WORK_ITEM_UNAVAILABLE",
+                detail: "the host could not issue a bounded reviewer request right now",
+            },
+        ))),
+        Err(error) => Err(DriverError::Persistence(error)),
     }
 }
 

@@ -31,6 +31,7 @@ use crate::external_model_work::{
     MAX_HOST_STEPS_PER_CALL, ModelWorkItem, SubmissionDecision, SubmissionId, SubmissionReceipt,
     WorkId, WorkItemState, WorkRole, check_response_bounds, payload_digest,
 };
+use crate::external_publish::{self, ReviewerOutcome};
 use crate::external_writer::{self, WriterStageOutcome};
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_api::{self, GoalApiError};
@@ -51,10 +52,34 @@ pub(crate) const PLANNER_OUTPUT_REQUIRED_FIELDS: &[&str] = &[
     "criterion_bindings",
 ];
 
+/// The minimum top-level fields a V1 Writer submission must carry.
+pub(crate) const WRITER_OUTPUT_REQUIRED_FIELDS: &[&str] = &[
+    "goal_id",
+    "task_id",
+    "attempt_id",
+    "goal_revision",
+    "plan_revision",
+    "status",
+    "summary",
+    "evidence",
+    "proposed_operations",
+];
+
 /// The minimum top-level fields a V1 Readonly submission must carry.
 ///
 /// The identity fields are host-issued values the client must echo back, which
 /// is how the host refuses an answer aimed at a superseded Attempt.
+pub(crate) const REVIEWER_OUTPUT_REQUIRED_FIELDS: &[&str] = &[
+    "goal_id",
+    "task_id",
+    "attempt_id",
+    "goal_revision",
+    "plan_revision",
+    "summary",
+    "blocking_findings",
+    "evidence",
+];
+
 pub(crate) const READONLY_OUTPUT_REQUIRED_FIELDS: &[&str] = &[
     "goal_id",
     "task_id",
@@ -491,6 +516,8 @@ fn driver_view(
 fn model_work_view(item: ModelWorkItem) -> ModelWorkView {
     let required_fields = match item.role() {
         WorkRole::Readonly => READONLY_OUTPUT_REQUIRED_FIELDS,
+        WorkRole::Writer => WRITER_OUTPUT_REQUIRED_FIELDS,
+        WorkRole::Reviewer => REVIEWER_OUTPUT_REQUIRED_FIELDS,
         _ => PLANNER_OUTPUT_REQUIRED_FIELDS,
     };
     let request = serde_json::from_str(item.request_payload()).unwrap_or(Value::Null);
@@ -781,6 +808,22 @@ pub(crate) fn goal_submit(
             &submission_id,
             &payload_sha256,
             active,
+        );
+    }
+
+    // The Reviewer role (E5-B) validates the untrusted verdict against the durable
+    // postimage and lets the Task's own REVIEW_GATE decide. A pass only reaches
+    // VERIFYING; the host Task Verifier still owns COMPLETED.
+    if active.role() == WorkRole::Reviewer {
+        return submit_reviewer_response(
+            store,
+            session,
+            &goal,
+            &goal_id,
+            &request,
+            &work_id,
+            &submission_id,
+            &payload_sha256,
         );
     }
 
@@ -1188,6 +1231,76 @@ fn submit_writer_response(
             next_action_for_outcome("COMMITTED"),
         )),
         WriterStageOutcome::Refused { code } => Ok(rejected_view(
+            goal,
+            request,
+            "REJECTED_STALE_REVISION",
+            code,
+            payload_sha256,
+            "CALL_GOAL_NEXT",
+        )),
+    }
+}
+
+/// Validate and record one external Reviewer submission (E5-B).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Goal, work identity, digest, and the untrusted payload are independent authority channels."
+)]
+fn submit_reviewer_response(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    goal_id: &GoalId,
+    request: &GoalSubmitRequest,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+) -> Result<ExternalGoalSubmitView, GoalApiError> {
+    let raw = serde_json::to_vec(&request.response).map_err(|_| {
+        GoalApiError::external(
+            "INVALID_ARGUMENT",
+            "the submitted response could not be serialized for host validation",
+        )
+    })?;
+    let outcome = external_publish::commit_external_reviewer_result(
+        store,
+        session,
+        goal_id,
+        goal.revision(),
+        work_id,
+        submission_id,
+        payload_sha256,
+        &raw,
+    )
+    .map_err(GoalApiError::from_orchestrator)?;
+
+    match outcome {
+        ReviewerOutcome::Recorded {
+            goal,
+            receipt,
+            blocked,
+        } => {
+            let code = receipt.code().to_owned();
+            Ok(submit_view(
+                &goal,
+                request,
+                if blocked {
+                    "REJECTED_SCHEMA"
+                } else {
+                    "COMMITTED"
+                },
+                &code,
+                Some(receipt_view(&receipt)),
+                None,
+                payload_sha256,
+                next_action_for_outcome(if blocked {
+                    "REJECTED_SCHEMA"
+                } else {
+                    "COMMITTED"
+                }),
+            ))
+        }
+        ReviewerOutcome::Refused { code } => Ok(rejected_view(
             goal,
             request,
             "REJECTED_STALE_REVISION",

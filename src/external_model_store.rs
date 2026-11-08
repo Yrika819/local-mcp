@@ -327,6 +327,25 @@ pub(crate) fn commit_planner_submission(
     }
 }
 
+/// Atomically mark the submitted WorkItem COMMITTED after the host applied it.
+pub(crate) fn commit_complete_active_work(
+    store: &TaskStore,
+    session_id: &str,
+    goal_id: &GoalId,
+    expected_revision: u64,
+    code: &'static str,
+) -> Result<Goal, OrchestratorError> {
+    let (_, goal) = mutate_external(
+        store,
+        session_id,
+        goal_id,
+        expected_revision,
+        move |state, _now| state.complete_active_work(code),
+    )?;
+    Ok(goal)
+}
+
+/// Atomically mark the submitted WorkItem COMMITTED after the host applied it.
 /// Invalidate the active WorkItem during a host-owned cancellation.
 ///
 /// Called from the existing `goal_cancel` mutation closure so cancellation and

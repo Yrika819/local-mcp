@@ -521,28 +521,38 @@ fn goal_submit_never_mutates_the_workspace() {
 
 #[test]
 fn the_external_submission_path_has_no_writer_or_approval_reachability() {
-    // A source-level guard: the external modules must not name the mutation,
-    // approval, or publish boundaries. `goal_submit` records intent; it never
-    // gains write authority (ADR-07 / TM-03).
+    // Submission validates and stages; only `external_publish` may reach the host
+    // write boundary, and nothing may reach the approval channel or a raw write.
     for path in [
         "src/external_goal_api.rs",
-        "src/external_goal_driver.rs",
+        "src/external_writer.rs",
         "src/external_model_store.rs",
         "src/external_model_work.rs",
     ] {
         let source = std::fs::read_to_string(path).unwrap();
         for needle in [
-            "workspace_publish",
+            // The identity helper (`workspace_publish::scope_identity`) is a pure
+            // hash and is shared with the Codex path; the publication primitive is
+            // not, and must never be reachable from submission.
+            "workspace_publish::publish",
+            "PublishRequest",
             "WriteBoundary",
-            "proposed_operations",
             "approvals::",
             "without_sandbox",
+            "std::fs::write",
         ] {
             assert!(
                 !source.contains(needle),
                 "{path} must not reach the host mutation/approval boundary via {needle}"
             );
         }
+    }
+    let publish = std::fs::read_to_string("src/external_publish.rs").unwrap();
+    for needle in ["approvals::", "without_sandbox", "std::fs::write"] {
+        assert!(
+            !publish.contains(needle),
+            "external_publish must not reach {needle}"
+        );
     }
 }
 

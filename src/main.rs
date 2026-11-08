@@ -16,6 +16,7 @@ mod external_goal_api;
 mod external_goal_driver;
 mod external_model_store;
 mod external_model_work;
+mod external_publish;
 mod external_writer;
 mod failure_class;
 mod fallback;
