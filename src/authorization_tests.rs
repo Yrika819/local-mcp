@@ -942,3 +942,43 @@ fn at_gw_021d_a_stale_goal_snapshot_cannot_bypass_a_restored_ledger() {
         "a refused publication never charges"
     );
 }
+
+#[test]
+fn at_gw_013c_reanchoring_the_same_grant_preserves_spent_budget() {
+    let f = fixture("reanchor");
+    let grant = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        2,
+        4096,
+        600,
+    );
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1
+    );
+    // A second Writer WorkItem under the same grant re-anchors it; that must
+    // not hand the earlier operation's budget back.
+    crate::authorization_store::record_anchor_grant(&f.store, &f.session.id, &f.goal_id, &grant)
+        .unwrap();
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1
+    );
+}

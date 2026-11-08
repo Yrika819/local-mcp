@@ -302,8 +302,15 @@ pub(crate) fn record_anchor_grant(
     let grant_id = grant.grant_id().to_owned();
     let epoch = grant.authorization_epoch();
     update_anchor(store, session_id, goal_id, move |anchor| {
+        // Only a *new generation* starts a fresh budget. Re-anchoring the same
+        // grant (for example when a second Writer WorkItem is issued under it)
+        // must preserve the usage floor, or the budget could be spent twice.
+        let new_generation =
+            anchor.last_grant_id() != Some(grant_id.as_str()) || anchor.highest_epoch() < epoch;
+        if new_generation {
+            anchor.reset_usage_floor();
+        }
         anchor.record_grant(&grant_id, epoch);
-        anchor.reset_usage_floor();
     })
 }
 
