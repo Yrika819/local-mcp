@@ -32,6 +32,11 @@ use crate::external_writer::{self, WriterIssueOutcome};
 use crate::goal::Goal;
 use crate::goal_finalizer::{self, GoalFinalizationOutcome};
 use crate::goal_verifier;
+use crate::managed_worktree_create::HostWorktreeCreator;
+use crate::managed_worktree_observe::HostGit;
+use crate::managed_worktree_prepare::{
+    ManagedWorkspacePreparation, SessionManagedCreationApprover, prepare_managed_workspace,
+};
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner;
 use crate::readiness;
@@ -82,10 +87,7 @@ pub(crate) enum DriverRefusal {
     /// A host-owned step was attempted and refused by its own validator
     /// (Task Verifier, Goal Verifier, finalizer). Reported, never retried
     /// blindly and never reported as success.
-    HostStepRefused {
-        code: &'static str,
-        detail: &'static str,
-    },
+    HostStepRefused { code: &'static str, detail: String },
     /// The Scheduler selected no host action for this durable state.
     NoAction { code: &'static str },
     /// A PENDING Task is waiting on an active predecessor that cannot complete
@@ -182,6 +184,13 @@ pub(crate) async fn advance_external_step(
     session: &config::Session,
     goal: &Goal,
 ) -> Result<DriverReport, DriverError> {
+    // E5-D: an EXTERNAL managed Goal must reach ACTIVE through the same host
+    // preparation path the CODEX runner uses, before any Planner/Writer work can
+    // be issued. The execution-root gate then revalidates the exact worktree on
+    // every step that derives a root.
+    if goal.workspace_mode().is_managed() && goal.execution_root().is_none() {
+        return prepare_external_managed_workspace(store, session, goal).await;
+    }
     let state = external_state(goal).map_err(DriverError::Persistence)?;
     if let Some(active) = state.active_work() {
         match active.state() {
@@ -293,7 +302,7 @@ pub(crate) async fn advance_external_step(
                 Err(error) => Ok(DriverReport::reused(DriverOutcome::Refused(
                     DriverRefusal::HostStepRefused {
                         code: verifier_failure_code(&error),
-                        detail: "the host Task Verifier refused to verify this Task",
+                        detail: "the host Task Verifier refused to verify this Task".to_owned(),
                     },
                 ))),
             }
@@ -313,7 +322,7 @@ pub(crate) async fn advance_external_step(
                 Err(error) => Ok(DriverReport::reused(DriverOutcome::Refused(
                     DriverRefusal::HostStepRefused {
                         code: goal_verifier_failure_code(&error),
-                        detail: "the host Goal Verifier refused to evaluate this Goal",
+                        detail: "the host Goal Verifier refused to evaluate this Goal".to_owned(),
                     },
                 ))),
             }
@@ -330,7 +339,8 @@ pub(crate) async fn advance_external_step(
         SchedulerDecision::RunReviewer { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code: "REVIEWER_RECOVERY_DEFERRED",
-                detail: "the external reviewer leg is not resumable from this durable state",
+                detail: "the external reviewer leg is not resumable from this durable state"
+                    .to_owned(),
             },
         ))),
         SchedulerDecision::UnsupportedWorker { worker, .. } => Ok(DriverReport::reused(
@@ -383,7 +393,8 @@ async fn no_action_step(
                         Ok(DriverReport::reused(DriverOutcome::Refused(
                             DriverRefusal::HostStepRefused {
                                 code: "GOAL_FINALIZATION_BLOCKED",
-                                detail: "the host Goal Finalizer refused to complete this Goal",
+                                detail: "the host Goal Finalizer refused to complete this Goal"
+                                    .to_owned(),
                             },
                         )))
                     }
@@ -391,7 +402,7 @@ async fn no_action_step(
                 Err(_) => Ok(DriverReport::reused(DriverOutcome::Refused(
                     DriverRefusal::HostStepRefused {
                         code: "GOAL_FINALIZATION_FAILED",
-                        detail: "the host Goal Finalizer refused to complete this Goal",
+                        detail: "the host Goal Finalizer refused to complete this Goal".to_owned(),
                     },
                 ))),
             }
@@ -547,6 +558,54 @@ fn issue_planner_work_item(
     }
 }
 
+/// Run the existing managed-worktree preparation for an EXTERNAL Goal.
+///
+/// The creation intent, approval, reconciliation, lease, and Session path gate
+/// are exactly the CODEX path's: this function adds no second creation route and
+/// never accepts a model- or client-supplied root.
+async fn prepare_external_managed_workspace(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+) -> Result<DriverReport, DriverError> {
+    let approver = SessionManagedCreationApprover::new(session.id.clone());
+    let preparation = prepare_managed_workspace(
+        store,
+        session,
+        goal.id(),
+        &HostGit::new(),
+        &HostWorktreeCreator::new(),
+        &approver,
+    )
+    .await;
+    match preparation {
+        Ok(ManagedWorkspacePreparation::NotManaged) => {
+            Ok(DriverReport::advanced(DriverOutcome::Progress {
+                code: "MANAGED_WORKSPACE_NOT_APPLICABLE",
+                detail: "the Goal does not use a managed workspace",
+            }))
+        }
+        Ok(ManagedWorkspacePreparation::Active { .. }) => {
+            Ok(DriverReport::advanced(DriverOutcome::Progress {
+                code: "MANAGED_WORKSPACE_PREPARED",
+                detail: "the host prepared and activated the managed worktree for this Goal",
+            }))
+        }
+        Ok(ManagedWorkspacePreparation::Blocked(block)) => Ok(DriverReport::reused(
+            DriverOutcome::Refused(DriverRefusal::HostStepRefused {
+                code: "MANAGED_WORKSPACE_BLOCKED",
+                detail: format!("{}: {}", block.code, block.detail),
+            }),
+        )),
+        Err(error) => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code: "MANAGED_WORKSPACE_UNAVAILABLE",
+                detail: error.to_string(),
+            },
+        ))),
+    }
+}
+
 /// Publish the prepared Writer intent of a SUBMITTED WorkItem, then mark it
 /// COMMITTED (E5-A2).
 ///
@@ -564,7 +623,7 @@ async fn publish_submitted_writer_work(
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code: "WRITER_TASK_INVALID",
-                detail: "the accepted writer submission names no Task",
+                detail: "the accepted writer submission names no Task".to_owned(),
             },
         )));
     };
@@ -592,27 +651,25 @@ async fn publish_submitted_writer_work(
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code: "WRITER_INTENT_NOT_PREPARED",
-                detail: "the accepted writer submission has no prepared intent",
+                detail: "the accepted writer submission has no prepared intent".to_owned(),
             },
         )));
     };
-    let stage = match external_writer::verify_prepared_stage(
-        store,
-        session,
-        goal,
-        &task_id,
-        &operation_id,
-    ) {
-        Ok(stage) => stage,
-        Err(_) => {
-            return Ok(DriverReport::reused(DriverOutcome::Refused(
-                DriverRefusal::HostStepRefused {
-                    code: "WRITER_STAGE_UNUSABLE",
-                    detail: "the sealed writer stage cannot be verified against the durable intent",
-                },
-            )));
-        }
-    };
+    let stage =
+        match external_writer::verify_prepared_stage(store, session, goal, &task_id, &operation_id)
+        {
+            Ok(stage) => stage,
+            Err(_) => {
+                return Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::HostStepRefused {
+                        code: "WRITER_STAGE_UNUSABLE",
+                        detail:
+                            "the sealed writer stage cannot be verified against the durable intent"
+                                .to_owned(),
+                    },
+                )));
+            }
+        };
     let boundary = crate::writer::ExecutionWriteBoundary;
     match external_publish::publish_prepared_writer_intent(
         store,
@@ -644,7 +701,7 @@ async fn publish_submitted_writer_work(
         Ok(PublishOutcome::Refused { code }) => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code,
-                detail: "the host refused to publish the prepared writer intent",
+                detail: "the host refused to publish the prepared writer intent".to_owned(),
             },
         ))),
         Err(error) => Err(DriverError::Persistence(error)),
@@ -666,7 +723,8 @@ fn issue_replanner_work_item(
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code,
-                detail: "the Scheduler selected a replan the host no longer considers eligible",
+                detail: "the Scheduler selected a replan the host no longer considers eligible"
+                    .to_owned(),
             },
         )));
     }
@@ -703,7 +761,7 @@ fn issue_reviewer_work_item(
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code,
-                detail: "the writer Task cannot request a reviewer in its current state",
+                detail: "the writer Task cannot request a reviewer in its current state".to_owned(),
             },
         )));
     }
@@ -718,7 +776,7 @@ fn issue_reviewer_work_item(
         Ok(None) => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {
                 code: "REVIEWER_WORK_ITEM_UNAVAILABLE",
-                detail: "the host could not issue a bounded reviewer request right now",
+                detail: "the host could not issue a bounded reviewer request right now".to_owned(),
             },
         ))),
         Err(error) => Err(DriverError::Persistence(error)),
@@ -745,6 +803,12 @@ fn issue_writer_work_item(
         Ok(WriterIssueOutcome::Refused(block)) => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::Budget(block),
         ))),
+        Ok(WriterIssueOutcome::Unauthorized { code, detail }) => Ok(DriverReport::reused(
+            DriverOutcome::Refused(DriverRefusal::HostStepRefused {
+                code,
+                detail: detail.to_owned(),
+            }),
+        )),
         Err(error) => Err(DriverError::Persistence(error)),
     }
 }

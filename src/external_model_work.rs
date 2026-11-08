@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::agent::ModelRole;
+use crate::authorization::{AuthorizationAnchor, GrantBinding, RequestedWriteScopeV1};
 use crate::orchestrator_error::OrchestratorError;
 
 /// B-07: one Goal may have at most one active WorkItem.
@@ -77,7 +78,16 @@ pub(crate) const MAX_RECEIPT_DETAIL_BYTES: usize = 512;
 /// Bound for a stop/diagnostic code.
 pub(crate) const MAX_STOP_CODE_BYTES: usize = 128;
 
-pub(crate) const EXTERNAL_MODEL_SCHEMA_VERSION: u32 = 1;
+/// Current External sub-record schema.
+///
+/// Schema 2 adds the Owner write-scope proposal, the authorization anchor, and
+/// the per-WorkItem grant binding. Schema 1 remains readable (the new fields
+/// default to "no authorization"), which is what makes a pre-authorization
+/// EXTERNAL Goal fail closed instead of becoming unreadable.
+pub(crate) const EXTERNAL_MODEL_SCHEMA_VERSION: u32 = 2;
+
+/// The last External sub-record schema before Authorization B.
+pub(crate) const EXTERNAL_MODEL_SCHEMA_WITHOUT_AUTHORIZATION: u32 = 1;
 
 /// Output contract for the Planner role in V1.
 pub(crate) const OUTPUT_CONTRACT_PLANNER_V1: &str = "planner-proposal-v1";
@@ -323,6 +333,11 @@ pub(crate) struct ModelWorkItem {
     submitted_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_code: Option<String>,
+    /// The Owner authorization this WorkItem is bound to. Present for a Writer
+    /// issued after Authorization B; absent for every other role and for any
+    /// pre-authorization WorkItem (which therefore cannot publish).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization: Option<GrantBinding>,
 }
 
 impl ModelWorkItem {
@@ -366,6 +381,7 @@ impl ModelWorkItem {
             created_at: created_at.into(),
             submitted_at: None,
             terminal_code: None,
+            authorization: None,
         };
         item.validate()?;
         Ok(item)
@@ -409,6 +425,18 @@ impl ModelWorkItem {
             return Err(OrchestratorError::CorruptGoal(
                 "external work item terminal code is not bounded".to_owned(),
             ));
+        }
+        if let Some(binding) = self.authorization.as_ref() {
+            binding.validate().map_err(|_| {
+                OrchestratorError::CorruptGoal(
+                    "external work item authorization binding is malformed".to_owned(),
+                )
+            })?;
+            if self.role != WorkRole::Writer {
+                return Err(OrchestratorError::CorruptGoal(
+                    "only a Writer work item may carry an authorization binding".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -475,6 +503,29 @@ impl ModelWorkItem {
 
     pub(crate) fn terminal_code(&self) -> Option<&str> {
         self.terminal_code.as_deref()
+    }
+
+    pub(crate) fn authorization(&self) -> Option<&GrantBinding> {
+        self.authorization.as_ref()
+    }
+
+    /// Bind an already-issued WorkItem to an Owner grant.
+    pub(crate) fn with_authorization(
+        mut self,
+        binding: GrantBinding,
+    ) -> Result<Self, OrchestratorError> {
+        if self.authorization.is_some() {
+            return Err(OrchestratorError::CorruptGoal(
+                "external work item already carries an authorization binding".to_owned(),
+            ));
+        }
+        binding.validate().map_err(|_| {
+            OrchestratorError::CorruptGoal(
+                "external work item authorization binding is malformed".to_owned(),
+            )
+        })?;
+        self.authorization = Some(binding);
+        Ok(self)
     }
 
     pub(crate) fn summary(&self) -> ModelWorkItemSummary {
@@ -727,6 +778,13 @@ pub(crate) struct ExternalModelState {
     role_attempts: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_stop: Option<ExternalStop>,
+    /// The untrusted Owner scope proposal supplied at `goal_start`. Data only:
+    /// no grant exists until the Owner Control Surface issues one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_scope: Option<RequestedWriteScopeV1>,
+    /// Durable authorization epoch anchor. Updated only under Goal CAS.
+    #[serde(default)]
+    authorization_anchor: AuthorizationAnchor,
 }
 
 impl ExternalModelState {
@@ -739,6 +797,8 @@ impl ExternalModelState {
             issue_counter: 0,
             role_attempts: BTreeMap::new(),
             last_stop: None,
+            write_scope: None,
+            authorization_anchor: AuthorizationAnchor::default(),
         }
     }
 
@@ -768,6 +828,31 @@ impl ExternalModelState {
 
     pub(crate) fn last_stop(&self) -> Option<&ExternalStop> {
         self.last_stop.as_ref()
+    }
+
+    pub(crate) fn write_scope(&self) -> Option<&RequestedWriteScopeV1> {
+        self.write_scope.as_ref()
+    }
+
+    pub(crate) fn set_write_scope(&mut self, scope: RequestedWriteScopeV1) {
+        self.write_scope = Some(scope);
+        self.upgrade_schema();
+    }
+
+    pub(crate) fn authorization_anchor(&self) -> &AuthorizationAnchor {
+        &self.authorization_anchor
+    }
+
+    pub(crate) fn authorization_anchor_mut(&mut self) -> &mut AuthorizationAnchor {
+        &mut self.authorization_anchor
+    }
+
+    /// A durable record written by an older binary is upgraded on the next
+    /// mutation, never silently at read time.
+    fn upgrade_schema(&mut self) {
+        if self.schema_version < EXTERNAL_MODEL_SCHEMA_VERSION {
+            self.schema_version = EXTERNAL_MODEL_SCHEMA_VERSION;
+        }
     }
 
     /// Whether the active slot holds a pre-E4 accepted-but-unapplied WorkItem.
@@ -850,6 +935,7 @@ impl ExternalModelState {
         })?;
         self.issue_counter = expected_counter;
         self.pending_work = Some(item);
+        self.upgrade_schema();
         Ok(())
     }
 
@@ -943,6 +1029,7 @@ impl ExternalModelState {
             }
         }
         self.last_stop = None;
+        self.upgrade_schema();
         Ok(())
     }
 
@@ -997,11 +1084,23 @@ impl ExternalModelState {
         goal_id: &str,
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
-        if self.schema_version != EXTERNAL_MODEL_SCHEMA_VERSION {
+        if self.schema_version != EXTERNAL_MODEL_SCHEMA_VERSION
+            && self.schema_version != EXTERNAL_MODEL_SCHEMA_WITHOUT_AUTHORIZATION
+        {
             return Err(OrchestratorError::UnsupportedSchema(u64::from(
                 self.schema_version,
             )));
         }
+        if let Some(scope) = self.write_scope.as_ref() {
+            scope.validate().map_err(|_| {
+                OrchestratorError::CorruptGoal(
+                    "external write-scope proposal is malformed".to_owned(),
+                )
+            })?;
+        }
+        self.authorization_anchor.validate().map_err(|_| {
+            OrchestratorError::CorruptGoal("external authorization anchor is malformed".to_owned())
+        })?;
         if self.issue_counter > MAX_MODEL_WORK_ITEMS_PER_GOAL {
             return Err(OrchestratorError::CorruptGoal(
                 "external work item counter exceeds the lifetime budget".to_owned(),

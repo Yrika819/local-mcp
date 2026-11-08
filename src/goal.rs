@@ -1635,6 +1635,24 @@ impl Goal {
         self.external_model.as_deref_mut()
     }
 
+    /// Attach the untrusted Owner write-scope proposal to a new EXTERNAL Goal.
+    ///
+    /// This creates no authority: it records what the Owner will be asked to
+    /// approve. Only the Owner Control Surface can turn it into a grant.
+    pub(crate) fn set_external_write_scope(
+        &mut self,
+        scope: crate::authorization::RequestedWriteScopeV1,
+    ) -> Result<(), OrchestratorError> {
+        let state = self.external_model_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "write_scope requires an EXTERNAL model backend".to_owned(),
+            )
+        })?;
+        state.set_write_scope(scope);
+        self.validate_external_authorization_state()?;
+        Ok(())
+    }
+
     pub(crate) fn id(&self) -> &GoalId {
         &self.id
     }
@@ -4195,6 +4213,22 @@ impl Goal {
         }
     }
 
+    /// Validate the additive Authorization B fields on the EXTERNAL sub-record.
+    fn validate_external_authorization_state(&self) -> Result<(), OrchestratorError> {
+        let Some(state) = self.external_model.as_deref() else {
+            return Ok(());
+        };
+        if state.write_scope().is_some() && !self.model_backend.is_external() {
+            return Err(OrchestratorError::CorruptGoal(
+                "a write-scope proposal requires the EXTERNAL model backend".to_owned(),
+            ));
+        }
+        state.authorization_anchor().validate().map_err(|_| {
+            OrchestratorError::CorruptGoal("external authorization anchor is malformed".to_owned())
+        })?;
+        Ok(())
+    }
+
     /// Validate the additive External Agent Backend fields.
     ///
     /// The pairing is the invariant: `EXTERNAL` requires durable external state
@@ -4251,6 +4285,7 @@ impl Goal {
         }
         self.validate_managed_workspace_state()?;
         self.validate_model_backend_state()?;
+        self.validate_external_authorization_state()?;
         let mut criterion_ids = BTreeSet::new();
         for criterion in &self.completion_criteria {
             criterion.id.validate()?;

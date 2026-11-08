@@ -1462,3 +1462,253 @@ fn at_e5_027e_a_non_mutating_writer_status_is_recorded_without_a_stage() {
     // The prepared-intent helper never treats a repudiated attempt as publishable.
     assert!(external_writer::pending_prepared_intent(&goal, task.id()).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Authorization B (AT-GW) — the grant gate around the existing Writer path.
+// ---------------------------------------------------------------------------
+
+fn scoped_fixture(
+    label: &str,
+    paths: &[&str],
+    max_operations: u32,
+    max_bytes: u64,
+) -> (Fixture, GoalId) {
+    let root = std::env::temp_dir().join(format!("local-mcp-gw-{label}-{}", Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    let state = root.join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(workspace.join("code.txt"), b"fn main() {}\n").unwrap();
+    std::fs::write(workspace.join("other.txt"), b"untouched\n").unwrap();
+    let session = config::Session {
+        id: format!("gw-{label}-{}", Uuid::new_v4()),
+        cwd: workspace.clone(),
+        permitted_directories: vec![workspace],
+    };
+    let store = TaskStore::with_state_root(state);
+    let view = goal_api::goal_start(
+        &json!({
+            "session_id": session.id,
+            "objective": "Authorization B writer gate",
+            "model_backend": "EXTERNAL",
+            "write_scope": {
+                "allowed_paths": paths,
+                "allowed_operations": ["WRITE_UTF8"],
+                "max_operations": max_operations,
+                "max_bytes": max_bytes,
+                "expires_in_seconds": 600
+            }
+        }),
+        &session,
+        &store,
+    )
+    .unwrap();
+    let view = serde_json::to_value(view).unwrap();
+    let goal_id = GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap();
+    (
+        Fixture {
+            root,
+            session,
+            store,
+        },
+        goal_id,
+    )
+}
+
+fn install_grant(f: &Fixture, goal_id: &GoalId, paths: &[&str], ops: u32, bytes: u64) {
+    let goal = f.store.load_goal(&f.session.id, goal_id).unwrap();
+    crate::authorization_store::test_support::install_grant(
+        &f.store, &goal, paths, ops, bytes, 600,
+    );
+}
+
+fn writer_answer_multi(work: &Value, operations: &[(&str, &str, Value)]) -> Value {
+    let request = &work["request"];
+    json!({
+        "goal_id": request["goal_id"],
+        "task_id": request["task_id"],
+        "attempt_id": request["attempt_id"],
+        "goal_revision": request["goal_revision"],
+        "plan_revision": request["plan_revision"],
+        "status": "candidate_complete",
+        "summary": "update the target files",
+        "evidence": [{"kind": "writer-evidence", "value": "files changed"}],
+        "proposed_operations": operations
+            .iter()
+            .map(|(path, content, preimage)| json!({
+                "kind": "WRITE_UTF8",
+                "path": path,
+                "expected_preimage": preimage,
+                "content": content
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn code_preimage(f: &Fixture) -> Value {
+    let content = std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap();
+    json!({"kind": "SHA256", "sha256": sha256_hex(&content)})
+}
+
+fn other_preimage(f: &Fixture) -> Value {
+    let content = std::fs::read_to_string(f.session.cwd.join("other.txt")).unwrap();
+    json!({"kind": "SHA256", "sha256": sha256_hex(&content)})
+}
+
+#[test]
+fn at_gw_001_no_grant_blocks_writer_issuance_without_writing() {
+    let (f, goal_id) = scoped_fixture("nogrant", &["code.txt"], 4, 4096);
+    let before = workspace_digest(&f.session.cwd);
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "BLOCKED", "{next}");
+    assert_eq!(
+        next["blockers"][0]["code"], "WRITE_AUTHORIZATION_UNAVAILABLE",
+        "{next}"
+    );
+    assert!(
+        next["model_work"].is_null(),
+        "no work may be issued: {next}"
+    );
+    assert_eq!(workspace_digest(&f.session.cwd), before);
+
+    // Granting the exact scope unblocks the real Writer path.
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    let goal = goal_of(&f, &goal_id);
+    let binding = crate::external_model_store::external_state(&goal)
+        .unwrap()
+        .active_work()
+        .and_then(|item| item.authorization())
+        .expect("writer WorkItem carries the grant binding");
+    assert_eq!(binding.authorization_epoch(), 1);
+    assert_eq!(work["role"], "WRITER");
+}
+
+#[test]
+fn at_gw_015_a_revoked_grant_blocks_the_writer_path_end_to_end() {
+    let (f, goal_id) = scoped_fixture("revoked", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let before = workspace_digest(&f.session.cwd);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    let submitted = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &work,
+            writer_answer(
+                &work,
+                "code.txt",
+                "fn main() { changed(); }\n",
+                code_preimage(&f),
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        submitted["outcome"], "ACCEPTED_FOR_HOST_PROCESSING",
+        "{submitted}"
+    );
+
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "BLOCKED", "{next}");
+    let code = next["blockers"][0]["code"].as_str().unwrap_or_default();
+    assert!(
+        code.starts_with("WRITE_AUTHORIZATION_"),
+        "revocation must surface as authorization loss, got {next}"
+    );
+    assert_eq!(
+        workspace_digest(&f.session.cwd),
+        before,
+        "a revoked grant never publishes"
+    );
+}
+
+#[test]
+fn at_gw_009_an_out_of_scope_operation_is_refused_before_staging() {
+    let (f, goal_id) = scoped_fixture("scope", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let before = workspace_digest(&f.session.cwd);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["other.txt"],
+            Value::Null,
+        ),
+    );
+    let submitted = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &work,
+            writer_answer(&work, "other.txt", "rewritten\n", other_preimage(&f)),
+        ),
+    )
+    .unwrap();
+    assert_eq!(submitted["outcome"], "REJECTED_AUTHORITY", "{submitted}");
+    assert_eq!(
+        submitted["code"], "WRITE_AUTHORIZATION_SCOPE_MISMATCH",
+        "{submitted}"
+    );
+    assert_eq!(workspace_digest(&f.session.cwd), before);
+}
+
+#[test]
+fn at_gw_013_the_grant_operation_budget_bounds_a_multi_file_proposal() {
+    let (f, goal_id) = scoped_fixture("budget", &["code.txt", "other.txt"], 1, 4096);
+    install_grant(&f, &goal_id, &["code.txt", "other.txt"], 1, 4096);
+    let before = workspace_digest(&f.session.cwd);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt", "other.txt"],
+            Value::Null,
+        ),
+    );
+    let submitted = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &work,
+            writer_answer_multi(
+                &work,
+                &[
+                    ("code.txt", "fn main() { changed(); }\n", code_preimage(&f)),
+                    ("other.txt", "rewritten\n", other_preimage(&f)),
+                ],
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(submitted["outcome"], "REJECTED_AUTHORITY", "{submitted}");
+
+    assert_eq!(submitted["code"], "WRITE_BUDGET_EXHAUSTED", "{submitted}");
+    assert_eq!(workspace_digest(&f.session.cwd), before);
+}

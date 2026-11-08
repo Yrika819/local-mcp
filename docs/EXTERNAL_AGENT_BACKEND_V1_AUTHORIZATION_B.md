@@ -172,7 +172,7 @@ Decision:
 
 * `authorization/<session>/<goal>.json` is the **authoritative grant ledger**
   written only by the OCS (plus the publisher's locked usage update).
-* `ExternalModelState` (schema 2) stores
+* `ExternalModelState` (EXTERNAL sub-schema 2; the containing Goal schema stays 6) stores
   `authorization_anchor: { highest_epoch, revoked_at_epoch, last_grant_id }`,
   updated only through Goal CAS. This is the rollback anchor and the point that
   makes a revoked grant unusable even if the ledger is restored.
@@ -384,7 +384,7 @@ older than the Goal's own memory of it.
 | Owner request | `authorizations::request_owner_grant` | session pipe only; bounded response wait; no Goal lock held |
 | OCS approval | `approvals::handle_input` + ledger | goal ownership, EXTERNAL backend, goal identity digest, workspace identity, path authority, nonce |
 | Writer WorkItem issuance (W0) | `external_writer::issue_external_writer_work_item` | ACTIVE + epoch + anchor + expiry + workspace + path scope + remaining budget; binds `grant_id`/`epoch` into the WorkItem and the anchor in the same commit |
-| Stage commit (W1) | `external_writer::commit_external_writer_preparation` | re-validate the binding, every operation path under `allowed_paths`, operations ⊆ allowed set, projected budget ≤ grant budget; record the binding in `MutationIntent` and `StageManifest` |
+| Stage commit (W1) | `external_writer::commit_external_writer_preparation` | re-validate the binding, every operation path under `allowed_paths`, operations ⊆ allowed set, projected budget ≤ grant budget; record the binding in the durable `MutationIntent` |
 | Publication (W2) | `external_publish::publish_prepared_writer_intent` | **per operation**: ledger lock → ACTIVE + epoch + anchor + expiry + workspace + path + op + budget → idempotent charge → `BeginOperation` → write via `ExecutionWriteBoundary`/`workspace_publish` → postimage → `CompleteOperation` |
 | Revocation | OCS `/grant revoke` | ledger lock → `REVOKE_REQUESTED` → finalize `REVOKED` → anchor CAS; blocks the next operation |
 | Recovery | existing Writer reconciliation + driver | a revoked/invalidated grant blocks publication; journal state is preserved; no auto re-grant |
@@ -428,8 +428,16 @@ cache across a process, lock release, or await.
 }
 ```
 
-`goal_next`, `goal_status`, `goal_result` gain the same `authorization` view
-(additive field). Progress/stop codes:
+`goal_status` and `goal_result` gain the same `authorization` view (additive).
+`goal_next` reports authorization state through its existing blocker/progress
+codes so every branch keeps one typed shape:
+
+```text
+outcome: BLOCKED  blockers[0].code: WRITE_AUTHORIZATION_<...>
+outcome: HOST_PROGRESS (grant active, work continues)
+```
+
+Progress/stop codes:
 
 ```text
 WRITE_AUTHORIZATION_REQUIRED     no grant; Writer cannot be issued
@@ -449,9 +457,10 @@ Console commands (Owner, `local-mcp start`):
 /permission ...                       (unchanged)
 /grant list                           pending + active + history (bounded)
 /grant status
-/grant approve <request-id> <nonce>
-/grant deny <request-id> [reason]
-/grant revoke [<grant-id>]
+/grant approve <goal-id> <request-id> <nonce>
+/grant deny <goal-id> <request-id>
+/grant renew <goal-id>          (Owner-initiated re-issue after expiry/revocation)
+/grant revoke <goal-id>
 ```
 
 MCP callers cannot invoke any of these; the pipe has no decision message type,
@@ -516,7 +525,46 @@ integration phase and recorded separately from these unit/integration tests.
 
 ---
 
-## 11. Open Owner decisions
+## 11. Implementation status (updated at the Authorization implementation PR)
+
+| Area | Status |
+|---|---|
+| `GoalWriteGrantV1`, ledger, anchor, usage accounting | implemented (`src/authorization.rs`, `src/authorization_store.rs`) |
+| OCS console commands + live nonce | implemented (`src/approvals.rs`) |
+| `goal_start` `write_scope` proposal (EXTERNAL only) | implemented; durable in the EXTERNAL sub-record |
+| `goal_next` Owner request / typed refusal | implemented |
+| Writer issuance, stage, per-operation publication gate | implemented |
+| Revocation fence + epoch + rollback anchor | implemented |
+| Managed-worktree preparation for EXTERNAL | implemented through the existing `prepare_managed_workspace` |
+| Unit/integration acceptance (AT-GW-001..025 partial) | 20 tests green on Windows; full suite 1596 green |
+| Crash-injection matrix (AT-GW-017/018, publication crash) | **not yet implemented** (A3) |
+| AT-E5-029 / 030 / 043 re-evaluation | 029 and 030 covered by the no-grant/revocation tests and by the absence of a Goal lock during the Owner wait; 043 remains covered by existing reconciliation (no change to UNKNOWN semantics) |
+| Independent security review | **pending** |
+
+Known implementation notes:
+
+* The grant binding is recorded in the `ModelWorkItem` and in the durable
+  `MutationIntent` of the prepared write. The stage is content-scoped by that
+  same intent; publish re-reads the binding and the ledger under the fence.
+* A test-only Approval Harness (`authorization_store::test_support`) mirrors the
+  OCS two-write sequence so pre-Authorization-B Writer regression fixtures keep
+  their coverage. It exists only under `cfg(test)` and cannot appear in a
+  production binary.
+* EXTERNAL sub-schema 1 is migrated to 2 in the store decode path with an empty
+  scope and a zero anchor. No grant is invented.
+
+## 12. Campaign checkpoint
+
+| Phase | Base | Head | Draft PR | State |
+|---|---|---|---|---|
+| A0 design | PR #47 `08f3edf` | `3320dcd` | #48 | docs reviewed against code |
+| A1+A2 implementation | `3320dcd` | (this commit) | stacked on #48 | local tests + full suite green; CI pending |
+| A3 reliability | this PR | — | not yet opened | pending |
+| D0–D1 managed routing | this PR | — | not yet opened | preparation step implemented; E2E pending |
+| D2–D4 integration | — | — | not yet opened | pending |
+| Independent security review | — | — | — | pending |
+
+## 13. Open Owner decisions
 
 1. **R-1 acceptance.** Is the deployment assumption "the agent cannot use the
    OCS console or the state directory outside GoalLatch" acceptable for V1 Beta,

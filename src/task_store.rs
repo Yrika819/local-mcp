@@ -467,11 +467,67 @@ impl TaskStore {
                  verification evidence"
             )));
         }
+        // Authorization B added fields to the EXTERNAL sub-record only. The
+        // Goal schema is unchanged, so the nested record is normalized here:
+        // a schema-1 EXTERNAL record becomes schema 2 with an empty scope and a
+        // zero anchor, which means "no grant" and therefore fails closed for
+        // Writer issuance. Nothing invents authority during migration.
+        let mut value = value;
+        Self::normalize_external_model_schema(&mut value)?;
         let goal: Goal = serde_json::from_value(value).map_err(|error| {
             OrchestratorError::CorruptGoal(format!("durable Goal shape is invalid: {error}"))
         })?;
         goal.validate()?;
         Ok(goal)
+    }
+
+    /// Normalize the EXTERNAL sub-record schema in place.
+    fn normalize_external_model_schema(value: &mut Value) -> Result<(), OrchestratorError> {
+        let Some(object) = value.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(external) = object.get_mut("external_model") else {
+            return Ok(());
+        };
+        if external.is_null() {
+            return Ok(());
+        }
+        let Some(record) = external.as_object_mut() else {
+            return Err(OrchestratorError::CorruptGoal(
+                "durable external model state is not an object".to_owned(),
+            ));
+        };
+        let version = record
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "durable external model state has no schema_version".to_owned(),
+                )
+            })?;
+        match version {
+            v if v
+                == u64::from(
+                    crate::external_model_work::EXTERNAL_MODEL_SCHEMA_WITHOUT_AUTHORIZATION,
+                ) =>
+            {
+                record.insert(
+                    "schema_version".to_owned(),
+                    Value::from(crate::external_model_work::EXTERNAL_MODEL_SCHEMA_VERSION),
+                );
+                record
+                    .entry("write_scope".to_owned())
+                    .or_insert(Value::Null);
+                record
+                    .entry("authorization_anchor".to_owned())
+                    .or_insert_with(|| serde_json::json!({}));
+                Ok(())
+            }
+            v if v == u64::from(crate::external_model_work::EXTERNAL_MODEL_SCHEMA_VERSION) => {
+                Ok(())
+            }
+            other => Err(OrchestratorError::UnsupportedSchema(other)),
+        }
     }
 
     /// Migrate a schema-4 durable Goal to schema 5 by deciding its durable

@@ -65,7 +65,7 @@ pub(crate) struct GitCommandOutput {
 }
 
 /// An injectable seam for read-only Git observation.
-pub(crate) trait ReadOnlyGit {
+pub(crate) trait ReadOnlyGit: Send + Sync {
     fn run(&self, args: &[&str], cwd: &Path) -> Result<GitCommandOutput, DiscoveryError>;
 
     fn ref_exists(&self, ref_name: &str, cwd: &Path) -> Result<bool, DiscoveryError>;

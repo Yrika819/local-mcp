@@ -6,6 +6,8 @@
 mod agent;
 mod approvals;
 mod atomic_publish_frame;
+mod authorization;
+mod authorization_store;
 #[cfg(target_os = "linux")]
 mod bubblewrap_support;
 mod config;
@@ -76,6 +78,8 @@ mod writer_stage;
 mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
+#[cfg(test)]
+mod authorization_tests;
 #[cfg(test)]
 mod external_dag_tests;
 #[cfg(test)]

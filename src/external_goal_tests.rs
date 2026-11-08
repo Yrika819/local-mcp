@@ -157,7 +157,7 @@ fn goal_start_opts_into_external_and_records_durable_state() {
     assert_eq!(state.receipts().len(), 0);
     let document = serde_json::to_value(&goal).unwrap();
     assert_eq!(document["model_backend"], "EXTERNAL");
-    assert_eq!(document["external_model"]["schema_version"], 1);
+    assert_eq!(document["external_model"]["schema_version"], 2);
 }
 
 #[test]
