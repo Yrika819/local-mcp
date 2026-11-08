@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::authorization::{AuthorizationView, RequestedWriteScopeV1};
+use crate::authorization_store;
 use crate::config;
 use crate::failure_class::{FailureClass, LEGACY_READONLY_RESPONSE_LIMIT_REPORT};
 use crate::fallback::{SideEffectClass, SideEffectState};
@@ -252,6 +254,10 @@ struct GoalStartRequest {
     /// This is host policy, decided once at creation and immutable afterwards.
     #[serde(default)]
     model_backend: Option<String>,
+    /// Untrusted Owner write-scope proposal for an EXTERNAL Goal. Data only:
+    /// the Owner Control Surface must still issue a grant before any write.
+    #[serde(default)]
+    write_scope: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +338,9 @@ pub(crate) struct GoalStartView {
     idempotent_replay: bool,
     /// Additive host-owned backend policy. Existing fields are unchanged.
     model_backend: ModelBackend,
+    /// Additive Authorization B projection. `NOT_REQUESTED` for every Goal that
+    /// supplied no `write_scope` (which includes every CODEX Goal).
+    authorization: AuthorizationView,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -419,6 +428,9 @@ pub(crate) struct GoalStatusView {
     external_budget: Option<ExternalBudgetView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_external_stop: Option<ExternalStopView>,
+    /// Additive Authorization B projection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization: Option<AuthorizationView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -535,6 +547,21 @@ pub(crate) fn goal_start_with_managed_root(
     validate_session_binding(&request.session_id, session)?;
     validate_start_request(&request)?;
     let backend = requested_backend(&request)?;
+    // The write scope is a proposal to the Owner, never an authorization. It is
+    // accepted only for an EXTERNAL Goal; CODEX behavior is unchanged.
+    let write_scope = match (backend.is_external(), request.write_scope.as_ref()) {
+        (true, Some(value)) => Some(
+            RequestedWriteScopeV1::from_mcp_value(value)
+                .map_err(|error| GoalApiError::invalid(error.code()))?,
+        ),
+        (true, None) => None,
+        (false, Some(_)) => {
+            return Err(GoalApiError::invalid(
+                "write_scope is only accepted for the EXTERNAL model backend",
+            ));
+        }
+        (false, None) => None,
+    };
 
     let deterministic_id = request
         .idempotency_key
@@ -545,7 +572,11 @@ pub(crate) fn goal_start_with_managed_root(
         match store.load_goal(&session.id, goal_id) {
             Ok(existing) => {
                 if same_start_payload(&existing, &request) {
-                    return Ok(start_view(&existing, true));
+                    return Ok(start_view(
+                        &existing,
+                        true,
+                        authorization_store::authorization_view(store, &existing),
+                    ));
                 }
                 return Err(GoalApiError::idempotency_conflict(&existing));
             }
@@ -605,7 +636,11 @@ pub(crate) fn goal_start_with_managed_root(
         .map_err(GoalApiError::from_orchestrator)?
     };
     // The backend policy is applied once, here, before the first durable write.
-    let goal = goal.with_creation_backend(backend);
+    let mut goal = goal.with_creation_backend(backend);
+    if let Some(scope) = write_scope {
+        goal.set_external_write_scope(scope)
+            .map_err(GoalApiError::from_orchestrator)?;
+    }
 
     if let Err(error) = store.create_goal(&goal) {
         if matches!(error, OrchestratorError::ActiveGoalAlreadyExists)
@@ -613,7 +648,11 @@ pub(crate) fn goal_start_with_managed_root(
         {
             match store.load_goal(&session.id, goal_id) {
                 Ok(existing) if same_start_payload(&existing, &request) => {
-                    return Ok(start_view(&existing, true));
+                    return Ok(start_view(
+                        &existing,
+                        true,
+                        authorization_store::authorization_view(store, &existing),
+                    ));
                 }
                 Ok(existing) => return Err(GoalApiError::idempotency_conflict(&existing)),
                 Err(OrchestratorError::GoalNotFound) => {}
@@ -638,7 +677,8 @@ pub(crate) fn goal_start_with_managed_root(
     let durable = store
         .load_goal(&session.id, goal.id())
         .map_err(GoalApiError::from_orchestrator)?;
-    Ok(start_view(&durable, false))
+    let authorization = authorization_store::authorization_view(store, &durable);
+    Ok(start_view(&durable, false, authorization))
 }
 
 pub(crate) fn goal_status(
@@ -649,7 +689,9 @@ pub(crate) fn goal_status(
     let request: GoalLookupRequest = parse_request(args)?;
     validate_session_binding(&request.session_id, session)?;
     let goal = resolve_goal(store, &session.id, request.goal_id.as_deref())?;
-    Ok(status_view(&goal))
+    let mut view = status_view(&goal);
+    view.authorization = Some(authorization_store::authorization_view(store, &goal));
+    Ok(view)
 }
 
 pub(crate) fn goal_pause(
@@ -1602,7 +1644,11 @@ fn cancel_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     Ok(())
 }
 
-fn start_view(goal: &Goal, idempotent_replay: bool) -> GoalStartView {
+fn start_view(
+    goal: &Goal,
+    idempotent_replay: bool,
+    authorization: AuthorizationView,
+) -> GoalStartView {
     GoalStartView {
         goal_id: goal.id().as_str().to_owned(),
         session_id: goal.session_id().to_owned(),
@@ -1612,6 +1658,7 @@ fn start_view(goal: &Goal, idempotent_replay: bool) -> GoalStartView {
         created_at: goal.created_at().to_owned(),
         idempotent_replay,
         model_backend: goal.model_backend(),
+        authorization,
     }
 }
 
@@ -1661,6 +1708,7 @@ fn status_view(goal: &Goal) -> GoalStatusView {
         pending_work_id: pending_work_id_for(goal),
         external_budget: budget_view_for(goal),
         last_external_stop: last_stop_view_for(goal),
+        authorization: None,
     }
 }
 
@@ -1999,6 +2047,16 @@ fn same_start_payload(goal: &Goal, request: &GoalStartRequest) -> bool {
         && requested_backend(request)
             .map(|backend| goal.model_backend() == backend)
             .unwrap_or(false)
+        // The write-scope proposal is part of the request identity: a replay
+        // must not silently hand back a Goal proposing a different scope.
+        && goal
+            .external_model()
+            .and_then(|state| state.write_scope())
+            .cloned()
+            == request
+                .write_scope
+                .as_ref()
+                .and_then(|value| RequestedWriteScopeV1::from_mcp_value(value).ok())
 }
 
 /// Resolve the caller's requested backend spelling.

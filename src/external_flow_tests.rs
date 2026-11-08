@@ -924,7 +924,6 @@ fn the_external_submission_path_never_reaches_the_write_or_approval_boundary() {
             "workspace_publish::publish",
             "PublishRequest",
             "WriteBoundary",
-            "approvals::",
             "without_sandbox",
             "std::fs::write",
         ] {
@@ -933,6 +932,18 @@ fn the_external_submission_path_never_reaches_the_write_or_approval_boundary() {
                 "{path} must not reach {needle} from the submission path"
             );
         }
+    }
+
+    // Authorization B adds exactly one Owner-facing call to `goal_next`: a grant
+    // *request* over the session pipe. It is not an approval and cannot authorize
+    // a write, so it must not be the per-operation approval primitive.
+    let api = std::fs::read_to_string("src/external_goal_api.rs").unwrap();
+    assert!(api.contains("approvals::request_grant_from_owner"));
+    for forbidden in ["approvals::request(", "approvals::activity("] {
+        assert!(
+            !api.contains(forbidden),
+            "goal_next must not reach the host approval primitive via {forbidden}"
+        );
     }
 
     // The publication step may use the host writer boundary, but still never the

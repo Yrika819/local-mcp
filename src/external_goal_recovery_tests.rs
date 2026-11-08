@@ -537,7 +537,6 @@ fn the_external_submission_path_has_no_writer_or_approval_reachability() {
             "workspace_publish::publish",
             "PublishRequest",
             "WriteBoundary",
-            "approvals::",
             "without_sandbox",
             "std::fs::write",
         ] {
@@ -546,6 +545,17 @@ fn the_external_submission_path_has_no_writer_or_approval_reachability() {
                 "{path} must not reach the host mutation/approval boundary via {needle}"
             );
         }
+    }
+
+    // Authorization B: `goal_next` may *request* an Owner grant, never a
+    // per-operation host approval and never a write.
+    let api = std::fs::read_to_string("src/external_goal_api.rs").unwrap();
+    assert!(api.contains("approvals::request_grant_from_owner"));
+    for forbidden in ["approvals::request(", "approvals::activity("] {
+        assert!(
+            !api.contains(forbidden),
+            "goal_next must not reach the host approval primitive via {forbidden}"
+        );
     }
     let publish = std::fs::read_to_string("src/external_publish.rs").unwrap();
     for needle in ["approvals::", "without_sandbox", "std::fs::write"] {

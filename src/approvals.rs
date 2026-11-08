@@ -16,9 +16,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
+use crate::authorization::PendingGrantRequestV1;
+use crate::authorization_store;
 use crate::config::{self, Session};
+use crate::goal::GoalId;
 #[cfg(unix)]
 use crate::secure_fs;
+use crate::task_store::TaskStore;
 
 trait SessionIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> SessionIo for T {}
@@ -177,6 +181,13 @@ enum Message {
         title: String,
         detail: Option<String>,
     },
+    /// A request for the Owner to issue a GoalWriteGrant. This is a *request*
+    /// only: the Owner Control Surface decides, and no field in this message can
+    /// create, widen, or revive a grant.
+    GrantRequest {
+        session_id: String,
+        goal_id: String,
+    },
 }
 
 /// One approval waiting for the operator's answer, with its enqueue time.
@@ -191,6 +202,20 @@ struct PendingApproval {
     stream: SessionStream,
     enqueued: std::time::Instant,
 }
+
+/// One Owner grant request shown on the console.
+///
+/// The live nonce exists only here (process memory) and on the console until the
+/// Owner answers; the durable ledger holds only its digest. A restarted OCS
+/// therefore cannot approve its own earlier request.
+struct PendingGrant {
+    request: PendingGrantRequestV1,
+    stream: SessionStream,
+    enqueued: std::time::Instant,
+}
+
+/// Bounded number of grant requests one session will display at once.
+const MAX_PENDING_GRANTS: usize = 4;
 
 /// Read one session message with an explicit deadline.
 ///
@@ -486,6 +511,81 @@ pub async fn request(
     }
 }
 
+/// Result of asking the Owner Control Surface for a write grant.
+///
+/// Reached from `external_goal_api::goal_next` and from AT-GW-025. The lint is
+/// scoped because the test target's dead-code roots do not traverse the MCP
+/// dispatch chain.
+#[allow(dead_code, reason = "reached from goal_next and AT-GW-025")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerGrantOutcome {
+    Approved,
+    Denied,
+    /// The Owner has not answered yet. The durable request stays pending.
+    Pending,
+    /// The OCS refused the request itself (unknown Goal, wrong session, ...).
+    Invalid,
+    /// No OCS is listening. This is a fail-closed condition for writes.
+    Unavailable,
+}
+
+/// Ask the OCS to begin a grant request for one EXTERNAL Goal.
+///
+/// This is a *request*, never a decision: the message contains only the session
+/// and Goal identity, and every scope value the Owner sees is re-derived from the
+/// durable Goal by the OCS. The live nonce never travels back over this channel.
+#[allow(dead_code, reason = "reached from goal_next and AT-GW-025")]
+pub(crate) async fn request_grant_from_owner(
+    session_id: &str,
+    goal_id: &str,
+    wait: Duration,
+) -> OwnerGrantOutcome {
+    let Ok(path) = config::socket_path(session_id) else {
+        return OwnerGrantOutcome::Unavailable;
+    };
+    let io_timeout = crate::resource_limits::APPROVAL_IO_TIMEOUT;
+    let mut stream = match tokio::time::timeout(io_timeout, connect(&path)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return OwnerGrantOutcome::Unavailable,
+    };
+    let payload = serde_json::to_vec(&Message::GrantRequest {
+        session_id: session_id.to_owned(),
+        goal_id: goal_id.to_owned(),
+    });
+    let Ok(payload) = payload else {
+        return OwnerGrantOutcome::Unavailable;
+    };
+    if tokio::time::timeout(io_timeout, stream.write_all(&payload))
+        .await
+        .is_err()
+        || tokio::time::timeout(
+            io_timeout,
+            stream.write_all(
+                b"
+",
+            ),
+        )
+        .await
+        .is_err()
+        || tokio::time::timeout(io_timeout, stream.shutdown())
+            .await
+            .is_err()
+    {
+        return OwnerGrantOutcome::Unavailable;
+    }
+    let mut response = String::new();
+    match tokio::time::timeout(wait, BufReader::new(stream).read_line(&mut response)).await {
+        Ok(Ok(_)) => match response.trim() {
+            "approved" => OwnerGrantOutcome::Approved,
+            "denied" => OwnerGrantOutcome::Denied,
+            "invalid" => OwnerGrantOutcome::Invalid,
+            "pending" | "busy" => OwnerGrantOutcome::Pending,
+            _ => OwnerGrantOutcome::Invalid,
+        },
+        _ => OwnerGrantOutcome::Pending,
+    }
+}
+
 #[cfg(all(test, windows))]
 async fn accept_test_approval_connection(
     listener: &mut SessionListener,
@@ -685,12 +785,23 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
         session.cwd.display()
     );
 
+    // The OCS needs the durable Goal store to validate a grant request against
+    // the Goal it names. It never holds the Goal lock while the Owner decides.
+    let store = TaskStore::new()?;
+    let mut pending_grants: Vec<PendingGrant> = Vec::new();
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<PendingApproval>::new();
     let mut yolo = false;
     loop {
         tokio::select! {
-            served = handle_approval_connection(&mut listener, &mut pending, yolo) => {
+            served = handle_approval_connection(
+                &mut listener,
+                &mut pending,
+                yolo,
+                &session,
+                &store,
+                &mut pending_grants,
+            ) => {
                 // Accept failures (`served` Err) still end the session: without
                 // a listener there is nobody to approve anything, and silently
                 // looping would wedge every future approval. Per-connection
@@ -702,7 +813,16 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
                 // No eviction here: handle_input snapshots the shown head
                 // first, so an expiry between display and answer discards the
                 // input instead of deciding a request the operator never saw.
-                handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
+                handle_input_at(
+                    line.trim(),
+                    &mut session,
+                    &mut yolo,
+                    &mut pending,
+                    Some(&store),
+                    Some(&mut pending_grants),
+                    std::time::Instant::now(),
+                )
+                .await?;
             }
         }
     }
@@ -719,6 +839,9 @@ async fn handle_approval_connection(
     listener: &mut SessionListener,
     pending: &mut VecDeque<PendingApproval>,
     yolo: bool,
+    session: &Session,
+    store: &TaskStore,
+    pending_grants: &mut Vec<PendingGrant>,
 ) -> Result<()> {
     let mut stream = listener.accept().await?;
     match read_session_message(&mut stream).await {
@@ -736,6 +859,26 @@ async fn handle_approval_connection(
         }
         Ok(Message::Approval { request }) => {
             enqueue_approval(pending, request, stream).await;
+        }
+        Ok(Message::GrantRequest {
+            session_id,
+            goal_id,
+        }) => {
+            // Note: `yolo` is intentionally not consulted. Session yolo may
+            // auto-answer per-operation host approvals; it can never issue a
+            // Goal-scoped write grant.
+            if let Err(detail) = accept_grant_request(
+                session,
+                store,
+                pending_grants,
+                &session_id,
+                &goal_id,
+                stream,
+            )
+            .await
+            {
+                eprintln!("Grant request refused: {detail}");
+            }
         }
     }
     Ok(())
@@ -755,6 +898,343 @@ fn show_activity(title: &str, detail: Option<&str>) {
             eprintln!("  {line}");
         }
     }
+}
+
+/// Handle one inbound grant request from the MCP server.
+///
+/// Everything the Owner sees is re-derived from the durable Goal: the request
+/// cannot supply a scope, a workspace, a budget, or an identity. The nonce is
+/// generated here, printed only here, and persisted only as a digest.
+async fn accept_grant_request(
+    session: &Session,
+    store: &TaskStore,
+    pending_grants: &mut Vec<PendingGrant>,
+    session_id: &str,
+    goal_id: &str,
+    mut stream: SessionStream,
+) -> Result<(), String> {
+    if session_id != session.id {
+        answer(&mut stream, b"invalid\n").await;
+        return Err("grant request named another session".to_owned());
+    }
+    if pending_grants.len() >= MAX_PENDING_GRANTS {
+        answer(&mut stream, b"busy\n").await;
+        return Err("too many pending grant requests".to_owned());
+    }
+    let parsed_goal = GoalId::parse(goal_id).map_err(|_| "unsafe goal id".to_owned())?;
+    let goal = store
+        .load_goal(&session.id, &parsed_goal)
+        .map_err(|_| "goal not found for this session".to_owned())?;
+    if !goal.model_backend().is_external() {
+        answer(&mut stream, b"invalid\n").await;
+        return Err("grant request named a CODEX goal".to_owned());
+    }
+    if authorization_store::scope_of(&goal).is_none() {
+        answer(&mut stream, b"invalid\n").await;
+        return Err("goal has no write-scope proposal".to_owned());
+    }
+    // An already-active, usable grant makes a repeated request a no-op.
+    if authorization_store::usable_grant(store, &goal).is_ok() {
+        answer(&mut stream, b"approved\n").await;
+        return Ok(());
+    }
+    if pending_grants
+        .iter()
+        .any(|entry| entry.request.goal_id() == goal_id)
+    {
+        answer(&mut stream, b"pending\n").await;
+        return Ok(());
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let nonce = grant_nonce();
+    let request = authorization_store::begin_request_for_goal(
+        store,
+        &goal,
+        request_id,
+        crate::authorization::nonce_sha256(&nonce),
+    )
+    .map_err(|error| error.code().to_owned())?;
+    show_grant_request(&request, &nonce);
+    pending_grants.push(PendingGrant {
+        request,
+        stream,
+        enqueued: std::time::Instant::now(),
+    });
+    Ok(())
+}
+
+/// A short, human-entered Owner nonce. Not a long-term secret: it exists to make
+/// the decision channel live and non-durable, not to resist an attacker who can
+/// already read the console (residual risk R-1).
+fn grant_nonce() -> String {
+    let raw = Uuid::new_v4().simple().to_string();
+    raw[..12].to_owned()
+}
+
+fn show_grant_request(request: &PendingGrantRequestV1, nonce: &str) {
+    eprintln!(
+        "\n[grant] request {}\n  goal: {}  session: {}\n  workspace: {:?} {}\n  paths: {}\n  operations: WRITE_UTF8\n  budget: {} operations / {} bytes\n  expires: {}",
+        request.request_id(),
+        request.goal_id(),
+        request.session_id(),
+        request.workspace().mode(),
+        request.workspace().root().display(),
+        request
+            .path_rules()
+            .iter()
+            .map(|rule| match rule.kind() {
+                crate::authorization::GrantPathKind::Tree if rule.path().is_empty() =>
+                    "**".to_owned(),
+                crate::authorization::GrantPathKind::Tree => format!("{}/**", rule.path()),
+                crate::authorization::GrantPathKind::File => rule.path().to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        request.budget().max_operations(),
+        request.budget().max_bytes(),
+        request.expires_at()
+    );
+    eprintln!(
+        "  Owner nonce: {nonce}\n  Approve: /grant approve {} {} {nonce}\n  Deny:    /grant deny {} {}",
+        request.goal_id(),
+        request.request_id(),
+        request.goal_id(),
+        request.request_id()
+    );
+}
+
+/// Handle every `/grant ...` console command. Returns `false` when the input is
+/// not a grant command, so the caller can fall through to the existing parser.
+async fn handle_grant_command(
+    command: &str,
+    session: &Session,
+    store: &TaskStore,
+    pending_grants: &mut Vec<PendingGrant>,
+) -> Result<bool> {
+    let Some(rest) = command.strip_prefix("/grant") else {
+        return Ok(false);
+    };
+    let mut parts = rest.split_whitespace();
+    let action = parts.next().unwrap_or("help");
+    match action {
+        "" | "help" => {
+            eprintln!(
+                "/grant list\n/grant status <goal>\n/grant approve <goal> <request> <nonce>\n/grant deny <goal> <request>\n/grant renew <goal>\n/grant revoke <goal>"
+            );
+        }
+        "list" => {
+            evict_stale_grant_requests(pending_grants);
+            if pending_grants.is_empty() {
+                eprintln!("No pending grant requests.");
+            }
+            for entry in pending_grants.iter() {
+                eprintln!(
+                    "PENDING goal {} request {} expires {}",
+                    entry.request.goal_id(),
+                    entry.request.request_id(),
+                    entry.request.expires_at()
+                );
+            }
+        }
+        "status" => {
+            let Some(goal_id) = parts.next() else {
+                eprintln!("usage: /grant status <goal>");
+                return Ok(true);
+            };
+            match grant_goal(store, session, goal_id) {
+                Ok(goal) => {
+                    eprintln!(
+                        "Authorization: {}",
+                        authorization_store::authorization_view(store, &goal).state
+                    );
+                    match authorization_store::load_ledger(store, &session.id, goal.id().as_str()) {
+                        Ok(Some(ledger)) => {
+                            eprintln!("{}", authorization_store::describe_ledger(&ledger))
+                        }
+                        Ok(None) => eprintln!("No authorization ledger for this Goal."),
+                        Err(error) => eprintln!("Authorization state unreadable: {}", error.code()),
+                    }
+                    match authorization_store::anchor_of(&goal) {
+                        Ok(anchor) => eprintln!(
+                            "Anchor: highest epoch {} revoked at {:?} last grant {:?}",
+                            anchor.highest_epoch(),
+                            anchor.revoked_at_epoch(),
+                            anchor.last_grant_id()
+                        ),
+                        Err(error) => eprintln!("Anchor unreadable: {}", error.code()),
+                    }
+                }
+                Err(detail) => eprintln!("{detail}"),
+            }
+        }
+        "approve" => {
+            let Some(goal_id) = parts.next() else {
+                eprintln!("usage: /grant approve <goal> <request> <nonce>");
+                return Ok(true);
+            };
+            let Some(request_id) = parts.next() else {
+                eprintln!("usage: /grant approve <goal> <request> <nonce>");
+                return Ok(true);
+            };
+            let Some(nonce) = parts.next() else {
+                eprintln!("usage: /grant approve <goal> <request> <nonce>");
+                return Ok(true);
+            };
+            // The in-memory copy is a usability aid, never the authority: the
+            // durable ledger verifies the nonce digest independently.
+            let in_memory = pending_grants
+                .iter()
+                .position(|entry| entry.request.request_id() == request_id);
+            if in_memory.is_none() {
+                eprintln!(
+                    "Note: this request is not in the live queue; the durable nonce digest will decide."
+                );
+            }
+            let decision_id = Uuid::new_v4().to_string();
+            match authorization_store::approve_pending(
+                store,
+                &session.id,
+                goal_id,
+                request_id,
+                nonce,
+                decision_id,
+            ) {
+                Ok(grant) => {
+                    if let Some(index) = in_memory {
+                        let mut entry = pending_grants.remove(index);
+                        answer(&mut entry.stream, b"approved\n").await;
+                    }
+                    eprintln!(
+                        "GRANT ACTIVE {} epoch {} expires {}",
+                        grant.grant_id(),
+                        grant.authorization_epoch(),
+                        grant.expires_at()
+                    );
+                }
+                Err(error) => {
+                    if let Some(index) = in_memory {
+                        let mut entry = pending_grants.remove(index);
+                        answer(&mut entry.stream, b"invalid\n").await;
+                    }
+                    eprintln!(
+                        "Grant approval refused: {} ({})",
+                        error.detail(),
+                        error.code()
+                    );
+                }
+            }
+        }
+        "deny" => {
+            let Some(goal_id) = parts.next() else {
+                eprintln!("usage: /grant deny <goal> <request>");
+                return Ok(true);
+            };
+            let Some(request_id) = parts.next() else {
+                eprintln!("usage: /grant deny <goal> <request>");
+                return Ok(true);
+            };
+            let in_memory = pending_grants
+                .iter()
+                .position(|entry| entry.request.request_id() == request_id);
+            let decision_id = Uuid::new_v4().to_string();
+            match authorization_store::deny_pending(
+                store,
+                &session.id,
+                goal_id,
+                request_id,
+                decision_id,
+                None,
+            ) {
+                Ok(()) => {
+                    if let Some(index) = in_memory {
+                        let mut entry = pending_grants.remove(index);
+                        answer(&mut entry.stream, b"denied\n").await;
+                    }
+                    eprintln!("Grant request denied.");
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Grant denial refused: {} ({})",
+                        error.detail(),
+                        error.code()
+                    )
+                }
+            }
+        }
+        "renew" => {
+            let Some(goal_id) = parts.next() else {
+                eprintln!("usage: /grant renew <goal>");
+                return Ok(true);
+            };
+            match grant_goal(store, session, goal_id) {
+                Ok(goal) => {
+                    if authorization_store::scope_of(&goal).is_none() {
+                        eprintln!("This Goal has no write-scope proposal to renew.");
+                        return Ok(true);
+                    }
+                    let request_id = Uuid::new_v4().to_string();
+                    let nonce = grant_nonce();
+                    match authorization_store::begin_request_for_goal(
+                        store,
+                        &goal,
+                        request_id,
+                        crate::authorization::nonce_sha256(&nonce),
+                    ) {
+                        Ok(request) => show_grant_request(&request, &nonce),
+                        Err(error) => eprintln!(
+                            "Grant renewal refused: {} ({})",
+                            error.detail(),
+                            error.code()
+                        ),
+                    }
+                }
+                Err(detail) => eprintln!("{detail}"),
+            }
+        }
+        "revoke" => {
+            let Some(goal_id) = parts.next() else {
+                eprintln!("usage: /grant revoke <goal>");
+                return Ok(true);
+            };
+            match authorization_store::revoke_active(store, &session.id, goal_id, None) {
+                Ok((grant_id, epoch)) => {
+                    eprintln!("GRANT REVOKED {grant_id} (epoch {epoch})");
+                    // Answer any live request for the same Goal truthfully.
+                    if let Some(index) = pending_grants
+                        .iter()
+                        .position(|entry| entry.request.goal_id() == goal_id)
+                    {
+                        let mut entry = pending_grants.remove(index);
+                        answer(&mut entry.stream, b"denied\n").await;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Revocation refused: {} ({})", error.detail(), error.code())
+                }
+            }
+        }
+        _ => eprintln!("Unknown grant command: /grant {action}"),
+    }
+    Ok(true)
+}
+
+fn evict_stale_grant_requests(pending_grants: &mut Vec<PendingGrant>) {
+    let now = std::time::Instant::now();
+    pending_grants.retain(|entry| {
+        now.saturating_duration_since(entry.enqueued)
+            <= Duration::from_secs(crate::authorization::PENDING_GRANT_TTL_SECONDS)
+    });
+}
+
+fn grant_goal(
+    store: &TaskStore,
+    session: &Session,
+    goal_id: &str,
+) -> Result<crate::goal::Goal, String> {
+    let parsed = GoalId::parse(goal_id).map_err(|_| "unsafe goal id".to_owned())?;
+    store
+        .load_goal(&session.id, &parsed)
+        .map_err(|_| "goal not found for this session".to_owned())
 }
 
 #[cfg(unix)]
@@ -783,13 +1263,23 @@ async fn remove_stale_socket(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_input(
     input: &str,
     session: &mut Session,
     yolo: &mut bool,
     pending: &mut VecDeque<PendingApproval>,
 ) -> Result<()> {
-    handle_input_at(input, session, yolo, pending, std::time::Instant::now()).await
+    handle_input_at(
+        input,
+        session,
+        yolo,
+        pending,
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .await
 }
 
 /// Handle one console input line with an injected clock.
@@ -801,12 +1291,25 @@ async fn handle_input_at(
     session: &mut Session,
     yolo: &mut bool,
     pending: &mut VecDeque<PendingApproval>,
+    store: Option<&TaskStore>,
+    pending_grants: Option<&mut Vec<PendingGrant>>,
     now: std::time::Instant,
 ) -> Result<()> {
     // Snapshot what the operator currently sees BEFORE expiry can move it.
     // Decision inputs below are checked against this snapshot: answering
     // anything else would grant or deny a request the operator never saw.
     let shown = pending.front().map(|entry| entry.request.id);
+    // Grant commands are parsed before the approval-answer arms so a pending
+    // host approval cannot swallow `/grant ...` as an unrecognized answer.
+    if input == "/grant" || input.starts_with("/grant ") {
+        match (store, pending_grants) {
+            (Some(store), Some(pending_grants)) => {
+                handle_grant_command(input, session, store, pending_grants).await?;
+            }
+            _ => eprintln!("grant commands are available only in the owner session"),
+        }
+        return Ok(());
+    }
     match input {
         "/permissions yolo" | "/permission yolo" => {
             *yolo = true;
@@ -946,6 +1449,12 @@ mod approval_stability_tests {
             cwd: std::env::temp_dir(),
             permitted_directories: vec![std::env::temp_dir()],
         }
+    }
+
+    fn test_store() -> TaskStore {
+        let root = std::env::temp_dir().join(format!("local-mcp-auth-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        TaskStore::with_state_root(root)
     }
 
     fn approval_request(operation: &str) -> Request {
@@ -1093,7 +1602,7 @@ mod approval_stability_tests {
         // between display and answer, so the answer must be discarded.
         let mut session = test_session();
         let mut yolo = false;
-        handle_input_at("y", &mut session, &mut yolo, &mut pending, now).await?;
+        handle_input_at("y", &mut session, &mut yolo, &mut pending, None, None, now).await?;
         assert!(
             read_client_line(&mut live_client).await.is_none(),
             "an answer meant for the expired display must never decide the next request"
@@ -1104,7 +1613,7 @@ mod approval_stability_tests {
             "the live request must still await confirmation"
         );
         // A fresh confirmation now decides B.
-        handle_input_at("y", &mut session, &mut yolo, &mut pending, now).await?;
+        handle_input_at("y", &mut session, &mut yolo, &mut pending, None, None, now).await?;
         assert_eq!(
             read_client_line(&mut live_client).await.as_deref(),
             Some("allow\n"),
@@ -1135,13 +1644,13 @@ mod approval_stability_tests {
         ]);
         let mut session = test_session();
         let mut yolo = false;
-        handle_input_at("n", &mut session, &mut yolo, &mut pending, now).await?;
+        handle_input_at("n", &mut session, &mut yolo, &mut pending, None, None, now).await?;
         assert!(
             read_client_line(&mut live_client).await.is_none(),
             "a deny meant for the expired display must not decide the next request"
         );
         assert_eq!(pending.len(), 1);
-        handle_input_at("n", &mut session, &mut yolo, &mut pending, now).await?;
+        handle_input_at("n", &mut session, &mut yolo, &mut pending, None, None, now).await?;
         assert_eq!(
             read_client_line(&mut live_client).await.as_deref(),
             Some("deny\n"),
@@ -1468,8 +1977,27 @@ mod approval_stability_tests {
                 Ok::<_, anyhow::Error>(stream)
             });
             let mut pending = VecDeque::new();
-            handle_approval_connection(&mut listener, &mut pending, false).await?;
-            handle_approval_connection(&mut listener, &mut pending, false).await?;
+            let session = test_session();
+            let store = test_store();
+            let mut pending_grants = Vec::new();
+            handle_approval_connection(
+                &mut listener,
+                &mut pending,
+                false,
+                &session,
+                &store,
+                &mut pending_grants,
+            )
+            .await?;
+            handle_approval_connection(
+                &mut listener,
+                &mut pending,
+                false,
+                &session,
+                &store,
+                &mut pending_grants,
+            )
+            .await?;
             assert_eq!(pending.len(), 1, "only the legitimate approval queues");
             assert_eq!(
                 pending.front().expect("queued").request.operation,
@@ -1526,8 +2054,19 @@ mod approval_stability_tests {
                 }));
             }
             let mut pending = VecDeque::new();
+            let session = test_session();
+            let store = test_store();
+            let mut pending_grants = Vec::new();
             for _ in 0..total {
-                handle_approval_connection(&mut listener, &mut pending, false).await?;
+                handle_approval_connection(
+                    &mut listener,
+                    &mut pending,
+                    false,
+                    &session,
+                    &store,
+                    &mut pending_grants,
+                )
+                .await?;
             }
             assert_eq!(
                 pending.len(),

@@ -355,7 +355,7 @@ impl ManagedCreationApproval {
 pub(crate) type ManagedApprovalFuture<'a> =
     Pin<Box<dyn Future<Output = Result<bool, ManagedWorkspaceError>> + Send + 'a>>;
 
-pub(crate) trait ManagedCreationApprover {
+pub(crate) trait ManagedCreationApprover: Send + Sync {
     /// Approve exactly this operation, or refuse it.
     ///
     /// Returning `Err` is a failure to obtain approval and is treated exactly

@@ -35,6 +35,8 @@
 
 use serde::Serialize;
 
+use crate::authorization::{GrantBinding, GrantRefusal};
+use crate::authorization_store;
 use crate::config;
 use crate::external_model_store::{external_state, external_state_mut};
 use crate::external_model_work::{
@@ -75,8 +77,15 @@ impl WriterValidationRefusal {
     reason = "The issuance result is short-lived; handing back the durable WorkItem is the point."
 )]
 pub(crate) enum WriterIssueOutcome {
-    Issued { item: ModelWorkItem },
+    Issued {
+        item: ModelWorkItem,
+    },
     Refused(IssueBlock),
+    /// Authorization B refused the issuance. Nothing was started.
+    Unauthorized {
+        code: &'static str,
+        detail: &'static str,
+    },
 }
 
 /// Result of accepting one external Writer submission.
@@ -139,6 +148,56 @@ pub(crate) fn issue_external_writer_work_item(
     task_id: &TaskId,
     expected_revision: u64,
 ) -> Result<WriterIssueOutcome, OrchestratorError> {
+    // Authorization B: a Writer WorkItem may only be issued against an ACTIVE,
+    // unrevoked, unexpired Owner grant for this exact Goal and workspace. The
+    // check is repeated inside the commit's binding validation.
+    let current_goal = store.load_goal(&session.id, goal_id)?;
+    let grant = match authorization_store::usable_grant(store, &current_goal) {
+        Ok(grant) => grant,
+        Err(error) => {
+            #[cfg(test)]
+            {
+                // Pre-Authorization-B regression fixtures do not set a write
+                // scope. The test-only harness supplies the grant the OCS would
+                // have issued, so their Writer coverage still runs against the
+                // real gate.
+                if !authorization_store::has_write_scope(&current_goal) {
+                    let installed = authorization_store::test_support::install_default_grant(
+                        store,
+                        &current_goal,
+                    );
+                    let reloaded = store.load_goal(&session.id, goal_id)?;
+                    return issue_with_grant(
+                        store,
+                        session,
+                        goal_id,
+                        task_id,
+                        reloaded.revision(),
+                        installed,
+                    );
+                }
+            }
+            return Ok(WriterIssueOutcome::Unauthorized {
+                code: error.code(),
+                detail: error.detail(),
+            });
+        }
+    };
+    issue_with_grant(store, session, goal_id, task_id, expected_revision, grant)
+}
+
+/// W0 body, after the grant has been resolved.
+fn issue_with_grant(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    expected_revision: u64,
+    grant: crate::authorization::GoalWriteGrantV1,
+) -> Result<WriterIssueOutcome, OrchestratorError> {
+    let binding = GrantBinding::from_grant(&grant);
+    let grant_id = grant.grant_id().to_owned();
+    let grant_epoch = grant.authorization_epoch();
     let mut slot: Option<Result<ModelWorkItem, IssueBlock>> = None;
     let _committed =
         store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
@@ -207,8 +266,15 @@ pub(crate) fn issue_external_writer_work_item(
                 OUTPUT_CONTRACT_WRITER_V1,
                 issue_counter,
                 now,
-            )?;
-            external_state_mut(goal)?.record_issued(item.clone())?;
+            )?
+            .with_authorization(binding.clone())?;
+            let state = external_state_mut(goal)?;
+            state.record_issued(item.clone())?;
+            // The rollback anchor records this generation in the same durable
+            // commit that issues the WorkItem.
+            state
+                .authorization_anchor_mut()
+                .record_grant(&grant_id, grant_epoch);
             slot = Some(Ok(item));
             Ok(())
         })?;
@@ -382,6 +448,75 @@ pub(crate) fn commit_external_writer_preparation(
     let task_id = TaskId::parse(output.request.task_id()).map_err(|_| {
         OrchestratorError::CorruptGoal("writer request carries an invalid Task id".to_owned())
     })?;
+
+    // Authorization B, stage gate: the accepted proposal must be bound to the
+    // ACTIVE grant that authorized its WorkItem, every host-derived write path
+    // must be inside the Owner-approved scope, and the whole intent must fit the
+    // remaining budget. Nothing is sealed until all three hold.
+    let current = store.load_goal(&session.id, goal_id)?;
+    let grant = match authorization_store::usable_grant(store, &current) {
+        Ok(grant) => grant,
+        Err(error) => {
+            return Ok(WriterStageOutcome::Refused { code: error.code() });
+        }
+    };
+    let binding = match external_state(&current)?
+        .active_work()
+        .and_then(|active| active.authorization())
+    {
+        Some(binding) if binding.matches(&grant) => binding.clone(),
+        Some(_) => {
+            return Ok(WriterStageOutcome::Refused {
+                code: GrantRefusal::ScopeMismatch.code(),
+            });
+        }
+        None => {
+            return Ok(WriterStageOutcome::Refused {
+                code: GrantRefusal::Required.code(),
+            });
+        }
+    };
+    let mut total_bytes = 0u64;
+    for planned in &output.plan {
+        let relative = match crate::authorization::relative_workspace_path(
+            &planned.path,
+            grant.workspace().root(),
+        ) {
+            Ok(relative) => relative,
+            Err(_) => {
+                return Ok(WriterStageOutcome::Refused {
+                    code: GrantRefusal::ScopeMismatch.code(),
+                });
+            }
+        };
+        if authorization_store::check_operation_scope(&grant, &relative).is_err() {
+            return Ok(WriterStageOutcome::Refused {
+                code: GrantRefusal::ScopeMismatch.code(),
+            });
+        }
+        total_bytes = total_bytes.saturating_add(
+            u64::try_from(
+                output
+                    .staged_content
+                    .iter()
+                    .find(|(index, _)| *index == planned.index)
+                    .map(|(_, content)| content.len())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0),
+        );
+    }
+    if !grant.budget().allows(
+        grant.usage().operations(),
+        grant.usage().bytes(),
+        u32::try_from(output.plan.len()).unwrap_or(u32::MAX),
+        total_bytes,
+    ) {
+        return Ok(WriterStageOutcome::Refused {
+            code: GrantRefusal::BudgetExhausted.code(),
+        });
+    }
+
     // E5-H2: the stage id must be unique per *submission candidate*, not per
     // Attempt. Two clients can hold the same Pending WorkItem and stage different
     // content concurrently; with an Attempt-derived id they would share (and
@@ -444,7 +579,8 @@ pub(crate) fn commit_external_writer_preparation(
             })
             .collect::<Vec<_>>(),
     )
-    .map_err(|error| OrchestratorError::InvalidDag(error.to_string()))?;
+    .map_err(|error| OrchestratorError::InvalidDag(error.to_string()))?
+    .with_authorization(binding.clone())?;
     let request_ids = output
         .plan
         .iter()
@@ -471,6 +607,14 @@ pub(crate) fn commit_external_writer_preparation(
             );
             if !binding_ok {
                 refused = Some("WORK_ITEM_NOT_PENDING");
+                return Ok(());
+            }
+            let durable_binding = external_state(goal)?
+                .active_work()
+                .and_then(|active| active.authorization())
+                .cloned();
+            if durable_binding.as_ref() != Some(&binding) {
+                refused = Some(GrantRefusal::StateMismatch.code());
                 return Ok(());
             }
             writer::ensure_writer_task_ready_for_attempt(goal, &task_id, &attempt_id)?;

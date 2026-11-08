@@ -18,9 +18,14 @@
 //! failed". The only transport errors here are malformed arguments, a Goal on
 //! the wrong backend, and durable-state failures.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::approvals::{self, OwnerGrantOutcome};
+use crate::authorization::GrantRefusal;
+use crate::authorization_store::{self, AuthorizationGateError};
 use crate::config;
 use crate::external_goal_driver as driver;
 use crate::external_goal_driver::{DriverError, DriverOutcome, DriverRefusal, DriverReport};
@@ -370,6 +375,88 @@ pub(crate) async fn goal_next(
         _ => {}
     }
 
+    // Authorization B: an EXTERNAL Goal that proposed a write scope cannot reach
+    // the Writer path until an Owner grant exists. The first call asks the Owner
+    // Control Surface; every later call reports the durable state without
+    // prompting again. A denied, expired or revoked grant is never re-requested
+    // automatically — that is an Owner action (`/grant renew`).
+    if authorization_store::has_write_scope(&goal) {
+        match authorization_store::usable_grant(store, &goal) {
+            Ok(_) => {}
+            Err(AuthorizationGateError::Refusal(GrantRefusal::Required)) => {
+                match approvals::request_grant_from_owner(
+                    &session.id,
+                    goal.id().as_str(),
+                    Duration::from_secs(90),
+                )
+                .await
+                {
+                    OwnerGrantOutcome::Approved => {}
+                    OwnerGrantOutcome::Denied => {
+                        return Ok(blocked_view(
+                            &goal,
+                            max_host_steps,
+                            GrantRefusal::Denied.code(),
+                            GrantRefusal::Denied.detail(),
+                        ));
+                    }
+                    OwnerGrantOutcome::Pending => {
+                        return Ok(blocked_view(
+                            &goal,
+                            max_host_steps,
+                            GrantRefusal::Pending.code(),
+                            GrantRefusal::Pending.detail(),
+                        ));
+                    }
+                    OwnerGrantOutcome::Invalid => {
+                        return Ok(blocked_view(
+                            &goal,
+                            max_host_steps,
+                            GrantRefusal::Required.code(),
+                            "the Owner Control Surface refused the grant request",
+                        ));
+                    }
+                    OwnerGrantOutcome::Unavailable => {
+                        return Ok(blocked_view(
+                            &goal,
+                            max_host_steps,
+                            GrantRefusal::Unavailable.code(),
+                            GrantRefusal::Unavailable.detail(),
+                        ));
+                    }
+                }
+            }
+            Err(AuthorizationGateError::Refusal(GrantRefusal::Pending)) => {
+                return Ok(blocked_view(
+                    &goal,
+                    max_host_steps,
+                    GrantRefusal::Pending.code(),
+                    GrantRefusal::Pending.detail(),
+                ));
+            }
+            Err(AuthorizationGateError::Refusal(GrantRefusal::Denied)) => {
+                return Ok(blocked_view(
+                    &goal,
+                    max_host_steps,
+                    GrantRefusal::Denied.code(),
+                    GrantRefusal::Denied.detail(),
+                ));
+            }
+            Err(AuthorizationGateError::Refusal(GrantRefusal::Unavailable)) => {
+                return Ok(blocked_view(
+                    &goal,
+                    max_host_steps,
+                    GrantRefusal::Unavailable.code(),
+                    GrantRefusal::Unavailable.detail(),
+                ));
+            }
+            // Expired / revoked / mismatch states are reported by the driver's
+            // own host step so a Goal that also needs managed preparation gets
+            // the right typed stop first.
+            Err(_) => {}
+        }
+    }
+
     let mut current = goal;
     let mut steps = 0u32;
     let report = loop {
@@ -499,7 +586,7 @@ fn driver_view(
             let mut builder = base_next_view(goal, "BLOCKED", steps, max_host_steps);
             builder.blockers = Some(vec![ExternalBlockerView {
                 code: code.to_owned(),
-                detail: detail.to_owned(),
+                detail,
                 mandatory: true,
             }]);
             builder.build()
@@ -1211,14 +1298,28 @@ fn submit_writer_response(
                         next_action_for_outcome("REJECTED_SCHEMA"),
                     ))
                 }
-                WriterStageOutcome::Refused { code } => Ok(rejected_view(
-                    goal,
-                    request,
-                    "REJECTED_STALE_REVISION",
-                    code,
-                    payload_sha256,
-                    "CALL_GOAL_NEXT",
-                )),
+                WriterStageOutcome::Refused { code } => {
+                    // Authorization refusals leave the WorkItem PENDING so the
+                    // Owner can repair the grant; they are not revision races.
+                    let authorization = code.starts_with("WRITE_AUTHORIZATION_")
+                        || code == "WRITE_BUDGET_EXHAUSTED";
+                    Ok(rejected_view(
+                        goal,
+                        request,
+                        if authorization {
+                            "REJECTED_AUTHORITY"
+                        } else {
+                            "REJECTED_STALE_REVISION"
+                        },
+                        code,
+                        payload_sha256,
+                        if authorization {
+                            "STOP_AND_RECONCILE"
+                        } else {
+                            "CALL_GOAL_NEXT"
+                        },
+                    ))
+                }
                 WriterStageOutcome::Prepared { .. } => Err(GoalApiError::external(
                     "INVALID_ARGUMENT",
                     "a refused writer proposal cannot be prepared",
@@ -1255,14 +1356,26 @@ fn submit_writer_response(
             payload_sha256,
             next_action_for_outcome("COMMITTED"),
         )),
-        WriterStageOutcome::Refused { code } => Ok(rejected_view(
-            goal,
-            request,
-            "REJECTED_STALE_REVISION",
-            code,
-            payload_sha256,
-            "CALL_GOAL_NEXT",
-        )),
+        WriterStageOutcome::Refused { code } => {
+            let authorization =
+                code.starts_with("WRITE_AUTHORIZATION_") || code == "WRITE_BUDGET_EXHAUSTED";
+            Ok(rejected_view(
+                goal,
+                request,
+                if authorization {
+                    "REJECTED_AUTHORITY"
+                } else {
+                    "REJECTED_STALE_REVISION"
+                },
+                code,
+                payload_sha256,
+                if authorization {
+                    "STOP_AND_RECONCILE"
+                } else {
+                    "CALL_GOAL_NEXT"
+                },
+            ))
+        }
     }
 }
 

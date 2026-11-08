@@ -23,6 +23,8 @@
 //! journal record proves: multi-file publication stays per-operation journaled
 //! and is never described as one atomic filesystem transaction.
 
+use crate::authorization::GrantRefusal;
+use crate::authorization_store;
 use crate::config;
 use crate::external_model_store::{external_state, external_state_mut};
 use crate::external_model_work::{
@@ -224,6 +226,14 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         contents.push(content);
     }
 
+    let binding = match intent.authorization() {
+        Some(binding) => binding.clone(),
+        None => {
+            return Ok(PublishOutcome::Refused {
+                code: GrantRefusal::Required.code(),
+            });
+        }
+    };
     let operation_id = intent.operation_id().to_owned();
     let scope_identity = intent.scope_identity().to_owned();
     let request_ids = intent
@@ -259,16 +269,73 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         let index_u32 = u32::try_from(index).map_err(|_| {
             OrchestratorError::InvalidDag("writer operation index overflow".to_owned())
         })?;
-        revision = store
-            .mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
-                writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
-                goal.task_advance_latest_mutation_intent(
-                    task_id,
-                    &operation_id,
-                    MutationIntentUpdate::BeginOperation { index: index_u32 },
-                )
-            })?
-            .revision();
+        // Authorization B linearization point.
+        //
+        // The grant state, epoch, anchor, workspace, path, operation and budget
+        // are verified under the per-Goal ledger lock, the operation id is
+        // charged idempotently, and `BeginOperation` is committed *before* the
+        // fence is released. A revocation that finalizes after this point cannot
+        // interleave with the begun operation; one that finalized before it is
+        // visible here and refuses.
+        let fresh_goal = store.load_goal(&session.id, goal_id)?;
+        let operation_key = format!("{operation_id}#{index_u32}");
+        let bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        let mut begin_error: Option<OrchestratorError> = None;
+        let mut began_revision: Option<u64> = None;
+        let gate = authorization_store::authorize_operation(
+            store,
+            &fresh_goal,
+            &binding,
+            &operation_key,
+            bytes,
+            |grant| {
+                let relative = crate::authorization::relative_workspace_path(
+                    &paths[index],
+                    grant.workspace().root(),
+                )?;
+                authorization_store::check_operation_scope(grant, &relative)
+            },
+            |_grant| match store.mutate_goal_snapshot(
+                &session.id,
+                goal_id,
+                revision,
+                |goal, _now| {
+                    writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
+                    goal.task_advance_latest_mutation_intent(
+                        task_id,
+                        &operation_id,
+                        MutationIntentUpdate::BeginOperation { index: index_u32 },
+                    )
+                },
+            ) {
+                Ok(committed) => {
+                    began_revision = Some(committed.revision());
+                    Ok(())
+                }
+                Err(error) => {
+                    begin_error = Some(error);
+                    Err(GrantRefusal::StateMismatch)
+                }
+            },
+        );
+        match gate {
+            Ok(()) => {}
+            Err(authorization_store::AuthorizationGateError::Refusal(refusal)) => {
+                if let Some(error) = begin_error {
+                    return Err(error);
+                }
+                return Ok(PublishOutcome::Refused {
+                    code: refusal.code(),
+                });
+            }
+            Err(error) => {
+                if let Some(error) = begin_error {
+                    return Err(error);
+                }
+                return Ok(PublishOutcome::Refused { code: error.code() });
+            }
+        }
+        revision = began_revision.unwrap_or(revision);
         let output = match boundary
             .write(writer::WriterWriteRequest {
                 path: &paths[index],
