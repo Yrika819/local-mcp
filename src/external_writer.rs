@@ -382,7 +382,17 @@ pub(crate) fn commit_external_writer_preparation(
     let task_id = TaskId::parse(output.request.task_id()).map_err(|_| {
         OrchestratorError::CorruptGoal("writer request carries an invalid Task id".to_owned())
     })?;
-    let operation_id = format!("e5-writer:{}", output.request.attempt_id());
+    // E5-H2: the stage id must be unique per *submission candidate*, not per
+    // Attempt. Two clients can hold the same Pending WorkItem and stage different
+    // content concurrently; with an Attempt-derived id they would share (and
+    // overwrite) one directory, and the loser's cleanup would delete the winner's
+    // linked stage. A fresh nonce per candidate makes every stage immutable and
+    // unambiguously owned.
+    let operation_id = format!(
+        "e5-writer:{}:{}",
+        output.request.attempt_id(),
+        uuid::Uuid::new_v4()
+    );
     let scope_identity = crate::workspace_publish::scope_identity(
         &output
             .plan
@@ -401,11 +411,15 @@ pub(crate) fn commit_external_writer_preparation(
     };
 
     // Seal the private stage before linking it to the Goal.
+    #[cfg(test)]
+    test_hooks::before_stage(payload_sha256, &operation_id);
     let stage =
         match writer_stage::write_stage(store.state_root(), &identity, &output.staged_content) {
             Ok(stage) => stage,
             Err(error) => return Err(stage_error_to_orchestrator(error)),
         };
+    #[cfg(test)]
+    test_hooks::after_stage(payload_sha256, &operation_id);
     if stage.operation_count() != output.plan.len() {
         return Err(OrchestratorError::CorruptGoal(
             "writer stage does not match its host-derived plan".to_owned(),
@@ -509,13 +523,9 @@ pub(crate) fn commit_external_writer_preparation(
     match committed {
         Ok(goal) => {
             if let Some(code) = refused {
-                // The stage is provably unlinked: no intent exists for it.
-                let _ = writer_stage::remove_never_begun_stage(
-                    store.state_root(),
-                    &session.id,
-                    goal_id.as_str(),
-                    &operation_id,
-                );
+                // Our commit did not happen. Remove *our own* stage only, and only
+                // after proving the durable state does not reference this id.
+                remove_own_stage_if_unlinked(store, session, goal_id, &operation_id);
                 return Ok(WriterStageOutcome::Refused { code });
             }
             let receipt = outcome.ok_or_else(|| {
@@ -531,25 +541,15 @@ pub(crate) fn commit_external_writer_preparation(
             })
         }
         Err(OrchestratorError::RevisionConflict { .. }) => {
-            let _ = writer_stage::remove_never_begun_stage(
-                store.state_root(),
-                &session.id,
-                goal_id.as_str(),
-                &operation_id,
-            );
+            // Another client committed first. Its stage is sealed under its own
+            // id; ours is unlinked, so only ours is removed.
+            remove_own_stage_if_unlinked(store, session, goal_id, &operation_id);
             Ok(WriterStageOutcome::Refused {
                 code: "GOAL_REVISION_STALE",
             })
         }
         Err(error) => {
-            // The commit failed, so the stage is not linked. Remove it so a
-            // retry starts from a clean, verifiable state.
-            let _ = writer_stage::remove_never_begun_stage(
-                store.state_root(),
-                &session.id,
-                goal_id.as_str(),
-                &operation_id,
-            );
+            remove_own_stage_if_unlinked(store, session, goal_id, &operation_id);
             Err(error)
         }
     }
@@ -861,8 +861,121 @@ pub(crate) fn verify_prepared_stage(
     Ok(stage)
 }
 
+/// Remove one candidate's stage, but only when it is provably unlinked.
+///
+/// A stage created by this call is linked to the Goal only by the commit that
+/// records the `MutationIntent`. If that commit failed, the id cannot be
+/// referenced — unless a concurrent identical candidate somehow produced the same
+/// id, which the per-candidate nonce makes impossible. The durable re-read is
+/// still performed as defence in depth: if anything references the id, the stage
+/// is left alone.
+fn remove_own_stage_if_unlinked(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    operation_id: &str,
+) {
+    let referenced = match store.load_goal(&session.id, goal_id) {
+        Ok(goal) => goal.tasks().values().any(|task| {
+            task.latest_attempt()
+                .and_then(|attempt| attempt.mutation_intent())
+                .is_some_and(|intent| intent.operation_id() == operation_id)
+        }),
+        // If the state cannot be read, keep the stage: losing it is worse than
+        // leaving an inert orphan.
+        Err(_) => true,
+    };
+    if referenced {
+        return;
+    }
+    let _ = writer_stage::remove_never_begun_stage(
+        store.state_root(),
+        &session.id,
+        goal_id.as_str(),
+        operation_id,
+    );
+}
+
 fn stage_error_to_orchestrator(error: StageError) -> OrchestratorError {
     OrchestratorError::InvalidDag(format!("{}: writer stage is not usable", error.code()))
+}
+
+/// Deterministic checkpoints used by the E5-H2 race tests.
+///
+/// Production builds contain none of this: the call sites are `#[cfg(test)]`-gated
+/// and the module disappears entirely, so no synchronization primitive can be
+/// reached from a real server.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    /// `(payload digest, phase) -> gate`.
+    type Gates = HashMap<(String, Phase), Arc<(Mutex<bool>, Condvar)>>;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) enum Phase {
+        BeforeStage,
+        AfterStage,
+    }
+
+    static GATES: OnceLock<Mutex<Gates>> = OnceLock::new();
+
+    fn gates() -> &'static Mutex<Gates> {
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Install a gate that blocks the thread staging `payload_sha256` at `phase`.
+    pub(crate) fn arm(payload_sha256: &str, phase: Phase) -> Arc<(Mutex<bool>, Condvar)> {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        gates()
+            .lock()
+            .expect("gate registry")
+            .insert((payload_sha256.to_owned(), phase), gate.clone());
+        gate
+    }
+
+    /// Wait at an armed gate. Returns immediately when none is armed.
+    fn wait(payload_sha256: &str, phase: Phase) {
+        let gate = gates()
+            .lock()
+            .expect("gate registry")
+            .get(&(payload_sha256.to_owned(), phase))
+            .cloned();
+        if let Some(gate) = gate {
+            let (lock, condvar) = &*gate;
+            let mut open = lock.lock().expect("gate state");
+            while !*open {
+                open = condvar.wait(open).expect("gate wait");
+            }
+        }
+    }
+
+    /// Release one armed gate.
+    pub(crate) fn release(payload_sha256: &str, phase: Phase) {
+        let gate = gates()
+            .lock()
+            .expect("gate registry")
+            .remove(&(payload_sha256.to_owned(), phase));
+        if let Some(gate) = gate {
+            let (lock, condvar) = &*gate;
+            *lock.lock().expect("gate state") = true;
+            condvar.notify_all();
+        }
+    }
+
+    /// Remove every gate so one test cannot leak into another.
+    pub(crate) fn clear() {
+        gates().lock().expect("gate registry").clear();
+    }
+
+    pub(crate) fn before_stage(payload_sha256: &str, _operation_id: &str) {
+        wait(payload_sha256, Phase::BeforeStage);
+    }
+
+    pub(crate) fn after_stage(payload_sha256: &str, _operation_id: &str) {
+        wait(payload_sha256, Phase::AfterStage);
+    }
 }
 
 #[cfg(test)]
