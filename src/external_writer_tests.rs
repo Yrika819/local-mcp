@@ -2046,3 +2046,76 @@ fn at_e5_073_the_external_driver_prepares_a_clean_managed_goal() {
     assert_eq!(git(root, &["rev-parse", "HEAD"]), base);
     assert_eq!(git(&f.session.cwd, &["status", "--porcelain"]), "");
 }
+
+#[test]
+fn at_gw_013d_goal_next_resumes_an_already_charged_operation_at_the_ceiling() {
+    let (f, goal_id) = scoped_fixture("resume-ceiling", &["code.txt"], 1, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 1, 4096);
+    let content = "fn main() { println!(\"resume\"); }\n";
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    let submitted = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &work,
+            writer_answer(
+                &work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        submitted["outcome"], "ACCEPTED_FOR_HOST_PROCESSING",
+        "{submitted}"
+    );
+
+    // Charge the exact operation but stop before BeginOperation (the crash
+    // window), leaving the one-operation grant at its ceiling.
+    let goal = goal_of(&f, &goal_id);
+    let task_id = crate::task::TaskId::parse(work["task_id"].as_str().unwrap()).unwrap();
+    let binding = crate::external_model_store::external_state(&goal)
+        .unwrap()
+        .active_work()
+        .and_then(|item| item.authorization())
+        .cloned()
+        .expect("writer WorkItem binding");
+    let operation_id = goal.tasks()[&task_id]
+        .latest_attempt()
+        .and_then(|attempt| attempt.mutation_intent())
+        .map(|intent| intent.operation_id().to_owned())
+        .expect("prepared intent");
+    drop(
+        crate::authorization_store::acquire_publication_fence(
+            &f.store,
+            &goal,
+            &binding,
+            &format!("{operation_id}#0"),
+            content.len() as u64,
+            |_| Ok(()),
+        )
+        .unwrap(),
+    );
+
+    // The public entry point must resume this exact operation, not block the
+    // Goal because the grant is at its ceiling.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "MODEL_REQUIRED", "{next}");
+    assert_eq!(next["model_work"]["role"], "REVIEWER", "{next}");
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        content
+    );
+}

@@ -587,8 +587,26 @@ exceeds the code.
 
 Also: concurrent publishers now receive typed refusals
 (`WRITER_PUBLICATION_CONFLICT`, `WRITER_PUBLICATION_NOT_AUTHORIZED`,
-`WRITER_COMPLETION_CONFLICT`, `WRITER_COMPLETION_NOT_JOURNALED`) instead of a
-generic persistence error; `WRITER_COMPLETION_*` preserves the APPLYING journal.
+`WRITER_COMPLETION_NOT_JOURNALED`) instead of a generic persistence error. A
+completion revision conflict keeps the pre-existing `RevisionConflict` error and
+the APPLYING journal (AT-E5-042 semantics), so `WRITER_COMPLETION_CONFLICT` is
+not emitted.
+
+### 11.3 Round-3 security remediation
+
+Round 3 reviewed `35ad119` and found one High, two Medium and two Low issues.
+
+| ID | Finding | Fix |
+|---|---|---|
+| R3-H1 | The approval parser diagnostic and the unrecognized-answer echo printed IPC-controlled text raw | Both are sanitized; the parser failure is bounded and escaped like every other console field. |
+| R3-M1 | The public `goal_next` authorization gate rejected an already-charged operation at the budget ceiling and blocked the prepared slot, so the charge→crash recovery never reached the operation-specific resume | `BudgetExhausted` is no longer treated as authorization loss in the pre-step; the driver decides, and the publication path resumes the exact charged operation. AT-GW-013d exercises this through `goal_next` with a real `write_scope`. |
+| R3-M2 | A concurrent publisher that advanced the journal between the initial check and the Begin CAS surfaced `GOAL_STATE_CORRUPT` | A `CorruptGoal` from the Begin CAS is now a typed `WRITER_PUBLICATION_CONFLICT`; no write occurs and no corruption is claimed. |
+| R3-L1 | Re-anchoring the same grant generation reset its usage floor | Only a strictly new generation resets the floor; AT-GW-013c. |
+| R3-L2 | A maximum-length tree rule could render past the display cap and hide its `/**` suffix | The display bound reserves room for the rendered suffix; the path model bound is unchanged. |
+
+`REVOCATION_DEFERRED`: a fence timeout now returns that explicit code instead of
+`AUTHORIZATION_STATE_IO`, matching §6.4. It still never reports `REVOKED`.
+
 
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.

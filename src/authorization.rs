@@ -1814,6 +1814,9 @@ pub(crate) enum GrantError {
     Revoked,
     BudgetExhausted,
     StateMismatch(&'static str),
+    /// The per-Goal fence could not be acquired within its bound. Revocation is
+    /// deferred; it is **not** reported as revoked.
+    FenceTimeout,
     Io,
 }
 
@@ -1834,6 +1837,7 @@ impl GrantError {
             Self::Revoked => "WRITE_AUTHORIZATION_REVOKED",
             Self::BudgetExhausted => "WRITE_BUDGET_EXHAUSTED",
             Self::StateMismatch(_) => "AUTHORIZATION_STATE_MISMATCH",
+            Self::FenceTimeout => "REVOCATION_DEFERRED",
             Self::Io => "AUTHORIZATION_STATE_IO",
         }
     }
@@ -1846,6 +1850,8 @@ impl std::fmt::Display for GrantError {
             | Self::Corrupt(detail)
             | Self::WorkspaceUnavailable(detail) => formatter.write_str(detail),
             Self::StateMismatch(detail) => formatter.write_str(detail),
+            Self::FenceTimeout => formatter
+                .write_str("the authorization fence is busy; the operation was not changed"),
             Self::Io => formatter.write_str("authorization state I/O failed"),
             other => formatter.write_str(other.code()),
         }

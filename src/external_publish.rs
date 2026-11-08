@@ -372,6 +372,14 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                     code: "WRITER_PUBLICATION_NOT_AUTHORIZED",
                 });
             }
+            // Another publisher may already have advanced this operation
+            // between our initial Prepared check and this CAS. That is a typed
+            // publication conflict, not durable-state corruption.
+            Err(OrchestratorError::CorruptGoal(_)) => {
+                return Ok(PublishOutcome::Refused {
+                    code: "WRITER_PUBLICATION_CONFLICT",
+                });
+            }
             Err(error) => return Err(error),
         }
         let output = match boundary

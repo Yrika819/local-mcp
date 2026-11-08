@@ -891,7 +891,10 @@ async fn handle_approval_connection(
             // drop this connection and keep serving. Propagating with `?`
             // here killed the whole session UI on one bad client, taking
             // every later approval down with it.
-            eprintln!("Ignoring session connection: {error:#}");
+            eprintln!(
+                "Ignoring session connection: {}",
+                sanitize_console_field(&format!("{error:#}"), 4096)
+            );
         }
         Ok(Message::Activity { title, detail }) => show_activity(&title, detail.as_deref()),
         Ok(Message::Approval { request }) if yolo => {
@@ -1471,7 +1474,11 @@ async fn handle_input_at(
                 return Ok(());
             }
             if let Some((id, operation)) = answer_head(pending, b"deny\n").await {
-                eprintln!("Denied {operation} {id} (unrecognized response: {command})");
+                eprintln!(
+                    "Denied {} {id} (unrecognized response: {})",
+                    sanitize_console_field(&operation, 256),
+                    sanitize_console_field(command, 256)
+                );
             }
             show_next(pending)?;
         }

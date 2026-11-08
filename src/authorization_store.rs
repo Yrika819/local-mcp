@@ -224,6 +224,9 @@ fn acquire_ledger_lock(
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(GrantError::FenceTimeout);
+            }
             Err(_) => return Err(GrantError::Io),
         }
     }

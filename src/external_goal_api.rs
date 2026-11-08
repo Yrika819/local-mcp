@@ -450,6 +450,10 @@ pub(crate) async fn goal_next(
                     GrantRefusal::Unavailable.detail(),
                 ));
             }
+            // An exhausted budget is not authorization loss: the publication
+            // path may still resume the exact already-charged operation, and
+            // read-only host steps remain allowed. Let the driver decide.
+            Err(AuthorizationGateError::Refusal(GrantRefusal::BudgetExhausted)) => {}
             // Expired, revoked, rolled-back or otherwise unusable authorization
             // is a mandatory stop. Release a *prepared* Writer slot first (never
             // an APPLYING one), then report the exact code.
