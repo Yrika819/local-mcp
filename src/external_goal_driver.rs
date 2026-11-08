@@ -27,6 +27,7 @@ use crate::external_model_work::{
     WorkItemState, WorkRole, sha256_hex,
 };
 use crate::external_publish::{self, PublishOutcome};
+use crate::external_replanner::{self, ReplanIssueOutcome};
 use crate::external_writer::{self, WriterIssueOutcome};
 use crate::goal::Goal;
 use crate::goal_finalizer::{self, GoalFinalizationOutcome};
@@ -317,11 +318,9 @@ pub(crate) async fn advance_external_step(
                 ))),
             }
         }
-        SchedulerDecision::Replan { .. } => Ok(DriverReport::reused(DriverOutcome::Refused(
-            DriverRefusal::RoleNotWired {
-                stage: WorkRole::Replanner.as_str(),
-            },
-        ))),
+        SchedulerDecision::Replan { trigger_task_id } => {
+            issue_replanner_work_item(store, session, goal, &trigger_task_id)
+        }
         SchedulerDecision::RunWriter { task_id } => {
             issue_writer_work_item(store, session, goal, &task_id)
         }
@@ -632,6 +631,43 @@ async fn publish_submitted_writer_work(
             eprintln!("DEBUG publish error: {error}");
             Err(DriverError::Persistence(error))
         }
+    }
+}
+
+/// Issue the Replanner WorkItem for a durable trigger (E5-C).
+fn issue_replanner_work_item(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+    trigger_task_id: &TaskId,
+) -> Result<DriverReport, DriverError> {
+    if let Some(code) = external_replanner::replan_unavailable_reason(goal) {
+        return Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code,
+                detail: "the Scheduler selected a replan the host no longer considers eligible",
+            },
+        )));
+    }
+    match external_replanner::issue_external_replanner_work_item(
+        store,
+        session,
+        goal.id(),
+        trigger_task_id,
+        goal.revision(),
+    ) {
+        Ok(ReplanIssueOutcome::Issued { item }) => {
+            Ok(DriverReport::advanced(DriverOutcome::ModelRequired(item)))
+        }
+        Ok(ReplanIssueOutcome::Refused(block)) => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::Budget(block),
+        ))),
+        Ok(ReplanIssueOutcome::TriggerGone) => Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::NoAction {
+                code: "REPLAN_TRIGGER_GONE",
+            },
+        ))),
+        Err(error) => Err(DriverError::Persistence(error)),
     }
 }
 

@@ -17,6 +17,7 @@ mod external_goal_driver;
 mod external_model_store;
 mod external_model_work;
 mod external_publish;
+mod external_replanner;
 mod external_writer;
 mod failure_class;
 mod fallback;
@@ -85,6 +86,8 @@ mod external_goal_api_tests;
 mod external_goal_recovery_tests;
 #[cfg(test)]
 mod external_goal_tests;
+#[cfg(test)]
+mod external_replanner_tests;
 #[cfg(test)]
 mod external_reviewer_recovery_tests;
 #[cfg(test)]
