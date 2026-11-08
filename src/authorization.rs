@@ -153,6 +153,28 @@ impl GrantPathRule {
         if self.path.len() > MAX_GRANT_PATH_BYTES {
             return Err(GrantError::InvalidRequest("path rule is too long"));
         }
+        // The Owner reads this spelling on the console before approving it, so a
+        // control character or a bidi override is an approval-UI injection
+        // primitive, not merely a strange filename.
+        if self.path.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{202a}'
+                        | '\u{202b}'
+                        | '\u{202c}'
+                        | '\u{202d}'
+                        | '\u{202e}'
+                        | '\u{2066}'
+                        | '\u{2067}'
+                        | '\u{2068}'
+                        | '\u{2069}'
+                )
+        }) {
+            return Err(GrantError::InvalidRequest(
+                "path rule contains a control or bidi character",
+            ));
+        }
         if self.path.is_empty() {
             if self.kind != GrantPathKind::Tree {
                 return Err(GrantError::InvalidRequest(

@@ -621,3 +621,18 @@ fn at_gw_024_a_revocation_after_authorization_blocks_every_later_operation() {
     }
     assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
 }
+
+#[test]
+fn at_gw_009b_path_rules_reject_console_injection_characters() {
+    for rejected in [
+        "src/\u{1b}[2Jevil",
+        "src/\u{7}bell",
+        "src/\u{202e}gnp.exe",
+        "src/\u{2066}isolate",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must not reach the Owner console"
+        );
+    }
+}
