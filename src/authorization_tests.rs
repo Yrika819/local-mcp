@@ -804,3 +804,141 @@ fn at_gw_009c_a_write_scope_rule_cannot_escape_through_an_existing_symlink() {
     .unwrap_err();
     assert_eq!(error.code(), "INVALID_ARGUMENT");
 }
+
+#[test]
+fn at_gw_019c_a_new_grant_generation_has_a_fresh_budget_floor() {
+    let f = fixture("regrant-budget");
+    let first = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    let first_binding = crate::authorization::GrantBinding::from_grant(&first);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &first_binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None)
+        .unwrap();
+    let second = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        0,
+        "a new generation starts with its own budget"
+    );
+    let second_binding = crate::authorization::GrantBinding::from_grant(&second);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &second_binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn at_gw_013b_an_already_charged_operation_resumes_at_the_budget_ceiling() {
+    let f = fixture("resume");
+    let grant = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    // Charge op#0 but do not begin it (the crash window).
+    drop(
+        crate::authorization_store::acquire_publication_fence(
+            &f.store,
+            &f.goal(),
+            &binding,
+            "op#0",
+            4,
+            |_| Ok(()),
+        )
+        .unwrap(),
+    );
+    // A different operation is genuinely over budget.
+    let error = crate::authorization_store::acquire_publication_fence(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#1",
+        1,
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(error), GrantRefusal::BudgetExhausted);
+    // The exact charged operation resumes without a second charge.
+    drop(
+        crate::authorization_store::acquire_publication_fence(
+            &f.store,
+            &f.goal(),
+            &binding,
+            "op#0",
+            4,
+            |_| Ok(()),
+        )
+        .unwrap(),
+    );
+    assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
+}
+
+#[test]
+fn at_gw_021d_a_stale_goal_snapshot_cannot_bypass_a_restored_ledger() {
+    let f = fixture("stale-anchor");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    let stale_goal = f.goal();
+    let path =
+        authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str()).unwrap();
+    let before_revocation = std::fs::read(&path).unwrap();
+
+    authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None).unwrap();
+    // Ledger-only rollback: the Goal keeps its durable revocation anchor.
+    std::fs::write(&path, before_revocation).unwrap();
+
+    // The caller holds a pre-revocation Goal snapshot. The fence must re-read the
+    // authoritative Goal and refuse; it must also not consume budget.
+    let error = authorization_store::acquire_publication_fence(
+        &f.store,
+        &stale_goal,
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        refusal(error),
+        GrantRefusal::Revoked | GrantRefusal::StateMismatch | GrantRefusal::RollbackDetected
+    ));
+    assert_eq!(
+        f.ledger().latest_grant().unwrap().usage().operations(),
+        0,
+        "a refused publication never charges"
+    );
+}

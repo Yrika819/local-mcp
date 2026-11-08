@@ -569,6 +569,27 @@ two Medium issues. All six are addressed on the integration branch:
 | M1 | The Owner-requested grant lifetime was ignored; every grant got the 15-minute pending TTL | Pending TTL and grant lifetime are separate. Approval issues `now + requested_lifetime_seconds`, bounded to `[60s, 7d]`. AT-GW-028b. |
 | M2 | A surviving command line could approve a pending request after an OCS restart | Approval requires the request to be live in this process's queue **and** the nonce digest to match. `/grant renew` adds its request to the same queue. |
 
+### 11.2 Round-2 security remediation
+
+Round 2 reviewed `dadfad5` and found four High and three Medium issues. The
+fixes are in the integration branch; the exact bounds are stated so no claim
+exceeds the code.
+
+| ID | Finding | Fix |
+|---|---|---|
+| R2-H1 | A stale Goal snapshot plus a ledger-only restore could bypass the durable revocation anchor | `prepare_charge` re-reads the authoritative Goal **under the ledger fence** and validates the anchor from that read. `revoke_active` writes the anchor under the same fence, so a stale snapshot cannot authorize. AT-GW-021d. |
+| R2-H2 | Raw IPC fields remained at several console sinks (cwd, queue notices, expiry, yolo drain, decision echoes) | Every IPC-derived field at every console sink passes through `sanitize_console_field`. |
+| R2-H3 | The grant display could hide a broad rule behind a 4 KiB join cap and showed the pending TTL instead of the grant lifetime | Every path rule is printed in full, one per line; the console shows the requested grant duration, the grant expiry if approved now, and the separate pending-request expiry. |
+| R2-H4 | The anchor CAS returned a newer revision, removing the revision conflict that would have stopped a cancellation race | The `BeginOperation` CAS now requires Goal `RUNNING` and the exact live `SUBMITTED` Writer WorkItem with the expected grant binding, not just Task/Attempt identity. |
+| R2-M1 | A replacement grant inherited the previous generation's usage floor | A new grant generation resets the floor (its own budget); same-generation retries keep it. AT-GW-019c. |
+| R2-M2 | A crash after the charge but before BeginOperation could not resume at the budget ceiling | An operation id that is already charged may resume after all other checks; a different id may not. AT-GW-013b. |
+| R2-M3 | No hard deadline on the publication helper's execution | **Accepted residual (availability).** The revoker's lock wait is bounded at 30 s and it never reports `REVOKED` on timeout; a stalled helper can hold the fence until the Owner terminates it. Adding a process deadline requires a publication-specific child-process timeout/kill path and is tracked as V1 hardening, not claimed here. |
+
+Also: concurrent publishers now receive typed refusals
+(`WRITER_PUBLICATION_CONFLICT`, `WRITER_PUBLICATION_NOT_AUTHORIZED`,
+`WRITER_COMPLETION_CONFLICT`, `WRITER_COMPLETION_NOT_JOURNALED`) instead of a
+generic persistence error; `WRITER_COMPLETION_*` preserves the APPLYING journal.
+
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.
 

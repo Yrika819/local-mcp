@@ -1079,6 +1079,14 @@ impl AuthorizationAnchor {
         }
     }
 
+    /// A new grant generation has its own budget; the previous generation's
+    /// floor must not exhaust it. Rollback protection for the new generation is
+    /// rebuilt by its own charges.
+    pub(crate) fn reset_usage_floor(&mut self) {
+        self.usage_operations = 0;
+        self.usage_bytes = 0;
+    }
+
     pub(crate) fn record_revocation(&mut self, epoch: u64) {
         if epoch > self.highest_epoch {
             self.highest_epoch = epoch;
@@ -1650,6 +1658,30 @@ impl AuthorizationLedgerV1 {
         anchor: &AuthorizationAnchor,
         now: &str,
     ) -> Result<&GoalWriteGrantV1, GrantRefusal> {
+        self.resolve_grant(anchor, now, None)
+    }
+
+    /// Resolve a grant for one specific operation.
+    ///
+    /// A crash after the durable charge but before `BeginOperation` leaves the
+    /// operation charged while the grant is at its budget ceiling. Re-running
+    /// that exact operation id may use its existing charge; a different id may
+    /// not.
+    pub(crate) fn usable_grant_for_operation(
+        &self,
+        anchor: &AuthorizationAnchor,
+        now: &str,
+        operation_id: &str,
+    ) -> Result<&GoalWriteGrantV1, GrantRefusal> {
+        self.resolve_grant(anchor, now, Some(operation_id))
+    }
+
+    fn resolve_grant(
+        &self,
+        anchor: &AuthorizationAnchor,
+        now: &str,
+        resume_operation_id: Option<&str>,
+    ) -> Result<&GoalWriteGrantV1, GrantRefusal> {
         if anchor.validate().is_err() {
             return Err(GrantRefusal::StateMismatch);
         }
@@ -1703,8 +1735,10 @@ impl AuthorizationLedgerV1 {
         }
         let effective_operations = grant.usage.operations().max(anchor.usage_operations());
         let effective_bytes = grant.usage.bytes().max(anchor.usage_bytes());
-        if effective_operations >= grant.budget.max_operations()
-            || effective_bytes >= grant.budget.max_bytes()
+        let resume_charged = resume_operation_id.is_some_and(|id| grant.usage.is_charged(id));
+        if !resume_charged
+            && (effective_operations >= grant.budget.max_operations()
+                || effective_bytes >= grant.budget.max_bytes())
         {
             return Err(GrantRefusal::BudgetExhausted);
         }

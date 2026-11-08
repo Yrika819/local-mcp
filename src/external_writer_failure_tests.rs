@@ -1082,3 +1082,51 @@ fn at_gw_019b_authorization_loss_releases_a_prepared_slot_but_never_an_applying_
     let goal2 = goal_of(&f2, &goal_id2);
     assert!(external_state(&goal2).unwrap().active_work().is_some());
 }
+
+#[test]
+fn at_gw_019d_a_pending_writer_work_item_is_released_when_authorization_is_lost() {
+    let f = fixture("gw-pending-release");
+    let view = goal_api::goal_start(
+        &json!({
+            "session_id": f.session.id,
+            "objective": "pending authorization loss",
+            "model_backend": "EXTERNAL",
+        }),
+        &f.session,
+        &f.store,
+    )
+    .map(|view| serde_json::to_value(view).unwrap())
+    .unwrap();
+    let goal_id = GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap();
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            writer_plan(&planner_work, "fn main() {}\n"),
+        ),
+    )
+    .unwrap();
+    let work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    assert_eq!(work["role"], "WRITER", "{work}");
+    let task_id = TaskId::parse(work["task_id"].as_str().unwrap()).unwrap();
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+    let released = external_publish::record_authorization_refusal(
+        &f.store,
+        &f.session,
+        &goal_id,
+        "WRITE_AUTHORIZATION_REVOKED",
+    )
+    .unwrap();
+    assert!(released.is_some());
+    let goal = goal_of(&f, &goal_id);
+    assert!(external_state(&goal).unwrap().active_work().is_none());
+    assert_eq!(
+        goal.tasks()[&task_id].status(),
+        crate::task::TaskStatus::Blocked
+    );
+}

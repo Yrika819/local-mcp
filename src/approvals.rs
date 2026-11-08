@@ -385,7 +385,7 @@ async fn enqueue_approval(
         // newcomer that must wait.
         eprintln!(
             "Queued {} ({} pending); awaiting decision on:",
-            newcomer,
+            sanitize_console_field(&newcomer, 256),
             pending.len()
         );
     }
@@ -403,7 +403,7 @@ async fn refuse_overload(
 ) -> Uuid {
     eprintln!(
         "[full] denying {} {} (approval queue holds {})",
-        request.operation,
+        sanitize_console_field(&request.operation, 256),
         request.id,
         pending.len()
     );
@@ -481,7 +481,8 @@ fn evict_expired_at(pending: &mut VecDeque<PendingApproval>, now: std::time::Ins
         if let Some(entry) = pending.pop_front() {
             eprintln!(
                 "[expired] {} {} (caller timed out; no approval granted)",
-                entry.request.operation, entry.request.id
+                sanitize_console_field(&entry.request.operation, 256),
+                entry.request.id
             );
         }
     }
@@ -1014,30 +1015,44 @@ fn grant_nonce() -> String {
 }
 
 fn show_grant_request(request: &PendingGrantRequestV1, nonce: &str) {
-    let paths = request
-        .path_rules()
-        .iter()
-        .map(|rule| match rule.kind() {
-            crate::authorization::GrantPathKind::Tree if rule.path().is_empty() => "**".to_owned(),
-            crate::authorization::GrantPathKind::Tree => format!("{}/**", rule.path()),
-            crate::authorization::GrantPathKind::File => rule.path().to_owned(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let now = crate::authorization::now_unix_seconds();
+    let grant_expiry =
+        crate::authorization::format_utc_rfc3339(now + request.requested_lifetime_seconds() as i64);
     eprintln!(
-        "\n[grant] request {}\n  goal: {}  session: {}\n  workspace: {:?} {}\n  paths: {}\n  operations: WRITE_UTF8\n  budget: {} operations / {} bytes\n  expires: {}",
+        "
+[grant] request {}
+  goal: {}  session: {}
+  workspace: {:?} {}
+  operations: WRITE_UTF8
+  budget: {} operations / {} bytes
+  grant duration: {}s (grant expires if approved now: {})
+  request expires: {}",
         sanitize_console_field(request.request_id(), 128),
         sanitize_console_field(request.goal_id(), 128),
         sanitize_console_field(request.session_id(), 128),
         request.workspace().mode(),
         sanitize_console_field(&request.workspace().root().to_string_lossy(), 4096),
-        sanitize_console_field(&paths, 4096),
         request.budget().max_operations(),
         request.budget().max_bytes(),
+        request.requested_lifetime_seconds(),
+        sanitize_console_field(&grant_expiry, 64),
         sanitize_console_field(request.expires_at(), 64)
     );
+    // Every rule is printed in full, one per line. A joined or truncated list
+    // could hide a broad rule such as `**` behind the display cap.
+    eprintln!("  paths ({}):", request.path_rules().len());
+    for rule in request.path_rules() {
+        let rendered = match rule.kind() {
+            crate::authorization::GrantPathKind::Tree if rule.path().is_empty() => "**".to_owned(),
+            crate::authorization::GrantPathKind::Tree => format!("{}/**", rule.path()),
+            crate::authorization::GrantPathKind::File => rule.path().to_owned(),
+        };
+        eprintln!("    {}", sanitize_console_field(&rendered, 4096));
+    }
     eprintln!(
-        "  Owner nonce: {nonce}\n  Approve: /grant approve {} {} {nonce}\n  Deny:    /grant deny {} {}",
+        "  Owner nonce: {nonce}
+  Approve: /grant approve {} {} {nonce}
+  Deny:    /grant deny {} {}",
         request.goal_id(),
         request.request_id(),
         request.goal_id(),
@@ -1384,7 +1399,8 @@ async fn handle_input_at(
             while let Some(mut entry) = pending.pop_front() {
                 eprintln!(
                     "[yolo] allowing {}: {}",
-                    entry.request.operation, entry.request.detail
+                    sanitize_console_field(&entry.request.operation, 256),
+                    sanitize_console_field(&entry.request.detail, 4096)
                 );
                 answer(&mut entry.stream, b"allow\n").await;
             }
@@ -1401,7 +1417,7 @@ async fn handle_input_at(
                 return Ok(());
             }
             if let Some((id, operation)) = answer_head(pending, b"allow\n").await {
-                eprintln!("Allowed {operation} {id}");
+                eprintln!("Allowed {} {id}", sanitize_console_field(&operation, 256));
             }
             show_next(pending)?;
         }
@@ -1411,7 +1427,7 @@ async fn handle_input_at(
                 return Ok(());
             }
             if let Some((id, operation)) = answer_head(pending, b"deny\n").await {
-                eprintln!("Denied {operation} {id}");
+                eprintln!("Denied {} {id}", sanitize_console_field(&operation, 256));
             }
             show_next(pending)?;
         }
@@ -1490,7 +1506,7 @@ fn show_request(request: &Request) -> Result<()> {
         "\n[{}] {}\ncwd: {}\n{}",
         request.id,
         sanitize_console_field(&request.operation, 256),
-        request.cwd.display(),
+        sanitize_console_field(&request.cwd.to_string_lossy(), 4096),
         sanitize_console_field(&request.detail, 4096)
     );
     eprint!("Allow without sandbox? [y/N] ");

@@ -188,6 +188,7 @@ pub(crate) fn save_ledger(
 }
 
 /// Holds the per-Goal ledger lock and releases it on drop.
+#[derive(Debug)]
 struct LedgerGuard {
     file: File,
 }
@@ -302,6 +303,7 @@ pub(crate) fn record_anchor_grant(
     let epoch = grant.authorization_epoch();
     update_anchor(store, session_id, goal_id, move |anchor| {
         anchor.record_grant(&grant_id, epoch);
+        anchor.reset_usage_floor();
     })
 }
 
@@ -535,6 +537,7 @@ where
 /// operation is executing: it either runs before the operation begins (and the
 /// operation is refused) or after the operation is durably journaled. The lock
 /// is per Goal, never the session lock, and every wait is bounded.
+#[derive(Debug)]
 pub(crate) struct PublicationFence {
     _guard: LedgerGuard,
     grant: GoalWriteGrantV1,
@@ -589,13 +592,21 @@ where
         return Err(GrantError::BackendNotExternal.into());
     }
     let guard = acquire_ledger_lock(store, goal.session_id(), goal.id().as_str())?;
+    // The caller's Goal snapshot may predate the fence. Re-read the
+    // authoritative Goal *while holding it*: the revocation anchor is written
+    // under this same lock, so a stale anchor can never authorize a write.
+    let goal = store
+        .load_goal(goal.session_id(), goal.id())
+        .map_err(|_| GrantError::Io)?;
     let mut ledger = load_with_lock(store, goal.session_id(), goal.id().as_str(), &guard)?
         .ok_or(GrantRefusal::Required)?;
-    ledger.matches_goal(goal)?;
-    let workspace = crate::authorization::GrantWorkspaceIdentity::from_goal(goal)?;
-    let anchor = anchor_of(goal)?;
+    ledger.matches_goal(&goal)?;
+    let workspace = crate::authorization::GrantWorkspaceIdentity::from_goal(&goal)?;
+    let anchor = anchor_of(&goal)?;
     let now = crate::authorization::format_utc_rfc3339(crate::authorization::now_unix_seconds());
-    let grant = ledger.usable_grant(&anchor, &now)?.clone();
+    let grant = ledger
+        .usable_grant_for_operation(&anchor, &now, operation_id)?
+        .clone();
     if grant.workspace().digest() != workspace.digest() {
         return Err(GrantRefusal::ScopeMismatch.into());
     }

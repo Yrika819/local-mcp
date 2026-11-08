@@ -23,7 +23,7 @@
 //! journal record proves: multi-file publication stays per-operation journaled
 //! and is never described as one atomic filesystem transaction.
 
-use crate::authorization::GrantRefusal;
+use crate::authorization::{GrantBinding, GrantRefusal};
 use crate::authorization_store;
 use crate::config;
 use crate::external_model_store::{external_state, external_state_mut};
@@ -141,6 +141,42 @@ pub(crate) fn published_intent_awaiting_completion(
         return None;
     }
     Some(intent.operation_id().to_owned())
+}
+
+/// The exact authority state a publication operation must observe at the moment
+/// it begins.
+///
+/// The revision refresh performed by the usage-floor CAS must not let a
+/// cancellation, a pause, or a replaced WorkItem slip through: `BeginOperation`
+/// re-checks the Goal status and the live WorkItem binding, not only the Task
+/// and Attempt identity.
+fn ensure_writer_publishable(
+    goal: &Goal,
+    task_id: &TaskId,
+    attempt_id: &str,
+    binding: &GrantBinding,
+) -> Result<(), OrchestratorError> {
+    if goal.status() != crate::goal::GoalStatus::Running {
+        return Err(OrchestratorError::InvalidDag(
+            "the Goal is not RUNNING; publication is not authorized".to_owned(),
+        ));
+    }
+    let active = external_state(goal)?.active_work().ok_or_else(|| {
+        OrchestratorError::InvalidDag(
+            "the active external WorkItem was cancelled; publication is not authorized".to_owned(),
+        )
+    })?;
+    if active.role() != WorkRole::Writer
+        || active.state() != WorkItemState::Submitted
+        || active.task_id() != Some(task_id.as_str())
+        || active.attempt_id() != Some(attempt_id)
+        || active.authorization() != Some(binding)
+    {
+        return Err(OrchestratorError::InvalidDag(
+            "the active external WorkItem no longer authorizes this publication".to_owned(),
+        ));
+    }
+    writer::ensure_writer_task_ready_for_attempt(goal, task_id, attempt_id)
 }
 
 /// Publish one prepared external writer intent through the existing host write
@@ -311,16 +347,33 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         // the Goal revision. Bind `BeginOperation` to the revision the fence
         // produced, not the pre-fence snapshot.
         revision = fence.goal_revision();
-        revision = store
-            .mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
-                writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
-                goal.task_advance_latest_mutation_intent(
-                    task_id,
-                    &operation_id,
-                    MutationIntentUpdate::BeginOperation { index: index_u32 },
-                )
-            })?
-            .revision();
+        let begun = store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
+            // Re-check Goal status and the live WorkItem binding inside the
+            // same CAS as BeginOperation: a cancellation or WorkItem
+            // replacement after the fence was acquired must still win.
+            ensure_writer_publishable(goal, task_id, &attempt_id, &binding)?;
+            goal.task_advance_latest_mutation_intent(
+                task_id,
+                &operation_id,
+                MutationIntentUpdate::BeginOperation { index: index_u32 },
+            )
+        });
+        match begun {
+            Ok(committed) => revision = committed.revision(),
+            // A concurrent client won the same operation, or the Task/WorkItem
+            // moved on. This is a typed refusal, not a persistence failure.
+            Err(OrchestratorError::RevisionConflict { .. }) => {
+                return Ok(PublishOutcome::Refused {
+                    code: "WRITER_PUBLICATION_CONFLICT",
+                });
+            }
+            Err(OrchestratorError::InvalidDag(_)) => {
+                return Ok(PublishOutcome::Refused {
+                    code: "WRITER_PUBLICATION_NOT_AUTHORIZED",
+                });
+            }
+            Err(error) => return Err(error),
+        }
         let output = match boundary
             .write(writer::WriterWriteRequest {
                 path: &paths[index],
@@ -361,16 +414,32 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
             });
         }
         changed.push(paths[index].clone());
-        revision = store
-            .mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
-                writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
-                goal.task_advance_latest_mutation_intent(
-                    task_id,
-                    &operation_id,
-                    MutationIntentUpdate::CompleteOperation { index: index_u32 },
-                )
-            })?
-            .revision();
+        let completed = store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
+            writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
+            goal.task_advance_latest_mutation_intent(
+                task_id,
+                &operation_id,
+                MutationIntentUpdate::CompleteOperation { index: index_u32 },
+            )
+        });
+        match completed {
+            Ok(committed) => revision = committed.revision(),
+            Err(error @ OrchestratorError::RevisionConflict { .. }) => {
+                // Preserve the pre-existing cancellation semantics: the journal
+                // stays APPLYING and the caller sees the CAS conflict.
+                drop(fence);
+                return Err(error);
+            }
+            Err(OrchestratorError::InvalidDag(_)) => {
+                // The bytes are written but the journal stays APPLYING: this is
+                // UNKNOWN, never "not performed" and never blindly retried.
+                drop(fence);
+                return Ok(PublishOutcome::Refused {
+                    code: "WRITER_COMPLETION_NOT_JOURNALED",
+                });
+            }
+            Err(error) => return Err(error),
+        }
         drop(fence);
     }
 
@@ -791,10 +860,12 @@ pub(crate) fn record_authorization_refusal(
     else {
         return Ok(None);
     };
-    let Some(intent) = attempt.mutation_intent() else {
-        return Ok(None);
-    };
-    if intent.state() != crate::mutation::MutationIntentState::Prepared {
+    // A PENDING WorkItem has no journal yet; a prepared one has a journal that
+    // proves no operation began. Both can be released safely. An APPLYING or
+    // UNKNOWN intent is evidence that must be preserved for reconciliation.
+    if let Some(intent) = attempt.mutation_intent()
+        && intent.state() != crate::mutation::MutationIntentState::Prepared
+    {
         return Ok(None);
     }
     let attempt_id = attempt.id().as_str().to_owned();
