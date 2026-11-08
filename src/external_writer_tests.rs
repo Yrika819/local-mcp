@@ -2024,3 +2024,25 @@ fn at_e5_072_082_body() {
         0
     );
 }
+
+#[cfg(not(windows))]
+#[test]
+fn at_e5_073_the_external_driver_prepares_a_clean_managed_goal() {
+    // Windows gates managed creation behind the interactive approval IPC; the
+    // Unix policy has no such gate, so this drives the production driver path.
+    let (f, goal_id, base) = managed_fixture("driver-prepare");
+    install_grant(&f, &goal_id, &["code.txt"], 8, 8192);
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        matches!(
+            next["outcome"].as_str(),
+            Some("HOST_PROGRESS") | Some("MODEL_REQUIRED")
+        ),
+        "the driver must prepare the worktree, got {next}"
+    );
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let root = goal.execution_root().expect("managed execution root");
+    assert!(root.exists());
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), base);
+    assert_eq!(git(&f.session.cwd, &["status", "--porcelain"]), "");
+}
