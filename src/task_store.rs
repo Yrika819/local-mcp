@@ -66,6 +66,12 @@ impl TaskStore {
         })
     }
 
+    /// Root of the durable host state. Used by the private Writer stage, which
+    /// must live outside the Goal workspace.
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
     #[cfg(test)]
     pub(crate) fn with_state_root(state_root: PathBuf) -> Self {
         Self {

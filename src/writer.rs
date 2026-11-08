@@ -295,7 +295,7 @@ pub(crate) enum WriterStatus {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriterResult {
+pub(crate) struct WriterResult {
     goal_id: String,
     task_id: String,
     attempt_id: String,
@@ -309,14 +309,14 @@ struct WriterResult {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriterEvidence {
+pub(crate) struct WriterEvidence {
     kind: String,
     value: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-enum WriterOperation {
+pub(crate) enum WriterOperation {
     WriteUtf8 {
         path: String,
         expected_preimage: PreimageExpectation,
@@ -326,7 +326,7 @@ enum WriterOperation {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-enum PreimageExpectation {
+pub(crate) enum PreimageExpectation {
     Sha256 { sha256: String },
     Absent,
 }
@@ -344,20 +344,147 @@ struct ReviewerResult {
     evidence: Vec<WriterEvidence>,
 }
 
+#[expect(
+    dead_code,
+    reason = "External Writer validation reads the same validated proposal the Codex path applies."
+)]
+impl WriterResult {
+    pub(crate) fn status(&self) -> WriterStatus {
+        self.status
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn operations_ref(&self) -> &[WriterOperation] {
+        &self.proposed_operations
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "External Writer validation consumes the host-materialized write plan."
+)]
+impl MaterializedWrite {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub(crate) fn expected_preimage(&self) -> &PreimageExpectation {
+        &self.expected_preimage
+    }
+
+    pub(crate) fn before(&self) -> &FileState {
+        &self.before
+    }
+
+    pub(crate) fn parent(&self) -> &Path {
+        &self.parent
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FileState {
+pub(crate) struct FileState {
     exists: bool,
     size: Option<u64>,
     sha256: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-struct MaterializedWrite {
+pub(crate) struct MaterializedWrite {
     path: PathBuf,
     parent: PathBuf,
     expected_preimage: PreimageExpectation,
     content: String,
     before: FileState,
+}
+
+/// Re-check, inside a commit closure, that the Writer Attempt is still the one
+/// the WorkItem was bound to.
+///
+/// Used by the external Writer path: validation happens outside the lock, so the
+/// commit itself must prove the Task is still RUNNING on this exact Attempt
+/// (which also still holds the workspace mutation lease).
+pub(crate) fn ensure_writer_task_ready_for_attempt(
+    goal: &Goal,
+    task_id: &TaskId,
+    attempt_id: &str,
+) -> Result<(), OrchestratorError> {
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| OrchestratorError::InvalidDag("writer Task is missing".to_owned()))?;
+    if task.status() != TaskStatus::Running || task.worker() != WorkerKind::CodexWriter {
+        return Err(OrchestratorError::InvalidDag(
+            "writer Task is no longer the active CODEX_WRITER attempt".to_owned(),
+        ));
+    }
+    let attempt = task.latest_attempt().ok_or_else(|| {
+        OrchestratorError::CorruptGoal("RUNNING writer Task lacks an Attempt".to_owned())
+    })?;
+    if attempt.id().as_str() != attempt_id {
+        return Err(OrchestratorError::InvalidDag(
+            "writer Attempt identity changed".to_owned(),
+        ));
+    }
+    if task.scope().operation_kind() == TaskOperationKind::ReadOnly {
+        return Err(OrchestratorError::InvalidDag(
+            "writer mutation requires a mutating TaskScope".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Host gates every writer attempt passes before an Attempt begins.
+///
+/// Shared by the Codex writer path and external Writer WorkItem issuance so a
+/// WorkItem can never be issued for a Task the host would refuse to run.
+pub(crate) fn ensure_writer_task_ready(
+    goal: &Goal,
+    task_id: &TaskId,
+) -> Result<(), OrchestratorError> {
+    if goal.status() != GoalStatus::Running {
+        return Err(OrchestratorError::InvalidDag(
+            "writer attempt requires a RUNNING Goal".to_owned(),
+        ));
+    }
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| OrchestratorError::InvalidDag("writer Task is missing".to_owned()))?;
+    if task.status() != TaskStatus::Ready {
+        return Err(OrchestratorError::InvalidDag(
+            "writer attempt requires a READY Task".to_owned(),
+        ));
+    }
+    if task.worker() != WorkerKind::CodexWriter {
+        return Err(OrchestratorError::InvalidDag(
+            "writer mutation requires CODEX_WRITER".to_owned(),
+        ));
+    }
+    if task.scope().operation_kind() == TaskOperationKind::ReadOnly {
+        return Err(OrchestratorError::InvalidDag(
+            "writer mutation requires a mutating TaskScope".to_owned(),
+        ));
+    }
+    if task.semantic_attempts_remaining() == 0 {
+        return Err(OrchestratorError::InvalidDag(
+            "writer Task attempt budget is exhausted".to_owned(),
+        ));
+    }
+    if goal.tasks().iter().any(|(candidate_id, candidate)| {
+        candidate_id != task_id && holds_workspace_mutation_lease(candidate)
+    }) {
+        return Err(OrchestratorError::InvalidDag(
+            "WORKSPACE_MUTATION lease is already held".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn begin_writer_attempt(
@@ -375,41 +502,7 @@ pub(crate) fn begin_writer_attempt(
                     "writer execution-root gate refused: {error}"
                 ))
             })?;
-            if goal.status() != GoalStatus::Running {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer attempt requires a RUNNING Goal".to_owned(),
-                ));
-            }
-            let task = goal.tasks().get(task_id).ok_or_else(|| {
-                OrchestratorError::InvalidDag("writer Task is missing".to_owned())
-            })?;
-            if task.status() != TaskStatus::Ready {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer attempt requires a READY Task".to_owned(),
-                ));
-            }
-            if task.worker() != WorkerKind::CodexWriter {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer mutation requires CODEX_WRITER".to_owned(),
-                ));
-            }
-            if task.scope().operation_kind() == TaskOperationKind::ReadOnly {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer mutation requires a mutating TaskScope".to_owned(),
-                ));
-            }
-            if task.semantic_attempts_remaining() == 0 {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer Task attempt budget is exhausted".to_owned(),
-                ));
-            }
-            if goal.tasks().iter().any(|(candidate_id, candidate)| {
-                candidate_id != task_id && holds_workspace_mutation_lease(candidate)
-            }) {
-                return Err(OrchestratorError::InvalidDag(
-                    "WORKSPACE_MUTATION lease is already held".to_owned(),
-                ));
-            }
+            ensure_writer_task_ready(goal, task_id)?;
             goal.transition_task(
                 task_id,
                 TaskStatus::Running,
@@ -1194,6 +1287,20 @@ fn build_writer_request(
     task_id: &TaskId,
     session: &config::Session,
 ) -> Result<WriterRequest, WriterError> {
+    build_writer_request_at_revision(goal, task_id, session, goal.revision())
+}
+
+/// Build the host-authored writer request with an explicit goal revision.
+///
+/// The external backend issues a Writer WorkItem inside the same commit that
+/// starts the Attempt, so the request must be bound to the revision that commit
+/// produces — the revision the client will submit against.
+pub(crate) fn build_writer_request_at_revision(
+    goal: &Goal,
+    task_id: &TaskId,
+    session: &config::Session,
+    goal_revision: u64,
+) -> Result<WriterRequest, WriterError> {
     let task = goal.tasks().get(task_id).ok_or_else(|| {
         WriterError::AuthorityViolation("writer Task disappeared after checkpoint".to_owned())
     })?;
@@ -1206,7 +1313,7 @@ fn build_writer_request(
         goal_id: goal.id().as_str().to_owned(),
         task_id: task_id.as_str().to_owned(),
         attempt_id: attempt.id().as_str().to_owned(),
-        goal_revision: goal.revision(),
+        goal_revision,
         plan_revision: goal.plan_revision(),
         goal_cwd: execution_root,
         task_title: task.title().to_owned(),
@@ -1216,7 +1323,7 @@ fn build_writer_request(
     })
 }
 
-fn parse_and_validate_writer_result(
+pub(crate) fn parse_and_validate_writer_result(
     raw: &[u8],
     request: &WriterRequest,
 ) -> Result<WriterResult, WriterError> {
@@ -1380,7 +1487,7 @@ fn is_canonical_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn materialize_operations(
+pub(crate) fn materialize_operations(
     goal: &Goal,
     session: &config::Session,
     task_id: &TaskId,
@@ -1613,7 +1720,7 @@ fn contains_git_internal(path: &Path) -> bool {
         .any(|component| matches!(component, Component::Normal(value) if value == ".git"))
 }
 
-fn observe_file_state(path: &Path) -> Result<FileState, WriterError> {
+pub(crate) fn observe_file_state(path: &Path) -> Result<FileState, WriterError> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(FileState {
             exists: false,
@@ -1663,7 +1770,7 @@ fn preimage_matches(state: &FileState, expectation: &PreimageExpectation) -> boo
 
 /// Translate the Writer's durable expectation into the publication primitive's
 /// expectation. These are two views of one fact, not two independent decisions.
-fn commit_preimage(expectation: &PreimageExpectation) -> ExpectedPreimage {
+pub(crate) fn commit_preimage(expectation: &PreimageExpectation) -> ExpectedPreimage {
     match expectation {
         PreimageExpectation::Absent => ExpectedPreimage::Absent,
         PreimageExpectation::Sha256 { sha256 } => ExpectedPreimage::Sha256(sha256.clone()),
@@ -1940,7 +2047,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
+pub(crate) fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
     match preimage {
         PreimageExpectation::Absent => MutationPreimage::Absent,
         PreimageExpectation::Sha256 { sha256 } => MutationPreimage::Sha256 {
@@ -1949,7 +2056,7 @@ fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
     }
 }
 
-fn mutation_observation(state: &FileState) -> FileObservation {
+pub(crate) fn mutation_observation(state: &FileState) -> FileObservation {
     if state.exists {
         FileObservation::exists(
             state.size.unwrap_or(0),

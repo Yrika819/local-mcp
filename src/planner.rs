@@ -854,6 +854,15 @@ pub(crate) fn validate_and_normalize_scope(
                 .to_owned(),
         ));
     }
+    // A Writer Task that declares a READ_ONLY scope can never be executed: the
+    // writer gate requires a mutating scope and the readonly gate requires a
+    // read-only worker. Refusing it at plan time keeps such a Goal from
+    // materializing a Task no host step could ever run.
+    if worker == WorkerKind::CodexWriter && proposal.operation_kind == TaskOperationKind::ReadOnly {
+        return Err(PlannerError::PlanAuthorityViolation(
+            "CODEX_WRITER requires a mutating TaskScope".to_owned(),
+        ));
+    }
 
     let effectful = proposal.operation_kind != TaskOperationKind::ReadOnly;
     let allowed_paths = normalize_path_set(&proposal.allowed_paths, goal_root, effectful)?;
