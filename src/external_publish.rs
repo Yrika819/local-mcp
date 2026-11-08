@@ -293,23 +293,28 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                     &paths[index],
                     grant.workspace().root(),
                 )?;
-                authorization_store::check_operation_scope(grant, &relative)?;
-                match store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
+                authorization_store::check_operation_scope(grant, &relative)
+            },
+            |_grant| match store.mutate_goal_snapshot(
+                &session.id,
+                goal_id,
+                revision,
+                |goal, _now| {
                     writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
                     goal.task_advance_latest_mutation_intent(
                         task_id,
                         &operation_id,
                         MutationIntentUpdate::BeginOperation { index: index_u32 },
                     )
-                }) {
-                    Ok(committed) => {
-                        began_revision = Some(committed.revision());
-                        Ok(())
-                    }
-                    Err(error) => {
-                        begin_error = Some(error);
-                        Err(GrantRefusal::StateMismatch)
-                    }
+                },
+            ) {
+                Ok(committed) => {
+                    began_revision = Some(committed.revision());
+                    Ok(())
+                }
+                Err(error) => {
+                    begin_error = Some(error);
+                    Err(GrantRefusal::StateMismatch)
                 }
             },
         );

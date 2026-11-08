@@ -223,16 +223,27 @@ fn run_publication(
     operation_id: &str,
     boundary: &dyn WriteBoundary,
 ) -> Result<PublishOutcome, crate::orchestrator_error::OrchestratorError> {
-    let goal = goal_of(f, goal_id);
+    run_publication_with(f, &f.store, goal_id, task_id, operation_id, boundary)
+}
+
+fn run_publication_with(
+    f: &Fixture,
+    store: &TaskStore,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    operation_id: &str,
+    boundary: &dyn WriteBoundary,
+) -> Result<PublishOutcome, crate::orchestrator_error::OrchestratorError> {
+    let goal = store.load_goal(&f.session.id, goal_id)?;
     let stage =
-        external_writer::verify_prepared_stage(&f.store, &f.session, &goal, task_id, operation_id)
+        external_writer::verify_prepared_stage(store, &f.session, &goal, task_id, operation_id)
             .expect("stage verifies");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime")
         .block_on(external_publish::publish_prepared_writer_intent(
-            &f.store,
+            store,
             &f.session,
             goal_id,
             task_id,
@@ -816,5 +827,207 @@ fn at_e5_045_publication_writes_a_regular_file_with_the_exact_bytes() {
     assert_eq!(
         intent.operations()[0].state(),
         MutationOperationState::Applied
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Authorization B reliability (AT-GW-017/018/019/020/023/024).
+// ---------------------------------------------------------------------------
+
+fn grant_usage(f: &Fixture, goal_id: &GoalId) -> (u32, u64) {
+    let ledger = crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+        .unwrap()
+        .expect("grant ledger exists");
+    let grant = ledger.latest_grant().expect("grant exists");
+    (grant.usage().operations(), grant.usage().bytes())
+}
+
+#[test]
+fn at_gw_017_a_crash_after_the_charge_before_begin_operation_never_double_charges() {
+    let f = fixture("gw-charge");
+    let content = "fn main() { /* charged once */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+
+    // Attempt 1 of this store instance is the BeginOperation commit, so the
+    // operation is charged but never begins.
+    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(1));
+    let boundary = crate::writer::ExecutionWriteBoundary;
+    let result = run_publication_with(&f, &failing, &goal_id, &task_id, &operation_id, &boundary);
+    assert!(result.is_err(), "the BeginOperation commit must fail");
+    assert_eq!(file_content(&f), "fn main() {}\n");
+    assert_eq!(
+        grant_usage(&f, &goal_id).0,
+        1,
+        "the charge happened before the side effect and is never refunded"
+    );
+    assert_eq!(
+        intent(&f, &goal_id, &task_id).state(),
+        MutationIntentState::Prepared,
+        "no operation began"
+    );
+
+    // Retrying with a healthy store re-uses the charge and publishes once.
+    let clean = TaskStore::with_state_root(f.root.join("state"));
+    let goal = clean.load_goal(&f.session.id, &goal_id).unwrap();
+    let stage =
+        external_writer::verify_prepared_stage(&clean, &f.session, &goal, &task_id, &operation_id)
+            .expect("stage verifies");
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(external_publish::publish_prepared_writer_intent(
+            &clean,
+            &f.session,
+            &goal_id,
+            &task_id,
+            &operation_id,
+            &stage,
+            &boundary,
+        ))
+        .expect("publication");
+    assert!(
+        matches!(outcome, PublishOutcome::Published { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(file_content(&f), content);
+    assert_eq!(
+        grant_usage(&f, &goal_id).0,
+        1,
+        "one operation id is charged exactly once"
+    );
+}
+
+#[test]
+fn at_gw_018_a_boundary_failure_after_begin_is_unknown_and_consumes_one_charge() {
+    let f = fixture("gw-unknown");
+    let content = "fn main() { /* unknown */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+    let boundary = FaultyBoundary {
+        fault: BoundaryFault::FailBeforeWrite,
+    };
+    let _ = run_publication(&f, &goal_id, &task_id, &operation_id, &boundary);
+    assert_eq!(file_content(&f), "fn main() {}\n");
+    assert_eq!(grant_usage(&f, &goal_id).0, 1);
+    assert_eq!(
+        intent(&f, &goal_id, &task_id).state(),
+        MutationIntentState::Applying,
+        "an unknown side effect stays journaled as applying"
+    );
+
+    // A second publication attempt must not write or charge again.
+    let result = run_publication(
+        &f,
+        &goal_id,
+        &task_id,
+        &operation_id,
+        &crate::writer::ExecutionWriteBoundary,
+    )
+    .expect("publication call");
+    assert!(
+        matches!(result, PublishOutcome::Refused { .. }),
+        "an applying intent is never re-published: {result:?}"
+    );
+    assert_eq!(file_content(&f), "fn main() {}\n");
+    assert_eq!(grant_usage(&f, &goal_id).0, 1);
+}
+
+#[test]
+fn at_gw_019_a_grant_reissue_invalidates_the_prepared_work_item() {
+    let f = fixture("gw-regrant");
+    let content = "fn main() { /* old grant */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+    assert_eq!(grant_usage(&f, &goal_id).0, 0);
+
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+    let goal = goal_of(&f, &goal_id);
+    crate::authorization_store::test_support::install_grant(&f.store, &goal, &["**"], 8, 8192, 600);
+
+    let result = run_publication(
+        &f,
+        &goal_id,
+        &task_id,
+        &operation_id,
+        &crate::writer::ExecutionWriteBoundary,
+    )
+    .expect("publication call");
+    assert!(
+        matches!(result, PublishOutcome::Refused { .. }),
+        "the old WorkItem binding must not use the new grant: {result:?}"
+    );
+    assert_eq!(file_content(&f), "fn main() {}\n");
+    // The new grant was not charged by the refused old binding.
+    assert_eq!(grant_usage(&f, &goal_id).0, 0);
+}
+
+#[test]
+fn at_gw_020_a_schema_1_external_goal_migrates_without_inventing_a_grant() {
+    let f = fixture("gw-schema1");
+    let goal_id = goal_api::goal_start(
+        &json!({
+            "session_id": f.session.id,
+            "objective": "legacy external goal",
+            "model_backend": "EXTERNAL",
+        }),
+        &f.session,
+        &f.store,
+    )
+    .map(|view| serde_json::to_value(view).unwrap())
+    .map(|view| GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap())
+    .unwrap();
+    let path = f.store.goal_path_for_test(&f.session.id, &goal_id).unwrap();
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let mut document = serde_json::to_value(&goal).unwrap();
+    let external = document["external_model"].as_object_mut().unwrap();
+    external.insert("schema_version".to_owned(), json!(1));
+    external.remove("write_scope");
+    external.remove("authorization_anchor");
+    std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    let migrated = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let state = crate::external_model_store::external_state(&migrated).unwrap();
+    assert_eq!(
+        state.schema_version(),
+        crate::external_model_work::EXTERNAL_MODEL_SCHEMA_VERSION
+    );
+    assert!(state.write_scope().is_none());
+    assert_eq!(state.authorization_anchor().highest_epoch(), 0);
+    assert_eq!(
+        crate::authorization_store::usable_grant(&f.store, &migrated)
+            .unwrap_err()
+            .code(),
+        "WRITE_AUTHORIZATION_REQUIRED"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn at_gw_009_a_symlink_swap_is_refused_before_the_budget_charge() {
+    let f = fixture("gw-symlink");
+    let content = "fn main() { /* never */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+    let outside = f.root.join("outside.txt");
+    std::fs::write(&outside, b"outside\n").unwrap();
+    std::fs::remove_file(f.session.cwd.join("code.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.session.cwd.join("code.txt")).unwrap();
+
+    let result = run_publication(
+        &f,
+        &goal_id,
+        &task_id,
+        &operation_id,
+        &crate::writer::ExecutionWriteBoundary,
+    )
+    .expect("publication call");
+    assert!(
+        matches!(result, PublishOutcome::Refused { .. }),
+        "a swapped symlink must be refused: {result:?}"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
+    assert_eq!(
+        grant_usage(&f, &goal_id).0,
+        0,
+        "a refused path check never charges the grant"
     );
 }

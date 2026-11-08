@@ -411,9 +411,15 @@ fn at_gw_015_016_revocation_blocks_new_operations_and_is_idempotent() {
     assert!(authorization_store::check_operation_scope(&grant, &relative).is_ok());
 
     // A budget charge succeeds while ACTIVE.
-    authorization_store::authorize_operation(&f.store, &goal, &binding, "op#0", 4, |grant| {
-        authorization_store::check_operation_scope(grant, &relative)
-    })
+    authorization_store::authorize_operation(
+        &f.store,
+        &goal,
+        &binding,
+        "op#0",
+        4,
+        |grant| authorization_store::check_operation_scope(grant, &relative),
+        |_| Ok(()),
+    )
     .unwrap();
 
     let (first_id, epoch) =
@@ -428,11 +434,16 @@ fn at_gw_015_016_revocation_blocks_new_operations_and_is_idempotent() {
     assert_eq!(second_id, first_id);
 
     // No new operation can be authorized after REVOKED.
-    let error =
-        authorization_store::authorize_operation(&f.store, &f.goal(), &binding, "op#1", 4, |_| {
-            Ok(())
-        })
-        .unwrap_err();
+    let error = authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#1",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap_err();
     assert!(matches!(
         refusal(error),
         GrantRefusal::Revoked | GrantRefusal::StateMismatch
@@ -453,15 +464,26 @@ fn at_gw_013_budget_exhaustion_is_refused_before_the_side_effect() {
     let binding = crate::authorization::GrantBinding::from_grant(&grant);
     let path = workspace_path(&f, "src/main.rs");
     let relative = relative_workspace_path(&path, grant.workspace().root()).unwrap();
-    authorization_store::authorize_operation(&f.store, &f.goal(), &binding, "op#0", 4, |grant| {
-        authorization_store::check_operation_scope(grant, &relative)
-    })
+    authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |grant| authorization_store::check_operation_scope(grant, &relative),
+        |_| Ok(()),
+    )
     .unwrap();
-    let error =
-        authorization_store::authorize_operation(&f.store, &f.goal(), &binding, "op#1", 1, |_| {
-            Ok(())
-        })
-        .unwrap_err();
+    let error = authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#1",
+        1,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap_err();
     assert_eq!(refusal(error), GrantRefusal::BudgetExhausted);
 }
 
@@ -481,6 +503,7 @@ fn at_gw_010_scope_mismatch_is_refused_by_the_grant_not_the_writer() {
         "op#0",
         8,
         |grant| authorization_store::check_operation_scope(grant, &relative),
+        |_| Ok(()),
     )
     .unwrap_err();
     assert_eq!(refusal(error), GrantRefusal::ScopeMismatch);
@@ -531,4 +554,70 @@ fn at_gw_025_an_absent_owner_surface_fails_closed() {
         std::time::Duration::from_millis(50),
     ));
     assert_eq!(outcome, crate::approvals::OwnerGrantOutcome::Unavailable);
+}
+
+#[test]
+fn at_gw_023_two_concurrent_charges_for_one_operation_id_charge_once() {
+    let f = fixture("concurrent");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    let goal = f.goal();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let store = &f.store;
+            let goal = &goal;
+            let binding = &binding;
+            scope.spawn(move || {
+                crate::authorization_store::authorize_operation(
+                    store,
+                    goal,
+                    binding,
+                    "op#0",
+                    4,
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            });
+        }
+    });
+    let ledger = f.ledger();
+    assert_eq!(ledger.latest_grant().unwrap().usage().operations(), 1);
+    assert_eq!(ledger.latest_grant().unwrap().usage().bytes(), 4);
+}
+
+#[test]
+fn at_gw_024_a_revocation_after_authorization_blocks_every_later_operation() {
+    let f = fixture("fence");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None)
+        .unwrap();
+    for operation in ["op#1", "op#2"] {
+        let error = crate::authorization_store::authorize_operation(
+            &f.store,
+            &f.goal(),
+            &binding,
+            operation,
+            1,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refusal(error),
+            GrantRefusal::Revoked | GrantRefusal::StateMismatch
+        ));
+    }
+    assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
 }

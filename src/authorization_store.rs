@@ -478,16 +478,18 @@ pub(crate) fn usable_grant(
 /// workspace and binding have been verified, so a path check cannot race a
 /// revocation or a grant replacement. The charge is written before the caller
 /// performs the side effect and is idempotent per operation id.
-pub(crate) fn authorize_operation<F>(
+pub(crate) fn authorize_operation<P, B>(
     store: &TaskStore,
     goal: &Goal,
     binding: &GrantBinding,
     operation_id: &str,
     bytes: u64,
-    check: F,
+    preflight: P,
+    begin: B,
 ) -> Result<(), AuthorizationGateError>
 where
-    F: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
+    P: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
+    B: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
 {
     if !goal.model_backend().is_external() {
         return Err(GrantError::BackendNotExternal.into());
@@ -499,18 +501,23 @@ where
     let workspace = crate::authorization::GrantWorkspaceIdentity::from_goal(goal)?;
     let anchor = anchor_of(goal)?;
     let now = crate::authorization::format_utc_rfc3339(crate::authorization::now_unix_seconds());
-    let grant = ledger.usable_grant(&anchor, &now)?;
+    let grant = ledger.usable_grant(&anchor, &now)?.clone();
     if grant.workspace().digest() != workspace.digest() {
         return Err(GrantRefusal::ScopeMismatch.into());
     }
-    if !binding.matches(grant) {
+    if !binding.matches(&grant) {
         return Err(GrantRefusal::ScopeMismatch.into());
     }
-    check(grant)?;
+    // Preflight is pure: a path/operation mismatch never consumes budget.
+    preflight(&grant)?;
+    // The charge is durable before the operation may begin. If `begin` then
+    // fails, the charge is deliberately not refunded: no side effect occurred,
+    // but the durable fence already spent the budget, and returning it without
+    // proof is exactly what this design forbids.
     let grant_id = grant.grant_id().to_owned();
     ledger.charge_operation(&grant_id, operation_id, bytes, &now)?;
     save_ledger(store, &ledger)?;
-    Ok(())
+    begin(&grant).map_err(AuthorizationGateError::from)
 }
 
 /// Convenience path check used by the publication gate.

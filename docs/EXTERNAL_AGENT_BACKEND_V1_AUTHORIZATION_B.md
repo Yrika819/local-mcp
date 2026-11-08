@@ -536,8 +536,9 @@ integration phase and recorded separately from these unit/integration tests.
 | Writer issuance, stage, per-operation publication gate | implemented |
 | Revocation fence + epoch + rollback anchor | implemented |
 | Managed-worktree preparation for EXTERNAL | implemented through the existing `prepare_managed_workspace` |
-| Unit/integration acceptance (AT-GW-001..025 partial) | 20 tests green on Windows; full suite 1596 green |
-| Crash-injection matrix (AT-GW-017/018, publication crash) | **not yet implemented** (A3) |
+| Unit/integration acceptance (AT-GW-001..025) | 27 tests green on Windows; full suite green |
+| Crash injection: charge→begin, begin→write, write→complete, re-grant, schema-1 migration | implemented (A3) |
+| Concurrent same-operation charge and post-revocation refusal | implemented (A3) |
 | AT-E5-029 / 030 / 043 re-evaluation | 029 and 030 covered by the no-grant/revocation tests and by the absence of a Goal lock during the Owner wait; 043 remains covered by existing reconciliation (no change to UNKNOWN semantics) |
 | Independent security review | **pending** |
 
@@ -558,8 +559,7 @@ Known implementation notes:
 | Phase | Base | Head | Draft PR | State |
 |---|---|---|---|---|
 | A0 design | PR #47 `08f3edf` | `3320dcd` | #48 | docs reviewed against code |
-| A1+A2 implementation | `3320dcd` | (this commit) | stacked on #48 | local tests + full suite green; CI pending |
-| A3 reliability | this PR | — | not yet opened | pending |
+| A1+A2+A3 implementation | `3320dcd` | `2f574ce` + this commit | #49 | local tests + full suite green; CI pending |
 | D0–D1 managed routing | this PR | — | not yet opened | preparation step implemented; E2E pending |
 | D2–D4 integration | — | — | not yet opened | pending |
 | Independent security review | — | — | — | pending |
