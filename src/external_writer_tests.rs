@@ -2260,3 +2260,48 @@ fn at_gw_025c_a_pending_writer_under_a_lapsed_grant_is_released() {
                 || blocker.code() == "WRITE_BUDGET_EXHAUSTED")
     );
 }
+
+#[test]
+fn at_gw_025d_a_pending_writer_revoked_via_the_owner_path_blocks_its_task() {
+    let (f, goal_id) = scoped_fixture("pending-revoke", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    assert_eq!(work["role"], "WRITER", "{work}");
+    // Normal Owner revocation advances the Goal anchor revision.
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "a revoked writer request must not be handed back: {next}"
+    );
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none()
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "WRITE_AUTHORIZATION_REVOKED"),
+        "the Task records the revocation, got {:?}",
+        task.blockers()
+    );
+    assert_eq!(
+        task.status(),
+        TaskStatus::Blocked,
+        "the Task must not be left RUNNING with the mutation lease"
+    );
+}

@@ -643,6 +643,14 @@ is exercised indirectly by the in-flight fence test, not by waiting 30 s.
 
 `R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps.
 
+### 11.7 Round-7 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R7-M1 | Normal Owner revocation advances the Goal revision through the anchor, so the pending-Writer authorization cleanup was skipped and the generic branch left a RUNNING Task holding the mutation lease | The pending-Writer authorization check now runs **before** the revision branch; an unusable grant always goes through the prepared-only cleanup. AT-GW-025d uses the real `revoke_active` path and asserts the Task is Blocked with `WRITE_AUTHORIZATION_REVOKED`, not left RUNNING. |
+
+`R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps.
+
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.
 
