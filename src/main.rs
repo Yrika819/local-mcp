@@ -87,6 +87,8 @@ mod external_goal_recovery_tests;
 #[cfg(test)]
 mod external_goal_tests;
 #[cfg(test)]
+mod external_h3_reliability_tests;
+#[cfg(test)]
 mod external_replanner_tests;
 #[cfg(test)]
 mod external_reviewer_recovery_tests;
