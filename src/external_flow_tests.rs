@@ -906,29 +906,51 @@ fn a_readonly_submission_cannot_revive_a_cancelled_goal() {
 }
 
 #[test]
-fn the_external_readonly_path_never_reaches_the_writer_or_approval_boundary() {
-    // Source-level guard for E4-B: wiring the external loop must not hand it the
-    // mutation or approval boundary, and must not let it spawn a Codex process.
+fn the_external_submission_path_never_reaches_the_write_or_approval_boundary() {
+    // E5 structure: submission only validates, seals, and durably prepares. The
+    // host's write boundary is reachable solely from `external_publish` (the
+    // publication step), so the submission path must not name it at all.
     for path in [
         "src/external_goal_api.rs",
-        "src/external_goal_driver.rs",
+        "src/external_writer.rs",
         "src/external_model_store.rs",
+        "src/external_model_work.rs",
     ] {
         let source = std::fs::read_to_string(path).unwrap();
         for needle in [
-            "workspace_publish",
+            // The identity helper (`workspace_publish::scope_identity`) is a pure
+            // hash and is shared with the Codex path; the publication primitive is
+            // not, and must never be reachable from submission.
+            "workspace_publish::publish",
+            "PublishRequest",
             "WriteBoundary",
             "approvals::",
             "without_sandbox",
-            "ProductionModelTransport",
-            "GoalModelAgent",
+            "std::fs::write",
         ] {
             assert!(
                 !source.contains(needle),
-                "{path} must not reach {needle} from the external loop"
+                "{path} must not reach {needle} from the submission path"
             );
         }
     }
+
+    // The publication step may use the host writer boundary, but still never the
+    // approval channel, a raw filesystem write, or a model transport.
+    let publish = std::fs::read_to_string("src/external_publish.rs").unwrap();
+    for needle in [
+        "approvals::",
+        "without_sandbox",
+        "std::fs::write",
+        "ProductionModelTransport",
+        "GoalModelAgent",
+    ] {
+        assert!(
+            !publish.contains(needle),
+            "external_publish must not reach {needle}"
+        );
+    }
+    assert!(publish.contains("writer::WriterWriteRequest"));
 }
 
 #[test]

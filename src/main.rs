@@ -16,6 +16,8 @@ mod external_goal_api;
 mod external_goal_driver;
 mod external_model_store;
 mod external_model_work;
+mod external_publish;
+mod external_writer;
 mod failure_class;
 mod fallback;
 mod git_command_class;
@@ -51,6 +53,7 @@ mod process_blocking;
 mod process_group;
 #[cfg(windows)]
 mod process_job;
+mod readiness;
 mod readonly_worker;
 mod replanner;
 mod resource_limits;
@@ -66,11 +69,14 @@ mod worker_capability;
 mod workspace_publish;
 mod workspace_snapshot;
 mod writer;
+mod writer_stage;
 
 #[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
+#[cfg(test)]
+mod external_dag_tests;
 #[cfg(test)]
 mod external_flow_tests;
 #[cfg(test)]
@@ -79,6 +85,8 @@ mod external_goal_api_tests;
 mod external_goal_recovery_tests;
 #[cfg(test)]
 mod external_goal_tests;
+#[cfg(test)]
+mod external_writer_tests;
 #[cfg(test)]
 mod goal_backends_tests;
 #[cfg(test)]

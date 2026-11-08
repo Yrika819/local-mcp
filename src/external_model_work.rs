@@ -85,6 +85,12 @@ pub(crate) const OUTPUT_CONTRACT_PLANNER_V1: &str = "planner-proposal-v1";
 /// Output contract for the Readonly role in V1.
 pub(crate) const OUTPUT_CONTRACT_READONLY_V1: &str = "readonly-investigation-v1";
 
+/// Output contract for the Writer role in V1.
+pub(crate) const OUTPUT_CONTRACT_WRITER_V1: &str = "writer-proposal-v1";
+
+/// Output contract for the Reviewer role in V1.
+pub(crate) const OUTPUT_CONTRACT_REVIEWER_V1: &str = "reviewer-verdict-v1";
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct WorkId(String);
@@ -934,6 +940,30 @@ impl ExternalModelState {
             }
         }
         self.last_stop = None;
+        Ok(())
+    }
+
+    /// SUBMITTED -> COMMITTED for the active WorkItem.
+    ///
+    /// Used by the two-phase Writer: the acceptance receipt is the submission
+    /// verdict, and *this* transition is the durable fact that the host applied
+    /// the prepared intent. No second receipt is invented for the same
+    /// submission id.
+    pub(crate) fn complete_active_work(&mut self, code: &str) -> Result<(), OrchestratorError> {
+        let item = self.pending_work.as_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "completing external work requires an active work item".to_owned(),
+            )
+        })?;
+        if item.state != WorkItemState::Submitted {
+            return Err(OrchestratorError::CorruptGoal(
+                "only a SUBMITTED external work item may be completed".to_owned(),
+            ));
+        }
+        item.state = WorkItemState::Committed;
+        item.terminal_code = Some(code.to_owned());
+        self.work_history.push(item.summary());
+        self.pending_work = None;
         Ok(())
     }
 
