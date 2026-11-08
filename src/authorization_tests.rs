@@ -621,3 +621,458 @@ fn at_gw_024_a_revocation_after_authorization_blocks_every_later_operation() {
     }
     assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
 }
+
+#[test]
+fn at_gw_009b_path_rules_reject_console_injection_characters() {
+    for rejected in [
+        "src/\u{1b}[2Jevil",
+        "src/\u{7}bell",
+        "src/\u{202e}gnp.exe",
+        "src/\u{2066}isolate",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must not reach the Owner console"
+        );
+    }
+}
+
+#[test]
+fn at_gw_021b_the_revocation_anchor_precedes_revoked_and_is_repaired_on_retry() {
+    let f = fixture("h3-anchor");
+    let grant = f.install();
+    let path =
+        authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str()).unwrap();
+    let before_revocation = std::fs::read(&path).unwrap();
+
+    authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None).unwrap();
+    // Simulate a crash after the ledger reached REVOKED but before the anchor
+    // was durable.
+    let revision = f.goal().revision();
+    f.store
+        .mutate_goal_snapshot(&f.session.id, &f.goal_id, revision, |goal, _now| {
+            *crate::external_model_store::external_state_mut(goal)?.authorization_anchor_mut() =
+                AuthorizationAnchor::default();
+            Ok(())
+        })
+        .unwrap();
+    // The idempotent retry repairs the anchor instead of returning early.
+    authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None).unwrap();
+    let anchor = authorization_store::anchor_of(&f.goal()).unwrap();
+    assert_eq!(
+        anchor.revoked_at_epoch(),
+        Some(grant.authorization_epoch()),
+        "the retry must restore the revocation anchor"
+    );
+
+    // Restoring the pre-revocation ACTIVE ledger must still be denied.
+    std::fs::write(&path, before_revocation).unwrap();
+    assert!(authorization_store::usable_grant(&f.store, &f.goal()).is_err());
+}
+
+#[test]
+fn at_gw_021c_a_restored_ledger_cannot_regain_spent_budget() {
+    let f = fixture("h4-budget");
+    let grant = authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    let path =
+        authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str()).unwrap();
+    let before_charge = std::fs::read(&path).unwrap();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
+
+    // Restore the ACTIVE ledger from before the charge: same grant id and
+    // epoch, usage 0. The Goal anchor's monotonic floor must still deny a
+    // second operation.
+    std::fs::write(&path, before_charge).unwrap();
+    let error = authorization_store::usable_grant(&f.store, &f.goal()).unwrap_err();
+    assert_eq!(refusal(error), GrantRefusal::BudgetExhausted);
+    assert_eq!(
+        authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1
+    );
+}
+
+#[test]
+fn at_gw_016b_revocation_waits_for_an_in_flight_operation_fence() {
+    use std::sync::mpsc;
+    let f = fixture("h1-fence");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (revoke_tx, revoke_rx) = mpsc::channel::<std::time::Duration>();
+    std::thread::scope(|scope| {
+        let store = &f.store;
+        let goal = f.goal();
+        let binding = &binding;
+        scope.spawn(move || {
+            let goal_ref = &goal;
+            let _fence = crate::authorization_store::acquire_publication_fence(
+                store,
+                goal_ref,
+                binding,
+                "op#0",
+                4,
+                |_| Ok(()),
+            )
+            .unwrap();
+            started_tx.send(()).unwrap();
+            // Hold the fence as a filesystem operation would.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        });
+        started_rx.recv().unwrap();
+        let store = &f.store;
+        let session = &f.session;
+        let goal_id = f.goal_id.as_str();
+        scope.spawn(move || {
+            let started = std::time::Instant::now();
+            crate::authorization_store::revoke_active(store, &session.id, goal_id, None).unwrap();
+            revoke_tx.send(started.elapsed()).unwrap();
+        });
+        let waited = revoke_rx.recv().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "revocation must wait for the in-flight fence, waited {waited:?}"
+        );
+    });
+    assert!(authorization_store::usable_grant(&f.store, &f.goal()).is_err());
+}
+
+#[test]
+fn at_gw_028b_the_requested_grant_lifetime_is_honoured() {
+    let f = fixture("lifetime");
+    let grant = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        4,
+        4096,
+        60,
+    );
+    let issued = parse_utc_rfc3339_seconds(grant.issued_at()).unwrap();
+    let expires = parse_utc_rfc3339_seconds(grant.expires_at()).unwrap();
+    assert!(expires > issued);
+    assert!(
+        expires - issued <= 61,
+        "a 60-second request must not become a 15-minute grant"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn at_gw_009c_a_write_scope_rule_cannot_escape_through_an_existing_symlink() {
+    let f = fixture("rule-symlink");
+    let outside = f.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.session.cwd.join("src/escape")).unwrap();
+    let scope = RequestedWriteScopeV1::from_mcp_value(&json!({
+        "allowed_paths": ["src/escape/**"],
+        "allowed_operations": ["WRITE_UTF8"],
+        "max_operations": 1,
+        "max_bytes": 100,
+        "expires_in_seconds": 300
+    }))
+    .unwrap();
+    let now = now_unix_seconds();
+    let error = authorization_store::begin_pending_request(
+        &f.store,
+        &f.goal(),
+        &scope,
+        Uuid::new_v4().to_string(),
+        crate::authorization::nonce_sha256("nonce"),
+        format_utc_rfc3339(now),
+        format_utc_rfc3339(now + 300),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "INVALID_ARGUMENT");
+}
+
+#[test]
+fn at_gw_019c_a_new_grant_generation_has_a_fresh_budget_floor() {
+    let f = fixture("regrant-budget");
+    let first = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    let first_binding = crate::authorization::GrantBinding::from_grant(&first);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &first_binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None)
+        .unwrap();
+    let second = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        0,
+        "a new generation starts with its own budget"
+    );
+    let second_binding = crate::authorization::GrantBinding::from_grant(&second);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &second_binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn at_gw_013b_an_already_charged_operation_resumes_at_the_budget_ceiling() {
+    let f = fixture("resume");
+    let grant = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    // Charge op#0 but do not begin it (the crash window).
+    drop(
+        crate::authorization_store::acquire_publication_fence(
+            &f.store,
+            &f.goal(),
+            &binding,
+            "op#0",
+            4,
+            |_| Ok(()),
+        )
+        .unwrap(),
+    );
+    // A different operation is genuinely over budget.
+    let error = crate::authorization_store::acquire_publication_fence(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#1",
+        1,
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(error), GrantRefusal::BudgetExhausted);
+    // The exact charged operation resumes without a second charge.
+    drop(
+        crate::authorization_store::acquire_publication_fence(
+            &f.store,
+            &f.goal(),
+            &binding,
+            "op#0",
+            4,
+            |_| Ok(()),
+        )
+        .unwrap(),
+    );
+    assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
+}
+
+#[test]
+fn at_gw_021d_a_stale_goal_snapshot_cannot_bypass_a_restored_ledger() {
+    let f = fixture("stale-anchor");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    let stale_goal = f.goal();
+    let path =
+        authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str()).unwrap();
+    let before_revocation = std::fs::read(&path).unwrap();
+
+    authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None).unwrap();
+    // Ledger-only rollback: the Goal keeps its durable revocation anchor.
+    std::fs::write(&path, before_revocation).unwrap();
+
+    // The caller holds a pre-revocation Goal snapshot. The fence must re-read the
+    // authoritative Goal and refuse; it must also not consume budget.
+    let error = authorization_store::acquire_publication_fence(
+        &f.store,
+        &stale_goal,
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        refusal(error),
+        GrantRefusal::Revoked | GrantRefusal::StateMismatch | GrantRefusal::RollbackDetected
+    ));
+    assert_eq!(
+        f.ledger().latest_grant().unwrap().usage().operations(),
+        0,
+        "a refused publication never charges"
+    );
+}
+
+#[test]
+fn at_gw_013c_reanchoring_the_same_grant_preserves_spent_budget() {
+    let f = fixture("reanchor");
+    let grant = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        2,
+        4096,
+        600,
+    );
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1
+    );
+    // A second Writer WorkItem under the same grant re-anchors it; that must
+    // not hand the earlier operation's budget back.
+    crate::authorization_store::record_anchor_grant(&f.store, &f.session.id, &f.goal_id, &grant)
+        .unwrap();
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1
+    );
+}
+
+#[test]
+fn at_gw_026_codex_goals_are_unaffected_by_authorization() {
+    let f = fixture("codex-unaffected");
+    // write_scope is EXTERNAL-only.
+    let error = goal_api::goal_start(
+        &json!({
+            "session_id": f.session.id,
+            "objective": "codex must not gain a write scope",
+            "model_backend": "CODEX",
+            "write_scope": {
+                "allowed_paths": ["src/**"],
+                "allowed_operations": ["WRITE_UTF8"],
+                "max_operations": 1,
+                "max_bytes": 100,
+                "expires_in_seconds": 300
+            }
+        }),
+        &f.session,
+        &f.store,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "INVALID_ARGUMENT");
+}
+
+#[test]
+fn at_gw_009d_console_safety_covers_all_bidi_and_separator_controls() {
+    for rejected in [
+        "src/\u{061c}alm",
+        "src/\u{200e}lrm",
+        "src/\u{200f}rlm",
+        "src/\u{2028}line",
+        "src/\u{2029}para",
+        "src/\u{feff}bom",
+        "src/\u{e0041}tag",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must be refused"
+        );
+    }
+    assert!(crate::authorization::is_console_unsafe('\u{200e}'));
+    assert!(crate::authorization::is_console_unsafe('\u{2028}'));
+    assert!(!crate::authorization::is_console_unsafe('a'));
+}
+
+#[test]
+fn at_gw_021e_a_stale_grant_cannot_displace_the_anchor_last_grant() {
+    let mut anchor = AuthorizationAnchor::default();
+    anchor.record_grant("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 2);
+    anchor.record_grant("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 1);
+    assert_eq!(
+        anchor.last_grant_id(),
+        Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    );
+    assert_eq!(anchor.highest_epoch(), 2);
+}
+
+#[test]
+fn at_gw_009e_the_console_filter_covers_format_and_invisible_characters() {
+    for rejected in [
+        "src/\u{00ad}soft",
+        "src/\u{200b}zero",
+        "src/\u{200c}zwnj",
+        "src/\u{200d}zwj",
+        "src/\u{2060}wordjoiner",
+        "src/\u{fff9}interlinear",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must be refused"
+        );
+    }
+    assert!(crate::authorization::is_console_unsafe('\u{00ad}'));
+    assert!(crate::authorization::is_console_unsafe('\u{200b}'));
+    assert!(crate::authorization::is_console_unsafe('\u{2060}'));
+}
+
+#[test]
+fn at_gw_009f_supplementary_plane_format_characters_are_refused() {
+    for rejected in [
+        "src/\u{1d173}musical",
+        "src/\u{110bd}kaithi",
+        "src/\u{13430}egyptian",
+        "src/\u{1bca0}shorthand",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must be refused"
+        );
+    }
+    assert!(crate::authorization::is_console_unsafe('\u{1d173}'));
+    assert!(crate::authorization::is_console_unsafe('\u{110bd}'));
+}

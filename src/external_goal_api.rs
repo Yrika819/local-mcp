@@ -450,17 +450,38 @@ pub(crate) async fn goal_next(
                     GrantRefusal::Unavailable.detail(),
                 ));
             }
-            // Expired / revoked / mismatch states are reported by the driver's
-            // own host step so a Goal that also needs managed preparation gets
-            // the right typed stop first.
-            Err(_) => {}
+            // An exhausted budget is not authorization loss: the publication
+            // path may still resume the exact already-charged operation, and
+            // read-only host steps remain allowed. Let the driver decide.
+            Err(AuthorizationGateError::Refusal(GrantRefusal::BudgetExhausted)) => {}
+            // Expired / revoked / rolled-back / workspace-changed authorization
+            // is enforced at the Writer boundaries (issuance, stage, publish),
+            // not as a whole-Goal stop. Read-only planning, review, verification
+            // and finalization must remain able to finish work that was already
+            // authorized before the grant lapsed.
+            Err(AuthorizationGateError::Refusal(
+                GrantRefusal::Expired
+                | GrantRefusal::Revoked
+                | GrantRefusal::StateMismatch
+                | GrantRefusal::RollbackDetected
+                | GrantRefusal::ScopeMismatch,
+            )) => {}
+            // A corrupt or unreadable authorization state is a genuine stop.
+            Err(error) => {
+                let code = error.code();
+                let detail = error.detail();
+                return Ok(blocked_view(&goal, max_host_steps, code, detail));
+            }
         }
     }
 
     let mut current = goal;
     let mut steps = 0u32;
     let report = loop {
-        let report = driver::advance_external_step(store, session, &current)
+        // Boxed because the host step now includes the managed-workspace
+        // evidence observation future; keeping it inline overflows a test
+        // thread's stack in the deepest external role chain.
+        let report = Box::pin(driver::advance_external_step(store, session, &current))
             .await
             .map_err(driver_error)?;
         steps = steps.saturating_add(report.host_steps_executed);

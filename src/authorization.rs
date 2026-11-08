@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config;
 use crate::goal::Goal;
 use crate::managed_worktree::{ManagedWorktreeLifecycle, WorkspaceMode};
 use crate::orchestrator_error::OrchestratorError;
@@ -64,6 +65,37 @@ pub(crate) const MAX_DENY_REASON_BYTES: usize = 256;
 /// never blocked indefinitely by a writer.
 pub(crate) const AUTHORIZATION_FENCE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
+
+/// Characters that may not reach the Owner console or a display-bound name.
+///
+/// Covers C0/C1/DEL (`char::is_control`), the Unicode bidi controls (including
+/// ALM/LRM/RLM, embeddings/overrides, isolates and deprecated formatting
+/// characters), the line/paragraph separators, the BOM, and the tag block.
+pub(crate) fn is_console_unsafe(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
 
 /// The only write operation kind V1 can grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -151,6 +183,14 @@ impl GrantPathRule {
     fn validate(&self) -> Result<(), GrantError> {
         if self.path.len() > MAX_GRANT_PATH_BYTES {
             return Err(GrantError::InvalidRequest("path rule is too long"));
+        }
+        // The Owner reads this spelling on the console before approving it, so a
+        // control character or a bidi override is an approval-UI injection
+        // primitive, not merely a strange filename.
+        if self.path.chars().any(is_console_unsafe) {
+            return Err(GrantError::InvalidRequest(
+                "path rule contains a control or bidi character",
+            ));
         }
         if self.path.is_empty() {
             if self.kind != GrantPathKind::Tree {
@@ -297,9 +337,12 @@ impl GrantUsage {
     }
 
     fn validate(&self, budget: &WriteBudgetV1) -> Result<(), GrantError> {
-        if self.operations != self.charged_operation_ids.len() as u32 {
+        // `operations` may exceed the id table after a ledger restore: the Goal
+        // anchor keeps the spent count while the restored ledger lost the ids.
+        // It may never be below the table, and it may never exceed the budget.
+        if self.operations < self.charged_operation_ids.len() as u32 {
             return Err(GrantError::Corrupt(
-                "grant usage count does not match its charge table",
+                "grant usage count is below its charge table",
             ));
         }
         if self.charged_operation_ids.len() > MAX_GRANT_OPERATIONS as usize
@@ -461,7 +504,10 @@ impl GrantWorkspaceIdentity {
                 "the managed worktree is blocked",
             ));
         }
-        let root = std::fs::canonicalize(record.worktree_root()).map_err(|_| {
+        // The managed root may not exist yet (REQUESTED). `canonical_future_path`
+        // resolves the existing ancestors and keeps the compact Git-compatible
+        // spelling that `validated_execution_root` and the writer paths use.
+        let root = config::canonical_future_path(record.worktree_root()).map_err(|_| {
             GrantError::WorkspaceUnavailable("the managed worktree root cannot be resolved")
         })?;
         Self::new(
@@ -505,7 +551,7 @@ impl GrantWorkspaceIdentity {
                     .worktree_id
                     .as_deref()
                     .ok_or(GrantError::Corrupt("managed workspace has no worktree id"))?;
-                crate::managed_worktree::validate_object_id(id, "grant worktree id")
+                crate::managed_worktree::WorktreeId::parse(id)
                     .map_err(|_| GrantError::Corrupt("managed workspace id is malformed"))?;
                 let base = self
                     .base_commit
@@ -644,7 +690,15 @@ pub(crate) struct PendingGrantRequestV1 {
     budget: WriteBudgetV1,
     requested_at: String,
     expires_at: String,
+    /// Lifetime the Owner is approving for the *grant*, measured from approval.
+    /// The pending request has its own shorter TTL in `expires_at`.
+    #[serde(default = "default_grant_lifetime_seconds")]
+    requested_lifetime_seconds: u64,
     nonce_sha256: String,
+}
+
+fn default_grant_lifetime_seconds() -> u64 {
+    3_600
 }
 
 impl PendingGrantRequestV1 {
@@ -664,6 +718,7 @@ impl PendingGrantRequestV1 {
         budget: WriteBudgetV1,
         requested_at: String,
         expires_at: String,
+        requested_lifetime_seconds: u64,
         nonce_sha256: String,
     ) -> Result<Self, GrantError> {
         let request = Self {
@@ -678,6 +733,7 @@ impl PendingGrantRequestV1 {
             budget,
             requested_at,
             expires_at,
+            requested_lifetime_seconds,
             nonce_sha256,
         };
         request.validate()?;
@@ -714,6 +770,10 @@ impl PendingGrantRequestV1 {
 
     pub(crate) fn expires_at(&self) -> &str {
         &self.expires_at
+    }
+
+    pub(crate) fn requested_lifetime_seconds(&self) -> u64 {
+        self.requested_lifetime_seconds
     }
 
     pub(crate) fn validate(&self) -> Result<(), GrantError> {
@@ -758,6 +818,13 @@ impl PendingGrantRequestV1 {
         if expires <= requested || expires - requested > PENDING_GRANT_TTL_SECONDS as i64 {
             return Err(GrantError::Corrupt(
                 "pending request lifetime is outside the host bound",
+            ));
+        }
+        if !(MIN_GRANT_TTL_SECONDS..=MAX_GRANT_TTL_SECONDS)
+            .contains(&self.requested_lifetime_seconds)
+        {
+            return Err(GrantError::Corrupt(
+                "approved grant lifetime is outside the host bound",
             ));
         }
         Ok(())
@@ -818,6 +885,10 @@ impl GoalWriteGrantV1 {
 
     pub(crate) fn expires_at(&self) -> &str {
         &self.expires_at
+    }
+
+    pub(crate) fn issued_at(&self) -> &str {
+        &self.issued_at
     }
 
     pub(crate) fn owner_decision_id(&self) -> &str {
@@ -980,6 +1051,12 @@ pub(crate) struct AuthorizationAnchor {
     revoked_at_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_grant_id: Option<String>,
+    /// Monotonic usage floor. Charges are mirrored here under Goal CAS so a
+    /// restored (rolled-back) ledger cannot regain spent budget.
+    #[serde(default)]
+    usage_operations: u32,
+    #[serde(default)]
+    usage_bytes: u64,
 }
 
 impl AuthorizationAnchor {
@@ -996,10 +1073,37 @@ impl AuthorizationAnchor {
     }
 
     pub(crate) fn record_grant(&mut self, grant_id: &str, epoch: u64) {
-        if epoch > self.highest_epoch {
+        // A stale-generation issuance must never displace a newer generation
+        // the Goal has already observed.
+        if epoch >= self.highest_epoch {
             self.highest_epoch = epoch;
+            self.last_grant_id = Some(grant_id.to_owned());
         }
-        self.last_grant_id = Some(grant_id.to_owned());
+    }
+
+    pub(crate) fn usage_operations(&self) -> u32 {
+        self.usage_operations
+    }
+
+    pub(crate) fn usage_bytes(&self) -> u64 {
+        self.usage_bytes
+    }
+
+    pub(crate) fn record_usage_floor(&mut self, operations: u32, bytes: u64) {
+        if operations > self.usage_operations {
+            self.usage_operations = operations;
+        }
+        if bytes > self.usage_bytes {
+            self.usage_bytes = bytes;
+        }
+    }
+
+    /// A new grant generation has its own budget; the previous generation's
+    /// floor must not exhaust it. Rollback protection for the new generation is
+    /// rebuilt by its own charges.
+    pub(crate) fn reset_usage_floor(&mut self) {
+        self.usage_operations = 0;
+        self.usage_bytes = 0;
     }
 
     pub(crate) fn record_revocation(&mut self, epoch: u64) {
@@ -1309,7 +1413,7 @@ impl AuthorizationLedgerV1 {
             allowed_operations: pending.allowed_operations.clone(),
             budget: pending.budget,
             issued_at: now.to_owned(),
-            expires_at: pending.expires_at.clone(),
+            expires_at: format_utc_rfc3339(now_seconds + pending.requested_lifetime_seconds as i64),
             authorization_epoch: epoch,
             revocation: GrantRevocation::not_revoked(),
             usage: GrantUsage::default(),
@@ -1517,6 +1621,53 @@ impl AuthorizationLedgerV1 {
         }
     }
 
+    /// Charge one operation id with an explicit monotonic floor.
+    ///
+    /// The floor comes from the Goal anchor, so a ledger restore that lost a
+    /// charge can never spend the same budget twice: the effective usage is the
+    /// maximum of the ledger and the anchor.
+    pub(crate) fn charge_operation_with_floor(
+        &mut self,
+        grant_id: &str,
+        operation_id: &str,
+        bytes: u64,
+        floor_operations: u32,
+        floor_bytes: u64,
+        now: &str,
+    ) -> Result<bool, GrantError> {
+        let grant = self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.grant_id == grant_id)
+            .ok_or(GrantError::UnknownGrant)?;
+        if grant.revocation.state() != GrantRevocationState::NotRevoked {
+            return Err(GrantError::Revoked);
+        }
+        if grant.usage.is_charged(operation_id) {
+            return Ok(false);
+        }
+        let base_operations = grant.usage.operations.max(floor_operations);
+        let base_bytes = grant.usage.bytes.max(floor_bytes);
+        if !grant.budget.allows(base_operations, base_bytes, 1, bytes) {
+            return Err(GrantError::BudgetExhausted);
+        }
+        if grant.usage.charged_operation_ids.len() >= MAX_GRANT_OPERATIONS as usize {
+            return Err(GrantError::BudgetExhausted);
+        }
+        grant.usage.operations = base_operations
+            .checked_add(1)
+            .ok_or(GrantError::BudgetExhausted)?;
+        grant.usage.bytes = base_bytes
+            .checked_add(bytes)
+            .ok_or(GrantError::BudgetExhausted)?;
+        grant
+            .usage
+            .charged_operation_ids
+            .push(operation_id.to_owned());
+        self.last_transition_at = Some(now.to_owned());
+        Ok(true)
+    }
+
     /// Resolve the grant that may authorize work right now.
     ///
     /// This is the single state/expiry/anchor decision used by the issuance,
@@ -1525,6 +1676,30 @@ impl AuthorizationLedgerV1 {
         &self,
         anchor: &AuthorizationAnchor,
         now: &str,
+    ) -> Result<&GoalWriteGrantV1, GrantRefusal> {
+        self.resolve_grant(anchor, now, None)
+    }
+
+    /// Resolve a grant for one specific operation.
+    ///
+    /// A crash after the durable charge but before `BeginOperation` leaves the
+    /// operation charged while the grant is at its budget ceiling. Re-running
+    /// that exact operation id may use its existing charge; a different id may
+    /// not.
+    pub(crate) fn usable_grant_for_operation(
+        &self,
+        anchor: &AuthorizationAnchor,
+        now: &str,
+        operation_id: &str,
+    ) -> Result<&GoalWriteGrantV1, GrantRefusal> {
+        self.resolve_grant(anchor, now, Some(operation_id))
+    }
+
+    fn resolve_grant(
+        &self,
+        anchor: &AuthorizationAnchor,
+        now: &str,
+        resume_operation_id: Option<&str>,
     ) -> Result<&GoalWriteGrantV1, GrantRefusal> {
         if anchor.validate().is_err() {
             return Err(GrantRefusal::StateMismatch);
@@ -1577,8 +1752,12 @@ impl AuthorizationLedgerV1 {
         if now_seconds < issued || now_seconds >= expires {
             return Err(GrantRefusal::Expired);
         }
-        if grant.usage.operations() >= grant.budget.max_operations()
-            || grant.usage.bytes() >= grant.budget.max_bytes()
+        let effective_operations = grant.usage.operations().max(anchor.usage_operations());
+        let effective_bytes = grant.usage.bytes().max(anchor.usage_bytes());
+        let resume_charged = resume_operation_id.is_some_and(|id| grant.usage.is_charged(id));
+        if !resume_charged
+            && (effective_operations >= grant.budget.max_operations()
+                || effective_bytes >= grant.budget.max_bytes())
         {
             return Err(GrantRefusal::BudgetExhausted);
         }
@@ -1654,6 +1833,11 @@ pub(crate) enum GrantError {
     Revoked,
     BudgetExhausted,
     StateMismatch(&'static str),
+    /// The per-Goal fence could not be acquired within its bound.
+    FenceTimeout,
+    /// A revocation could not take the fence. It is deferred; it is **not**
+    /// reported as revoked.
+    RevocationDeferred,
     Io,
 }
 
@@ -1674,6 +1858,8 @@ impl GrantError {
             Self::Revoked => "WRITE_AUTHORIZATION_REVOKED",
             Self::BudgetExhausted => "WRITE_BUDGET_EXHAUSTED",
             Self::StateMismatch(_) => "AUTHORIZATION_STATE_MISMATCH",
+            Self::FenceTimeout => "AUTHORIZATION_FENCE_BUSY",
+            Self::RevocationDeferred => "REVOCATION_DEFERRED",
             Self::Io => "AUTHORIZATION_STATE_IO",
         }
     }
@@ -1686,6 +1872,11 @@ impl std::fmt::Display for GrantError {
             | Self::Corrupt(detail)
             | Self::WorkspaceUnavailable(detail) => formatter.write_str(detail),
             Self::StateMismatch(detail) => formatter.write_str(detail),
+            Self::FenceTimeout => formatter
+                .write_str("the authorization fence is busy; the operation was not changed"),
+            Self::RevocationDeferred => formatter.write_str(
+                "the revocation fence is busy; the grant was not changed and is still active",
+            ),
             Self::Io => formatter.write_str("authorization state I/O failed"),
             other => formatter.write_str(other.code()),
         }
@@ -1845,6 +2036,10 @@ pub(crate) fn relative_workspace_path(
     path: &Path,
     workspace_root: &Path,
 ) -> Result<NormalizedWorkspacePath, GrantRefusal> {
+    // Match the root's spelling convention so a Windows verbatim operation path
+    // and a compact managed root compare correctly.
+    let path = config::canonical_path_like(path, workspace_root)
+        .map_err(|_| GrantRefusal::ScopeMismatch)?;
     let relative = path
         .strip_prefix(workspace_root)
         .map_err(|_| GrantRefusal::ScopeMismatch)?;
@@ -1872,7 +2067,7 @@ pub(crate) fn relative_workspace_path(
 /// every existing id validator accepts it.
 pub(crate) fn deterministic_grant_id(request_id: &str, epoch: u64) -> String {
     let mut framed = Vec::new();
-    framed.extend_from_slice(b"local-mcp/grant-id/v1 ");
+    framed.extend_from_slice(b"local-mcp/grant-id/v1\0");
     push_framed(&mut framed, request_id.as_bytes());
     push_framed(&mut framed, &epoch.to_le_bytes());
     let digest = Sha256::digest(&framed);

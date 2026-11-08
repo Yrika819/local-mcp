@@ -535,12 +535,13 @@ integration phase and recorded separately from these unit/integration tests.
 | `goal_next` Owner request / typed refusal | implemented |
 | Writer issuance, stage, per-operation publication gate | implemented |
 | Revocation fence + epoch + rollback anchor | implemented |
+| Independent security review | round 1 complete; H1–H4 + M1/M2 remediated (see §12.1) |
 | Managed-worktree preparation for EXTERNAL | implemented through the existing `prepare_managed_workspace` |
 | Unit/integration acceptance (AT-GW-001..025) | 27 tests green on Windows; full suite green |
 | Crash injection: charge→begin, begin→write, write→complete, re-grant, schema-1 migration | implemented (A3) |
 | Concurrent same-operation charge and post-revocation refusal | implemented (A3) |
 | AT-E5-029 / 030 / 043 re-evaluation | 029 and 030 covered by the no-grant/revocation tests and by the absence of a Goal lock during the Owner wait; 043 remains covered by existing reconciliation (no change to UNKNOWN semantics) |
-| Independent security review | **pending** |
+| Independent security review | round 1 complete; remediation pending re-review |
 
 Known implementation notes:
 
@@ -554,17 +555,169 @@ Known implementation notes:
 * EXTERNAL sub-schema 1 is migrated to 2 in the store decode path with an empty
   scope and a zero anchor. No grant is invented.
 
+### 11.1 Round-1 security remediation
+
+An independent review (separate provider/model, read-only) found four High and
+two Medium issues. All six are addressed on the integration branch:
+
+| ID | Finding | Fix |
+|---|---|---|
+| H1 | The ledger fence ended before the filesystem write, so a revocation could finalize while a write was about to start | The per-Goal fence is now held across `BeginOperation` → write → postimage → `CompleteOperation`. Revocation waits for the in-flight operation (bounded by `AUTHORIZATION_FENCE_TIMEOUT` and the operation's own bounds); it never reports `REVOKED` while a write is executing. AT-GW-016b proves the wait. |
+| H2 | Untrusted console text could repaint or reorder the approval prompt (path rules, activity, approval detail) | All untrusted console fields pass through `sanitize_console_field`; path rules reject C0/C1 and bidi characters at the model; the OCS resolves every rule against the workspace root and rejects symlink/junction escapes before approval. AT-GW-009b/009c. |
+| H3 | `REVOKED` was saved before the Goal anchor; a crash left a replayable anchor and retry returned early | The revocation anchor is written **before** the ledger finalizes `REVOKED`; an idempotent retry repairs a missing anchor. AT-GW-021b. |
+| H4 | Restoring an older ACTIVE ledger with the same grant/epoch restored spent budget | The Goal anchor now carries a monotonic usage floor (`usage_operations`, `usage_bytes`), written under Goal CAS before each charge. Effective usage is `max(ledger, anchor)`, so a restored ledger cannot regain budget. AT-GW-021c. |
+| M1 | The Owner-requested grant lifetime was ignored; every grant got the 15-minute pending TTL | Pending TTL and grant lifetime are separate. Approval issues `now + requested_lifetime_seconds`, bounded to `[60s, 7d]`. AT-GW-028b. |
+| M2 | A surviving command line could approve a pending request after an OCS restart | Approval requires the request to be live in this process's queue **and** the nonce digest to match. `/grant renew` adds its request to the same queue. |
+
+### 11.2 Round-2 security remediation
+
+Round 2 reviewed `dadfad5` and found four High and three Medium issues. The
+fixes are in the integration branch; the exact bounds are stated so no claim
+exceeds the code.
+
+| ID | Finding | Fix |
+|---|---|---|
+| R2-H1 | A stale Goal snapshot plus a ledger-only restore could bypass the durable revocation anchor | `prepare_charge` re-reads the authoritative Goal **under the ledger fence** and validates the anchor from that read. `revoke_active` writes the anchor under the same fence, so a stale snapshot cannot authorize. AT-GW-021d. |
+| R2-H2 | Raw IPC fields remained at several console sinks (cwd, queue notices, expiry, yolo drain, decision echoes) | Every IPC-derived field at every console sink passes through `sanitize_console_field`. |
+| R2-H3 | The grant display could hide a broad rule behind a 4 KiB join cap and showed the pending TTL instead of the grant lifetime | Every path rule is printed in full, one per line; the console shows the requested grant duration, the grant expiry if approved now, and the separate pending-request expiry. |
+| R2-H4 | The anchor CAS returned a newer revision, removing the revision conflict that would have stopped a cancellation race | The `BeginOperation` CAS now requires Goal `RUNNING` and the exact live `SUBMITTED` Writer WorkItem with the expected grant binding, not just Task/Attempt identity. |
+| R2-M1 | A replacement grant inherited the previous generation's usage floor | A new grant generation resets the floor (its own budget); same-generation retries keep it. AT-GW-019c. |
+| R2-M2 | A crash after the charge but before BeginOperation could not resume at the budget ceiling | An operation id that is already charged may resume after all other checks; a different id may not. AT-GW-013b. |
+| R2-M3 | No hard deadline on the publication helper's execution | **Accepted residual (availability).** The revoker's lock wait is bounded at 30 s and it never reports `REVOKED` on timeout; a stalled helper can hold the fence until the Owner terminates it. Adding a process deadline requires a publication-specific child-process timeout/kill path and is tracked as V1 hardening, not claimed here. |
+
+Also: concurrent publishers now receive typed refusals
+(`WRITER_PUBLICATION_CONFLICT`, `WRITER_PUBLICATION_NOT_AUTHORIZED`,
+`WRITER_COMPLETION_NOT_JOURNALED`) instead of a generic persistence error. A
+completion revision conflict keeps the pre-existing `RevisionConflict` error and
+the APPLYING journal (AT-E5-042 semantics), so `WRITER_COMPLETION_CONFLICT` is
+not emitted.
+
+### 11.3 Round-3 security remediation
+
+Round 3 reviewed `35ad119` and found one High, two Medium and two Low issues.
+
+| ID | Finding | Fix |
+|---|---|---|
+| R3-H1 | The approval parser diagnostic and the unrecognized-answer echo printed IPC-controlled text raw | Both are sanitized; the parser failure is bounded and escaped like every other console field. |
+| R3-M1 | The public `goal_next` authorization gate rejected an already-charged operation at the budget ceiling and blocked the prepared slot, so the charge→crash recovery never reached the operation-specific resume | `BudgetExhausted` is no longer treated as authorization loss in the pre-step; the driver decides, and the publication path resumes the exact charged operation. AT-GW-013d exercises this through `goal_next` with a real `write_scope`. |
+| R3-M2 | A concurrent publisher that advanced the journal between the initial check and the Begin CAS surfaced `GOAL_STATE_CORRUPT` | A `CorruptGoal` from the Begin CAS is now a typed `WRITER_PUBLICATION_CONFLICT`; no write occurs and no corruption is claimed. |
+| R3-L1 | Re-anchoring the same grant generation reset its usage floor | Only a strictly new generation resets the floor; AT-GW-013c. |
+| R3-L2 | A maximum-length tree rule could render past the display cap and hide its `/**` suffix | The display bound reserves room for the rendered suffix; the path model bound is unchanged. |
+
+`REVOCATION_DEFERRED`: a fence timeout now returns that explicit code instead of
+`AUTHORIZATION_STATE_IO`, matching §6.4. It still never reports `REVOKED`.
+
+
+### 11.4 Round-4 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R4-M1 | A READY Writer refused at issuance stayed READY, so the Scheduler re-selected it forever and later READY read-only Tasks never ran | The driver now durably cancels the never-issued READY Writer with a mandatory blocker (`record_writer_authorization_block`); READY has no direct BLOCKED edge. AT-GW-013e. |
+| R4-L1 | A maximum-length tree rule could lose its `/**` suffix at the display cap | The display bound reserves the rendered suffix; the console bound test checks a 4,095-byte path + `/**`. |
+| R4-L2 | Any `CorruptGoal` from the Begin CAS was labelled a publication conflict | Only an already-advanced journal/operation is a typed `WRITER_PUBLICATION_CONFLICT`; genuine durable corruption propagates. |
+| R4-L3 | The sanitizer's bidi coverage was narrower than Unicode `Bidi_Control` | One shared `is_console_unsafe` covers C0/C1, ALM/LRM/RLM, embeddings/overrides/isolates, U+206A–F, Zl/Zp, BOM and tag characters; used by both the path-rule validator and the console sanitizer. AT-GW-009d. |
+| R4-L4 | A stale-generation issuance could overwrite the anchor's `last_grant_id` and disable a newer grant | `record_grant` only advances for `epoch >= highest_epoch`; AT-GW-021e. |
+| I-2 | No named CODEX regression test | `at_gw_026_codex_goals_are_unaffected_by_authorization`. |
+| I-3 | A raw NUL byte in a source literal made `authorization.rs` look binary to grep | Replaced with the `\0` escape. |
+| I-5 | `REVOCATION_DEFERRED` was also emitted for a publication fence timeout | Split into `AUTHORIZATION_FENCE_BUSY` (publication) and `REVOCATION_DEFERRED` (revocation). |
+
+`I-6` (no 30-second fence-timeout test) remains a test-coverage gap; the timeout
+is exercised indirectly by the in-flight fence test, not by waiting 30 s.
+
+### 11.5 Round-5 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R5-M1 | Expiry/revocation stopped the whole Goal, so read-only planning, review, verification and finalization could not finish work that was already authorized | The `goal_next` pre-step no longer turns Expired/Revoked/StateMismatch/RollbackDetected/ScopeMismatch into a whole-Goal stop. Write authorization is enforced at the Writer boundaries (issuance, stage, publish); read-only host steps continue. AT-GW-025b proves an expired grant still issues a Planner WorkItem and writes nothing. |
+| R5-L1 | The console filter omitted several `Cf` format characters (soft hyphen, ZWSP/ZWNJ/ZWJ, word joiner, interlinear marks) | The shared `is_console_unsafe` covers those ranges; AT-GW-009e. |
+| R5-I1 | The design document itself contained a literal NUL in the I-3 note | Replaced with printable escape text. |
+
+`R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps, not code fixes.
+
+### 11.6 Round-6 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R6-M1 | A Writer WorkItem issued under a valid grant and then left PENDING when the grant expired occupied the slot forever; a submission could not be staged and read-only work was starved | The driver now detects a PENDING Writer whose grant is no longer usable, releases the slot through the existing prepared-only cleanup, and continues; independent read-only steps remain selectable. AT-GW-025c exercises this through the public `goal_next`. APPLYING/UNKNOWN intents are never cancelled. |
+| R6-L1 | 30 supplementary-plane `Cf` characters (U+110BD, U+110CD, U+13430–3F, U+1BCA0–A3, U+1D173–7A) still passed validation and display sanitization | Added to the shared `is_console_unsafe`; AT-GW-009f. |
+
+`R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps.
+
+### 11.7 Round-7 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R7-M1 | Normal Owner revocation advances the Goal revision through the anchor, so the pending-Writer authorization cleanup was skipped and the generic branch left a RUNNING Task holding the mutation lease | The pending-Writer authorization check now runs **before** the revision branch; an unusable grant always goes through the prepared-only cleanup. AT-GW-025d uses the real `revoke_active` path and asserts the Task is Blocked with `WRITE_AUTHORIZATION_REVOKED`, not left RUNNING. |
+
+`R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps.
+
+### 11.8 Round-8 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R8-M1 | If the Owner revoked G1 and approved G2 before `goal_next`, the pending Writer's G1 binding was not compared with the resolved G2 grant, so the generic revision branch cancelled only the WorkItem and left its Task RUNNING with the mutation lease | The pending-Writer check now compares the WorkItem's grant binding with the resolved grant. A mismatch goes through the prepared-only cleanup with `WRITE_AUTHORIZATION_REISSUED`. AT-GW-025e asserts BLOCKED, no active WorkItem and no held lease. |
+
+The final R8-M1 fix is covered by the named regression but was not included in
+an independent review round; rounds 1–8 found no unresolved Critical/High code
+defect after each round's remediation.
+
+The reviewer's CODEX regression check was static only; the full local suite
+(including all CODEX regression modules) was run after the remediation.
+
 ## 12. Campaign checkpoint
 
-| Phase | Base | Head | Draft PR | State |
+| Phase | Branch | Base | Head | Draft PR |
 |---|---|---|---|---|
-| A0 design | PR #47 `08f3edf` | `3320dcd` | #48 | docs reviewed against code |
-| A1+A2+A3 implementation | `3320dcd` | `2f574ce` + this commit | #49 | local tests + full suite green; CI pending |
-| D0–D1 managed routing | this PR | — | not yet opened | preparation step implemented; E2E pending |
-| D2–D4 integration | — | — | not yet opened | pending |
-| Independent security review | — | — | — | pending |
+| A0 design | `feat/goal-write-grant-a0` | PR #47 `08f3edf` | `3320dcd` | #48 |
+| A1 + A2 + A3 | `feat/goal-write-grant-a1` | `3320dcd` | `327b461` | #49 |
+| D0–D4 + security remediation | `feat/goal-write-grant-d` | `327b461` | see PR #50 head | #50 |
 
-## 13. Open Owner decisions
+* `main` remains `e6950fdc3bab72982285888a81cce822743fbba5`.
+* PRs #42–#47 are untouched. No merge, un-draft, tag, or release was performed.
+* PR #49 Required CI: **22/22 success** on `327b461` (push and pull_request runs).
+* PR #50 Required CI: see the PR checks at its final head.
+* Local Windows verification on the final head: `cargo fmt --all -- --check`,
+  `cargo check --locked --all-targets`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
+  `cargo test --locked` (**1616 unit + 16 + 5 + 21 integration, 0 failed**,
+  including **37 AT-GW tests**).
+
+### 12.1 Acceptance mapping (executed, fixed-JSON fixtures)
+
+This campaign's evidence is deterministic host fixtures. It is **not** real-model
+dogfooding, and the two are not conflated.
+
+| Requirement | Test evidence (all run in the full suite) |
+|---|---|
+| AT-E5-072 PRIMARY binding | `external_writer_tests::at_e5_028_to_034_publication_and_review_reach_host_goal_completion` (primary root) |
+| AT-E5-073 managed clean creation | `external_writer_tests::at_e5_073_the_external_driver_prepares_a_clean_managed_goal` (Unix; Windows creation gate is covered by the existing approval-gated managed suite) |
+| AT-E5-074 dirty primary refused | `external_writer_tests::at_e5_074_a_dirty_primary_refuses_external_managed_preparation` |
+| AT-E5-075 forged worktree root | `managed_worktree_creation_tests` (host-derived root; no model/client field) + `ManagedRootSource::Host` |
+| AT-E5-076 stale worktree identity | `managed_worktree_*` execution-root/reconciliation suites + `authorization_tests::at_gw_008` |
+| AT-E5-077 writer in managed workspace | `external_writer_tests::at_e5_072_082_external_managed_writer_reaches_host_evidence_without_touching_primary` |
+| AT-E5-078 snapshot evidence | same test (`managed_workspace_verification_evidence`, `goal_result` re-observation) |
+| AT-E5-079 finalization blocked | `managed_workspace_verification_evidence_tests` + `goal_finalizer_tests` (missing/mismatched evidence never COMPLETED) |
+| AT-E5-080 concurrent primary advance | `managed_worktree_creation_tests` base-advanced/reconciliation cases |
+| AT-E5-081 crash during evidence persistence | `managed_workspace_verification_evidence_tests` + `managed_worktree_*` fault cases |
+| AT-E5-082 no auto-merge/push | `at_e5_072_082` asserts primary HEAD/status unchanged, managed HEAD at base, no ref change |
+| Scenario A (readonly DAG) | `external_dag_tests::at_e5_001..007` (linear, diamond, multi-ready, blocked, failed, superseded) |
+| Scenario B (Writer→Reviewer→Verifier) | `external_writer_tests::at_e5_028_to_034...` and the managed E2E |
+| Scenario C (Replanner→DAG→Verifier) | `external_replanner_tests::at_e5_057`, `at_e5_066_070...` |
+| Scenario D (crash/resume/reconcile) | `external_goal_recovery_tests`, `external_h3_reliability_tests`, `external_writer_failure_tests`, and AT-GW-017/018/019/021/023/024 |
+
+### 12.2 Not verified in this campaign
+
+* Real external-model dogfooding (E5-E): **NOT RUN**. All scenarios above use
+  fixed JSON fixtures; no claim of real-model behaviour is made.
+* Native Windows junction/ADS race execution against the grant gate: the
+  existing session-authority tests cover junctions/ADS; the new
+  grant-rule-escape test is Unix-only.
+* A hard publication-helper execution deadline (R2-M3): accepted availability
+  residual.
+* Same-UID process impersonation resistance (R-1/C3): **NOT VERIFIED** by
+  design.
+
+## 13. Open Owner decisions## 13. Open Owner decisions
 
 1. **R-1 acceptance.** Is the deployment assumption "the agent cannot use the
    OCS console or the state directory outside GoalLatch" acceptable for V1 Beta,

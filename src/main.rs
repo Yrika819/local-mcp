@@ -239,6 +239,10 @@ fn main() -> Result<()> {
 
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                // The external host-step chain (managed-workspace evidence
+                // observation included) is deep enough that the platform's
+                // default worker stack is not a safe bound.
+                .thread_stack_size(8 * 1024 * 1024)
                 .build()?
                 .block_on(run(command))
         }

@@ -25,6 +25,7 @@ use crate::task_store::TaskStore;
 
 struct Fixture {
     root: PathBuf,
+    managed_root: PathBuf,
     session: config::Session,
     store: TaskStore,
 }
@@ -49,6 +50,7 @@ fn fixture(label: &str) -> Fixture {
         permitted_directories: vec![workspace],
     };
     Fixture {
+        managed_root: root.join("managed"),
         root,
         session,
         store: TaskStore::with_state_root(state),
@@ -1507,6 +1509,7 @@ fn scoped_fixture(
     let goal_id = GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap();
     (
         Fixture {
+            managed_root: root.join("managed"),
             root,
             session,
             store,
@@ -1630,11 +1633,30 @@ fn at_gw_015_a_revoked_grant_blocks_the_writer_path_end_to_end() {
     crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
         .unwrap();
     let next = goal_next(&f.session, &f.store, &goal_id);
-    assert_eq!(next["outcome"], "BLOCKED", "{next}");
-    let code = next["blockers"][0]["code"].as_str().unwrap_or_default();
     assert!(
-        code.starts_with("WRITE_AUTHORIZATION_"),
-        "revocation must surface as authorization loss, got {next}"
+        matches!(
+            next["outcome"].as_str(),
+            Some("BLOCKED") | Some("NO_ACTION_WITH_REASON")
+        ),
+        "revocation must stop the writer path: {next}"
+    );
+    // The prepared slot is durably released and the Task records the exact
+    // authorization code; the Goal is not left spinning on the revoked grant.
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none(),
+        "a revoked prepared slot is released"
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "WRITE_AUTHORIZATION_REVOKED"),
+        "the Task records the authorization stop: {:?}",
+        task.blockers()
     );
     assert_eq!(
         workspace_digest(&f.session.cwd),
@@ -1711,4 +1733,622 @@ fn at_gw_013_the_grant_operation_budget_bounds_a_multi_file_proposal() {
 
     assert_eq!(submitted["code"], "WRITE_BUDGET_EXHAUSTED", "{submitted}");
     assert_eq!(workspace_digest(&f.session.cwd), before);
+}
+
+#[test]
+fn at_e5_074_a_dirty_primary_refuses_external_managed_preparation() {
+    let (f, goal_id, _base) = managed_fixture("dirty");
+    // A grant bound to the requested managed identity lets goal_next reach the
+    // host preparation step instead of stopping at the authorization gate.
+    install_grant(&f, &goal_id, &["code.txt"], 8, 8192);
+    std::fs::write(
+        f.session.cwd.join("code.txt"),
+        b"dirty primary
+",
+    )
+    .unwrap();
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "BLOCKED", "{next}");
+    assert_eq!(
+        next["blockers"][0]["code"], "MANAGED_WORKSPACE_BLOCKED",
+        "{next}"
+    );
+    assert!(
+        !f.managed_root
+            .join(&f.session.id)
+            .join(goal_id.as_str())
+            .exists(),
+        "no worktree may be created for a dirty primary"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        "dirty primary
+"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E5-D / D2–D4 — EXTERNAL Writer, Reviewer and host evidence in a managed
+// worktree. AT-E5-072, 077, 078, 079, 082.
+// ---------------------------------------------------------------------------
+
+fn git(cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap_or_else(|error| panic!("could not run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned()
+}
+
+struct AllowAllApprovals;
+
+impl crate::managed_worktree_prepare::ManagedCreationApprover for AllowAllApprovals {
+    fn approve(
+        &self,
+        _request: &crate::managed_worktree_prepare::ManagedCreationApproval,
+    ) -> crate::managed_worktree_prepare::ManagedApprovalFuture<'_> {
+        Box::pin(async { Ok(true) })
+    }
+}
+
+fn managed_fixture(label: &str) -> (Fixture, GoalId, String) {
+    let raw_root =
+        std::env::temp_dir().join(format!("local-mcp-gw-managed-{label}-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&raw_root).unwrap();
+    let root = std::fs::canonicalize(&raw_root).unwrap();
+    let primary = root.join("primary");
+    let managed = root.join("managed");
+    let state = root.join("state");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&managed).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    git(&primary, &["init", "-q", "."]);
+    git(&primary, &["config", "core.autocrlf", "false"]);
+    git(
+        &primary,
+        &["config", "user.email", "managed@example.invalid"],
+    );
+    git(&primary, &["config", "user.name", "Managed E2E"]);
+    git(&primary, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(primary.join("code.txt"), b"fn main() {}\n").unwrap();
+    git(&primary, &["add", "code.txt"]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    let base = git(&primary, &["rev-parse", "HEAD"]);
+
+    let session = config::Session {
+        id: format!("gw-managed-{label}-{}", Uuid::new_v4()),
+        cwd: primary.clone(),
+        permitted_directories: vec![primary],
+    };
+    let store = TaskStore::with_state_root(state);
+    let mut fixture = Fixture {
+        root: root.clone(),
+        managed_root: managed.clone(),
+        session,
+        store,
+    };
+    let view = goal_api::goal_start_with_managed_root(
+        &json!({
+            "session_id": fixture.session.id,
+            "objective": "Managed Authorization B E2E",
+            "workspace_mode": "MANAGED_WORKTREE",
+            "model_backend": "EXTERNAL",
+            "write_scope": {
+                "allowed_paths": ["code.txt"],
+                "allowed_operations": ["WRITE_UTF8"],
+                "max_operations": 8,
+                "max_bytes": 8192,
+                "expires_in_seconds": 600
+            }
+        }),
+        &fixture.session,
+        &fixture.store,
+        &crate::goal_api::ManagedRootSource::fixed(managed.clone()),
+    )
+    .unwrap();
+    let view = serde_json::to_value(view).unwrap();
+    let goal_id = GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap();
+    let canonical_managed = std::fs::canonicalize(&fixture.managed_root).unwrap();
+    if !fixture
+        .session
+        .permitted_directories
+        .contains(&canonical_managed)
+    {
+        fixture
+            .session
+            .permitted_directories
+            .push(canonical_managed);
+        fixture.session.permitted_directories.sort();
+    }
+    (fixture, goal_id, base)
+}
+
+fn prepare_managed_external(f: &Fixture, goal_id: &GoalId) {
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            crate::managed_worktree_prepare::prepare_managed_workspace_with_policy(
+                &f.store,
+                &f.session,
+                goal_id,
+                &crate::managed_worktree_observe::HostGit::new(),
+                &crate::managed_worktree_create::HostWorktreeCreator::new(),
+                &AllowAllApprovals,
+                false,
+            ),
+        )
+        .expect("managed preparation");
+    assert!(
+        matches!(
+            outcome,
+            crate::managed_worktree_prepare::ManagedWorkspacePreparation::Active { .. }
+        ),
+        "managed workspace did not become ACTIVE"
+    );
+}
+
+#[test]
+fn at_e5_072_082_external_managed_writer_reaches_host_evidence_without_touching_primary() {
+    // The managed host-step chain is deep; run it on an explicit stack so the
+    // test exercises the code, not the harness thread's default stack limit.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(at_e5_072_082_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn at_e5_072_082_body() {
+    let (f, goal_id, base) = managed_fixture("e2e");
+    prepare_managed_external(&f, &goal_id);
+    install_grant(&f, &goal_id, &["code.txt"], 8, 8192);
+    crate::model_accounting::reset_for_test();
+
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let managed_root = goal
+        .execution_root()
+        .expect("managed execution root")
+        .to_path_buf();
+    assert_ne!(managed_root, f.session.cwd);
+    assert!(
+        std::fs::canonicalize(&managed_root)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&f.managed_root).unwrap())
+    );
+
+    let content = "fn main() { println!(\"managed\"); }\n";
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    let planned = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, content),
+        ),
+    )
+    .unwrap();
+    assert_eq!(planned["outcome"], "COMMITTED", "{planned}");
+
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    assert_eq!(writer_work["role"], "WRITER", "{writer_work}");
+    let staged = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
+            writer_answer(
+                &writer_work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        staged["outcome"], "ACCEPTED_FOR_HOST_PROCESSING",
+        "{staged}"
+    );
+
+    let reviewed = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(reviewed["outcome"], "MODEL_REQUIRED", "{reviewed}");
+    assert_eq!(reviewed["model_work"]["role"], "REVIEWER", "{reviewed}");
+    // AT-E5-077: the write happened in the managed root only.
+    assert_eq!(
+        std::fs::read_to_string(managed_root.join("code.txt")).unwrap(),
+        content
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        "fn main() {}\n"
+    );
+
+    let reviewer_work = reviewed["model_work"].clone();
+    let verdict = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &reviewer_work,
+            reviewer_answer(&reviewer_work, 0),
+        ),
+    )
+    .unwrap();
+    assert_eq!(verdict["outcome"], "COMMITTED", "{verdict}");
+    let finished = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(finished["status"], "COMPLETED", "{finished}");
+
+    // AT-E5-078: durable managed evidence names the exact worktree and head.
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let evidence = goal
+        .managed_workspace_verification_evidence()
+        .expect("managed verification evidence");
+    assert_eq!(evidence.observed_head(), base);
+    assert!(!evidence.workspace_snapshot_digest().is_empty());
+    let record = goal.managed_worktree().expect("worktree record");
+    assert_eq!(record.worktree_root(), managed_root);
+
+    // The result projection re-observes the managed worktree and matches the
+    // durable evidence (identity is not conflated with the content snapshot).
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(goal_api::goal_result_async(
+            &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+            &f.session,
+            &f.store,
+        ))
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    let workspace = result["managed_workspace"]
+        .as_object()
+        .expect("managed workspace result");
+    assert_eq!(
+        workspace["worktree_path"],
+        managed_root.to_string_lossy().as_ref()
+    );
+    assert!(
+        workspace["changed_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "code.txt"),
+        "{result}"
+    );
+
+    // AT-E5-082: no automatic merge, commit, push, or new primary ref.
+    assert_eq!(git(&f.session.cwd, &["rev-parse", "HEAD"]), base);
+    assert_eq!(git(&f.session.cwd, &["status", "--porcelain"]), "");
+    assert_eq!(git(&managed_root, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        crate::model_accounting::snapshot_for_test().codex_spawn_count,
+        0
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn at_e5_073_the_external_driver_prepares_a_clean_managed_goal() {
+    // Windows gates managed creation behind the interactive approval IPC; the
+    // Unix policy has no such gate, so this drives the production driver path.
+    let (f, goal_id, base) = managed_fixture("driver-prepare");
+    install_grant(&f, &goal_id, &["code.txt"], 8, 8192);
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        matches!(
+            next["outcome"].as_str(),
+            Some("HOST_PROGRESS") | Some("MODEL_REQUIRED")
+        ),
+        "the driver must prepare the worktree, got {next}"
+    );
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let root = goal.execution_root().expect("managed execution root");
+    assert!(root.exists());
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), base);
+    assert_eq!(git(&f.session.cwd, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn at_gw_013d_goal_next_resumes_an_already_charged_operation_at_the_ceiling() {
+    let (f, goal_id) = scoped_fixture("resume-ceiling", &["code.txt"], 1, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 1, 4096);
+    let content = "fn main() { println!(\"resume\"); }\n";
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    let submitted = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &work,
+            writer_answer(
+                &work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        submitted["outcome"], "ACCEPTED_FOR_HOST_PROCESSING",
+        "{submitted}"
+    );
+
+    // Charge the exact operation but stop before BeginOperation (the crash
+    // window), leaving the one-operation grant at its ceiling.
+    let goal = goal_of(&f, &goal_id);
+    let task_id = crate::task::TaskId::parse(work["task_id"].as_str().unwrap()).unwrap();
+    let binding = crate::external_model_store::external_state(&goal)
+        .unwrap()
+        .active_work()
+        .and_then(|item| item.authorization())
+        .cloned()
+        .expect("writer WorkItem binding");
+    let operation_id = goal.tasks()[&task_id]
+        .latest_attempt()
+        .and_then(|attempt| attempt.mutation_intent())
+        .map(|intent| intent.operation_id().to_owned())
+        .expect("prepared intent");
+    drop(
+        crate::authorization_store::acquire_publication_fence(
+            &f.store,
+            &goal,
+            &binding,
+            &format!("{operation_id}#0"),
+            content.len() as u64,
+            |_| Ok(()),
+        )
+        .unwrap(),
+    );
+
+    // The public entry point must resume this exact operation, not block the
+    // Goal because the grant is at its ceiling.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "MODEL_REQUIRED", "{next}");
+    assert_eq!(next["model_work"]["role"], "REVIEWER", "{next}");
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn at_gw_013e_a_budget_refused_writer_is_durably_blocked_instead_of_reselected() {
+    let f = fixture("writer-block");
+    let goal_id = start_external(&f.session, &f.store);
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            writer_plan(&planner_work, &["code.txt"], Value::Null),
+        ),
+    )
+    .unwrap();
+    let goal = goal_of(&f, &goal_id);
+    let task_id = goal
+        .tasks()
+        .keys()
+        .next()
+        .expect("planned writer task")
+        .clone();
+    assert_eq!(goal.tasks()[&task_id].status(), TaskStatus::Ready);
+
+    let blocked = crate::external_publish::record_writer_authorization_block(
+        &f.store,
+        &f.session,
+        &goal_id,
+        &task_id,
+        "WRITE_BUDGET_EXHAUSTED",
+    )
+    .unwrap();
+    assert!(blocked.is_some());
+    assert_eq!(
+        goal_of(&f, &goal_id).tasks()[&task_id].status(),
+        TaskStatus::Cancelled
+    );
+
+    // The Scheduler must not hand back the same Writer WorkItem forever.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "a blocked writer must not be reissued: {next}"
+    );
+}
+
+#[test]
+fn at_gw_025b_an_expired_grant_still_allows_read_only_progress() {
+    let (f, goal_id) = scoped_fixture("expired-readonly", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let before = workspace_digest(&f.session.cwd);
+
+    let mut ledger =
+        crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+            .unwrap()
+            .unwrap();
+    let now = crate::authorization::now_unix_seconds();
+    ledger.force_grant_window(
+        &crate::authorization::format_utc_rfc3339(now - 120),
+        &crate::authorization::format_utc_rfc3339(now - 60),
+    );
+    crate::authorization_store::save_ledger(&f.store, &ledger).unwrap();
+
+    // The grant cannot authorize a write, but the Planner is read-only work and
+    // must still be issued: an expired grant is not a whole-Goal stop.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "MODEL_REQUIRED", "{next}");
+    assert_eq!(next["model_work"]["role"], "PLANNER", "{next}");
+    assert_eq!(workspace_digest(&f.session.cwd), before);
+}
+
+#[test]
+fn at_gw_025c_a_pending_writer_under_a_lapsed_grant_is_released() {
+    let (f, goal_id) = scoped_fixture("pending-lapse", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    assert_eq!(work["role"], "WRITER", "{work}");
+
+    // The grant lapses before the client submits the issued request.
+    let mut ledger =
+        crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+            .unwrap()
+            .unwrap();
+    let now = crate::authorization::now_unix_seconds();
+    ledger.force_grant_window(
+        &crate::authorization::format_utc_rfc3339(now - 120),
+        &crate::authorization::format_utc_rfc3339(now - 60),
+    );
+    crate::authorization_store::save_ledger(&f.store, &ledger).unwrap();
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "a lapsed writer request must not be handed back forever: {next}"
+    );
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none(),
+        "the dead writer slot is released"
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Blocked);
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code().starts_with("WRITE_AUTHORIZATION_")
+                || blocker.code() == "WRITE_BUDGET_EXHAUSTED")
+    );
+}
+
+#[test]
+fn at_gw_025d_a_pending_writer_revoked_via_the_owner_path_blocks_its_task() {
+    let (f, goal_id) = scoped_fixture("pending-revoke", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    assert_eq!(work["role"], "WRITER", "{work}");
+    // Normal Owner revocation advances the Goal anchor revision.
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "a revoked writer request must not be handed back: {next}"
+    );
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none()
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "WRITE_AUTHORIZATION_REVOKED"),
+        "the Task records the revocation, got {:?}",
+        task.blockers()
+    );
+    assert_eq!(
+        task.status(),
+        TaskStatus::Blocked,
+        "the Task must not be left RUNNING with the mutation lease"
+    );
+}
+
+#[test]
+fn at_gw_025e_a_reissued_grant_releases_the_old_pending_writer_and_lease() {
+    let (f, goal_id) = scoped_fixture("pending-reissue", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    assert_eq!(work["role"], "WRITER", "{work}");
+
+    // Owner revokes G1 and immediately approves G2 before goal_next runs.
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "the old generation's request must not be reissued: {next}"
+    );
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none()
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Blocked);
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "WRITE_AUTHORIZATION_REISSUED"),
+        "expected the superseded-generation blocker, got {:?}",
+        task.blockers()
+    );
+    assert!(
+        !crate::writer::holds_workspace_mutation_lease(task),
+        "a blocked pre-issuance Task must not keep the mutation lease"
+    );
 }

@@ -195,6 +195,49 @@ pub(crate) async fn advance_external_step(
     if let Some(active) = state.active_work() {
         match active.state() {
             WorkItemState::Pending => {
+                // A Writer WorkItem issued under a grant that has since
+                // expired or been revoked can never be staged. This check runs
+                // *before* the generic revision check because a normal
+                // revocation advances the Goal revision (the anchor CAS); the
+                // generic branch would cancel only the WorkItem and leave its
+                // RUNNING Task holding the mutation lease.
+                if active.role() == WorkRole::Writer {
+                    let resolved = crate::authorization_store::usable_grant(store, goal);
+                    let stale: Option<(&'static str, &'static str)> = match &resolved {
+                        Ok(grant) => {
+                            let current = crate::authorization::GrantBinding::from_grant(grant);
+                            if active.authorization() == Some(&current) {
+                                None
+                            } else {
+                                Some((
+                                    "WRITE_AUTHORIZATION_REISSUED",
+                                    "the Writer WorkItem belongs to a superseded grant generation",
+                                ))
+                            }
+                        }
+                        Err(error) => Some((error.code(), error.detail())),
+                    };
+                    if let Some((code, detail)) = stale {
+                        return match external_publish::record_authorization_refusal(
+                            store,
+                            session,
+                            goal.id(),
+                            code,
+                        ) {
+                            Ok(Some(_)) => Ok(DriverReport::advanced(DriverOutcome::Progress {
+                                code: "WRITE_AUTHORIZATION_SLOT_RELEASED",
+                                detail: "a Writer WorkItem issued under a lapsed or superseded grant was cancelled and its Task blocked",
+                            })),
+                            Ok(None) => Ok(DriverReport::reused(DriverOutcome::Refused(
+                                DriverRefusal::HostStepRefused {
+                                    code,
+                                    detail: detail.to_owned(),
+                                },
+                            ))),
+                            Err(error) => Err(DriverError::Persistence(error)),
+                        };
+                    }
+                }
                 if active.goal_revision() == goal.revision()
                     && active.plan_revision() == goal.plan_revision()
                 {
@@ -310,7 +353,31 @@ pub(crate) async fn advance_external_step(
         SchedulerDecision::VerifyGoal => {
             match goal_verifier::verify_goal(store, &session.id, goal.id(), revision) {
                 Ok(result) => {
-                    let code = match result.decision().outcome() {
+                    let outcome = result.decision().outcome();
+                    // E5-D: a managed Goal uses the same host evidence hook as
+                    // the CODEX scheduler. Without it the finalizer correctly
+                    // refuses to complete a managed Goal, so this is part of
+                    // verification, not an optional extra.
+                    if goal.workspace_mode().is_managed()
+                        && outcome == crate::task::VerificationOutcome::Passed
+                        && let Err(detail) = Box::pin(
+                            crate::scheduler::persist_managed_workspace_verification_evidence(
+                                store,
+                                session,
+                                result.goal(),
+                                result.record_id(),
+                            ),
+                        )
+                        .await
+                    {
+                        return Ok(DriverReport::reused(DriverOutcome::Refused(
+                            DriverRefusal::HostStepRefused {
+                                code: "MANAGED_EVIDENCE_PERSIST_FAILED",
+                                detail,
+                            },
+                        )));
+                    }
+                    let code = match outcome {
                         crate::task::VerificationOutcome::Passed => "GOAL_VERIFICATION_PASSED",
                         _ => "GOAL_VERIFICATION_NOT_PASSED",
                     };
@@ -698,12 +765,24 @@ async fn publish_submitted_writer_work(
                 detail: "every prepared writer operation was published and journaled by the host",
             }))
         }
-        Ok(PublishOutcome::Refused { code }) => Ok(DriverReport::reused(DriverOutcome::Refused(
-            DriverRefusal::HostStepRefused {
-                code,
-                detail: "the host refused to publish the prepared writer intent".to_owned(),
-            },
-        ))),
+        Ok(PublishOutcome::Refused { code }) => {
+            if (code.starts_with("WRITE_AUTHORIZATION_") || code == "WRITE_BUDGET_EXHAUSTED")
+                && external_publish::record_authorization_refusal(store, session, goal.id(), code)
+                    .map_err(DriverError::Persistence)?
+                    .is_some()
+            {
+                return Ok(DriverReport::advanced(DriverOutcome::Progress {
+                    code: "WRITE_AUTHORIZATION_SLOT_RELEASED",
+                    detail: "authorization was lost before any operation began; the prepared writer slot was cancelled and the Task blocked",
+                }));
+            }
+            Ok(DriverReport::reused(DriverOutcome::Refused(
+                DriverRefusal::HostStepRefused {
+                    code,
+                    detail: "the host refused to publish the prepared writer intent".to_owned(),
+                },
+            )))
+        }
         Err(error) => Err(DriverError::Persistence(error)),
     }
 }
@@ -803,12 +882,26 @@ fn issue_writer_work_item(
         Ok(WriterIssueOutcome::Refused(block)) => Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::Budget(block),
         ))),
-        Ok(WriterIssueOutcome::Unauthorized { code, detail }) => Ok(DriverReport::reused(
-            DriverOutcome::Refused(DriverRefusal::HostStepRefused {
-                code,
-                detail: detail.to_owned(),
-            }),
-        )),
+        Ok(WriterIssueOutcome::Unauthorized { code, detail }) => {
+            // A budget or authorization refusal must change durable state, or
+            // the Scheduler would select the same READY Writer forever and
+            // independent read-only Tasks would never run.
+            if code.starts_with("WRITE_AUTHORIZATION_") || code == "WRITE_BUDGET_EXHAUSTED" {
+                let _ = external_publish::record_writer_authorization_block(
+                    store,
+                    session,
+                    goal.id(),
+                    task_id,
+                    code,
+                );
+            }
+            Ok(DriverReport::reused(DriverOutcome::Refused(
+                DriverRefusal::HostStepRefused {
+                    code,
+                    detail: detail.to_owned(),
+                },
+            )))
+        }
         Err(error) => Err(DriverError::Persistence(error)),
     }
 }

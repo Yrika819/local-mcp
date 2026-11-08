@@ -582,7 +582,7 @@ where
     })
 }
 
-async fn persist_managed_workspace_verification_evidence(
+pub(crate) async fn persist_managed_workspace_verification_evidence(
     store: &TaskStore,
     session: &config::Session,
     verified_goal: &Goal,
