@@ -4883,6 +4883,96 @@ impl Goal {
         Ok(())
     }
 
+    /// Host-owned lookup of one Task's dependency closure.
+    ///
+    /// Exposed so a host readiness step can decide, on a snapshot it has already
+    /// loaded and validated, whether a PENDING Task may be armed. The rule is the
+    /// same one `transition_task` enforces: every dependency must be an active
+    /// (non-superseded) Task that reached host-verified COMPLETED.
+    pub(crate) fn dependencies_satisfied_for_host(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<bool, OrchestratorError> {
+        self.dependencies_satisfied(task_id)
+    }
+
+    /// PENDING Tasks that may be armed right now, in deterministic order.
+    ///
+    /// A Task is eligible only when it is PENDING, still carries active plan
+    /// authority, has no unresolved blocker, and every dependency is an active
+    /// Task at host-verified COMPLETED. Mandatory-first then
+    /// (created_plan_revision, TaskId) keeps the ordering stable and independent
+    /// of map iteration order.
+    pub(crate) fn ready_candidates(&self) -> Result<Vec<TaskId>, OrchestratorError> {
+        let mut eligible = Vec::new();
+        for (task_id, task) in &self.tasks {
+            if task.status() != TaskStatus::Pending
+                || !task.is_active_plan_authority()
+                || !task.blockers().is_empty()
+            {
+                continue;
+            }
+            if self.dependencies_satisfied(task_id)? {
+                eligible.push(task_id.clone());
+            }
+        }
+        eligible.sort_by(|left, right| {
+            let left_task = &self.tasks[left];
+            let right_task = &self.tasks[right];
+            right_task
+                .mandatory()
+                .cmp(&left_task.mandatory())
+                .then_with(|| {
+                    left_task
+                        .created_plan_revision()
+                        .cmp(&right_task.created_plan_revision())
+                })
+                .then_with(|| left.as_str().cmp(right.as_str()))
+        });
+        Ok(eligible)
+    }
+
+    /// Arm every eligible PENDING Task in one durable transition set.
+    ///
+    /// All transitions are applied to a private candidate and published only
+    /// after `validate()` passes, so a partially armed DAG is never committed.
+    /// The caller's `TaskStore` CAS then makes the whole set one snapshot commit.
+    pub(crate) fn propagate_ready_tasks(
+        &mut self,
+        now: &str,
+    ) -> Result<Vec<TaskId>, OrchestratorError> {
+        if !matches!(self.status, GoalStatus::Running | GoalStatus::Replanning) {
+            return Err(OrchestratorError::InvalidDag(
+                "readiness propagation requires a RUNNING or REPLANNING Goal".to_owned(),
+            ));
+        }
+        let candidates = self.ready_candidates()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut candidate = self.clone();
+        let mut armed = Vec::new();
+        for task_id in candidates {
+            let dependencies_satisfied = candidate.dependencies_satisfied(&task_id)?;
+            candidate
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidDag("readiness target disappeared".to_owned())
+                })?
+                .transition_to(
+                    TaskStatus::Ready,
+                    dependencies_satisfied,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+            armed.push(task_id);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(armed)
+    }
+
     fn dependencies_satisfied(&self, task_id: &TaskId) -> Result<bool, OrchestratorError> {
         let task = self
             .tasks

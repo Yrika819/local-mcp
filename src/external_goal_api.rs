@@ -474,6 +474,16 @@ fn driver_view(
             builder.no_action_reason = Some(code);
             builder.build()
         }
+        DriverOutcome::Refused(DriverRefusal::DependencyWaiting { code, detail }) => {
+            let mut builder = base_next_view(goal, "NO_ACTION_WITH_REASON", steps, max_host_steps);
+            builder.no_action_reason = Some(code);
+            builder.blockers = Some(vec![ExternalBlockerView {
+                code: code.to_owned(),
+                detail,
+                mandatory: false,
+            }]);
+            builder.build()
+        }
     }
 }
 

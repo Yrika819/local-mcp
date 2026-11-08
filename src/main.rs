@@ -51,6 +51,7 @@ mod process_blocking;
 mod process_group;
 #[cfg(windows)]
 mod process_job;
+mod readiness;
 mod readonly_worker;
 mod replanner;
 mod resource_limits;
@@ -71,6 +72,8 @@ mod writer;
 mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
+#[cfg(test)]
+mod external_dag_tests;
 #[cfg(test)]
 mod external_flow_tests;
 #[cfg(test)]

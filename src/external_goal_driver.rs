@@ -31,6 +31,7 @@ use crate::goal_finalizer::{self, GoalFinalizationOutcome};
 use crate::goal_verifier;
 use crate::orchestrator_error::OrchestratorError;
 use crate::planner;
+use crate::readiness;
 use crate::readonly_worker::{self, ReadonlyIssueOutcome};
 use crate::scheduler::{self, SchedulerDecision, SchedulerNoActionReason};
 use crate::task::{TaskId, TaskStatus, WorkerKind};
@@ -84,6 +85,11 @@ pub(crate) enum DriverRefusal {
     },
     /// The Scheduler selected no host action for this durable state.
     NoAction { code: &'static str },
+    /// A PENDING Task is waiting on an active predecessor that cannot complete
+    /// without host intervention (BLOCKED / FAILED / NEEDS_REPLAN). Reported as
+    /// a non-mandatory blocker so the caller sees the exact predecessor pair
+    /// without the Goal being durably marked blocked.
+    DependencyWaiting { code: &'static str, detail: String },
 }
 
 /// A driver result plus how many host steps it consumed.
@@ -218,6 +224,23 @@ pub(crate) async fn advance_external_step(
         }
     }
 
+    // E5-0: a pending host-only readiness transition is resolved before any new
+    // ModelWorkItem is issued, so the client is never asked to work on a graph
+    // the host has not finished arming.
+    match readiness::propagate_ready_tasks(store, session, goal) {
+        Ok(readiness::ReadinessOutcome::Propagated { armed }) => {
+            return Ok(DriverReport::advanced(DriverOutcome::Progress {
+                code: readiness::READINESS_PROPAGATED,
+                detail: if armed == 1 {
+                    "the host armed one Task whose active predecessors are verified complete"
+                } else {
+                    "the host armed every eligible Task whose active predecessors are verified complete"
+                },
+            }));
+        }
+        Ok(readiness::ReadinessOutcome::NothingEligible) => {}
+        Err(error) => return Err(DriverError::Persistence(error)),
+    }
     let selection = scheduler::select_scheduler_action(goal).map_err(|_| {
         DriverError::Persistence(OrchestratorError::CorruptGoal(
             "the scheduler rejected the durable external Goal state".to_owned(),
@@ -367,11 +390,24 @@ async fn no_action_step(
                 ))),
             }
         }
-        other => Ok(DriverReport::reused(DriverOutcome::Refused(
-            DriverRefusal::NoAction {
-                code: no_action_code(&other),
-            },
-        ))),
+        other => {
+            let code = no_action_code(&other);
+            if matches!(
+                other,
+                SchedulerNoActionReason::WaitingForDependencies
+                    | SchedulerNoActionReason::BlockedTasks
+                    | SchedulerNoActionReason::FailedTasks
+                    | SchedulerNoActionReason::ReadinessPropagationDeferred
+            ) && let Some(detail) = readiness::waiting_detail(goal)
+            {
+                return Ok(DriverReport::reused(DriverOutcome::Refused(
+                    DriverRefusal::DependencyWaiting { code, detail },
+                )));
+            }
+            Ok(DriverReport::reused(DriverOutcome::Refused(
+                DriverRefusal::NoAction { code },
+            )))
+        }
     }
 }
 
