@@ -86,6 +86,8 @@ mod external_goal_recovery_tests;
 #[cfg(test)]
 mod external_goal_tests;
 #[cfg(test)]
+mod external_reviewer_recovery_tests;
+#[cfg(test)]
 mod external_writer_failure_tests;
 #[cfg(test)]
 mod external_writer_race_tests;

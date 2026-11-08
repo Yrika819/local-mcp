@@ -84,7 +84,13 @@ pub(crate) fn reviewer_pending(goal: &Goal) -> Option<(TaskId, String, bool)> {
         let Some(intent) = attempt.mutation_intent() else {
             continue;
         };
-        if intent.state() != MutationIntentState::Applied {
+        // `ReconciledPerformed` is the state recovery reaches after reconciling a
+        // writer mutation whose completion could not be observed directly; the
+        // review leg must resume from it exactly like the normal path.
+        if !matches!(
+            intent.state(),
+            MutationIntentState::Applied | MutationIntentState::ReconciledPerformed
+        ) {
             continue;
         }
         let invoked = match intent.reviewer_state() {
@@ -373,7 +379,13 @@ pub(crate) fn issue_external_reviewer_work_item(
 ) -> Result<Option<ModelWorkItem>, OrchestratorError> {
     let mut slot: Option<Result<ModelWorkItem, ()>> = None;
     let precheck = store.load_goal(&session.id, goal_id)?;
-    if writer::build_external_reviewer_request(&precheck, task_id).is_err() {
+    let request = match writer::build_external_reviewer_request(&precheck, task_id) {
+        Ok(request) => request,
+        Err(_) => return Ok(None),
+    };
+    // Never ask for a review of a postimage the host no longer observes: a file
+    // changed after publication is a typed stop, not a review target.
+    if writer::reviewer_request_postimage_is_stale(&request) {
         return Ok(None);
     }
     store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {

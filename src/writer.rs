@@ -2186,7 +2186,11 @@ pub(crate) fn build_external_reviewer_request_at_revision(
     let intent = attempt.mutation_intent().ok_or_else(|| {
         WriterError::AuthorityViolation("reviewer request lacks MutationIntent".to_owned())
     })?;
-    if intent.state() != crate::mutation::MutationIntentState::Applied {
+    if !matches!(
+        intent.state(),
+        crate::mutation::MutationIntentState::Applied
+            | crate::mutation::MutationIntentState::ReconciledPerformed
+    ) {
         return Err(WriterError::AuthorityViolation(
             "reviewer request requires a fully applied writer intent".to_owned(),
         ));
@@ -2261,6 +2265,18 @@ impl ValidatedReviewerOutput {
     pub(crate) fn summary(&self) -> &str {
         &self.summary
     }
+}
+
+/// Whether any file in a reviewer request no longer matches its published digest.
+///
+/// The expected digest is the one the host published (recorded in the durable
+/// intent), so this detects drift rather than comparing a value to itself.
+pub(crate) fn reviewer_request_postimage_is_stale(request: &ReviewerRequest) -> bool {
+    request.files.iter().any(|file| {
+        observe_file_state(&file.path)
+            .map(|current| current.sha256 != file.after_sha256)
+            .unwrap_or(true)
+    })
 }
 
 /// Validate one untrusted external Reviewer response against the durable request.
