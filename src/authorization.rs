@@ -88,6 +88,11 @@ pub(crate) fn is_console_unsafe(character: char) -> bool {
                 | '\u{2060}'..='\u{206f}'
                 | '\u{feff}'
                 | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
                 | '\u{e0000}'..='\u{e007f}'
         )
 }

@@ -2210,3 +2210,53 @@ fn at_gw_025b_an_expired_grant_still_allows_read_only_progress() {
     assert_eq!(next["model_work"]["role"], "PLANNER", "{next}");
     assert_eq!(workspace_digest(&f.session.cwd), before);
 }
+
+#[test]
+fn at_gw_025c_a_pending_writer_under_a_lapsed_grant_is_released() {
+    let (f, goal_id) = scoped_fixture("pending-lapse", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let work = plan_writer_goal(
+        &f,
+        &goal_id,
+        writer_plan(
+            &goal_next(&f.session, &f.store, &goal_id)["model_work"].clone(),
+            &["code.txt"],
+            Value::Null,
+        ),
+    );
+    assert_eq!(work["role"], "WRITER", "{work}");
+
+    // The grant lapses before the client submits the issued request.
+    let mut ledger =
+        crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+            .unwrap()
+            .unwrap();
+    let now = crate::authorization::now_unix_seconds();
+    ledger.force_grant_window(
+        &crate::authorization::format_utc_rfc3339(now - 120),
+        &crate::authorization::format_utc_rfc3339(now - 60),
+    );
+    crate::authorization_store::save_ledger(&f.store, &ledger).unwrap();
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert!(
+        !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
+        "a lapsed writer request must not be handed back forever: {next}"
+    );
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none(),
+        "the dead writer slot is released"
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert_eq!(task.status(), TaskStatus::Blocked);
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code().starts_with("WRITE_AUTHORIZATION_")
+                || blocker.code() == "WRITE_BUDGET_EXHAUSTED")
+    );
+}

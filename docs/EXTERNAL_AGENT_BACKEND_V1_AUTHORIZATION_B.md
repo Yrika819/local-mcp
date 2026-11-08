@@ -634,6 +634,15 @@ is exercised indirectly by the in-flight fence test, not by waiting 30 s.
 
 `R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps, not code fixes.
 
+### 11.6 Round-6 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R6-M1 | A Writer WorkItem issued under a valid grant and then left PENDING when the grant expired occupied the slot forever; a submission could not be staged and read-only work was starved | The driver now detects a PENDING Writer whose grant is no longer usable, releases the slot through the existing prepared-only cleanup, and continues; independent read-only steps remain selectable. AT-GW-025c exercises this through the public `goal_next`. APPLYING/UNKNOWN intents are never cancelled. |
+| R6-L1 | 30 supplementary-plane `Cf` characters (U+110BD, U+110CD, U+13430–3F, U+1BCA0–A3, U+1D173–7A) still passed validation and display sanitization | Added to the shared `is_console_unsafe`; AT-GW-009f. |
+
+`R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps.
+
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.
 

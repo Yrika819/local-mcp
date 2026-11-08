@@ -198,6 +198,38 @@ pub(crate) async fn advance_external_step(
                 if active.goal_revision() == goal.revision()
                     && active.plan_revision() == goal.plan_revision()
                 {
+                    // A Writer WorkItem issued under a grant that has since
+                    // expired or been revoked can never be staged. Release the
+                    // slot durably instead of handing the same dead request back
+                    // forever and starving independent read-only work.
+                    if active.role() == WorkRole::Writer
+                        && let Err(error) = crate::authorization_store::usable_grant(store, goal)
+                    {
+                        let code = error.code();
+                        let detail = error.detail();
+                        match external_publish::record_authorization_refusal(
+                            store,
+                            session,
+                            goal.id(),
+                            code,
+                        ) {
+                            Ok(Some(_)) => {
+                                return Ok(DriverReport::advanced(DriverOutcome::Progress {
+                                    code: "WRITE_AUTHORIZATION_SLOT_RELEASED",
+                                    detail: "a Writer WorkItem issued under a lapsed grant was cancelled and its Task blocked",
+                                }));
+                            }
+                            Ok(None) => {
+                                return Ok(DriverReport::reused(DriverOutcome::Refused(
+                                    DriverRefusal::HostStepRefused {
+                                        code,
+                                        detail: detail.to_owned(),
+                                    },
+                                )));
+                            }
+                            Err(error) => return Err(DriverError::Persistence(error)),
+                        }
+                    }
                     return Ok(DriverReport::reused(DriverOutcome::ModelRequired(
                         active.clone(),
                     )));

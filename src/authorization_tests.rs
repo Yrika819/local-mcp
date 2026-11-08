@@ -1059,3 +1059,20 @@ fn at_gw_009e_the_console_filter_covers_format_and_invisible_characters() {
     assert!(crate::authorization::is_console_unsafe('\u{200b}'));
     assert!(crate::authorization::is_console_unsafe('\u{2060}'));
 }
+
+#[test]
+fn at_gw_009f_supplementary_plane_format_characters_are_refused() {
+    for rejected in [
+        "src/\u{1d173}musical",
+        "src/\u{110bd}kaithi",
+        "src/\u{13430}egyptian",
+        "src/\u{1bca0}shorthand",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must be refused"
+        );
+    }
+    assert!(crate::authorization::is_console_unsafe('\u{1d173}'));
+    assert!(crate::authorization::is_console_unsafe('\u{110bd}'));
+}
