@@ -560,8 +560,8 @@ Known implementation notes:
 |---|---|---|---|---|
 | A0 design | PR #47 `08f3edf` | `3320dcd` | #48 | docs reviewed against code |
 | A1+A2+A3 implementation | `3320dcd` | `2f574ce` + this commit | #49 | local tests + full suite green; CI pending |
-| D0–D1 managed routing | this PR | — | not yet opened | preparation step implemented; E2E pending |
-| D2–D4 integration | — | — | not yet opened | pending |
+| D0–D1 managed routing | `327b461` | same PR as A3? no: D branch | stacked on #49 | driver routes an unprepared EXTERNAL managed Goal through the existing `prepare_managed_workspace`; dirty primary refuses |
+| D2–D4 integration | D branch | — | stacked on #49 | Writer → Reviewer → Task Verifier → Goal Verifier → managed evidence → Finalizer E2E green; primary untouched; no auto-commit/merge |
 | Independent security review | — | — | — | pending |
 
 ## 13. Open Owner decisions

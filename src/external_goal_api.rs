@@ -460,7 +460,10 @@ pub(crate) async fn goal_next(
     let mut current = goal;
     let mut steps = 0u32;
     let report = loop {
-        let report = driver::advance_external_step(store, session, &current)
+        // Boxed because the host step now includes the managed-workspace
+        // evidence observation future; keeping it inline overflows a test
+        // thread's stack in the deepest external role chain.
+        let report = Box::pin(driver::advance_external_step(store, session, &current))
             .await
             .map_err(driver_error)?;
         steps = steps.saturating_add(report.host_steps_executed);

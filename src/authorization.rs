@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config;
 use crate::goal::Goal;
 use crate::managed_worktree::{ManagedWorktreeLifecycle, WorkspaceMode};
 use crate::orchestrator_error::OrchestratorError;
@@ -461,7 +462,10 @@ impl GrantWorkspaceIdentity {
                 "the managed worktree is blocked",
             ));
         }
-        let root = std::fs::canonicalize(record.worktree_root()).map_err(|_| {
+        // The managed root may not exist yet (REQUESTED). `canonical_future_path`
+        // resolves the existing ancestors and keeps the compact Git-compatible
+        // spelling that `validated_execution_root` and the writer paths use.
+        let root = config::canonical_future_path(record.worktree_root()).map_err(|_| {
             GrantError::WorkspaceUnavailable("the managed worktree root cannot be resolved")
         })?;
         Self::new(
@@ -505,7 +509,7 @@ impl GrantWorkspaceIdentity {
                     .worktree_id
                     .as_deref()
                     .ok_or(GrantError::Corrupt("managed workspace has no worktree id"))?;
-                crate::managed_worktree::validate_object_id(id, "grant worktree id")
+                crate::managed_worktree::WorktreeId::parse(id)
                     .map_err(|_| GrantError::Corrupt("managed workspace id is malformed"))?;
                 let base = self
                     .base_commit
@@ -1845,6 +1849,10 @@ pub(crate) fn relative_workspace_path(
     path: &Path,
     workspace_root: &Path,
 ) -> Result<NormalizedWorkspacePath, GrantRefusal> {
+    // Match the root's spelling convention so a Windows verbatim operation path
+    // and a compact managed root compare correctly.
+    let path = config::canonical_path_like(path, workspace_root)
+        .map_err(|_| GrantRefusal::ScopeMismatch)?;
     let relative = path
         .strip_prefix(workspace_root)
         .map_err(|_| GrantRefusal::ScopeMismatch)?;

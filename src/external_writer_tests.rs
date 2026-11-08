@@ -25,6 +25,7 @@ use crate::task_store::TaskStore;
 
 struct Fixture {
     root: PathBuf,
+    managed_root: PathBuf,
     session: config::Session,
     store: TaskStore,
 }
@@ -49,6 +50,7 @@ fn fixture(label: &str) -> Fixture {
         permitted_directories: vec![workspace],
     };
     Fixture {
+        managed_root: root.join("managed"),
         root,
         session,
         store: TaskStore::with_state_root(state),
@@ -1507,6 +1509,7 @@ fn scoped_fixture(
     let goal_id = GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap();
     (
         Fixture {
+            managed_root: root.join("managed"),
             root,
             session,
             store,
@@ -1711,4 +1714,313 @@ fn at_gw_013_the_grant_operation_budget_bounds_a_multi_file_proposal() {
 
     assert_eq!(submitted["code"], "WRITE_BUDGET_EXHAUSTED", "{submitted}");
     assert_eq!(workspace_digest(&f.session.cwd), before);
+}
+
+#[test]
+fn at_e5_074_a_dirty_primary_refuses_external_managed_preparation() {
+    let (f, goal_id, _base) = managed_fixture("dirty");
+    // A grant bound to the requested managed identity lets goal_next reach the
+    // host preparation step instead of stopping at the authorization gate.
+    install_grant(&f, &goal_id, &["code.txt"], 8, 8192);
+    std::fs::write(
+        f.session.cwd.join("code.txt"),
+        b"dirty primary
+",
+    )
+    .unwrap();
+
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "BLOCKED", "{next}");
+    assert_eq!(
+        next["blockers"][0]["code"], "MANAGED_WORKSPACE_BLOCKED",
+        "{next}"
+    );
+    assert!(
+        !f.managed_root
+            .join(&f.session.id)
+            .join(goal_id.as_str())
+            .exists(),
+        "no worktree may be created for a dirty primary"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        "dirty primary
+"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E5-D / D2–D4 — EXTERNAL Writer, Reviewer and host evidence in a managed
+// worktree. AT-E5-072, 077, 078, 079, 082.
+// ---------------------------------------------------------------------------
+
+fn git(cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap_or_else(|error| panic!("could not run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned()
+}
+
+struct AllowAllApprovals;
+
+impl crate::managed_worktree_prepare::ManagedCreationApprover for AllowAllApprovals {
+    fn approve(
+        &self,
+        _request: &crate::managed_worktree_prepare::ManagedCreationApproval,
+    ) -> crate::managed_worktree_prepare::ManagedApprovalFuture<'_> {
+        Box::pin(async { Ok(true) })
+    }
+}
+
+fn managed_fixture(label: &str) -> (Fixture, GoalId, String) {
+    let raw_root =
+        std::env::temp_dir().join(format!("local-mcp-gw-managed-{label}-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&raw_root).unwrap();
+    let root = std::fs::canonicalize(&raw_root).unwrap();
+    let primary = root.join("primary");
+    let managed = root.join("managed");
+    let state = root.join("state");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&managed).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    git(&primary, &["init", "-q", "."]);
+    git(&primary, &["config", "core.autocrlf", "false"]);
+    git(
+        &primary,
+        &["config", "user.email", "managed@example.invalid"],
+    );
+    git(&primary, &["config", "user.name", "Managed E2E"]);
+    git(&primary, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(primary.join("code.txt"), b"fn main() {}\n").unwrap();
+    git(&primary, &["add", "code.txt"]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    let base = git(&primary, &["rev-parse", "HEAD"]);
+
+    let session = config::Session {
+        id: format!("gw-managed-{label}-{}", Uuid::new_v4()),
+        cwd: primary.clone(),
+        permitted_directories: vec![primary],
+    };
+    let store = TaskStore::with_state_root(state);
+    let mut fixture = Fixture {
+        root: root.clone(),
+        managed_root: managed.clone(),
+        session,
+        store,
+    };
+    let view = goal_api::goal_start_with_managed_root(
+        &json!({
+            "session_id": fixture.session.id,
+            "objective": "Managed Authorization B E2E",
+            "workspace_mode": "MANAGED_WORKTREE",
+            "model_backend": "EXTERNAL",
+            "write_scope": {
+                "allowed_paths": ["code.txt"],
+                "allowed_operations": ["WRITE_UTF8"],
+                "max_operations": 8,
+                "max_bytes": 8192,
+                "expires_in_seconds": 600
+            }
+        }),
+        &fixture.session,
+        &fixture.store,
+        &crate::goal_api::ManagedRootSource::fixed(managed.clone()),
+    )
+    .unwrap();
+    let view = serde_json::to_value(view).unwrap();
+    let goal_id = GoalId::parse(view["goal_id"].as_str().unwrap()).unwrap();
+    let canonical_managed = std::fs::canonicalize(&fixture.managed_root).unwrap();
+    if !fixture
+        .session
+        .permitted_directories
+        .contains(&canonical_managed)
+    {
+        fixture
+            .session
+            .permitted_directories
+            .push(canonical_managed);
+        fixture.session.permitted_directories.sort();
+    }
+    (fixture, goal_id, base)
+}
+
+fn prepare_managed_external(f: &Fixture, goal_id: &GoalId) {
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            crate::managed_worktree_prepare::prepare_managed_workspace_with_policy(
+                &f.store,
+                &f.session,
+                goal_id,
+                &crate::managed_worktree_observe::HostGit::new(),
+                &crate::managed_worktree_create::HostWorktreeCreator::new(),
+                &AllowAllApprovals,
+                false,
+            ),
+        )
+        .expect("managed preparation");
+    assert!(
+        matches!(
+            outcome,
+            crate::managed_worktree_prepare::ManagedWorkspacePreparation::Active { .. }
+        ),
+        "managed workspace did not become ACTIVE"
+    );
+}
+
+#[test]
+fn at_e5_072_082_external_managed_writer_reaches_host_evidence_without_touching_primary() {
+    // The managed host-step chain is deep; run it on an explicit stack so the
+    // test exercises the code, not the harness thread's default stack limit.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(at_e5_072_082_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn at_e5_072_082_body() {
+    let (f, goal_id, base) = managed_fixture("e2e");
+    prepare_managed_external(&f, &goal_id);
+    install_grant(&f, &goal_id, &["code.txt"], 8, 8192);
+    crate::model_accounting::reset_for_test();
+
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let managed_root = goal
+        .execution_root()
+        .expect("managed execution root")
+        .to_path_buf();
+    assert_ne!(managed_root, f.session.cwd);
+    assert!(
+        std::fs::canonicalize(&managed_root)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&f.managed_root).unwrap())
+    );
+
+    let content = "fn main() { println!(\"managed\"); }\n";
+    let planner_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    let planned = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &planner_work,
+            reviewed_writer_plan(&planner_work, content),
+        ),
+    )
+    .unwrap();
+    assert_eq!(planned["outcome"], "COMMITTED", "{planned}");
+
+    let writer_work = goal_next(&f.session, &f.store, &goal_id)["model_work"].clone();
+    assert_eq!(writer_work["role"], "WRITER", "{writer_work}");
+    let staged = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &writer_work,
+            writer_answer(
+                &writer_work,
+                "code.txt",
+                content,
+                json!({"kind": "SHA256", "sha256": sha256_hex("fn main() {}\n")}),
+            ),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        staged["outcome"], "ACCEPTED_FOR_HOST_PROCESSING",
+        "{staged}"
+    );
+
+    let reviewed = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(reviewed["outcome"], "MODEL_REQUIRED", "{reviewed}");
+    assert_eq!(reviewed["model_work"]["role"], "REVIEWER", "{reviewed}");
+    // AT-E5-077: the write happened in the managed root only.
+    assert_eq!(
+        std::fs::read_to_string(managed_root.join("code.txt")).unwrap(),
+        content
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.session.cwd.join("code.txt")).unwrap(),
+        "fn main() {}\n"
+    );
+
+    let reviewer_work = reviewed["model_work"].clone();
+    let verdict = submit(
+        &f.session,
+        &f.store,
+        &submit_args(
+            &f.session,
+            &goal_id,
+            &reviewer_work,
+            reviewer_answer(&reviewer_work, 0),
+        ),
+    )
+    .unwrap();
+    assert_eq!(verdict["outcome"], "COMMITTED", "{verdict}");
+    let finished = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(finished["status"], "COMPLETED", "{finished}");
+
+    // AT-E5-078: durable managed evidence names the exact worktree and head.
+    let goal = f.store.load_goal(&f.session.id, &goal_id).unwrap();
+    let evidence = goal
+        .managed_workspace_verification_evidence()
+        .expect("managed verification evidence");
+    assert_eq!(evidence.observed_head(), base);
+    assert!(!evidence.workspace_snapshot_digest().is_empty());
+    let record = goal.managed_worktree().expect("worktree record");
+    assert_eq!(record.worktree_root(), managed_root);
+
+    // The result projection re-observes the managed worktree and matches the
+    // durable evidence (identity is not conflated with the content snapshot).
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(goal_api::goal_result_async(
+            &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+            &f.session,
+            &f.store,
+        ))
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    let workspace = result["managed_workspace"]
+        .as_object()
+        .expect("managed workspace result");
+    assert_eq!(
+        workspace["worktree_path"],
+        managed_root.to_string_lossy().as_ref()
+    );
+    assert!(
+        workspace["changed_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "code.txt"),
+        "{result}"
+    );
+
+    // AT-E5-082: no automatic merge, commit, push, or new primary ref.
+    assert_eq!(git(&f.session.cwd, &["rev-parse", "HEAD"]), base);
+    assert_eq!(git(&f.session.cwd, &["status", "--porcelain"]), "");
+    assert_eq!(git(&managed_root, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        crate::model_accounting::snapshot_for_test().codex_spawn_count,
+        0
+    );
 }

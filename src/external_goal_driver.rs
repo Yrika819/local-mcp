@@ -310,7 +310,31 @@ pub(crate) async fn advance_external_step(
         SchedulerDecision::VerifyGoal => {
             match goal_verifier::verify_goal(store, &session.id, goal.id(), revision) {
                 Ok(result) => {
-                    let code = match result.decision().outcome() {
+                    let outcome = result.decision().outcome();
+                    // E5-D: a managed Goal uses the same host evidence hook as
+                    // the CODEX scheduler. Without it the finalizer correctly
+                    // refuses to complete a managed Goal, so this is part of
+                    // verification, not an optional extra.
+                    if goal.workspace_mode().is_managed()
+                        && outcome == crate::task::VerificationOutcome::Passed
+                        && let Err(detail) = Box::pin(
+                            crate::scheduler::persist_managed_workspace_verification_evidence(
+                                store,
+                                session,
+                                result.goal(),
+                                result.record_id(),
+                            ),
+                        )
+                        .await
+                    {
+                        return Ok(DriverReport::reused(DriverOutcome::Refused(
+                            DriverRefusal::HostStepRefused {
+                                code: "MANAGED_EVIDENCE_PERSIST_FAILED",
+                                detail,
+                            },
+                        )));
+                    }
+                    let code = match outcome {
                         crate::task::VerificationOutcome::Passed => "GOAL_VERIFICATION_PASSED",
                         _ => "GOAL_VERIFICATION_NOT_PASSED",
                     };
