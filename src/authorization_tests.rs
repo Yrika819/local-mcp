@@ -1039,3 +1039,23 @@ fn at_gw_021e_a_stale_grant_cannot_displace_the_anchor_last_grant() {
     );
     assert_eq!(anchor.highest_epoch(), 2);
 }
+
+#[test]
+fn at_gw_009e_the_console_filter_covers_format_and_invisible_characters() {
+    for rejected in [
+        "src/\u{00ad}soft",
+        "src/\u{200b}zero",
+        "src/\u{200c}zwnj",
+        "src/\u{200d}zwj",
+        "src/\u{2060}wordjoiner",
+        "src/\u{fff9}interlinear",
+    ] {
+        assert!(
+            GrantPathRule::parse(rejected).is_err(),
+            "path rule {rejected:?} must be refused"
+        );
+    }
+    assert!(crate::authorization::is_console_unsafe('\u{00ad}'));
+    assert!(crate::authorization::is_console_unsafe('\u{200b}'));
+    assert!(crate::authorization::is_console_unsafe('\u{2060}'));
+}

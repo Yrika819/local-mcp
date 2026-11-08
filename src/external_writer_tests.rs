@@ -1633,11 +1633,30 @@ fn at_gw_015_a_revoked_grant_blocks_the_writer_path_end_to_end() {
     crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
         .unwrap();
     let next = goal_next(&f.session, &f.store, &goal_id);
-    assert_eq!(next["outcome"], "BLOCKED", "{next}");
-    let code = next["blockers"][0]["code"].as_str().unwrap_or_default();
     assert!(
-        code.starts_with("WRITE_AUTHORIZATION_"),
-        "revocation must surface as authorization loss, got {next}"
+        matches!(
+            next["outcome"].as_str(),
+            Some("BLOCKED") | Some("NO_ACTION_WITH_REASON")
+        ),
+        "revocation must stop the writer path: {next}"
+    );
+    // The prepared slot is durably released and the Task records the exact
+    // authorization code; the Goal is not left spinning on the revoked grant.
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        crate::external_model_store::external_state(&goal)
+            .unwrap()
+            .active_work()
+            .is_none(),
+        "a revoked prepared slot is released"
+    );
+    let task = goal.tasks().values().next().unwrap();
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "WRITE_AUTHORIZATION_REVOKED"),
+        "the Task records the authorization stop: {:?}",
+        task.blockers()
     );
     assert_eq!(
         workspace_digest(&f.session.cwd),
@@ -2165,4 +2184,29 @@ fn at_gw_013e_a_budget_refused_writer_is_durably_blocked_instead_of_reselected()
         !(next["outcome"] == "MODEL_REQUIRED" && next["model_work"]["role"] == "WRITER"),
         "a blocked writer must not be reissued: {next}"
     );
+}
+
+#[test]
+fn at_gw_025b_an_expired_grant_still_allows_read_only_progress() {
+    let (f, goal_id) = scoped_fixture("expired-readonly", &["code.txt"], 4, 4096);
+    install_grant(&f, &goal_id, &["code.txt"], 4, 4096);
+    let before = workspace_digest(&f.session.cwd);
+
+    let mut ledger =
+        crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+            .unwrap()
+            .unwrap();
+    let now = crate::authorization::now_unix_seconds();
+    ledger.force_grant_window(
+        &crate::authorization::format_utc_rfc3339(now - 120),
+        &crate::authorization::format_utc_rfc3339(now - 60),
+    );
+    crate::authorization_store::save_ledger(&f.store, &ledger).unwrap();
+
+    // The grant cannot authorize a write, but the Planner is read-only work and
+    // must still be issued: an expired grant is not a whole-Goal stop.
+    let next = goal_next(&f.session, &f.store, &goal_id);
+    assert_eq!(next["outcome"], "MODEL_REQUIRED", "{next}");
+    assert_eq!(next["model_work"]["role"], "PLANNER", "{next}");
+    assert_eq!(workspace_digest(&f.session.cwd), before);
 }

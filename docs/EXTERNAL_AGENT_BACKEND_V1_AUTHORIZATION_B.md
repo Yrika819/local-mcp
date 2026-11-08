@@ -618,11 +618,21 @@ Round 3 reviewed `35ad119` and found one High, two Medium and two Low issues.
 | R4-L3 | The sanitizer's bidi coverage was narrower than Unicode `Bidi_Control` | One shared `is_console_unsafe` covers C0/C1, ALM/LRM/RLM, embeddings/overrides/isolates, U+206A–F, Zl/Zp, BOM and tag characters; used by both the path-rule validator and the console sanitizer. AT-GW-009d. |
 | R4-L4 | A stale-generation issuance could overwrite the anchor's `last_grant_id` and disable a newer grant | `record_grant` only advances for `epoch >= highest_epoch`; AT-GW-021e. |
 | I-2 | No named CODEX regression test | `at_gw_026_codex_goals_are_unaffected_by_authorization`. |
-| I-3 | A raw NUL byte in a source literal made `authorization.rs` look binary to grep | Replaced with the ` ` escape. |
+| I-3 | A raw NUL byte in a source literal made `authorization.rs` look binary to grep | Replaced with the `\0` escape. |
 | I-5 | `REVOCATION_DEFERRED` was also emitted for a publication fence timeout | Split into `AUTHORIZATION_FENCE_BUSY` (publication) and `REVOCATION_DEFERRED` (revocation). |
 
 `I-6` (no 30-second fence-timeout test) remains a test-coverage gap; the timeout
 is exercised indirectly by the in-flight fence test, not by waiting 30 s.
+
+### 11.5 Round-5 remediation
+
+| ID | Finding | Fix |
+|---|---|---|
+| R5-M1 | Expiry/revocation stopped the whole Goal, so read-only planning, review, verification and finalization could not finish work that was already authorized | The `goal_next` pre-step no longer turns Expired/Revoked/StateMismatch/RollbackDetected/ScopeMismatch into a whole-Goal stop. Write authorization is enforced at the Writer boundaries (issuance, stage, publish); read-only host steps continue. AT-GW-025b proves an expired grant still issues a Planner WorkItem and writes nothing. |
+| R5-L1 | The console filter omitted several `Cf` format characters (soft hyphen, ZWSP/ZWNJ/ZWJ, word joiner, interlinear marks) | The shared `is_console_unsafe` covers those ranges; AT-GW-009e. |
+| R5-I1 | The design document itself contained a literal NUL in the I-3 note | Replaced with printable escape text. |
+
+`R-1/C3`, `R2-M3` and `I-6` remain as recorded constraints/gaps, not code fixes.
 
 The reviewer's CODEX regression check was static only; the full local suite
 (including all CODEX regression modules) was run after the remediation.

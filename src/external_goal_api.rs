@@ -454,14 +454,22 @@ pub(crate) async fn goal_next(
             // path may still resume the exact already-charged operation, and
             // read-only host steps remain allowed. Let the driver decide.
             Err(AuthorizationGateError::Refusal(GrantRefusal::BudgetExhausted)) => {}
-            // Expired, revoked, rolled-back or otherwise unusable authorization
-            // is a mandatory stop. Release a *prepared* Writer slot first (never
-            // an APPLYING one), then report the exact code.
+            // Expired / revoked / rolled-back / workspace-changed authorization
+            // is enforced at the Writer boundaries (issuance, stage, publish),
+            // not as a whole-Goal stop. Read-only planning, review, verification
+            // and finalization must remain able to finish work that was already
+            // authorized before the grant lapsed.
+            Err(AuthorizationGateError::Refusal(
+                GrantRefusal::Expired
+                | GrantRefusal::Revoked
+                | GrantRefusal::StateMismatch
+                | GrantRefusal::RollbackDetected
+                | GrantRefusal::ScopeMismatch,
+            )) => {}
+            // A corrupt or unreadable authorization state is a genuine stop.
             Err(error) => {
                 let code = error.code();
                 let detail = error.detail();
-                let _ =
-                    external_publish::record_authorization_refusal(store, session, goal.id(), code);
                 return Ok(blocked_view(&goal, max_host_steps, code, detail));
             }
         }
