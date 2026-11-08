@@ -54,6 +54,9 @@ pub(crate) enum StageError {
     IntegrityMismatch,
     /// The stage exceeds a host byte bound.
     Oversized,
+    /// A stage directory already exists for this id. Stages are immutable: a new
+    /// submission must use a new id rather than overwrite another one.
+    AlreadyExists,
 }
 
 impl StageError {
@@ -64,6 +67,7 @@ impl StageError {
             Self::IdentityMismatch => "WRITER_STAGE_IDENTITY_MISMATCH",
             Self::IntegrityMismatch => "WRITER_STAGE_INTEGRITY_MISMATCH",
             Self::Oversized => "WRITER_STAGE_OVERSIZED",
+            Self::AlreadyExists => "WRITER_STAGE_ALREADY_EXISTS",
         }
     }
 }
@@ -243,11 +247,25 @@ pub(crate) fn write_stage(
     );
     let parent = root.parent().ok_or(StageError::Io)?.to_path_buf();
     crate::secure_fs::ensure_private_directory(&parent, None).map_err(|_| StageError::Io)?;
-    crate::secure_fs::ensure_private_directory(&root, Some(&parent)).map_err(|_| {
-        // A stage directory that already exists is reused only when its manifest
-        // is rewritten below; a foreign object at that path is a hard failure.
-        StageError::Io
-    })?;
+
+    // Create-only. `create_dir` is the atomic "nobody else owns this id" claim on
+    // every supported platform, so two submissions can never write into the same
+    // stage. An existing directory is either another submission's sealed stage or
+    // debris, and in both cases this candidate must choose a new id instead of
+    // rewriting evidence.
+    match fs::create_dir(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StageError::AlreadyExists);
+        }
+        Err(_) => return Err(StageError::Io),
+    }
+    // Harden the freshly created directory with the crate's private-directory
+    // contract (owner check + 0700 on Unix).
+    if crate::secure_fs::ensure_private_directory(&root, Some(&parent)).is_err() {
+        let _ = fs::remove_dir(&root);
+        return Err(StageError::Io);
+    }
 
     let manifest = StageManifest {
         schema_version: STAGE_SCHEMA_VERSION,
@@ -267,10 +285,12 @@ pub(crate) fn write_stage(
 
     for (index, content) in operations {
         let destination = stage.content_path(*index);
-        write_private_atomic(&destination, content.as_bytes())?;
+        write_private_create_only(&destination, content.as_bytes())?;
     }
     let encoded = serde_json::to_vec_pretty(&manifest).map_err(|_| StageError::ManifestInvalid)?;
-    write_private_atomic(&stage.manifest_path(), &encoded)?;
+    // Write the manifest last: a stage without a manifest is never loadable, so a
+    // crash mid-stage leaves an inert orphan rather than a half-verified stage.
+    write_private_create_only(&stage.manifest_path(), &encoded)?;
     crate::secure_fs::sync_parent_directory(&root).map_err(|_| StageError::Io)?;
     Ok(stage)
 }
@@ -350,6 +370,18 @@ pub(crate) fn remove_never_begun_stage(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(StageError::Io),
     }
+}
+
+/// Write a file that must not exist yet.
+///
+/// Same private temp + fsync + atomic publish path as [`write_private_atomic`],
+/// but the final step refuses to replace an existing file. Used for stage content
+/// and the manifest, which together must be immutable once sealed.
+fn write_private_create_only(destination: &Path, bytes: &[u8]) -> Result<(), StageError> {
+    if destination.exists() {
+        return Err(StageError::AlreadyExists);
+    }
+    write_private_atomic(destination, bytes)
 }
 
 fn write_private_atomic(destination: &Path, bytes: &[u8]) -> Result<(), StageError> {
@@ -456,6 +488,21 @@ mod tests {
         assert_eq!(
             load_stage(&root, &other).unwrap_err().code(),
             "WRITER_STAGE_IDENTITY_MISMATCH"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_write_for_the_same_id_is_refused_and_does_not_touch_the_first() {
+        let root = root("immutable");
+        let identity = identity("op-sealed");
+        let stage = write_stage(&root, &identity, &[(0, "winner".to_owned())]).unwrap();
+        let attempt = write_stage(&root, &identity, &[(0, "loser".to_owned())]).unwrap_err();
+        assert_eq!(attempt.code(), "WRITER_STAGE_ALREADY_EXISTS");
+        // The winner's bytes are untouched.
+        assert_eq!(
+            stage.read_content(0, &sha256_hex(b"winner")).unwrap(),
+            "winner"
         );
         let _ = fs::remove_dir_all(&root);
     }

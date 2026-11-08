@@ -43,9 +43,19 @@ const SESSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Every fault point names the exact commit phase it interrupts, which is the contract."
+)]
 pub(crate) enum FaultPoint {
     BeforeTempWrite,
     BeforeReplace,
+    /// Fail the Nth durable commit (1-based) instead of every commit.
+    ///
+    /// Used by the E5 writer failure matrix to interrupt a multi-commit
+    /// publication at an exact step (for example after the postimage was written
+    /// but before `CompleteOperation` is journaled).
+    BeforeReplaceOnCommit(u32),
 }
 
 #[derive(Clone)]
@@ -53,6 +63,9 @@ pub(crate) struct TaskStore {
     state_root: PathBuf,
     #[cfg(test)]
     fault: Option<FaultPoint>,
+    /// Number of commit attempts observed, for [`FaultPoint::BeforeReplaceOnCommit`].
+    #[cfg(test)]
+    fault_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl TaskStore {
@@ -63,6 +76,8 @@ impl TaskStore {
             })?,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            fault_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 
@@ -77,6 +92,7 @@ impl TaskStore {
         Self {
             state_root,
             fault: None,
+            fault_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -94,6 +110,7 @@ impl TaskStore {
         Self {
             state_root,
             fault: Some(fault),
+            fault_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -648,11 +665,22 @@ impl TaskStore {
         }
 
         #[cfg(test)]
-        if self.fault == Some(FaultPoint::BeforeReplace) {
-            let _ = secure_fs::remove_private_temp(&temporary);
-            return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
-                "injected atomic replace failure",
-            )));
+        {
+            let attempt = self
+                .fault_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let fail = match self.fault {
+                Some(FaultPoint::BeforeReplace) => true,
+                Some(FaultPoint::BeforeReplaceOnCommit(nth)) => attempt == nth,
+                _ => false,
+            };
+            if fail {
+                let _ = secure_fs::remove_private_temp(&temporary);
+                return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
+                    "injected atomic replace failure",
+                )));
+            }
         }
 
         if let Err(error) = secure_fs::atomic_replace(&temporary, &path) {
