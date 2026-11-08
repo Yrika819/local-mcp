@@ -557,9 +557,10 @@ fn at_e5_039b_a_failed_complete_operation_commit_keeps_the_operation_applying() 
     let content = "fn main() { /* complete */ }\n";
     let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
 
-    // The publication loop performs: BeginOperation commit, publish, CompleteOperation
-    // commit. Fault the second commit of this store instance.
-    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(2));
+    // The publication loop performs: anchor usage floor, BeginOperation commit,
+    // publish, CompleteOperation commit. Fault the third commit of this store
+    // instance (CompleteOperation).
+    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(3));
     let goal = goal_of(&f, &goal_id);
     let stage = external_writer::verify_prepared_stage(
         &failing,
@@ -848,9 +849,9 @@ fn at_gw_017_a_crash_after_the_charge_before_begin_operation_never_double_charge
     let content = "fn main() { /* charged once */ }\n";
     let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
 
-    // Attempt 1 of this store instance is the BeginOperation commit, so the
+    // Commit 1 is the anchor usage floor; commit 2 is BeginOperation. The
     // operation is charged but never begins.
-    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(1));
+    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(2));
     let boundary = crate::writer::ExecutionWriteBoundary;
     let result = run_publication_with(&f, &failing, &goal_id, &task_id, &operation_id, &boundary);
     assert!(result.is_err(), "the BeginOperation commit must fail");
@@ -1030,4 +1031,54 @@ fn at_gw_009_a_symlink_swap_is_refused_before_the_budget_charge() {
         0,
         "a refused path check never charges the grant"
     );
+}
+
+#[test]
+fn at_gw_019b_authorization_loss_releases_a_prepared_slot_but_never_an_applying_one() {
+    let f = fixture("gw-release");
+    let (goal_id, task_id, _operation_id) = prepared_writer(&f, "fn main() { /* release */ }\n");
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+        .unwrap();
+    let released = external_publish::record_authorization_refusal(
+        &f.store,
+        &f.session,
+        &goal_id,
+        "WRITE_AUTHORIZATION_REVOKED",
+    )
+    .unwrap();
+    assert!(released.is_some(), "a prepared slot must be released");
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        external_state(&goal).unwrap().active_work().is_none(),
+        "the cancelled WorkItem no longer blocks new work"
+    );
+    assert_eq!(
+        goal.tasks()[&task_id].status(),
+        crate::task::TaskStatus::Blocked
+    );
+
+    // An APPLYING intent is evidence of a possible side effect: never cancel it.
+    let f2 = fixture("gw-release-applying");
+    let (goal_id2, task_id2, operation_id2) = prepared_writer(&f2, "fn main() { /* kept */ }\n");
+    let boundary = FaultyBoundary {
+        fault: BoundaryFault::FailBeforeWrite,
+    };
+    let _ = run_publication(&f2, &goal_id2, &task_id2, &operation_id2, &boundary);
+    assert_eq!(
+        intent(&f2, &goal_id2, &task_id2).state(),
+        MutationIntentState::Applying
+    );
+    let kept = external_publish::record_authorization_refusal(
+        &f2.store,
+        &f2.session,
+        &goal_id2,
+        "WRITE_AUTHORIZATION_REVOKED",
+    )
+    .unwrap();
+    assert!(
+        kept.is_none(),
+        "an applying intent must stay for reconciliation"
+    );
+    let goal2 = goal_of(&f2, &goal_id2);
+    assert!(external_state(&goal2).unwrap().active_work().is_some());
 }

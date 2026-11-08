@@ -535,12 +535,13 @@ integration phase and recorded separately from these unit/integration tests.
 | `goal_next` Owner request / typed refusal | implemented |
 | Writer issuance, stage, per-operation publication gate | implemented |
 | Revocation fence + epoch + rollback anchor | implemented |
+| Independent security review | round 1 complete; H1–H4 + M1/M2 remediated (see §12.1) |
 | Managed-worktree preparation for EXTERNAL | implemented through the existing `prepare_managed_workspace` |
 | Unit/integration acceptance (AT-GW-001..025) | 27 tests green on Windows; full suite green |
 | Crash injection: charge→begin, begin→write, write→complete, re-grant, schema-1 migration | implemented (A3) |
 | Concurrent same-operation charge and post-revocation refusal | implemented (A3) |
 | AT-E5-029 / 030 / 043 re-evaluation | 029 and 030 covered by the no-grant/revocation tests and by the absence of a Goal lock during the Owner wait; 043 remains covered by existing reconciliation (no change to UNKNOWN semantics) |
-| Independent security review | **pending** |
+| Independent security review | round 1 complete; remediation pending re-review |
 
 Known implementation notes:
 
@@ -553,6 +554,23 @@ Known implementation notes:
   production binary.
 * EXTERNAL sub-schema 1 is migrated to 2 in the store decode path with an empty
   scope and a zero anchor. No grant is invented.
+
+### 11.1 Round-1 security remediation
+
+An independent review (separate provider/model, read-only) found four High and
+two Medium issues. All six are addressed on the integration branch:
+
+| ID | Finding | Fix |
+|---|---|---|
+| H1 | The ledger fence ended before the filesystem write, so a revocation could finalize while a write was about to start | The per-Goal fence is now held across `BeginOperation` → write → postimage → `CompleteOperation`. Revocation waits for the in-flight operation (bounded by `AUTHORIZATION_FENCE_TIMEOUT` and the operation's own bounds); it never reports `REVOKED` while a write is executing. AT-GW-016b proves the wait. |
+| H2 | Untrusted console text could repaint or reorder the approval prompt (path rules, activity, approval detail) | All untrusted console fields pass through `sanitize_console_field`; path rules reject C0/C1 and bidi characters at the model; the OCS resolves every rule against the workspace root and rejects symlink/junction escapes before approval. AT-GW-009b/009c. |
+| H3 | `REVOKED` was saved before the Goal anchor; a crash left a replayable anchor and retry returned early | The revocation anchor is written **before** the ledger finalizes `REVOKED`; an idempotent retry repairs a missing anchor. AT-GW-021b. |
+| H4 | Restoring an older ACTIVE ledger with the same grant/epoch restored spent budget | The Goal anchor now carries a monotonic usage floor (`usage_operations`, `usage_bytes`), written under Goal CAS before each charge. Effective usage is `max(ledger, anchor)`, so a restored ledger cannot regain budget. AT-GW-021c. |
+| M1 | The Owner-requested grant lifetime was ignored; every grant got the 15-minute pending TTL | Pending TTL and grant lifetime are separate. Approval issues `now + requested_lifetime_seconds`, bounded to `[60s, 7d]`. AT-GW-028b. |
+| M2 | A surviving command line could approve a pending request after an OCS restart | Approval requires the request to be live in this process's queue **and** the nonce digest to match. `/grant renew` adds its request to the same queue. |
+
+The reviewer's CODEX regression check was static only; the full local suite
+(including all CODEX regression modules) was run after the remediation.
 
 ## 12. Campaign checkpoint
 

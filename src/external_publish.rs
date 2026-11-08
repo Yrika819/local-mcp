@@ -280,9 +280,12 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         let fresh_goal = store.load_goal(&session.id, goal_id)?;
         let operation_key = format!("{operation_id}#{index_u32}");
         let bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
-        let mut begin_error: Option<OrchestratorError> = None;
-        let mut began_revision: Option<u64> = None;
-        let gate = authorization_store::authorize_operation(
+        // The fence is held through BeginOperation, the filesystem write,
+        // postimage verification and CompleteOperation. A revocation therefore
+        // cannot finalize while this operation is executing: it either runs
+        // first (and this operation is refused) or waits for the operation to be
+        // durably journaled.
+        let fence = match authorization_store::acquire_publication_fence(
             store,
             &fresh_goal,
             &binding,
@@ -295,47 +298,29 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                 )?;
                 authorization_store::check_operation_scope(grant, &relative)
             },
-            |_grant| match store.mutate_goal_snapshot(
-                &session.id,
-                goal_id,
-                revision,
-                |goal, _now| {
-                    writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
-                    goal.task_advance_latest_mutation_intent(
-                        task_id,
-                        &operation_id,
-                        MutationIntentUpdate::BeginOperation { index: index_u32 },
-                    )
-                },
-            ) {
-                Ok(committed) => {
-                    began_revision = Some(committed.revision());
-                    Ok(())
-                }
-                Err(error) => {
-                    begin_error = Some(error);
-                    Err(GrantRefusal::StateMismatch)
-                }
-            },
-        );
-        match gate {
-            Ok(()) => {}
+        ) {
+            Ok(fence) => fence,
             Err(authorization_store::AuthorizationGateError::Refusal(refusal)) => {
-                if let Some(error) = begin_error {
-                    return Err(error);
-                }
                 return Ok(PublishOutcome::Refused {
                     code: refusal.code(),
                 });
             }
-            Err(error) => {
-                if let Some(error) = begin_error {
-                    return Err(error);
-                }
-                return Ok(PublishOutcome::Refused { code: error.code() });
-            }
-        }
-        revision = began_revision.unwrap_or(revision);
+            Err(error) => return Ok(PublishOutcome::Refused { code: error.code() }),
+        };
+        // The fence may have committed the anchor usage floor, which advances
+        // the Goal revision. Bind `BeginOperation` to the revision the fence
+        // produced, not the pre-fence snapshot.
+        revision = fence.goal_revision();
+        revision = store
+            .mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
+                writer::ensure_writer_task_ready_for_attempt(goal, task_id, &attempt_id)?;
+                goal.task_advance_latest_mutation_intent(
+                    task_id,
+                    &operation_id,
+                    MutationIntentUpdate::BeginOperation { index: index_u32 },
+                )
+            })?
+            .revision();
         let output = match boundary
             .write(writer::WriterWriteRequest {
                 path: &paths[index],
@@ -386,6 +371,7 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                 )
             })?
             .revision();
+        drop(fence);
     }
 
     // Record the host-observed performed mutation: worker report, file snapshots,
@@ -771,6 +757,61 @@ fn record_reviewer_refusal(
         )),
         Err(error) => Err(error),
     }
+}
+
+/// Record that authorization was lost or exhausted, and release the active slot
+/// when doing so cannot hide a side effect.
+///
+/// A revoked/expired grant or an exhausted budget must not leave a Goal forever
+/// wedged on a SUBMITTED Writer WorkItem. If (and only if) the journal still
+/// proves no operation began, the Task is blocked with the authorization code and
+/// the WorkItem is cancelled in the same commit. An APPLYING/UNKNOWN intent is
+/// left untouched: cancelling it would hide the very side effect recovery must
+/// reconcile.
+pub(crate) fn record_authorization_refusal(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    code: &'static str,
+) -> Result<Option<Goal>, OrchestratorError> {
+    let goal = store.load_goal(&session.id, goal_id)?;
+    let Some(active) = external_state(&goal)?.active_work() else {
+        return Ok(None);
+    };
+    if active.role() != WorkRole::Writer {
+        return Ok(None);
+    }
+    let Some(task_id) = active.task_id().and_then(|value| TaskId::parse(value).ok()) else {
+        return Ok(None);
+    };
+    let Some(attempt) = goal
+        .tasks()
+        .get(&task_id)
+        .and_then(|task| task.latest_attempt())
+    else {
+        return Ok(None);
+    };
+    let Some(intent) = attempt.mutation_intent() else {
+        return Ok(None);
+    };
+    if intent.state() != crate::mutation::MutationIntentState::Prepared {
+        return Ok(None);
+    }
+    let attempt_id = attempt.id().as_str().to_owned();
+    let committed =
+        store.mutate_goal_snapshot(&session.id, goal_id, goal.revision(), |goal, now| {
+            writer::ensure_writer_task_ready_for_attempt(goal, &task_id, &attempt_id)?;
+            goal.task_add_blocker(&task_id, crate::task::TaskBlocker::new(code, code, true))?;
+            goal.transition_task(
+                &task_id,
+                TaskStatus::Blocked,
+                TaskTransitionContext::default(),
+                now,
+            )?;
+            external_state_mut(goal)?.cancel_active_work(code);
+            Ok(())
+        })?;
+    Ok(Some(committed))
 }
 
 /// Whether the driver should stop because a published writer Task has no

@@ -636,3 +636,171 @@ fn at_gw_009b_path_rules_reject_console_injection_characters() {
         );
     }
 }
+
+#[test]
+fn at_gw_021b_the_revocation_anchor_precedes_revoked_and_is_repaired_on_retry() {
+    let f = fixture("h3-anchor");
+    let grant = f.install();
+    let path =
+        authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str()).unwrap();
+    let before_revocation = std::fs::read(&path).unwrap();
+
+    authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None).unwrap();
+    // Simulate a crash after the ledger reached REVOKED but before the anchor
+    // was durable.
+    let revision = f.goal().revision();
+    f.store
+        .mutate_goal_snapshot(&f.session.id, &f.goal_id, revision, |goal, _now| {
+            *crate::external_model_store::external_state_mut(goal)?.authorization_anchor_mut() =
+                AuthorizationAnchor::default();
+            Ok(())
+        })
+        .unwrap();
+    // The idempotent retry repairs the anchor instead of returning early.
+    authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None).unwrap();
+    let anchor = authorization_store::anchor_of(&f.goal()).unwrap();
+    assert_eq!(
+        anchor.revoked_at_epoch(),
+        Some(grant.authorization_epoch()),
+        "the retry must restore the revocation anchor"
+    );
+
+    // Restoring the pre-revocation ACTIVE ledger must still be denied.
+    std::fs::write(&path, before_revocation).unwrap();
+    assert!(authorization_store::usable_grant(&f.store, &f.goal()).is_err());
+}
+
+#[test]
+fn at_gw_021c_a_restored_ledger_cannot_regain_spent_budget() {
+    let f = fixture("h4-budget");
+    let grant = authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        1,
+        4096,
+        600,
+    );
+    let path =
+        authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str()).unwrap();
+    let before_charge = std::fs::read(&path).unwrap();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(f.ledger().latest_grant().unwrap().usage().operations(), 1);
+
+    // Restore the ACTIVE ledger from before the charge: same grant id and
+    // epoch, usage 0. The Goal anchor's monotonic floor must still deny a
+    // second operation.
+    std::fs::write(&path, before_charge).unwrap();
+    let error = authorization_store::usable_grant(&f.store, &f.goal()).unwrap_err();
+    assert_eq!(refusal(error), GrantRefusal::BudgetExhausted);
+    assert_eq!(
+        authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1
+    );
+}
+
+#[test]
+fn at_gw_016b_revocation_waits_for_an_in_flight_operation_fence() {
+    use std::sync::mpsc;
+    let f = fixture("h1-fence");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (revoke_tx, revoke_rx) = mpsc::channel::<std::time::Duration>();
+    std::thread::scope(|scope| {
+        let store = &f.store;
+        let goal = f.goal();
+        let binding = &binding;
+        scope.spawn(move || {
+            let goal_ref = &goal;
+            let _fence = crate::authorization_store::acquire_publication_fence(
+                store,
+                goal_ref,
+                binding,
+                "op#0",
+                4,
+                |_| Ok(()),
+            )
+            .unwrap();
+            started_tx.send(()).unwrap();
+            // Hold the fence as a filesystem operation would.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        });
+        started_rx.recv().unwrap();
+        let store = &f.store;
+        let session = &f.session;
+        let goal_id = f.goal_id.as_str();
+        scope.spawn(move || {
+            let started = std::time::Instant::now();
+            crate::authorization_store::revoke_active(store, &session.id, goal_id, None).unwrap();
+            revoke_tx.send(started.elapsed()).unwrap();
+        });
+        let waited = revoke_rx.recv().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "revocation must wait for the in-flight fence, waited {waited:?}"
+        );
+    });
+    assert!(authorization_store::usable_grant(&f.store, &f.goal()).is_err());
+}
+
+#[test]
+fn at_gw_028b_the_requested_grant_lifetime_is_honoured() {
+    let f = fixture("lifetime");
+    let grant = crate::authorization_store::test_support::install_grant(
+        &f.store,
+        &f.goal(),
+        &["src/**"],
+        4,
+        4096,
+        60,
+    );
+    let issued = parse_utc_rfc3339_seconds(grant.issued_at()).unwrap();
+    let expires = parse_utc_rfc3339_seconds(grant.expires_at()).unwrap();
+    assert!(expires > issued);
+    assert!(
+        expires - issued <= 61,
+        "a 60-second request must not become a 15-minute grant"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn at_gw_009c_a_write_scope_rule_cannot_escape_through_an_existing_symlink() {
+    let f = fixture("rule-symlink");
+    let outside = f.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.session.cwd.join("src/escape")).unwrap();
+    let scope = RequestedWriteScopeV1::from_mcp_value(&json!({
+        "allowed_paths": ["src/escape/**"],
+        "allowed_operations": ["WRITE_UTF8"],
+        "max_operations": 1,
+        "max_bytes": 100,
+        "expires_in_seconds": 300
+    }))
+    .unwrap();
+    let now = now_unix_seconds();
+    let error = authorization_store::begin_pending_request(
+        &f.store,
+        &f.goal(),
+        &scope,
+        Uuid::new_v4().to_string(),
+        crate::authorization::nonce_sha256("nonce"),
+        format_utc_rfc3339(now),
+        format_utc_rfc3339(now + 300),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "INVALID_ARGUMENT");
+}

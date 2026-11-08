@@ -722,12 +722,24 @@ async fn publish_submitted_writer_work(
                 detail: "every prepared writer operation was published and journaled by the host",
             }))
         }
-        Ok(PublishOutcome::Refused { code }) => Ok(DriverReport::reused(DriverOutcome::Refused(
-            DriverRefusal::HostStepRefused {
-                code,
-                detail: "the host refused to publish the prepared writer intent".to_owned(),
-            },
-        ))),
+        Ok(PublishOutcome::Refused { code }) => {
+            if (code.starts_with("WRITE_AUTHORIZATION_") || code == "WRITE_BUDGET_EXHAUSTED")
+                && external_publish::record_authorization_refusal(store, session, goal.id(), code)
+                    .map_err(DriverError::Persistence)?
+                    .is_some()
+            {
+                return Ok(DriverReport::advanced(DriverOutcome::Progress {
+                    code: "WRITE_AUTHORIZATION_SLOT_RELEASED",
+                    detail: "authorization was lost before any operation began; the prepared writer slot was cancelled and the Task blocked",
+                }));
+            }
+            Ok(DriverReport::reused(DriverOutcome::Refused(
+                DriverRefusal::HostStepRefused {
+                    code,
+                    detail: "the host refused to publish the prepared writer intent".to_owned(),
+                },
+            )))
+        }
         Err(error) => Err(DriverError::Persistence(error)),
     }
 }

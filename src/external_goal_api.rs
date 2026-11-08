@@ -450,10 +450,16 @@ pub(crate) async fn goal_next(
                     GrantRefusal::Unavailable.detail(),
                 ));
             }
-            // Expired / revoked / mismatch states are reported by the driver's
-            // own host step so a Goal that also needs managed preparation gets
-            // the right typed stop first.
-            Err(_) => {}
+            // Expired, revoked, rolled-back or otherwise unusable authorization
+            // is a mandatory stop. Release a *prepared* Writer slot first (never
+            // an APPLYING one), then report the exact code.
+            Err(error) => {
+                let code = error.code();
+                let detail = error.detail();
+                let _ =
+                    external_publish::record_authorization_refusal(store, session, goal.id(), code);
+                return Ok(blocked_view(&goal, max_host_steps, code, detail));
+            }
         }
     }
 

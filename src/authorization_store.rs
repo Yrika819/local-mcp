@@ -317,10 +317,28 @@ pub(crate) fn begin_pending_request(
     requested_at: String,
     expires_at: String,
 ) -> Result<PendingGrantRequestV1, AuthorizationGateError> {
+    let grant_lifetime_seconds = scope.expires_in_seconds();
     if !goal.model_backend().is_external() {
         return Err(GrantError::BackendNotExternal.into());
     }
     let workspace = crate::authorization::GrantWorkspaceIdentity::from_goal(goal)?;
+    // Resolve every rule against the exact workspace root now, so the Owner sees
+    // a scope that cannot escape through a pre-existing symlink/junction. The
+    // publish gate repeats this with the operation's canonical path.
+    let resolved_root = config::canonical_future_path(workspace.root())
+        .map_err(|_| GrantError::InvalidRequest("the workspace root cannot be resolved"))?;
+    for rule in scope.path_rules()? {
+        let candidate = workspace.root().join(rule.path());
+        let resolved = config::canonical_future_path(&candidate).map_err(|_| {
+            GrantError::InvalidRequest("a write-scope rule cannot be resolved inside the workspace")
+        })?;
+        if !resolved.starts_with(&resolved_root) {
+            return Err(GrantError::InvalidRequest(
+                "a write-scope rule escapes the workspace root",
+            )
+            .into());
+        }
+    }
     let request = PendingGrantRequestV1::new(
         request_id.clone(),
         goal.session_id().to_owned(),
@@ -333,20 +351,16 @@ pub(crate) fn begin_pending_request(
         scope.budget()?,
         requested_at,
         expires_at,
+        grant_lifetime_seconds,
         nonce_sha256,
     )?;
     let guard = acquire_ledger_lock(store, goal.session_id(), goal.id().as_str())?;
     let mut ledger = load_or_create(store, goal, &guard)?;
     let now = crate::authorization::now_unix_seconds();
     let now_text = crate::authorization::format_utc_rfc3339(now);
-    if let Some(existing) = ledger.pending() {
-        let still_live = crate::authorization::parse_utc_rfc3339_seconds(existing.expires_at())
-            .is_some_and(|expires| expires > now);
-        if still_live {
-            return Err(GrantError::PendingExists.into());
-        }
-    }
-    // A stale pending request is replaced by the new one.
+    // An earlier pending request can never be approved after an OCS restart
+    // (its live nonce is gone), and the OCS only calls this after checking its
+    // in-memory queue. Replacing it is therefore both safe and necessary.
     if ledger.pending().is_some() {
         ledger.replace_pending(request.clone(), &now_text)?;
     } else {
@@ -420,6 +434,8 @@ pub(crate) fn revoke_active(
     let now = now.unwrap_or_else(|| {
         crate::authorization::format_utc_rfc3339(crate::authorization::now_unix_seconds())
     });
+    let parsed_goal = GoalId::parse(goal_id)
+        .map_err(|_| GrantError::Corrupt("authorization goal id is malformed"))?;
     let guard = acquire_ledger_lock(store, session_id, goal_id)?;
     let mut ledger =
         load_with_lock(store, session_id, goal_id, &guard)?.ok_or(GrantError::UnknownGrant)?;
@@ -427,28 +443,45 @@ pub(crate) fn revoke_active(
         .latest_grant()
         .map(|grant| grant.grant_id().to_owned())
         .ok_or(GrantError::UnknownGrant)?;
+    let grant_epoch = ledger
+        .latest_grant()
+        .map(|grant| grant.authorization_epoch())
+        .unwrap_or(0);
     if ledger
         .latest_grant()
         .is_some_and(|grant| grant.revocation().state() == GrantRevocationState::Revoked)
     {
-        let epoch = ledger
-            .latest_grant()
-            .map(|grant| grant.authorization_epoch())
-            .unwrap_or(0);
-        return Ok((grant_id, epoch));
+        // Idempotent retry must also repair a crash window in which the ledger
+        // said REVOKED but the Goal anchor was never written. Without this, a
+        // restored ACTIVE ledger would satisfy the stale anchor.
+        let anchor = anchor_of(
+            &store
+                .load_goal(session_id, &parsed_goal)
+                .map_err(|_| GrantError::Io)?,
+        )?;
+        if anchor.revoked_at_epoch() != Some(grant_epoch) {
+            update_anchor(store, session_id, &parsed_goal, |anchor| {
+                anchor.record_revocation(grant_epoch);
+            })
+            .map_err(|_| GrantError::Io)?;
+        }
+        return Ok((grant_id, grant_epoch));
     }
+    // The anchor is written *before* REVOKED is finalized, so a crash can only
+    // leave an anchor that already denies the grant (fail closed), never a
+    // REVOKED ledger behind a stale anchor. The anchor names the *revoked*
+    // generation; the ledger's next epoch is greater, so a fresh grant is legal.
+    update_anchor(store, session_id, &parsed_goal, |anchor| {
+        anchor.record_revocation(grant_epoch);
+    })
+    .map_err(|_| GrantError::Io)?;
     let request_decision = uuid::Uuid::new_v4().to_string();
     ledger.request_revocation(&grant_id, request_decision, &now)?;
     save_ledger(store, &ledger)?;
     let final_decision = uuid::Uuid::new_v4().to_string();
-    let epoch = ledger.finalize_revocation(&grant_id, final_decision, &now)?;
+    let _next_epoch = ledger.finalize_revocation(&grant_id, final_decision, &now)?;
     save_ledger(store, &ledger)?;
-    let goal = GoalId::parse(goal_id).map_err(|_| GrantError::Corrupt("goal id"))?;
-    update_anchor(store, session_id, &goal, |anchor| {
-        anchor.record_revocation(epoch);
-    })
-    .map_err(|_| GrantError::Io)?;
-    Ok((grant_id, epoch))
+    Ok((grant_id, grant_epoch))
 }
 
 /// Read the grant that may authorize work right now (no lock, snapshot).
@@ -491,6 +524,67 @@ where
     P: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
     B: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
 {
+    let fence = prepare_charge(store, goal, binding, operation_id, bytes, preflight)?;
+    begin(fence.grant()).map_err(AuthorizationGateError::from)
+}
+
+/// A charged operation whose per-Goal ledger fence is still held.
+///
+/// Publication keeps this value alive across the filesystem write and the
+/// `CompleteOperation` commit. A revocation therefore cannot finalize while an
+/// operation is executing: it either runs before the operation begins (and the
+/// operation is refused) or after the operation is durably journaled. The lock
+/// is per Goal, never the session lock, and every wait is bounded.
+pub(crate) struct PublicationFence {
+    _guard: LedgerGuard,
+    grant: GoalWriteGrantV1,
+    goal_revision: u64,
+}
+
+impl PublicationFence {
+    pub(crate) fn grant(&self) -> &GoalWriteGrantV1 {
+        &self.grant
+    }
+
+    /// The Goal revision after the anchor usage floor was committed, if it was.
+    /// The caller must use this revision for `BeginOperation`.
+    pub(crate) fn goal_revision(&self) -> u64 {
+        self.goal_revision
+    }
+}
+
+/// Acquire the publication fence for one operation.
+///
+/// The grant state, epoch, anchor, expiry, workspace, binding and path/operation
+/// scope are verified under the fence; the monotonic usage floor is written to
+/// the Goal anchor and the operation id is charged before the caller may perform
+/// any side effect. The returned fence must be dropped only after the operation
+/// is complete or journaled UNKNOWN.
+pub(crate) fn acquire_publication_fence<P>(
+    store: &TaskStore,
+    goal: &Goal,
+    binding: &GrantBinding,
+    operation_id: &str,
+    bytes: u64,
+    preflight: P,
+) -> Result<PublicationFence, AuthorizationGateError>
+where
+    P: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
+{
+    prepare_charge(store, goal, binding, operation_id, bytes, preflight)
+}
+
+fn prepare_charge<P>(
+    store: &TaskStore,
+    goal: &Goal,
+    binding: &GrantBinding,
+    operation_id: &str,
+    bytes: u64,
+    preflight: P,
+) -> Result<PublicationFence, AuthorizationGateError>
+where
+    P: FnOnce(&GoalWriteGrantV1) -> Result<(), GrantRefusal>,
+{
     if !goal.model_backend().is_external() {
         return Err(GrantError::BackendNotExternal.into());
     }
@@ -510,14 +604,48 @@ where
     }
     // Preflight is pure: a path/operation mismatch never consumes budget.
     preflight(&grant)?;
-    // The charge is durable before the operation may begin. If `begin` then
-    // fails, the charge is deliberately not refunded: no side effect occurred,
-    // but the durable fence already spent the budget, and returning it without
-    // proof is exactly what this design forbids.
-    let grant_id = grant.grant_id().to_owned();
-    ledger.charge_operation(&grant_id, operation_id, bytes, &now)?;
-    save_ledger(store, &ledger)?;
-    begin(&grant).map_err(AuthorizationGateError::from)
+
+    let mut goal_revision = goal.revision();
+    if !grant.usage().is_charged(operation_id) {
+        let floor_operations = grant.usage().operations().max(anchor.usage_operations());
+        let floor_bytes = grant.usage().bytes().max(anchor.usage_bytes());
+        if !grant
+            .budget()
+            .allows(floor_operations, floor_bytes, 1, bytes)
+        {
+            return Err(GrantRefusal::BudgetExhausted.into());
+        }
+        // Anchor first: the Goal-side monotonic floor is what makes a restored
+        // ledger unable to regain spent budget. A crash between the two writes
+        // leaves a floor ahead of the ledger, which is conservative (never a
+        // refund) and is reconciled by the next charge.
+        let next_operations = floor_operations.saturating_add(1);
+        let next_bytes = floor_bytes.saturating_add(bytes);
+        let updated = update_anchor(store, goal.session_id(), goal.id(), |anchor| {
+            anchor.record_usage_floor(next_operations, next_bytes);
+        })
+        .map_err(|_| GrantError::Io)?;
+        goal_revision = updated.revision();
+        // The charge is durable before the operation may begin. If the caller's
+        // operation then fails, the charge is deliberately not refunded: no
+        // proof of non-performance exists yet, and the design forbids refunding
+        // without evidence.
+        let grant_id = grant.grant_id().to_owned();
+        ledger.charge_operation_with_floor(
+            &grant_id,
+            operation_id,
+            bytes,
+            floor_operations,
+            floor_bytes,
+            &now,
+        )?;
+        save_ledger(store, &ledger)?;
+    }
+    Ok(PublicationFence {
+        _guard: guard,
+        grant,
+        goal_revision,
+    })
 }
 
 /// Convenience path check used by the publication gate.
