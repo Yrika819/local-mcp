@@ -45,6 +45,7 @@ pub(crate) const REVIEWER_INVOCATION_STARTED: &str = "REVIEWER_INVOCATION_STARTE
 pub(crate) const REVIEWER_RECORDED: &str = "REVIEWER_RECORDED";
 
 /// Outcome of one publication attempt.
+#[derive(Debug)]
 pub(crate) enum PublishOutcome {
     Published { goal: Box<Goal> },
     Refused { code: &'static str },
@@ -55,6 +56,7 @@ pub(crate) enum PublishOutcome {
     clippy::large_enum_variant,
     reason = "The outcome is short-lived; carrying the committed Goal snapshot is the point."
 )]
+#[derive(Debug)]
 pub(crate) enum ReviewerOutcome {
     Recorded {
         goal: Goal,
@@ -108,6 +110,15 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
     boundary: &B,
 ) -> Result<PublishOutcome, OrchestratorError> {
     let goal = store.load_goal(&session.id, goal_id)?;
+    // A cancelled, pausing, or terminal Goal must never publish, even if its Task
+    // still looks RUNNING (cancellation rests in CANCELLING while the host
+    // reconciles the active Attempt). This is checked before the Task so a
+    // cancelled Goal is refused for the right reason.
+    if !matches!(goal.status(), crate::goal::GoalStatus::Running) {
+        return Ok(PublishOutcome::Refused {
+            code: "WRITER_GOAL_NOT_ACTIVE",
+        });
+    }
     let Some(task) = goal.tasks().get(task_id) else {
         return Ok(PublishOutcome::Refused {
             code: "WRITER_TASK_MISSING",
