@@ -91,6 +91,9 @@ pub(crate) const OUTPUT_CONTRACT_WRITER_V1: &str = "writer-proposal-v1";
 /// Output contract for the Reviewer role in V1.
 pub(crate) const OUTPUT_CONTRACT_REVIEWER_V1: &str = "reviewer-verdict-v1";
 
+/// Output contract for the Replanner role in V1.
+pub(crate) const OUTPUT_CONTRACT_REPLANNER_V1: &str = "replanner-proposal-v1";
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct WorkId(String);

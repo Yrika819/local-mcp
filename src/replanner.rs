@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -907,7 +907,7 @@ struct CriterionBindingStrengtheningProposal {
 }
 
 #[derive(Clone, Debug)]
-struct ValidatedReplan {
+pub(crate) struct ValidatedReplan {
     new_tasks: Vec<ValidatedNewTask>,
     add_dependencies: Vec<(ValidatedTaskRef, ValidatedTaskRef)>,
     add_verification: Vec<(TaskId, Vec<VerificationSpec>)>,
@@ -3008,6 +3008,122 @@ fn dependency_already_present(
             }),
     }
 }
+/// Bounded, model-free refusal for one external Replanner submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplanValidationRefusal {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ReplanValidationRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        self.detail
+    }
+}
+
+/// What a replayed replan proposal means against the durable Goal.
+///
+/// The external backend keys redelivery on the submission id, but a client may
+/// legitimately re-send the same plan under a new submission id. The host
+/// recognises that through the existing supersession/replacement records: the same
+/// effective proposal is already applied, a different one under the same request
+/// id is a conflict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplanReplay {
+    AlreadyApplied,
+    ConflictingDigest,
+}
+
+/// Detect a replay of a plan-level supersession or failed-task replacement.
+pub(crate) fn replan_replay_verdict(goal: &Goal, output: &[u8]) -> Option<ReplanReplay> {
+    let raw: serde_json::Value = serde_json::from_slice(output).ok()?;
+    let proposal: ReplanProposal = serde_json::from_value(raw.clone()).ok()?;
+    let digest = canonical_proposal_digest(&raw);
+    if let Some(supersession) = proposal.pristine_plan_supersession.as_ref()
+        && let Some(record) =
+            goal.find_pristine_plan_supersession(&supersession.rejection_request_id)
+    {
+        return Some(if record.canonical_proposal_digest() == digest {
+            ReplanReplay::AlreadyApplied
+        } else {
+            ReplanReplay::ConflictingDigest
+        });
+    }
+    for replacement in &proposal.replace_tasks {
+        if let Some(record) = goal.find_failed_task_replacement(&replacement.replan_request_id) {
+            return Some(if record.canonical_proposal_digest() == digest {
+                ReplanReplay::AlreadyApplied
+            } else {
+                ReplanReplay::ConflictingDigest
+            });
+        }
+    }
+    None
+}
+
+/// Strictly validate one untrusted external replan proposal.
+///
+/// Reuses exactly the validator the Codex replanner path runs, so scope,
+/// criterion coverage, dependency cycles, writer serialization, supersession
+/// pristineness, replacement closure and plan budgets are enforced by one code
+/// path.
+pub(crate) fn validate_replan_output_for_apply(
+    output: &[u8],
+    goal: &Goal,
+    goal_root: &Path,
+) -> Result<ValidatedReplan, ReplanValidationRefusal> {
+    if output.len() > planner::MAX_PLAN_PROPOSAL_BYTES {
+        return Err(ReplanValidationRefusal {
+            code: "REPLAN_PROPOSAL_TOO_LARGE",
+            detail: "the replan proposal exceeds the 256 KiB host limit",
+        });
+    }
+    parse_and_validate_proposal(output, goal, goal_root).map_err(|error| {
+        let code = match error {
+            ReplannerError::ReplannerOutputInvalid(_) => "REPLAN_PROPOSAL_INVALID_JSON",
+            ReplannerError::ReplannerSchemaViolation(_) => "REPLAN_SCHEMA_VIOLATION",
+            ReplannerError::ReplanAuthorityViolation(_) => "REPLAN_AUTHORITY_VIOLATION",
+            ReplannerError::ReplanNotApplicable(_) => "REPLAN_NOT_APPLICABLE",
+            ReplannerError::PlanConflict { .. } => "REPLAN_PLAN_CONFLICT",
+            _ => "REPLAN_REJECTED",
+        };
+        ReplanValidationRefusal {
+            code,
+            detail: "the host rejected the external replan proposal",
+        }
+    })
+}
+
+/// Apply a validated replan inside a caller-owned durable mutation.
+///
+/// The plan revision guard and the writer-serialization invariant are re-checked
+/// against the snapshot that will be persisted, so a validated replan can be
+/// applied at most once.
+pub(crate) fn apply_validated_replan_to_goal(
+    goal: &mut Goal,
+    expected_plan_revision: u32,
+    validated: ValidatedReplan,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    if goal.plan_revision() != expected_plan_revision {
+        return Err(OrchestratorError::InvalidDag(
+            "stale replan plan revision".to_owned(),
+        ));
+    }
+    materialize_validated_replan(goal, validated, now)?;
+    validate_writer_serialization(goal)
+}
+
+/// Host-owned replan eligibility, exposed so the external driver can decide
+/// whether a trigger is real before issuing a WorkItem.
+pub(crate) fn replan_eligible_for_host(goal: &Goal) -> Result<(), ReplannerError> {
+    ensure_replan_eligible(goal)
+}
+
 fn materialize_validated_replan(
     goal: &mut Goal,
     validated: ValidatedReplan,
