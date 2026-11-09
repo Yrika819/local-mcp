@@ -309,6 +309,20 @@ pub fn resolve_path_covered_by_session_authority(
 /// placing a linked worktree in Git administrative internals.
 pub const MANAGED_WORKTREE_ROOT_ENV: &str = "LOCAL_MCP_MANAGED_WORKTREE_ROOT";
 
+/// Host-owned environment override for the durable state root.
+///
+/// The durable state root holds the Session records, the Goal store and the
+/// Authorization B ledger. It exists so an operator (and the acceptance
+/// harnesses) can run a fully isolated server instance without touching the
+/// real per-user state, which is the only way a *real* MCP server process can
+/// be exercised against a throwaway workspace.
+///
+/// Like [`MANAGED_WORKTREE_ROOT_ENV`] this is host/operator configuration: it is
+/// read from the process environment only, never from MCP arguments, model
+/// prose, or a value derived from a workspace. A relative path is refused, so
+/// the resolved root never depends on the current directory of a request.
+pub const STATE_DIR_ENV: &str = "LOCAL_MCP_STATE_DIR";
+
 /// The host-owned root under which managed linked worktrees are created
 /// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` section 7).
 ///
@@ -329,6 +343,21 @@ pub fn managed_worktree_root() -> Result<PathBuf> {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
+    resolve_state_dir(std::env::var_os(STATE_DIR_ENV))
+}
+
+/// Pure resolver for [`state_dir`], so the override rule is testable without
+/// mutating the process environment of a parallel test run.
+fn resolve_state_dir(override_value: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(raw) = override_value {
+        let path = PathBuf::from(raw);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "{STATE_DIR_ENV} must be an absolute path: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .map(|path| path.join("local-mcp"))
@@ -478,6 +507,25 @@ pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state-root override is host configuration. An absolute path is used
+    /// verbatim; a relative one is refused rather than resolved against the
+    /// process working directory, so the durable state root can never become a
+    /// function of where a request happened to run.
+    #[test]
+    fn state_dir_override_requires_an_absolute_path() {
+        let absolute = std::env::temp_dir().join("local-mcp-state-dir-override-test");
+        assert_eq!(
+            resolve_state_dir(Some(absolute.clone().into_os_string())).unwrap(),
+            absolute
+        );
+        let relative = std::ffi::OsString::from("relative/state");
+        let error = resolve_state_dir(Some(relative)).expect_err("a relative root is refused");
+        assert!(
+            format!("{error}").contains(STATE_DIR_ENV),
+            "the refusal names the overridden variable: {error}"
+        );
+    }
 
     #[test]
     fn validates_custom_session_ids() {
