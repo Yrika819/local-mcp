@@ -434,6 +434,28 @@ fn test_grant_fixture_id_in(root: &std::path::Path) -> Option<String> {
     if canonical_root != canonical_declared {
         return None;
     }
+    // Disposability is enforced here, on the read path, not only when the marker
+    // was created: a marker written by hand (or imported) must not turn a real
+    // state root into a fixture root.
+    let default_root = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|path| path.join("local-mcp"));
+    if let Some(default_root) = default_root
+        && std::fs::canonicalize(&default_root).ok() == Some(canonical_root.clone())
+    {
+        return None;
+    }
+    let disposable = canonical_root.parent()?;
+    if disposable.join(".git").exists() {
+        return None;
+    }
+    // The workspace the marker names must be a sibling of the state root under
+    // that same disposable parent, which is the layout the fixture creates.
+    let declared_workspace = marker.get("workspace_root")?.as_str()?;
+    let canonical_workspace = std::fs::canonicalize(declared_workspace).ok()?;
+    if canonical_workspace.parent() != Some(disposable) {
+        return None;
+    }
     Some(fixture_id)
 }
 

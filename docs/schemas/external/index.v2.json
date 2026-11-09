@@ -58,10 +58,14 @@
         "criterion_bindings"
       ],
       "role": "PLANNER",
-      "schema_digest": "sha256:e9ba33f77eafa4dd3cfce2c8f17169ff12bd9e6f37b201990ba161c7ea5114b6"
+      "schema_digest": "sha256:9e35fba263117389a40d84e096165c8e1b5e4a93ba30690a7f1d5dc24a51f0f8"
     },
     {
       "conditions": [
+        {
+          "code": "READONLY_EVIDENCE_KIND_IS_THE_REQUIREMENT_ID",
+          "detail": "the host records each evidence item as a structured observation whose requirement_id is the item's `kind`; every request.verification entry of kind STRUCTURED_EVIDENCE must therefore appear as an evidence item with `kind` equal to that entry's requirement_id, or the Task Verifier reports the requirement as missing and the Task is blocked"
+        },
         {
           "code": "READONLY_IDENTITY_ECHO",
           "detail": "goal_id, task_id, attempt_id, goal_revision and plan_revision must equal the host-issued WorkItem identity; a mismatch is READONLY_IDENTITY_MISMATCH"
@@ -92,7 +96,8 @@
       "notes": [
         "Return exactly one JSON object. Any additional property is refused.",
         "The read-only role performs no writes and has no write authority.",
-        "candidate_complete hands the Task to the host Verifier; it is not a completion claim."
+        "candidate_complete hands the Task to the host Verifier; it is not a completion claim.",
+        "Echo every request.verification STRUCTURED_EVIDENCE requirement_id as an evidence item `kind`, with the observation in `value`. The host keys structured observations by that string."
       ],
       "optional_fields": [],
       "output_contract": "readonly-investigation-v1",
@@ -107,7 +112,7 @@
         "evidence"
       ],
       "role": "READONLY",
-      "schema_digest": "sha256:aebdd9f7e0edb6488fac86806476b0beaf5aba5fea188a4568746209d5145ff2"
+      "schema_digest": "sha256:09539972ea8fc534732597de90708a3cf2dbab870ac99320a84ad6d1c65d9013"
     },
     {
       "conditions": [
@@ -165,7 +170,7 @@
         "proposed_operations"
       ],
       "role": "WRITER",
-      "schema_digest": "sha256:fb5394c181c48b5bea8a42e13b8a0bd79c44cf01075bf012f6260b524dcf72c7"
+      "schema_digest": "sha256:575e5a9ac222eaa897c36da755a616f65ea4ac50f290931cdb6a2a2e23578f4f"
     },
     {
       "conditions": [
@@ -209,7 +214,7 @@
         "evidence"
       ],
       "role": "REVIEWER",
-      "schema_digest": "sha256:63e1d6c9dea7971a22451d49bd62ca28ad56d3cae5d7987b34dfee0123af7b6f"
+      "schema_digest": "sha256:6044ec5385ad4835db3862f4f9632948d1fbfb998aed1d4383116851d8b8cd75"
     },
     {
       "conditions": [
@@ -248,24 +253,24 @@
         "Replacement primitives are typed and travel with explicit request ids issued by the host."
       ],
       "optional_fields": [
-        "pristine_plan_supersession"
-      ],
-      "output_contract": "replanner-proposal-v1",
-      "required_fields": [
-        "goal_id",
-        "base_goal_revision",
-        "base_plan_revision",
-        "summary",
         "add_tasks",
         "add_dependencies",
         "strengthen_verification",
         "strengthen_mandatory",
         "strengthen_criterion_bindings",
         "resolve_needs_replan",
+        "pristine_plan_supersession",
         "replace_tasks"
       ],
+      "output_contract": "replanner-proposal-v1",
+      "required_fields": [
+        "goal_id",
+        "base_goal_revision",
+        "base_plan_revision",
+        "summary"
+      ],
       "role": "REPLANNER",
-      "schema_digest": "sha256:6791a950ef28c2764e076b01c3214d437097b147441385def134706baffd2094"
+      "schema_digest": "sha256:a91c9757ed5cc6251771fd885d7e63b84cb822c9a36ec24c819b0504aff56054"
     }
   ]
 }

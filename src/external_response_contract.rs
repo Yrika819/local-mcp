@@ -153,8 +153,6 @@ pub(crate) enum FieldKind {
     ArrayOf,
     /// Array of plain strings.
     TextArray,
-    /// Array of plain integers.
-    IntegerArray,
     /// Object whose shape is a named definition.
     Object,
 }
@@ -222,14 +220,6 @@ const fn text_array(name: &'static str) -> Field {
     Field {
         name,
         kind: FieldKind::TextArray,
-        ..Field::DEFAULT
-    }
-}
-
-const fn integer_array(name: &'static str) -> Field {
-    Field {
-        name,
-        kind: FieldKind::IntegerArray,
         ..Field::DEFAULT
     }
 }
@@ -326,10 +316,12 @@ const REPLAY_SAFETY_VALUES: &[&str] = &["SAFE_READ_ONLY", "VERIFY_BEFORE_RETRY",
 const EVIDENCE_FIELDS_READONLY: &[Field] = &[
     text("kind")
         .max_bytes(LIMIT_READONLY_EVIDENCE_FIELD_BYTES)
-        .note("non-empty"),
+        .note(
+            "non-empty. The host turns each evidence item into a structured observation keyed by THIS string, so for every request.verification entry of kind STRUCTURED_EVIDENCE this must be exactly that entry's requirement_id",
+        ),
     text("value")
         .max_bytes(LIMIT_READONLY_EVIDENCE_FIELD_BYTES)
-        .note("non-empty"),
+        .note("non-empty; the host stores this verbatim as the observation detail"),
 ];
 
 const EVIDENCE_FIELDS_WORKER: &[Field] = &[
@@ -338,16 +330,6 @@ const EVIDENCE_FIELDS_WORKER: &[Field] = &[
 ];
 
 const TAG_KIND: Field = text("kind").note("discriminator");
-
-const COMMAND_EXIT_FIELDS: &[Field] = &[
-    TAG_KIND.one_of(&["COMMAND_EXIT"]),
-    text_array("command").item_bounds(1, 256),
-    text("cwd")
-        .optional()
-        .note("optional working directory, relative to the Goal workspace"),
-    integer_array("accepted_exit_codes")
-        .note("exit codes as JSON numbers; an empty list means only zero is accepted"),
-];
 
 const FILE_EXISTS_FIELDS: &[Field] = &[
     TAG_KIND.one_of(&["FILE_EXISTS"]),
@@ -383,7 +365,11 @@ const REVIEW_GATE_FIELDS: &[Field] = &[
 ];
 
 const VERIFICATION_SPEC_BRANCHES: &[&[Field]] = &[
-    COMMAND_EXIT_FIELDS,
+    // COMMAND_EXIT exists in the serde enum but the shared verifier refuses it
+    // unconditionally ("COMMAND_EXIT verification is currently unsupported"), so
+    // it is deliberately NOT published: a contract that advertises a form the
+    // host always refuses is worse than one that omits it.
+    // COMMAND_EXIT_FIELDS,
     FILE_EXISTS_FIELDS,
     FILE_DIGEST_FIELDS,
     GIT_SCOPE_FIELDS,
@@ -394,7 +380,9 @@ const VERIFICATION_SPEC_BRANCHES: &[&[Field]] = &[
 
 const TASK_SCOPE_FIELDS: &[Field] = &[
     text_array("allowed_paths").item_bounds(1, LIMIT_SCOPE_PATHS_PER_KIND),
-    text_array("forbidden_paths").item_bounds(0, LIMIT_SCOPE_PATHS_PER_KIND),
+    text_array("forbidden_paths")
+        .item_bounds(0, LIMIT_SCOPE_PATHS_PER_KIND)
+        .optional(),
     text("operation_kind").one_of(OPERATION_KIND_VALUES),
     text("replay_safety").one_of(REPLAY_SAFETY_VALUES),
 ];
@@ -409,7 +397,26 @@ const PLAN_TASK_FIELDS: &[Field] = &[
         .note(WORKER_KIND_NOTE),
     text_array("dependencies")
         .max_bytes(LIMIT_PROPOSAL_ID_BYTES)
-        .item_bounds(0, LIMIT_DEPENDENCIES_PER_TASK),
+        .item_bounds(0, LIMIT_DEPENDENCIES_PER_TASK)
+        .optional(),
+    object_of("scope", "task_scope"),
+    array_of("verification", "verification_spec").item_bounds(1, LIMIT_VERIFICATION_PER_TASK),
+];
+
+/// Replanner task shape: identical to the Planner's except that `dependencies`
+/// are tagged task refs (`{"ref_kind":"EXISTING"|"NEW", ...}`), which is what
+/// `ReplanTaskProposal` actually deserializes.
+const REPLAN_TASK_FIELDS: &[Field] = &[
+    text("proposal_id").max_bytes(LIMIT_PROPOSAL_ID_BYTES),
+    text("title").max_bytes(LIMIT_PLAN_TITLE_BYTES),
+    text("objective").max_bytes(LIMIT_PLAN_OBJECTIVE_BYTES),
+    boolean("mandatory"),
+    text("worker")
+        .one_of(WORKER_KIND_VALUES)
+        .note(WORKER_KIND_NOTE),
+    array_of("dependencies", "task_ref")
+        .item_bounds(0, LIMIT_DEPENDENCIES_PER_TASK)
+        .optional(),
     object_of("scope", "task_scope"),
     array_of("verification", "verification_spec").item_bounds(1, LIMIT_VERIFICATION_PER_TASK),
 ];
@@ -511,6 +518,10 @@ pub(crate) const DEFINITIONS: &[Def] = &[
         body: DefBody::Object(PLAN_TASK_FIELDS),
     },
     Def {
+        name: "replan_task",
+        body: DefBody::Object(REPLAN_TASK_FIELDS),
+    },
+    Def {
         name: "plan_criterion_binding",
         body: DefBody::Object(PLAN_CRITERION_BINDING_FIELDS),
     },
@@ -598,6 +609,10 @@ const PLANNER_CONDITIONS: &[Condition] = &[
 ];
 
 const READONLY_CONDITIONS: &[Condition] = &[
+    Condition {
+        code: "READONLY_EVIDENCE_KIND_IS_THE_REQUIREMENT_ID",
+        detail: "the host records each evidence item as a structured observation whose requirement_id is the item's `kind`; every request.verification entry of kind STRUCTURED_EVIDENCE must therefore appear as an evidence item with `kind` equal to that entry's requirement_id, or the Task Verifier reports the requirement as missing and the Task is blocked",
+    },
     Condition {
         code: "READONLY_IDENTITY_ECHO",
         detail: "goal_id, task_id, attempt_id, goal_revision and plan_revision must equal the host-issued WorkItem identity; a mismatch is READONLY_IDENTITY_MISMATCH",
@@ -742,22 +757,32 @@ const REPLANNER_FIELDS: &[Field] = &[
     integer("base_goal_revision").echo(),
     integer("base_plan_revision").echo(),
     text("summary").max_bytes(LIMIT_PLAN_SUMMARY_BYTES),
-    array_of("add_tasks", "plan_task").item_bounds(0, LIMIT_PLAN_TASKS),
-    array_of("add_dependencies", "dependency_addition").item_bounds(0, LIMIT_PLAN_DEPENDENCY_EDGES),
+    array_of("add_tasks", "replan_task")
+        .item_bounds(0, LIMIT_PLAN_TASKS)
+        .optional(),
+    array_of("add_dependencies", "dependency_addition")
+        .item_bounds(0, LIMIT_PLAN_DEPENDENCY_EDGES)
+        .optional(),
     array_of("strengthen_verification", "verification_strengthening")
-        .item_bounds(0, LIMIT_VERIFICATION_TOTAL),
+        .item_bounds(0, LIMIT_VERIFICATION_TOTAL)
+        .optional(),
     array_of("strengthen_mandatory", "mandatory_strengthening")
-        .item_bounds(0, LIMIT_VERIFICATION_TOTAL),
+        .item_bounds(0, LIMIT_VERIFICATION_TOTAL)
+        .optional(),
     array_of(
         "strengthen_criterion_bindings",
         "criterion_binding_strengthening",
     )
-    .item_bounds(0, LIMIT_VERIFICATION_TOTAL),
+    .item_bounds(0, LIMIT_VERIFICATION_TOTAL)
+    .optional(),
     text_array("resolve_needs_replan")
         .item_bounds(0, LIMIT_VERIFICATION_TOTAL)
-        .note(REPLANNER_RESOLVE_NOTE),
+        .note(REPLANNER_RESOLVE_NOTE)
+        .optional(),
     object_of("pristine_plan_supersession", "pristine_plan_supersession").optional(),
-    array_of("replace_tasks", "task_replacement").item_bounds(0, LIMIT_PLAN_TASKS),
+    array_of("replace_tasks", "task_replacement")
+        .item_bounds(0, LIMIT_PLAN_TASKS)
+        .optional(),
 ];
 
 const PLANNER_NOTES: &[&str] = &[
@@ -770,6 +795,7 @@ const READONLY_NOTES: &[&str] = &[
     "Return exactly one JSON object. Any additional property is refused.",
     "The read-only role performs no writes and has no write authority.",
     "candidate_complete hands the Task to the host Verifier; it is not a completion claim.",
+    "Echo every request.verification STRUCTURED_EVIDENCE requirement_id as an evidence item `kind`, with the observation in `value`. The host keys structured observations by that string.",
 ];
 
 const WRITER_NOTES: &[&str] = &[
@@ -912,8 +938,11 @@ fn field_schema(field: &Field) -> Value {
             }
         }
         FieldKind::Integer => {
+            // The host parses these into u32/u64, so the published bound is the
+            // largest value every one of them can hold (H5-A round 2, R2-8).
             object.insert("type".to_owned(), json!("integer"));
             object.insert("minimum".to_owned(), json!(0));
+            object.insert("maximum".to_owned(), json!(u32::MAX));
         }
         FieldKind::Boolean => {
             object.insert("type".to_owned(), json!("boolean"));
@@ -927,10 +956,6 @@ fn field_schema(field: &Field) -> Value {
                 items.insert("x-max-bytes".to_owned(), json!(field.max_bytes));
             }
             object.insert("items".to_owned(), Value::Object(items));
-        }
-        FieldKind::IntegerArray => {
-            object.insert("type".to_owned(), json!("array"));
-            object.insert("items".to_owned(), json!({"type": "integer"}));
         }
         FieldKind::ArrayOf => {
             object.insert("type".to_owned(), json!("array"));

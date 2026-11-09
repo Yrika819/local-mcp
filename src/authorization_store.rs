@@ -505,6 +505,17 @@ pub(crate) fn revoke_active_within(
         .latest_grant()
         .is_some_and(|grant| grant.revocation().state() == GrantRevocationState::Revoked)
     {
+        // H5-A round 2 (R2-2): a reachable `REVOKED + APPLYING` state (an older
+        // binary, or a restored state) must not report success either. The
+        // barrier is a property of the Goal, not of this call's write order.
+        let settled = store
+            .load_goal(session_id, &parsed_goal)
+            .map_err(|_| GrantError::Io)?;
+        if settled.has_unresolved_publication() {
+            return Err(AuthorizationGateError::State(
+                GrantError::RevocationBlockedByPublication,
+            ));
+        }
         // Idempotent retry must also repair a crash window in which the ledger
         // said REVOKED but the Goal anchor was never written. Without this, a
         // restored ACTIVE ledger would satisfy the stale anchor.

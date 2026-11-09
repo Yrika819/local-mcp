@@ -116,9 +116,51 @@
         "properties": {
           "dependencies": {
             "items": {
-              "maxLength": 64,
-              "type": "string",
-              "x-max-bytes": 64
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "ref_kind": {
+                      "enum": [
+                        "EXISTING"
+                      ],
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "description": "an exact existing durable Task UUID",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "task_id"
+                  ],
+                  "title": "task_ref.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "proposal_id": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "ref_kind": {
+                      "enum": [
+                        "NEW"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "proposal_id"
+                  ],
+                  "title": "task_ref.1",
+                  "type": "object"
+                }
+              ]
             },
             "maxItems": 64,
             "type": "array"
@@ -173,7 +215,6 @@
             },
             "required": [
               "allowed_paths",
-              "forbidden_paths",
               "operation_kind",
               "replay_safety"
             ],
@@ -188,44 +229,6 @@
           "verification": {
             "items": {
               "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "accepted_exit_codes": {
-                      "description": "exit codes as JSON numbers; an empty list means only zero is accepted",
-                      "items": {
-                        "type": "integer"
-                      },
-                      "type": "array"
-                    },
-                    "command": {
-                      "items": {
-                        "type": "string"
-                      },
-                      "maxItems": 256,
-                      "minItems": 1,
-                      "type": "array"
-                    },
-                    "cwd": {
-                      "description": "optional working directory, relative to the Goal workspace",
-                      "type": "string"
-                    },
-                    "kind": {
-                      "description": "discriminator",
-                      "enum": [
-                        "COMMAND_EXIT"
-                      ],
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "kind",
-                    "command",
-                    "accepted_exit_codes"
-                  ],
-                  "title": "verification_spec.0",
-                  "type": "object"
-                },
                 {
                   "additionalProperties": false,
                   "properties": {
@@ -250,7 +253,7 @@
                     "path",
                     "must_be_file"
                   ],
-                  "title": "verification_spec.1",
+                  "title": "verification_spec.0",
                   "type": "object"
                 },
                 {
@@ -279,7 +282,7 @@
                     "path",
                     "expected_sha256"
                   ],
-                  "title": "verification_spec.2",
+                  "title": "verification_spec.1",
                   "type": "object"
                 },
                 {
@@ -307,7 +310,7 @@
                     "allowed_changed_paths",
                     "require_no_other_changes"
                   ],
-                  "title": "verification_spec.3",
+                  "title": "verification_spec.2",
                   "type": "object"
                 },
                 {
@@ -331,7 +334,7 @@
                     "kind",
                     "forbidden_paths"
                   ],
-                  "title": "verification_spec.4",
+                  "title": "verification_spec.3",
                   "type": "object"
                 },
                 {
@@ -354,7 +357,7 @@
                     "kind",
                     "requirement_id"
                   ],
-                  "title": "verification_spec.5",
+                  "title": "verification_spec.4",
                   "type": "object"
                 },
                 {
@@ -368,6 +371,7 @@
                       "type": "string"
                     },
                     "max_blocking_findings": {
+                      "maximum": 4294967295,
                       "minimum": 0,
                       "type": "integer"
                     }
@@ -376,7 +380,7 @@
                     "kind",
                     "max_blocking_findings"
                   ],
-                  "title": "verification_spec.6",
+                  "title": "verification_spec.5",
                   "type": "object"
                 }
               ]
@@ -400,21 +404,22 @@
           "objective",
           "mandatory",
           "worker",
-          "dependencies",
           "scope",
           "verification"
         ],
-        "title": "plan_task",
+        "title": "replan_task",
         "type": "object"
       },
       "maxItems": 128,
       "type": "array"
     },
     "base_goal_revision": {
+      "maximum": 4294967295,
       "minimum": 0,
       "type": "integer"
     },
     "base_plan_revision": {
+      "maximum": 4294967295,
       "minimum": 0,
       "type": "integer"
     },
@@ -755,44 +760,6 @@
                 {
                   "additionalProperties": false,
                   "properties": {
-                    "accepted_exit_codes": {
-                      "description": "exit codes as JSON numbers; an empty list means only zero is accepted",
-                      "items": {
-                        "type": "integer"
-                      },
-                      "type": "array"
-                    },
-                    "command": {
-                      "items": {
-                        "type": "string"
-                      },
-                      "maxItems": 256,
-                      "minItems": 1,
-                      "type": "array"
-                    },
-                    "cwd": {
-                      "description": "optional working directory, relative to the Goal workspace",
-                      "type": "string"
-                    },
-                    "kind": {
-                      "description": "discriminator",
-                      "enum": [
-                        "COMMAND_EXIT"
-                      ],
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "kind",
-                    "command",
-                    "accepted_exit_codes"
-                  ],
-                  "title": "verification_spec.0",
-                  "type": "object"
-                },
-                {
-                  "additionalProperties": false,
-                  "properties": {
                     "kind": {
                       "description": "discriminator",
                       "enum": [
@@ -814,7 +781,7 @@
                     "path",
                     "must_be_file"
                   ],
-                  "title": "verification_spec.1",
+                  "title": "verification_spec.0",
                   "type": "object"
                 },
                 {
@@ -843,7 +810,7 @@
                     "path",
                     "expected_sha256"
                   ],
-                  "title": "verification_spec.2",
+                  "title": "verification_spec.1",
                   "type": "object"
                 },
                 {
@@ -871,7 +838,7 @@
                     "allowed_changed_paths",
                     "require_no_other_changes"
                   ],
-                  "title": "verification_spec.3",
+                  "title": "verification_spec.2",
                   "type": "object"
                 },
                 {
@@ -895,7 +862,7 @@
                     "kind",
                     "forbidden_paths"
                   ],
-                  "title": "verification_spec.4",
+                  "title": "verification_spec.3",
                   "type": "object"
                 },
                 {
@@ -918,7 +885,7 @@
                     "kind",
                     "requirement_id"
                   ],
-                  "title": "verification_spec.5",
+                  "title": "verification_spec.4",
                   "type": "object"
                 },
                 {
@@ -932,6 +899,7 @@
                       "type": "string"
                     },
                     "max_blocking_findings": {
+                      "maximum": 4294967295,
                       "minimum": 0,
                       "type": "integer"
                     }
@@ -940,7 +908,7 @@
                     "kind",
                     "max_blocking_findings"
                   ],
-                  "title": "verification_spec.6",
+                  "title": "verification_spec.5",
                   "type": "object"
                 }
               ]
@@ -973,14 +941,7 @@
     "goal_id",
     "base_goal_revision",
     "base_plan_revision",
-    "summary",
-    "add_tasks",
-    "add_dependencies",
-    "strengthen_verification",
-    "strengthen_mandatory",
-    "strengthen_criterion_bindings",
-    "resolve_needs_replan",
-    "replace_tasks"
+    "summary"
   ],
   "title": "REPLANNER",
   "type": "object"

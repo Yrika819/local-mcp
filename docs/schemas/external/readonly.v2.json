@@ -9,13 +9,13 @@
         "additionalProperties": false,
         "properties": {
           "kind": {
-            "description": "non-empty",
+            "description": "non-empty. The host turns each evidence item into a structured observation keyed by THIS string, so for every request.verification entry of kind STRUCTURED_EVIDENCE this must be exactly that entry's requirement_id",
             "maxLength": 8192,
             "type": "string",
             "x-max-bytes": 8192
           },
           "value": {
-            "description": "non-empty",
+            "description": "non-empty; the host stores this verbatim as the observation detail",
             "maxLength": 8192,
             "type": "string",
             "x-max-bytes": 8192
@@ -35,10 +35,12 @@
       "type": "string"
     },
     "goal_revision": {
+      "maximum": 4294967295,
       "minimum": 0,
       "type": "integer"
     },
     "plan_revision": {
+      "maximum": 4294967295,
       "minimum": 0,
       "type": "integer"
     },

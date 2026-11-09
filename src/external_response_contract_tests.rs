@@ -54,6 +54,7 @@ const SUPPORTED_KEYWORDS: &[&str] = &[
     "maxItems",
     "items",
     "minimum",
+    "maximum",
     "properties",
     "required",
     "additionalProperties",
@@ -104,6 +105,11 @@ fn schema_accepts(schema: &Value, instance: &Value) -> Result<(), String> {
                 {
                     return Err(format!("string is too long for maxLength {limit}"));
                 }
+            }
+            if let Some(maximum) = object.get("maximum").and_then(Value::as_i64)
+                && instance.as_i64().is_some_and(|number| number > maximum)
+            {
+                return Err(format!("{instance} is above maximum {maximum}"));
             }
             if let Some(minimum) = object.get("minimum").and_then(Value::as_i64) {
                 let below = match (instance.as_i64(), instance.as_u64()) {
@@ -592,18 +598,28 @@ fn published_verification_vocabulary_matches_the_real_enum() {
     assert_eq!(real.len(), 7, "every VerificationSpec variant is sampled");
 
     let published = published_verification_kinds();
+    // H5-A round 2 (R2-9): matching the *serde* enum identity is not enough. What
+    // matters is the vocabulary the host actually accepts, so a kind that the
+    // shared validator refuses (COMMAND_EXIT) must not be published even though
+    // the type can represent it.
+    assert!(
+        published.len() <= real.len(),
+        "the contract publishes more kinds than the enum can represent"
+    );
+    assert!(
+        !published.contains(&"COMMAND_EXIT".to_owned()),
+        "COMMAND_EXIT is refused unconditionally by validate_and_normalize_verification,          so it must not be advertised as an accepted verification form"
+    );
     assert_eq!(
         published.len(),
-        real.len(),
-        "the contract publishes {} kinds, the enum has {}",
-        published.len(),
-        real.len()
+        real.len() - 1,
+        "exactly the one unsupported kind is withheld"
     );
 
-    for kind in &real {
+    for kind in &published {
         assert!(
-            published.contains(kind),
-            "the contract does not publish the real verification kind {kind}"
+            real.contains(kind),
+            "the contract publishes {kind}, which the VerificationSpec enum cannot represent"
         );
         let spec = verification_sample(kind);
         let sample = planner_with_verification(spec);
@@ -613,12 +629,10 @@ fn published_verification_vocabulary_matches_the_real_enum() {
         );
         assert_schema_accepts("PLANNER", &sample);
     }
-    for kind in &published {
-        assert!(
-            real.contains(kind),
-            "the contract publishes {kind}, which the VerificationSpec enum cannot represent"
-        );
-    }
+    // And the withheld kind is still refused end to end.
+    let withheld = planner_with_verification(verification_sample("COMMAND_EXIT"));
+    assert!(crate::planner::response_shape_accepts(&withheld));
+    assert_schema_refuses("PLANNER", &withheld);
 
     let mut bad = planner_sample();
     bad["tasks"][0]["verification"] = json!([{"kind": "RUN_ANYTHING", "command": ["rm"]}]);
@@ -1203,4 +1217,73 @@ fn planner_sample_survives_a_map_key_roundtrip() {
     let reordered = Value::Object(reordered);
     assert_eq!(sample, reordered);
     assert_schema_accepts("PLANNER", &reordered);
+}
+
+// ---------------------------------------------------------------------------
+// 10. H5-A round 2 (R2-6): the Replanner's task refs are typed, not strings.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replanner_task_dependencies_are_published_as_typed_refs() {
+    // The Planner's dependencies are proposal-id strings; the Replanner's are
+    // `{"ref_kind": ...}` objects. `add_tasks` must publish the Replanner shape,
+    // or a client that follows the contract produces an unparseable proposal.
+    let mut typed = replanner_sample();
+    typed["add_tasks"][0]["dependencies"] = json!([
+        {"ref_kind": "NEW", "proposal_id": "probe"}
+    ]);
+    assert_schema_accepts("REPLANNER", &typed);
+    assert!(
+        crate::replanner::response_shape_accepts(&typed),
+        "the typed dependency form is what the real proposal deserializes"
+    );
+
+    let mut strings = replanner_sample();
+    strings["add_tasks"][0]["dependencies"] = json!(["probe"]);
+    assert_schema_refuses("REPLANNER", &strings);
+    assert!(
+        !crate::replanner::response_shape_accepts(&strings),
+        "a plain-string Replanner dependency is not a valid task ref"
+    );
+
+    // The Planner still publishes strings, and its own validator agrees.
+    let mut planner_typed = planner_sample();
+    planner_typed["tasks"][0]["dependencies"] = json!([{"ref_kind": "NEW", "proposal_id": "x"}]);
+    assert_schema_refuses("PLANNER", &planner_typed);
+    assert!(!crate::planner::response_shape_accepts(&planner_typed));
+}
+
+#[test]
+fn serde_defaulted_replanner_fields_are_optional_in_the_contract() {
+    // Every additive array is `#[serde(default)]`, so a minimal replan that only
+    // adds Tasks must be contract-valid.
+    let minimal = json!({
+        "goal_id": "00000000-0000-4000-8000-000000000001",
+        "base_goal_revision": 11,
+        "base_plan_revision": 2,
+        "summary": "one additive prerequisite",
+        "add_tasks": [plan_task("probe", "CODEX_READONLY", "READ_ONLY", "SAFE_READ_ONLY")]
+    });
+    assert_schema_accepts("REPLANNER", &minimal);
+    assert!(
+        crate::replanner::response_shape_accepts(&minimal),
+        "a replan that omits the defaulted arrays must be accepted"
+    );
+
+    // A Planner task may also omit `dependencies` and the scope's
+    // `forbidden_paths`, both of which are serde-defaulted.
+    let mut minimal_plan = planner_sample();
+    minimal_plan["tasks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("dependencies");
+    minimal_plan["tasks"][0]["scope"]
+        .as_object_mut()
+        .unwrap()
+        .remove("forbidden_paths");
+    assert_schema_accepts("PLANNER", &minimal_plan);
+    assert!(
+        crate::planner::response_shape_accepts(&minimal_plan),
+        "serde-defaulted fields must not be required by the published contract"
+    );
 }

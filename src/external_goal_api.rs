@@ -161,6 +161,10 @@ pub(crate) struct ResponseContractView {
     contract_version: u32,
     role: &'static str,
     output_contract: String,
+    /// False when the persisted `output_contract` string is not one this host
+    /// knows; `role`/`schema` then describe the role's current contract and the
+    /// client must not treat it as the persisted one.
+    contract_resolved: bool,
     /// Canonical digest of `schema`; equal digests mean equal contracts.
     schema_digest: String,
     /// String bounds are UTF-8 byte counts, not characters.
@@ -714,11 +718,16 @@ fn response_contract_view(item: &ModelWorkItem) -> ResponseContractView {
     // and is reported through `output_contract` in the projection.
     let contract = external_response_contract::contract_for_output_contract(item.output_contract())
         .unwrap_or_else(|| external_response_contract::contract_for_role(item.role()));
+    // H5-A round 2 (R2-12): the projection must not describe a *different*
+    // contract than the one the WorkItem persists. An unresolvable string is
+    // reported through `output_contract` (verbatim) and flagged here.
+    let contract_resolved = contract.output_contract == item.output_contract();
     ResponseContractView {
         contract_id: external_response_contract::contract_id(contract),
         contract_version: external_response_contract::RESPONSE_CONTRACT_VERSION,
         role: contract.role,
         output_contract: item.output_contract().to_owned(),
+        contract_resolved,
         schema_digest: external_response_contract::schema_digest(contract),
         byte_semantics: external_response_contract::BYTE_SEMANTICS,
         max_response_bytes: contract.max_response_bytes,

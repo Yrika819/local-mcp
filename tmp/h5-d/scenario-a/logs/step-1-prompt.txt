@@ -1,0 +1,117 @@
+You are answering a GoalLatch external ModelWorkItem.
+
+Answer with exactly one JSON object and nothing else: no prose, no markdown
+fence, no explanation before or after.
+
+The host will refuse the submission if it violates this contract, so follow the
+`schema` exactly, including the `status` vocabulary and the identity fields you
+must echo:
+
+{
+  "additionalProperties": false,
+  "properties": {
+    "attempt_id": {
+      "type": "string"
+    },
+    "evidence": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "description": "non-empty",
+            "maxLength": 8192,
+            "type": "string",
+            "x-max-bytes": 8192
+          },
+          "value": {
+            "description": "non-empty",
+            "maxLength": 8192,
+            "type": "string",
+            "x-max-bytes": 8192
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "title": "evidence_item_readonly",
+        "type": "object"
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "goal_revision": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "plan_revision": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "candidate_complete",
+        "blocked",
+        "needs_replan",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "summary": {
+      "maxLength": 16384,
+      "type": "string",
+      "x-max-bytes": 16384
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "goal_id",
+    "task_id",
+    "attempt_id",
+    "goal_revision",
+    "plan_revision",
+    "status",
+    "summary",
+    "evidence"
+  ],
+  "title": "READONLY",
+  "type": "object"
+}
+
+The host-authored request for this WorkItem is:
+
+{
+  "allowed_paths": [
+    "\\\\?\\C:\\Users\\Yuta\\Desktop\\local-mcp-connector-parity\\.local\\h5-a\\tmp\\h5-d\\scenario-a\\repo\\src\\**",
+    "\\\\?\\C:\\Users\\Yuta\\Desktop\\local-mcp-connector-parity\\.local\\h5-a\\tmp\\h5-d\\scenario-a\\repo\\data\\inventory.txt"
+  ],
+  "attempt_id": "7df0735d-81bc-4489-9cf9-ba3c222745c8",
+  "forbidden_paths": [],
+  "goal_cwd": "\\\\?\\C:\\Users\\Yuta\\Desktop\\local-mcp-connector-parity\\.local\\h5-a\\tmp\\h5-d\\scenario-a\\repo",
+  "goal_id": "86e8b679-c57d-47f1-bb5e-e9ed06337b22",
+  "goal_revision": 6,
+  "plan_revision": 1,
+  "task_id": "d42c22c5-b969-4722-b0b1-0d3f5b1b05f0",
+  "task_objective": "Read files under src/ and data/inventory.txt. Count how many files under src/ declare a function, and calculate the total of the numeric values in data/inventory.txt. Report the counting approach, total, and concise file references or other supporting evidence. Do not modify anything. State any ambiguity or unreadable files explicitly.",
+  "task_title": "Survey source files and inventory",
+  "verification": [
+    {
+      "kind": "STRUCTURED_EVIDENCE",
+      "requirement_id": "5fe10aaf-ec29-469e-9ca1-10a245a65235"
+    }
+  ]
+}
+
+Rules that the schema cannot express:
+- READONLY_IDENTITY_ECHO: goal_id, task_id, attempt_id, goal_revision and plan_revision must equal the host-issued WorkItem identity; a mismatch is READONLY_IDENTITY_MISMATCH
+- READONLY_STATUS_VOCABULARY: status is exactly one of candidate_complete, blocked, needs_replan, failed; the host never accepts a model-declared completion such as COMPLETED
+- READONLY_EVIDENCE_TOTAL_BOUND: the sum of kind plus value bytes across all evidence items must not exceed the host total bound
+- READONLY_NO_WRITE_OPERATIONS: an object carrying proposed_operations or any write field is refused: the read-only role has no write authority
+
+Be concise. Do not invent facts you cannot observe in the workspace. If the
+request asks you to inspect files, inspect them.
