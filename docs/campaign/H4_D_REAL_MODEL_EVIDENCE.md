@@ -4,8 +4,15 @@ Executed: 2026-11-09, Windows 11 x64 (build 26300), rustc 1.96.0.
 Binary under test: `local-mcp.exe` built from this branch head
 (`feat/h4-a-mcp-contract-v1`, PR #51; parent commit `072fa15` = PR #50 head).
 `cargo build --locked --bin local-mcp` → `target/debug/local-mcp.exe`,
-sha256 `f3f5d65876970fe4a492645b5922847d0e00743297789d6dc993217e304c53ba`
-(local build; CI builds its own).
+sha256 `c7147f9ca956ebba93c7133154a5c731f24aa31ebbd8170d74de69333d9409fc`
+(local build of this branch head `37820a4`; CI builds its own).
+
+The run was executed twice: once to capture a genuine model schema failure
+(§ "the failure is the evidence") and again, on the final head, to confirm the
+end-to-end result. The model answers were authored by Codex `gpt-6.1-sol`; the
+second run replayed those same model-authored answers against the final binary
+with the newly issued host identity fields, which is why it has no rejection
+row.
 
 External model that authored both model responses: **Codex `gpt-6.1-sol`**
 (reasoning effort medium), a *different model* from the campaign agent, invoked as
@@ -54,6 +61,19 @@ needs the interactive Owner Control Surface; the Replanner (C) and crash/recover
 | Final verification | `PASSED`, `final_verification_id 6c617e37-9fa0-4b14-9b86-7bd6c7636969` |
 | Finalizer | progress code `GOAL_FINALIZED` — "the host Goal Finalizer completed the Goal on host-owned evidence" |
 | Codex spawned for this Goal | **0** (`model_backend: EXTERNAL`; the server only ever issued WorkItems) |
+
+Final-head rerun (same model answers, new host identity fields):
+
+| Field | Value |
+| --- | --- |
+| Goal | `905e0699-42fe-4838-9e2d-1f23a29a6211` |
+| Durable Goal file sha256 | `a2f29f00088b7bbc2aeb68f08afd194d81292f9357499ee49ce437aea9f42294` |
+| Planner receipt | `COMMITTED` / `PLAN_APPLIED` (rev 3) |
+| Read-only receipt | `COMMITTED` / `READONLY_CANDIDATE_COMPLETE` (rev 5) |
+| Final | `HOST_PROGRESS` → `COMPLETED` (rev 8), `GOAL_FINALIZED`, verification `PASSED`, 5 evidence items, task attempts 1 |
+| Identity replay | `REPLAY_OF_ACCEPTED_SUBMISSION`, stored receipt `received_at 13:18:24Z`, `committed_revision 3`, Goal unchanged at rev 8 |
+| Different payload, same ids | `CONFLICTING_DUPLICATE` — refused, no side effect |
+| Workspace after the run | exactly the 2 seeded files, unchanged (`src/main.rs` sha256 `77c072ca…`, `data/inventory.txt` sha256 `ed192a34…`) |
 
 ### Model work items and receipts
 
