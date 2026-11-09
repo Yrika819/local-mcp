@@ -45,11 +45,11 @@ real-model dogfooding isolatable.
 | Phase | Status | Evidence |
 | --- | --- | --- |
 | H4-0 Baseline / Risk Audit | DONE | §0 above, `docs/campaign/H4_RISK_REGISTER.md` |
-| H4-A MCP Contract Correctness | IN PROGRESS | branch `feat/h4-a-mcp-contract-v1` |
-| H4-B Authorization final audit | IN PROGRESS | independent reviewer running on fixed `072fa15` |
-| H4-C Publication / revocation reliability | IN PROGRESS | deadline + injectable fence wait on the H4-A branch |
-| H4-D Real-model dogfooding | BLOCKED (see §4) | isolation infrastructure lands in H4-A |
-| H4-E Integration readiness | OPEN | needs every PR head re-read |
+| H4-A MCP Contract Correctness | DONE | PR #51; `tests/mcp_contract.rs` drives the real binary |
+| H4-B Authorization final audit | DONE (findings closed) | independent review of `072fa15`: 0 Critical / 0 High; 1 MEDIUM + 1 LOW fixed with tests, negative control run |
+| H4-C Publication / revocation reliability | DONE | deadline in `sandbox.rs` + `at_gw_031..033`; residual orphan-descendant note |
+| H4-D Real-model dogfooding | PARTIAL | Scenario A executed with a real model end to end; B/C/D `NOT_VERIFIED` (no non-interactive grant path) |
+| H4-E Integration readiness | DONE | `docs/campaign/H4_E_INTEGRATION_READINESS.md` |
 | C3-0 Windows trust boundary | DESIGN COMPLETE | `docs/security/C3_0_WINDOWS_TRUST_BOUNDARY.md` |
 | S0-0 Serea contract assessment | DESIGN COMPLETE | `docs/integration/SEREA_S0_0_CONTRACT_ASSESSMENT.md` |
 
@@ -69,10 +69,29 @@ real-model dogfooding isolatable.
 
 * C3 / R-1 (same-OS-user Owner impersonation) — **open by design**. Not a code
   defect that H4 can close; see the C3-0 document.
-* Nothing else Critical/High is known at this checkpoint. This is not a PASS:
-  the independent review result is recorded when it lands.
+* Independent review of PR #50 head `072fa15` by Codex `gpt-6.1-sol` (xhigh):
+  **0 Critical, 0 High**. One MEDIUM (stale-generation usage-floor reset) and one
+  LOW (`REVOKE_REQUESTED` projected as `REVOKED`) — both confirmed against the
+  source, both fixed in this PR with regression tests, and the MEDIUM fix has a
+  negative control that fails without it.
+* The H4 diff itself (#51) has **not** been independently reviewed. That is
+  recorded as a remaining gate, not as a pass.
 
-## 4. H4-D blocker (explicit)
+## 4. H4-D result (see `docs/campaign/H4_D_REAL_MODEL_EVIDENCE.md`)
+
+Scenario A executed for real: isolated state root, real server process, real
+model output, Goal `f0c44a92-…` reached `COMPLETED` (revision 11) with final
+verification `PASSED`, after one genuine `READONLY_OUTPUT_INVALID` rejection of a
+model answer. Replay of an accepted submission returns
+`REPLAY_OF_ACCEPTED_SUBMISSION` across processes.
+
+Scenario B (Writer/Reviewer), C (Replanner) and the crash-injection half of D are
+`NOT_VERIFIED`: a `GoalWriteGrantV1` can only be issued from the interactive
+Owner Control Surface, and no non-interactive grant path exists in the shipped
+binary. The test-only grant harness is not reachable from an out-of-process run,
+and hand-writing a ledger record would bypass the boundary H4-B just reviewed.
+
+### Original blocker note
 
 Real-model dogfooding needs (a) an isolated state root, (b) an isolated
 workspace, (c) a real model to answer the ModelWorkItem, and (d) an Owner
