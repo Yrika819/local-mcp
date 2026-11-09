@@ -821,6 +821,62 @@ pub(crate) fn tools() -> Value {
         "maxItems": 8,
         "items": failed_task_replan_request_schema
     });
+    // The published EXTERNAL write-scope proposal. It mirrors
+    // `authorization::RequestedWriteScopeV1` field for field: the same five
+    // required keys, `deny_unknown_fields` as `additionalProperties: false`, and
+    // the same host bounds (`MAX_GRANT_PATH_RULES`, `MAX_GRANT_PATH_BYTES`,
+    // `MAX_GRANT_OPERATIONS`, `MAX_GRANT_BYTES`, `MIN_GRANT_TTL_SECONDS`,
+    // `MAX_GRANT_TTL_SECONDS`). A client that follows this schema therefore
+    // reaches exactly the values the runtime parser accepts, and the schema
+    // never advertises a field the parser refuses.
+    //
+    // This is a *proposal* the Owner Control Surface must still approve. It is
+    // host policy that it is refused for any non-EXTERNAL backend, which JSON
+    // Schema cannot express without conditional keywords, so it is documented
+    // here and enforced by the runtime parser.
+    let requested_write_scope_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Untrusted Owner write-scope proposal for an EXTERNAL Goal only. Creating a Goal with a scope authorizes nothing: a durable GoalWriteGrantV1 must still be issued and approved through the Owner Control Surface before any file is written. Refused for the CODEX backend.",
+        "properties": {
+            "allowed_paths": {
+                "type": "array",
+                "description": "Workspace-root-relative path rules (literal paths or bounded globs), e.g. 'src/lib.rs'.",
+                "items": {"type": "string", "minLength": 1, "maxLength": crate::authorization::MAX_GRANT_PATH_BYTES},
+                "minItems": 1,
+                "maxItems": crate::authorization::MAX_GRANT_PATH_RULES
+            },
+            "allowed_operations": {
+                "type": "array",
+                "description": "WRITE_UTF8 is the only operation V1 can authorize; exactly one entry is accepted.",
+                "items": {"type": "string", "enum": ["WRITE_UTF8"]},
+                "minItems": 1,
+                "maxItems": 1
+            },
+            "max_operations": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::authorization::MAX_GRANT_OPERATIONS
+            },
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::authorization::MAX_GRANT_BYTES
+            },
+            "expires_in_seconds": {
+                "type": "integer",
+                "minimum": crate::authorization::MIN_GRANT_TTL_SECONDS,
+                "maximum": crate::authorization::MAX_GRANT_TTL_SECONDS
+            }
+        },
+        "required": [
+            "allowed_paths",
+            "allowed_operations",
+            "max_operations",
+            "max_bytes",
+            "expires_in_seconds"
+        ]
+    });
     for tool in tools.as_array_mut().unwrap() {
         if matches!(
             tool.get("name").and_then(Value::as_str),
@@ -842,6 +898,21 @@ pub(crate) fn tools() -> Value {
             properties.insert(
                 "failed_task_replan_requests".to_owned(),
                 failed_task_replan_requests_schema.clone(),
+            );
+        }
+        // `write_scope` is parsed by `goal_start` for EXTERNAL Goals, so it must
+        // be advertised. Without it `additionalProperties:false` makes the whole
+        // field unreachable through any schema-following MCP client, and a
+        // standard client that validates before calling can never request a
+        // Writer grant at all.
+        if matches!(tool.get("name").and_then(Value::as_str), Some("goal_start"))
+            && let Some(properties) = tool
+                .pointer_mut("/inputSchema/properties")
+                .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "write_scope".to_owned(),
+                requested_write_scope_schema.clone(),
             );
         }
         if let Some(session_id) = tool

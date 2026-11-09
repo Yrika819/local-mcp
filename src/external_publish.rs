@@ -464,8 +464,11 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         {
             Ok(output) => output,
             Err(_) => {
-                // The helper could not run at all: the journal stays in
-                // APPLYING, which recovery reconciles. Never retried blindly.
+                // The helper either could not run at all, or ran until its hard
+                // deadline and was stopped. The two are not distinguishable from
+                // here and the journal stays in APPLYING, which recovery
+                // reconciles. Never retried blindly, and never reported as
+                // "nothing was written".
                 return Ok(PublishOutcome::Refused {
                     code: "WRITER_PUBLICATION_UNKNOWN",
                 });

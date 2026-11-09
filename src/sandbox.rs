@@ -510,6 +510,22 @@ pub(crate) async fn run_tracked_with_path(
     stdin: Option<&[u8]>,
     path: Option<&std::ffi::OsStr>,
 ) -> std::result::Result<Output, RunError> {
+    run_tracked_bounded(command, cwd, writable_roots, stdin, path, None).await
+}
+
+/// [`run_tracked_with_path`] with a hard execution deadline.
+///
+/// The deadline is the only difference: when it elapses the process group is
+/// terminated and the leader's exit is confirmed (bounded) before the error is
+/// returned. The error never claims the command had no effect.
+pub(crate) async fn run_tracked_bounded(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    path: Option<&std::ffi::OsStr>,
+    deadline: Option<tokio::time::Instant>,
+) -> std::result::Result<Output, RunError> {
     // Trusted parent-side setup gate. The Linux sandbox runtime is validated
     // here, before the helper is spawned, so an unusable runtime produces a
     // typed host-owned setup refusal while the requested command provably has
@@ -521,7 +537,7 @@ pub(crate) async fn run_tracked_with_path(
         .context("failed to start primary command")
         .map_err(RunError::not_started)?;
 
-    let capture = terminate_and_capture_bounded(&mut group, stdin).await;
+    let capture = terminate_and_capture_bounded(&mut group, stdin, deadline).await;
     let output = match capture.output {
         Ok(output) => output,
         Err(failure) => {
@@ -593,7 +609,21 @@ fn verify_platform_sandbox_support(
     }
 }
 
+/// Unbounded, platform-parity entry point.
+///
+/// H4-C: production publication now goes through [`run_bounded`], so this
+/// wrapper has no production caller in the `local-mcp` binary. It is kept (and
+/// exercised by the sandbox tests) as the reference shape callers use when no
+/// deadline is wanted, rather than deleting the seam and inviting an unbounded
+/// wait to be reintroduced ad hoc.
 #[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "production publication uses run_bounded; this is the no-deadline shape used by tests"
+    )
+)]
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -613,7 +643,19 @@ pub async fn run(
 /// without a `cfg` split of its own. On Windows it applies the same argv execution and
 /// restricted environment that every other Windows command already gets, and grants no
 /// containment it does not already have.
+///
+/// H4-C: on Windows the only caller was the publication helper, which now goes
+/// through the deadline-bounded [`run_bounded`]. The unbounded shape is kept so a
+/// future Windows caller keeps the same call signature as the Unix one, rather
+/// than reintroducing unbounded waits by accident.
 #[cfg(not(unix))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Windows keeps the unbounded shape for signature parity; the publication helper uses run_bounded"
+    )
+)]
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -632,6 +674,43 @@ pub async fn run_unrestricted(
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     run_unrestricted_inner(command, cwd, stdin, false)
+        .await
+        .map_err(|error| error.error)
+}
+
+/// [`run`] with a hard execution deadline.
+///
+/// Only the publication helper uses this. Every other caller keeps the previous
+/// unbounded wait, so no existing command gains a new failure mode. When the
+/// deadline elapses the process group is terminated and the leader's exit is
+/// confirmed before the error is returned, so a hung helper cannot leave an
+/// orphan behind; the error still means UNKNOWN side effects, never "nothing
+/// happened".
+#[cfg(unix)]
+pub(crate) async fn run_bounded(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+) -> Result<Output> {
+    run_tracked_bounded(command, cwd, writable_roots, stdin, None, Some(deadline))
+        .await
+        .map_err(|error| error.error)
+}
+
+/// Windows equivalent of the Unix [`run_bounded`]. Windows has no application
+/// sandbox (see [`run`]), so `writable_roots` is unused, exactly as in [`run`].
+#[cfg(not(unix))]
+pub(crate) async fn run_bounded(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+) -> Result<Output> {
+    let _ = writable_roots;
+    run_tracked_bounded(command, cwd, &[], stdin, None, Some(deadline))
         .await
         .map_err(|error| error.error)
 }
@@ -1103,6 +1182,15 @@ pub(crate) enum CaptureFailure {
     MissingPipe,
     /// The host could not observe termination, or could not read a pipe.
     Io(std::io::Error),
+    /// A hard execution deadline elapsed before the leader terminated.
+    ///
+    /// The process group has already been asked to stop and, when
+    /// `leader_finished` is set on the returned capture, the leader's exit was
+    /// observed. This value never means "the command did nothing": a command
+    /// that ran until the deadline may have performed any prefix of its side
+    /// effects, which is why callers must map it to an UNKNOWN outcome rather
+    /// than to a refusal.
+    DeadlineExceeded,
 }
 
 impl std::fmt::Display for CaptureFailure {
@@ -1113,6 +1201,10 @@ impl std::fmt::Display for CaptureFailure {
             Self::OutputLimit(error) => write!(formatter, "{error}"),
             Self::MissingPipe => formatter.write_str("command has no output pipe"),
             Self::Io(error) => write!(formatter, "command output capture failed: {error}"),
+            Self::DeadlineExceeded => formatter.write_str(
+                "command exceeded its execution deadline and was stopped; whether it \
+                 performed any side effect is unknown",
+            ),
         }
     }
 }
@@ -1122,7 +1214,7 @@ impl std::error::Error for CaptureFailure {
         match self {
             Self::OutputLimit(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::MissingPipe => None,
+            Self::MissingPipe | Self::DeadlineExceeded => None,
         }
     }
 }
@@ -1178,21 +1270,26 @@ struct GenericCapture {
 /// This is the generic command capture path. It differs from the trusted-Git
 /// runner in three ways that matter:
 ///
-/// * There is no command deadline. A long command runs until it finishes or is
-///   stopped, so waiting for the leader here is deliberately unbounded.
+/// * There is no command deadline unless the caller supplies one. A long command
+///   runs until it finishes or is stopped, so waiting for the leader here is
+///   deliberately unbounded by default. Publication callers do supply one, and
+///   the deadline is a *stop request plus exit confirmation*, never a claim that
+///   the command had no effect.
 /// * Both bounds are the frozen generic limits, not Git-specific ones.
 /// * After the leader terminates, both pipes get a bounded grace to reach EOF.
 ///   A descendant that inherited stdout/stderr and outlived its parent is the one
 ///   way capture can outlast the command; bounding that is what keeps a stray
 ///   descendant from holding the read open forever.
 ///
-/// Overflow is detected while reading, so exactly `limit` bytes is preserved and
-/// `limit + 1` is rejected without ever residing in memory. When either bound is
-/// breached the process group is terminated rather than merely abandoned, because
-/// stopping the read while the child runs would leave descendants alive.
+/// Overflow and deadline expiry are detected while reading, so exactly `limit`
+/// bytes is preserved and `limit + 1` is rejected without ever residing in
+/// memory. When either is breached the process group is terminated rather than
+/// merely abandoned, because stopping the read while the child runs would leave
+/// descendants alive.
 async fn terminate_and_capture_bounded(
     group: &mut ProcessGroup,
     stdin: Option<&[u8]>,
+    deadline: Option<tokio::time::Instant>,
 ) -> GenericCapture {
     use crate::resource_limits::{MAX_COMMAND_STDERR_BYTES, MAX_COMMAND_STDOUT_BYTES};
 
@@ -1263,16 +1360,25 @@ async fn terminate_and_capture_bounded(
                 "command output capture failed",
             )));
         }
+        // The deadline branch is only armed when the caller supplied one, so the
+        // default path keeps the exact previous behaviour.
+        let deadline_armed = deadline.is_some();
+        let deadline_at = deadline.unwrap_or_else(tokio::time::Instant::now);
         tokio::select! {
             result = group.wait_termination() => break result.map_err(CaptureFailure::Io),
             _ = state.notify.notified() => {}
+            () = tokio::time::sleep_until(deadline_at), if deadline_armed => {
+                break Err(CaptureFailure::DeadlineExceeded)
+            }
         }
     };
 
     let status = match termination {
         Err(failure) => {
-            // Overflow, a failed read, or an unobservable leader: the child may
-            // still be running, so the group is terminated before reporting.
+            // Overflow, a failed read, an unobservable leader, or an elapsed
+            // deadline: the child may still be running, so the group is
+            // terminated and the leader's exit is confirmed (bounded) before
+            // reporting.
             let leader_finished =
                 cleanup_generic_child(group, &mut stdout_task, &mut stderr_task).await;
             return GenericCapture {
@@ -1424,7 +1530,7 @@ pub(crate) async fn run_unrestricted_inner(
     let mut group = ProcessGroup::spawn(&mut process)
         .context("failed to start unsandboxed command")
         .map_err(|error| RunError::new(error, false, false))?;
-    let capture = terminate_and_capture_bounded(&mut group, stdin).await;
+    let capture = terminate_and_capture_bounded(&mut group, stdin, None).await;
     let output = match capture.output {
         Ok(output) => output,
         Err(failure) => {
@@ -2442,6 +2548,87 @@ mod windows_environment_parity_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&fixture);
+    }
+}
+
+/// H4-C — the hard execution deadline the publication helper relies on.
+///
+/// These tests drive the *shared* capture loop with a real child process, so the
+/// behaviour under test is the production one: the deadline stops the process
+/// group, the leader's exit is confirmed, and the error never claims the command
+/// had no effect.
+#[cfg(test)]
+mod deadline_tests {
+    use std::process::Stdio;
+
+    use std::time::{Duration, Instant};
+    use tokio::process::Command;
+
+    use super::{CaptureFailure, ProcessGroup, terminate_and_capture_bounded};
+
+    /// A child that outlives every deadline used here.
+    fn sleeper() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "cmd".to_owned(),
+                "/c".to_owned(),
+                "ping -n 30 127.0.0.1".to_owned(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()]
+        }
+    }
+
+    fn spawn(command: &[String]) -> ProcessGroup {
+        let mut process = Command::new(&command[0]);
+        process
+            .args(&command[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        ProcessGroup::spawn(&mut process).expect("the sleeper must start")
+    }
+
+    #[tokio::test]
+    async fn deadline_stops_the_group_and_confirms_the_leader_exited() {
+        let mut group = spawn(&sleeper());
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let capture = terminate_and_capture_bounded(&mut group, None, Some(deadline)).await;
+        let elapsed = started.elapsed();
+        match capture.output {
+            Err(CaptureFailure::DeadlineExceeded) => {}
+            Ok(_) => panic!("a sleeping child cannot complete before its deadline"),
+            Err(other) => panic!("expected a deadline failure, got {other:?}"),
+        }
+        assert!(
+            capture.leader_finished,
+            "the leader's exit must be confirmed before the deadline error is returned"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the deadline must not wait for the whole sleeper: {elapsed:?}"
+        );
+        // Dropping the group must not block on an already terminated child.
+        drop(group);
+    }
+
+    /// Passing no deadline keeps the previous unbounded behaviour, so no
+    /// existing caller gains a new failure mode.
+    #[tokio::test]
+    async fn without_a_deadline_a_short_command_completes() {
+        #[cfg(windows)]
+        let command = vec!["cmd".to_owned(), "/c".to_owned(), "echo ok".to_owned()];
+        #[cfg(not(windows))]
+        let command = vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()];
+        let mut group = spawn(&command);
+        let capture = terminate_and_capture_bounded(&mut group, None, None).await;
+        let output = capture.output.expect("the command must complete");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(capture.leader_finished);
     }
 }
 

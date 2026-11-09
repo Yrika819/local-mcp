@@ -1984,7 +1984,18 @@ impl AuthorizationView {
                 state: match refusal {
                     GrantRefusal::Pending => "PENDING",
                     GrantRefusal::Denied => "DENIED",
-                    GrantRefusal::Revoked => "REVOKED",
+                    // H4-B (independent review, LOW): `REVOKE_REQUESTED` and
+                    // `REVOKED` both deny publication, but they are different
+                    // durable states and this projection must not claim the
+                    // finalization write happened. The permission decision is
+                    // unchanged; only the reported state is derived from the
+                    // durable grant record.
+                    GrantRefusal::Revoked => {
+                        match ledger.latest_grant().map(|grant| grant.revocation.state()) {
+                            Some(GrantRevocationState::RevokeRequested) => "REVOKE_REQUESTED",
+                            _ => "REVOKED",
+                        }
+                    }
                     GrantRefusal::Expired => "EXPIRED",
                     GrantRefusal::Unavailable => "UNAVAILABLE",
                     GrantRefusal::Required => "REQUIRED",

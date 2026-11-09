@@ -208,6 +208,21 @@ fn acquire_ledger_lock(
     session_id: &str,
     goal_id: &str,
 ) -> Result<LedgerGuard, GrantError> {
+    acquire_ledger_lock_within(store, session_id, goal_id, AUTHORIZATION_FENCE_TIMEOUT)
+}
+
+/// [`acquire_ledger_lock`] with an injectable wait bound.
+///
+/// The production value is [`AUTHORIZATION_FENCE_TIMEOUT`] (30s). The bound is a
+/// parameter so the timeout path itself is directly testable without making the
+/// suite wait 30 real seconds; the constant and the behaviour are asserted
+/// separately by `at_gw_031`..`at_gw_033`.
+fn acquire_ledger_lock_within(
+    store: &TaskStore,
+    session_id: &str,
+    goal_id: &str,
+    fence_wait: Duration,
+) -> Result<LedgerGuard, GrantError> {
     let path = lock_path(store, session_id, goal_id)?;
     let directory = ledger_directory(store, session_id)?;
     ensure_directory(store, &directory)?;
@@ -217,7 +232,7 @@ fn acquire_ledger_lock(
         Err(_) => return Err(GrantError::Io),
     }
     let file = secure_fs::create_or_open_lock(&path).map_err(map_io)?;
-    let deadline = Instant::now() + AUTHORIZATION_FENCE_TIMEOUT;
+    let deadline = Instant::now() + fence_wait;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(LedgerGuard { file }),
@@ -305,11 +320,19 @@ pub(crate) fn record_anchor_grant(
     let grant_id = grant.grant_id().to_owned();
     let epoch = grant.authorization_epoch();
     update_anchor(store, session_id, goal_id, move |anchor| {
-        // Only a *new generation* starts a fresh budget. Re-anchoring the same
-        // grant (for example when a second Writer WorkItem is issued under it)
-        // must preserve the usage floor, or the budget could be spent twice.
-        let new_generation =
-            anchor.last_grant_id() != Some(grant_id.as_str()) || anchor.highest_epoch() < epoch;
+        // H4-B (independent review, MEDIUM): the usage floor may only be reset by
+        // a generation the Goal *accepts*. Before this guard, a rolled-back
+        // ledger whose next epoch was lower still produced a different grant id,
+        // which cleared the floor of the newer generation the Goal had already
+        // anchored. `record_grant` below then refused the stale epoch, so the
+        // outcome was "newer grant identity, zero usage floor" and spent budget
+        // came back. Requiring a strictly newer epoch than the anchor makes the
+        // reset and the identity update agree.
+        //
+        // Re-anchoring the same grant (a second Writer WorkItem under one grant)
+        // is not a new generation and keeps the floor. A conflicting id at an
+        // equal epoch is not provably newer, so it keeps the floor too.
+        let new_generation = epoch > anchor.highest_epoch();
         if new_generation {
             anchor.reset_usage_floor();
         }
@@ -443,18 +466,31 @@ pub(crate) fn revoke_active(
     goal_id: &str,
     now: Option<String>,
 ) -> Result<(String, u64), AuthorizationGateError> {
+    revoke_active_within(store, session_id, goal_id, now, AUTHORIZATION_FENCE_TIMEOUT)
+}
+
+/// [`revoke_active`] with an injectable fence wait, so the deferred-revocation
+/// path is directly testable without a 30 second wait.
+pub(crate) fn revoke_active_within(
+    store: &TaskStore,
+    session_id: &str,
+    goal_id: &str,
+    now: Option<String>,
+    fence_wait: Duration,
+) -> Result<(String, u64), AuthorizationGateError> {
     let now = now.unwrap_or_else(|| {
         crate::authorization::format_utc_rfc3339(crate::authorization::now_unix_seconds())
     });
     let parsed_goal = GoalId::parse(goal_id)
         .map_err(|_| GrantError::Corrupt("authorization goal id is malformed"))?;
-    let guard = acquire_ledger_lock(store, session_id, goal_id).map_err(|error| {
-        if error == GrantError::FenceTimeout {
-            GrantError::RevocationDeferred
-        } else {
-            error
-        }
-    })?;
+    let guard =
+        acquire_ledger_lock_within(store, session_id, goal_id, fence_wait).map_err(|error| {
+            if error == GrantError::FenceTimeout {
+                GrantError::RevocationDeferred
+            } else {
+                error
+            }
+        })?;
     let mut ledger =
         load_with_lock(store, session_id, goal_id, &guard)?.ok_or(GrantError::UnknownGrant)?;
     let grant_id = ledger
@@ -872,6 +908,60 @@ pub(crate) fn scope_of(goal: &Goal) -> Option<&RequestedWriteScopeV1> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    /// Hold the per-Goal ledger lock from the test process.
+    ///
+    /// This is the same lock the Owner Control Surface and the publication gate
+    /// take, so holding it is exactly what a concurrent revocation or a stuck
+    /// publisher looks like to the other side. The caller keeps the returned
+    /// file alive; dropping it releases the lock.
+    pub(crate) fn hold_ledger_lock(
+        store: &TaskStore,
+        session_id: &str,
+        goal_id: &str,
+    ) -> std::fs::File {
+        let directory = ledger_directory(store, session_id).expect("ledger directory");
+        ensure_directory(store, &directory).expect("ledger directory exists");
+        let path = lock_path(store, session_id, goal_id).expect("ledger lock path");
+        let file = secure_fs::create_or_open_lock(&path).expect("ledger lock file");
+        file.lock().expect("the test takes the ledger lock");
+        file
+    }
+
+    /// Attempt to take the ledger lock with an injected wait bound.
+    pub(crate) fn acquire_lock_with_wait(
+        store: &TaskStore,
+        session_id: &str,
+        goal_id: &str,
+        fence_wait: Duration,
+    ) -> Result<(), GrantError> {
+        acquire_ledger_lock_within(store, session_id, goal_id, fence_wait).map(drop)
+    }
+
+    /// Perform only the first revocation write (`REVOKE_REQUESTED`) and stop.
+    ///
+    /// This reproduces the crash window between the two deliberate revocation
+    /// writes without killing a process: the durable ledger says the Owner
+    /// requested revocation, and the finalization write never happened.
+    pub(crate) fn request_revocation_only(
+        store: &TaskStore,
+        session_id: &str,
+        goal_id: &str,
+    ) -> u64 {
+        let guard = acquire_ledger_lock(store, session_id, goal_id).expect("test fence");
+        let mut ledger = load_with_lock(store, session_id, goal_id, &guard)
+            .expect("ledger read")
+            .expect("ledger exists");
+        let grant = ledger.latest_grant().cloned().expect("grant exists");
+        let epoch = grant.authorization_epoch();
+        let now =
+            crate::authorization::format_utc_rfc3339(crate::authorization::now_unix_seconds());
+        ledger
+            .request_revocation(grant.grant_id(), uuid::Uuid::new_v4().to_string(), &now)
+            .expect("revocation request is accepted");
+        save_ledger(store, &ledger).expect("ledger write");
+        epoch
+    }
 
     /// Install one ACTIVE grant directly, as the OCS would.
     pub(crate) fn install_grant(
