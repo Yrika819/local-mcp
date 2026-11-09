@@ -28,17 +28,28 @@ use crate::task::{
 use crate::task_store::TaskStore;
 use crate::workspace_publish::{self, ExpectedPreimage};
 
-pub(crate) const MAX_WRITER_RESULT_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_WRITER_OPERATIONS: usize = 32;
-pub(crate) const MAX_WRITER_PATH_BYTES: usize = 4096;
-pub(crate) const MAX_WRITE_CONTENT_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_TOTAL_WRITE_CONTENT_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_WRITER_SUMMARY_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_WORKER_EVIDENCE_ITEMS: usize = 64;
-pub(crate) const MAX_WORKER_EVIDENCE_KIND_BYTES: usize = 128;
-pub(crate) const MAX_WORKER_EVIDENCE_VALUE_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_WORKER_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_REVIEW_RESULT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_WRITER_RESULT_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITER_RESULT_BYTES;
+pub(crate) const MAX_WRITER_OPERATIONS: usize =
+    crate::external_response_contract::LIMIT_WRITER_OPERATIONS;
+pub(crate) const MAX_WRITER_PATH_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITER_PATH_BYTES;
+pub(crate) const MAX_WRITE_CONTENT_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITE_CONTENT_BYTES;
+pub(crate) const MAX_TOTAL_WRITE_CONTENT_BYTES: usize =
+    crate::external_response_contract::LIMIT_TOTAL_WRITE_CONTENT_BYTES;
+pub(crate) const MAX_WRITER_SUMMARY_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITER_SUMMARY_BYTES;
+pub(crate) const MAX_WORKER_EVIDENCE_ITEMS: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_ITEMS;
+pub(crate) const MAX_WORKER_EVIDENCE_KIND_BYTES: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_KIND_BYTES;
+pub(crate) const MAX_WORKER_EVIDENCE_VALUE_BYTES: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_VALUE_BYTES;
+pub(crate) const MAX_WORKER_EVIDENCE_TOTAL_BYTES: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_TOTAL_BYTES;
+pub(crate) const MAX_REVIEW_RESULT_BYTES: usize =
+    crate::external_response_contract::LIMIT_REVIEW_RESULT_BYTES;
 
 #[derive(Debug)]
 #[expect(
@@ -334,7 +345,7 @@ pub(crate) enum PreimageExpectation {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewerResult {
+pub(crate) struct ReviewerResult {
     goal_id: String,
     task_id: String,
     attempt_id: String,
@@ -1482,7 +1493,7 @@ pub(crate) fn parse_and_validate_writer_result(
     Ok(result)
 }
 
-fn parse_and_validate_reviewer_result(
+pub(crate) fn parse_and_validate_reviewer_result(
     raw: &[u8],
     request: &ReviewerRequest,
 ) -> Result<ReviewerResult, WriterError> {
@@ -2392,6 +2403,18 @@ pub(crate) fn mutation_observation(state: &FileState) -> FileObservation {
 #[cfg(test)]
 fn parse_writer_result_for_test(raw: &[u8]) -> Result<WriterResult, String> {
     serde_json::from_slice(raw).map_err(|error| error.to_string())
+}
+
+/// H5-B: shape half of the writer validator, for the contract equivalence tests.
+#[cfg(test)]
+pub(crate) fn writer_response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<WriterResult>(value.clone()).is_ok()
+}
+
+/// H5-B: shape half of the reviewer validator, for the contract equivalence tests.
+#[cfg(test)]
+pub(crate) fn reviewer_response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<ReviewerResult>(value.clone()).is_ok()
 }
 
 #[cfg(test)]

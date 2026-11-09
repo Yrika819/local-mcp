@@ -38,6 +38,7 @@ use crate::external_model_work::{
 };
 use crate::external_publish::{self, ReviewerOutcome};
 use crate::external_replanner::{self, ReplanApplyOutcome};
+use crate::external_response_contract;
 use crate::external_writer::{self, WriterStageOutcome};
 use crate::goal::{Goal, GoalId, GoalStatus};
 use crate::goal_api::{self, GoalApiError};
@@ -149,6 +150,42 @@ pub(crate) struct ExternalProgressView {
     detail: &'static str,
 }
 
+/// H5-B: the machine-readable half of a WorkItem.
+///
+/// `response_required_fields` (kept for compatibility, same values) says *which*
+/// fields answer a WorkItem. This says what values those fields may hold, so a
+/// client is never asked to guess an enum or a byte bound.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ResponseContractView {
+    contract_id: String,
+    contract_version: u32,
+    role: &'static str,
+    output_contract: String,
+    /// Canonical digest of `schema`; equal digests mean equal contracts.
+    schema_digest: String,
+    /// String bounds are UTF-8 byte counts, not characters.
+    byte_semantics: &'static str,
+    /// Byte bound on the whole serialized response object.
+    max_response_bytes: usize,
+    /// Fields the host issued for this WorkItem; echo them verbatim.
+    identity_echo_fields: Vec<&'static str>,
+    required_fields: Vec<&'static str>,
+    optional_fields: Vec<&'static str>,
+    /// Host checks that are not expressible as per-field shape.
+    conditions: Vec<ResponseContractConditionView>,
+    /// Every decision a `goal_submit` of this response can receive.
+    submission_decisions: Vec<&'static str>,
+    notes: Vec<&'static str>,
+    /// The complete JSON Schema for this role's response object.
+    schema: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ResponseContractConditionView {
+    code: &'static str,
+    detail: &'static str,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ModelWorkView {
     work_id: String,
@@ -168,6 +205,8 @@ pub(crate) struct ModelWorkView {
     output_contract: String,
     /// Minimum required top-level fields of the response object.
     response_required_fields: Vec<&'static str>,
+    /// H5-B: machine-readable contract for this role's response.
+    response_contract: ResponseContractView,
     state: &'static str,
     issue_counter: u32,
     created_at: String,
@@ -277,6 +316,44 @@ pub(crate) fn codex_fallback_decision(active_goal: Option<&Goal>) -> CodexFallba
             CodexFallbackDecision::RefusedForExternalBackend
         }
         _ => CodexFallbackDecision::Allowed,
+    }
+}
+
+/// H5-A (independent review F4): the Codex-fallback decision for a session whose
+/// active Goal could not be *read*.
+///
+/// "There is no active Goal" and "the host could not tell whether there is one"
+/// are different facts, and only the first may open the Codex path. A corrupt or
+/// unreadable EXTERNAL Goal must not silently become "no EXTERNAL Goal" and
+/// unlock the one backend ADR-08 forbids for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexFallbackAuthority {
+    /// The active Goal was read (or is genuinely absent).
+    Established(CodexFallbackDecision),
+    /// The state could not be read, so the backend policy is unknown.
+    Unavailable,
+}
+
+impl CodexFallbackAuthority {
+    pub(crate) fn decision(self) -> CodexFallbackDecision {
+        match self {
+            Self::Established(decision) => decision,
+            // Fail closed: an unreadable store is treated as "may be EXTERNAL".
+            Self::Unavailable => CodexFallbackDecision::RefusedForExternalBackend,
+        }
+    }
+}
+
+pub(crate) fn codex_fallback_authority(
+    store: Option<&crate::task_store::TaskStore>,
+    session_id: &str,
+) -> CodexFallbackAuthority {
+    let Some(store) = store else {
+        return CodexFallbackAuthority::Unavailable;
+    };
+    match store.load_active_goal(session_id) {
+        Ok(active) => CodexFallbackAuthority::Established(codex_fallback_decision(active.as_ref())),
+        Err(_) => CodexFallbackAuthority::Unavailable,
     }
 }
 
@@ -630,6 +707,41 @@ fn driver_view(
     }
 }
 
+fn response_contract_view(item: &ModelWorkItem) -> ResponseContractView {
+    // Bound to the *persisted* `output_contract` string, not to the live role
+    // match, so a WorkItem reloaded from disk is described by the same contract
+    // it was issued under. An unknown string falls back to the role's contract
+    // and is reported through `output_contract` in the projection.
+    let contract = external_response_contract::contract_for_output_contract(item.output_contract())
+        .unwrap_or_else(|| external_response_contract::contract_for_role(item.role()));
+    ResponseContractView {
+        contract_id: external_response_contract::contract_id(contract),
+        contract_version: external_response_contract::RESPONSE_CONTRACT_VERSION,
+        role: contract.role,
+        output_contract: item.output_contract().to_owned(),
+        schema_digest: external_response_contract::schema_digest(contract),
+        byte_semantics: external_response_contract::BYTE_SEMANTICS,
+        max_response_bytes: contract.max_response_bytes,
+        identity_echo_fields: external_response_contract::identity_echo_fields(contract),
+        required_fields: external_response_contract::required_fields(contract),
+        optional_fields: external_response_contract::optional_fields(contract),
+        conditions: contract
+            .conditions
+            .iter()
+            .map(|condition| ResponseContractConditionView {
+                code: condition.code,
+                detail: condition.detail,
+            })
+            .collect(),
+        submission_decisions: SubmissionDecision::ALL
+            .iter()
+            .map(|decision| decision.as_str())
+            .collect(),
+        notes: contract.notes.to_vec(),
+        schema: external_response_contract::schema(contract),
+    }
+}
+
 fn model_work_view(item: ModelWorkItem) -> ModelWorkView {
     let required_fields = match item.role() {
         WorkRole::Readonly => READONLY_OUTPUT_REQUIRED_FIELDS,
@@ -638,6 +750,7 @@ fn model_work_view(item: ModelWorkItem) -> ModelWorkView {
         WorkRole::Replanner => REPLANNER_OUTPUT_REQUIRED_FIELDS,
         WorkRole::Planner => PLANNER_OUTPUT_REQUIRED_FIELDS,
     };
+    let response_contract = response_contract_view(&item);
     let request = serde_json::from_str(item.request_payload()).unwrap_or(Value::Null);
     ModelWorkView {
         work_id: item.work_id().as_str().to_owned(),
@@ -652,6 +765,7 @@ fn model_work_view(item: ModelWorkItem) -> ModelWorkView {
         request,
         output_contract: item.output_contract().to_owned(),
         response_required_fields: required_fields.to_vec(),
+        response_contract,
         state: item.state().as_str(),
         issue_counter: item.issue_counter(),
         created_at: item.created_at().to_owned(),
@@ -790,10 +904,20 @@ pub(crate) fn goal_submit(
                 "STOP_AND_RECONCILE",
             ));
         }
-        let outcome = if stored.payload_sha256() == payload_sha256 {
+        // H5-A (independent review F7): the replay label must describe the
+        // receipt that is actually being replayed. A stored *rejection* replayed
+        // with the same payload used to be reported as
+        // `REPLAY_OF_ACCEPTED_SUBMISSION`, which is false about the decision even
+        // though it is true about the idempotency.
+        let outcome = if stored.payload_sha256() != payload_sha256 {
+            "CONFLICTING_DUPLICATE"
+        } else if matches!(
+            stored.decision(),
+            SubmissionDecision::AcceptedForHostProcessing | SubmissionDecision::Committed
+        ) {
             "REPLAY_OF_ACCEPTED_SUBMISSION"
         } else {
-            "CONFLICTING_DUPLICATE"
+            "REPLAY_OF_STORED_RECEIPT"
         };
         return Ok(submit_view(
             &goal,
@@ -1675,6 +1799,7 @@ fn next_action_for_outcome(outcome: &'static str) -> &'static str {
         | "COMMITTED"
         | "REJECTED_SCHEMA"
         | "REPLAY_OF_ACCEPTED_SUBMISSION"
+        | "REPLAY_OF_STORED_RECEIPT"
         | "REJECTED_STALE_REVISION"
         | "BUDGET_EXHAUSTED" => "CALL_GOAL_NEXT",
         _ => "STOP_AND_RECONCILE",

@@ -31,7 +31,8 @@ pub(crate) const CODEX_READONLY_SOURCE: &str = "CODEX_READONLY";
 /// agent's claim, even though both pass the same validators.
 pub(crate) const EXTERNAL_READONLY_SOURCE: &str = "EXTERNAL_READONLY_AGENT";
 
-const MAX_READONLY_RESULT_BYTES: usize = 256 * 1024;
+const MAX_READONLY_RESULT_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_RESULT_BYTES;
 const MAX_READONLY_SUMMARY_BYTES: usize = crate::planner::MAX_READONLY_SUMMARY_BYTES;
 const MAX_READONLY_EVIDENCE_ITEMS: usize = crate::planner::MAX_READONLY_EVIDENCE_ITEMS;
 const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = crate::planner::MAX_READONLY_EVIDENCE_FIELD_BYTES;
@@ -133,7 +134,7 @@ struct ReadonlyEvidence {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadonlyResult {
+pub(crate) struct ReadonlyResult {
     goal_id: String,
     task_id: String,
     attempt_id: String,
@@ -303,7 +304,7 @@ fn build_request_at_revision(
     })
 }
 
-fn parse_and_validate(
+pub(crate) fn parse_and_validate(
     raw: &[u8],
     request: &ReadonlyRequest,
 ) -> Result<ReadonlyResult, ReadonlyError> {
@@ -1214,6 +1215,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+/// H5-B: shape half of the read-only validator, for the contract equivalence tests.
+#[cfg(test)]
+pub(crate) fn readonly_response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<ReadonlyResult>(value.clone()).is_ok()
 }
 
 #[cfg(test)]

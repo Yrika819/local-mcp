@@ -3430,6 +3430,14 @@ fn map_store_error(error: OrchestratorError) -> ReplannerError {
     }
 }
 
+/// H5-B: shape half of the replanner validator, for the contract equivalence
+/// tests. Byte bounds come from the shared `external_response_contract::LIMIT_*`
+/// constants the real validation reads.
+#[cfg(test)]
+pub(crate) fn response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<ReplanProposal>(value.clone()).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

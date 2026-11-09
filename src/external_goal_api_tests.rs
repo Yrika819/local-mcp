@@ -829,3 +829,40 @@ fn goal_status_and_result_expose_the_additive_external_projection() {
     // The frozen status vocabulary is untouched.
     assert_eq!(status["status"], "PLANNING");
 }
+
+// ---------------------------------------------------------------------------
+// H5-A (independent review F4) — an unreadable state root is not "no EXTERNAL
+// Goal".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unreadable_state_root_refuses_the_codex_fallback_gate() {
+    // "the host could not read the state" must not be treated as "there is no
+    // EXTERNAL Goal", because the Codex-fallback path is exactly what ADR-08
+    // forbids for one.
+    let unavailable = external_goal_api::codex_fallback_authority(None, "any-session");
+    assert_eq!(
+        unavailable,
+        external_goal_api::CodexFallbackAuthority::Unavailable
+    );
+    assert!(
+        !matches!(
+            unavailable.decision(),
+            external_goal_api::CodexFallbackDecision::Allowed
+        ),
+        "an unreadable state root must fail closed"
+    );
+
+    // A readable root with no active Goal still allows the previous behaviour.
+    let root = std::env::temp_dir().join(format!("local-mcp-h5a-f4-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = crate::task_store::TaskStore::with_state_root(root.clone());
+    let established = external_goal_api::codex_fallback_authority(Some(&store), "absent-session");
+    assert_eq!(
+        established,
+        external_goal_api::CodexFallbackAuthority::Established(
+            external_goal_api::CodexFallbackDecision::Allowed
+        )
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

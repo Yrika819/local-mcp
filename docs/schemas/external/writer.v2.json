@@ -1,0 +1,153 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "attempt_id": {
+      "type": "string"
+    },
+    "evidence": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "maxLength": 128,
+            "type": "string",
+            "x-max-bytes": 128
+          },
+          "value": {
+            "maxLength": 16384,
+            "type": "string",
+            "x-max-bytes": 16384
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "title": "evidence_item_worker",
+        "type": "object"
+      },
+      "maxItems": 64,
+      "type": "array"
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "goal_revision": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "plan_revision": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "proposed_operations": {
+      "items": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "content": {
+                "maxLength": 262144,
+                "type": "string",
+                "x-max-bytes": 262144
+              },
+              "expected_preimage": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "SHA256"
+                        ],
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "maxLength": 64,
+                        "type": "string",
+                        "x-max-bytes": 64
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "sha256"
+                    ],
+                    "title": "expected_preimage.0",
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "ABSENT"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "title": "expected_preimage.1",
+                    "type": "object"
+                  }
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "WRITE_UTF8"
+                ],
+                "type": "string"
+              },
+              "path": {
+                "maxLength": 4096,
+                "type": "string",
+                "x-max-bytes": 4096
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "expected_preimage",
+              "content"
+            ],
+            "title": "writer_operation.0",
+            "type": "object"
+          }
+        ]
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "status": {
+      "enum": [
+        "candidate_complete",
+        "blocked",
+        "needs_replan",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "summary": {
+      "maxLength": 8192,
+      "type": "string",
+      "x-max-bytes": 8192
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "goal_id",
+    "task_id",
+    "attempt_id",
+    "goal_revision",
+    "plan_revision",
+    "status",
+    "summary",
+    "evidence",
+    "proposed_operations"
+  ],
+  "title": "WRITER",
+  "type": "object"
+}

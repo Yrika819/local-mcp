@@ -1,0 +1,271 @@
+{
+  "byte_semantics": "UTF8_BYTES",
+  "contract_id": "goallatch.external.response.v2",
+  "contract_version": 2,
+  "generated_by": "src/external_response_contract.rs",
+  "regenerate_with": "cargo test regenerate_response_contract_artifacts -- --ignored",
+  "roles": [
+    {
+      "conditions": [
+        {
+          "code": "PLANNER_IDENTITY_ECHO",
+          "detail": "goal_id and goal_revision must equal the values the host issued for this WorkItem"
+        },
+        {
+          "code": "PLANNER_PROPOSAL_ID_UNIQUE",
+          "detail": "proposal_id values must be unique within the plan and must not be durable Task ids"
+        },
+        {
+          "code": "PLANNER_REQUIRED_CRITERIA_COVERED",
+          "detail": "every required request completion criterion must appear exactly once in criterion_bindings"
+        },
+        {
+          "code": "PLANNER_DEPENDENCY_ACYCLIC",
+          "detail": "dependencies must reference proposal ids in this plan, must not self-reference, and must be acyclic"
+        },
+        {
+          "code": "PLANNER_SCOPE_WITHIN_AUTHORITY",
+          "detail": "allowed_paths must stay inside the Goal execution root; LOCAL_MUTATION/HOST_NATIVE_APPROVED require VERIFY_BEFORE_RETRY or NEVER_AUTOMATIC, READ_ONLY requires SAFE_READ_ONLY"
+        },
+        {
+          "code": "PLANNER_MANDATORY_PRESENT",
+          "detail": "at least one Task must be mandatory and no mandatory Task may depend on an optional Task"
+        },
+        {
+          "code": "PLANNER_VERIFICATION_NON_EMPTY",
+          "detail": "each Task requires 1..=32 verification specifications"
+        }
+      ],
+      "contract_id": "goallatch.external.response.v2/PLANNER/planner-proposal-v1",
+      "file": "planner.v2.json",
+      "identity_echo_fields": [
+        "goal_id",
+        "goal_revision"
+      ],
+      "max_response_bytes": 262144,
+      "notes": [
+        "Return exactly one JSON object. Any additional property is refused.",
+        "Echo goal_id and goal_revision from the host-issued WorkItem request.",
+        "Never claim that work ran, and never author durable Task ids."
+      ],
+      "optional_fields": [],
+      "output_contract": "planner-proposal-v1",
+      "required_fields": [
+        "goal_id",
+        "goal_revision",
+        "summary",
+        "tasks",
+        "criterion_bindings"
+      ],
+      "role": "PLANNER",
+      "schema_digest": "sha256:e9ba33f77eafa4dd3cfce2c8f17169ff12bd9e6f37b201990ba161c7ea5114b6"
+    },
+    {
+      "conditions": [
+        {
+          "code": "READONLY_IDENTITY_ECHO",
+          "detail": "goal_id, task_id, attempt_id, goal_revision and plan_revision must equal the host-issued WorkItem identity; a mismatch is READONLY_IDENTITY_MISMATCH"
+        },
+        {
+          "code": "READONLY_STATUS_VOCABULARY",
+          "detail": "status is exactly one of candidate_complete, blocked, needs_replan, failed; the host never accepts a model-declared completion such as COMPLETED"
+        },
+        {
+          "code": "READONLY_EVIDENCE_TOTAL_BOUND",
+          "detail": "the sum of kind plus value bytes across all evidence items must not exceed the host total bound"
+        },
+        {
+          "code": "READONLY_NO_WRITE_OPERATIONS",
+          "detail": "an object carrying proposed_operations or any write field is refused: the read-only role has no write authority"
+        }
+      ],
+      "contract_id": "goallatch.external.response.v2/READONLY/readonly-investigation-v1",
+      "file": "readonly.v2.json",
+      "identity_echo_fields": [
+        "goal_id",
+        "task_id",
+        "attempt_id",
+        "goal_revision",
+        "plan_revision"
+      ],
+      "max_response_bytes": 262144,
+      "notes": [
+        "Return exactly one JSON object. Any additional property is refused.",
+        "The read-only role performs no writes and has no write authority.",
+        "candidate_complete hands the Task to the host Verifier; it is not a completion claim."
+      ],
+      "optional_fields": [],
+      "output_contract": "readonly-investigation-v1",
+      "required_fields": [
+        "goal_id",
+        "task_id",
+        "attempt_id",
+        "goal_revision",
+        "plan_revision",
+        "status",
+        "summary",
+        "evidence"
+      ],
+      "role": "READONLY",
+      "schema_digest": "sha256:aebdd9f7e0edb6488fac86806476b0beaf5aba5fea188a4568746209d5145ff2"
+    },
+    {
+      "conditions": [
+        {
+          "code": "WRITER_IDENTITY_ECHO",
+          "detail": "goal_id, task_id, attempt_id, goal_revision and plan_revision must equal the host-issued WorkItem identity"
+        },
+        {
+          "code": "WRITER_STATUS_VOCABULARY",
+          "detail": "status is exactly one of candidate_complete, blocked, needs_replan, failed"
+        },
+        {
+          "code": "WRITER_CANDIDATE_COMPLETE_REQUIRES_OPERATIONS",
+          "detail": "status candidate_complete requires 1..=32 proposed_operations; any other status requires 0"
+        },
+        {
+          "code": "WRITER_PREIMAGE_EXPECTATION",
+          "detail": "expected_preimage is either {kind:SHA256, sha256:<64 lowercase hex>} or {kind:ABSENT}; a mismatched preimage is refused before any write"
+        },
+        {
+          "code": "WRITER_OPERATION_BOUNDS",
+          "detail": "paths must stay inside the granted write scope, single-file content is bounded, and total write content is bounded"
+        },
+        {
+          "code": "WRITER_NO_SELF_AUTHORITY",
+          "detail": "the model never authorizes itself: the host checks the Owner grant, scope and preimage independently of this response"
+        }
+      ],
+      "contract_id": "goallatch.external.response.v2/WRITER/writer-proposal-v1",
+      "file": "writer.v2.json",
+      "identity_echo_fields": [
+        "goal_id",
+        "task_id",
+        "attempt_id",
+        "goal_revision",
+        "plan_revision"
+      ],
+      "max_response_bytes": 1048576,
+      "notes": [
+        "Return exactly one JSON object. Any additional property is refused.",
+        "The writer role proposes; only the host validates the Owner grant, scope, preimage and postimage.",
+        "Never write files, execute mutating commands, or claim Task/Goal completion."
+      ],
+      "optional_fields": [],
+      "output_contract": "writer-proposal-v1",
+      "required_fields": [
+        "goal_id",
+        "task_id",
+        "attempt_id",
+        "goal_revision",
+        "plan_revision",
+        "status",
+        "summary",
+        "evidence",
+        "proposed_operations"
+      ],
+      "role": "WRITER",
+      "schema_digest": "sha256:fb5394c181c48b5bea8a42e13b8a0bd79c44cf01075bf012f6260b524dcf72c7"
+    },
+    {
+      "conditions": [
+        {
+          "code": "REVIEWER_IDENTITY_ECHO",
+          "detail": "goal_id, task_id, attempt_id, goal_revision and plan_revision must equal the host-issued WorkItem identity"
+        },
+        {
+          "code": "REVIEWER_FINDINGS_ARE_COUNTED_NOT_CLAIMED",
+          "detail": "blocking_findings is a non-negative integer count; the host decides whether the review gate passes"
+        },
+        {
+          "code": "REVIEWER_CANNOT_COMPLETE",
+          "detail": "a reviewer response never completes a Task or a Goal; completion needs the host Verifier and Finalizer"
+        }
+      ],
+      "contract_id": "goallatch.external.response.v2/REVIEWER/reviewer-verdict-v1",
+      "file": "reviewer.v2.json",
+      "identity_echo_fields": [
+        "goal_id",
+        "task_id",
+        "attempt_id",
+        "goal_revision",
+        "plan_revision"
+      ],
+      "max_response_bytes": 131072,
+      "notes": [
+        "Return exactly one JSON object. Any additional property is refused.",
+        "blocking_findings is a count, not a verdict: the host applies the review gate."
+      ],
+      "optional_fields": [],
+      "output_contract": "reviewer-verdict-v1",
+      "required_fields": [
+        "goal_id",
+        "task_id",
+        "attempt_id",
+        "goal_revision",
+        "plan_revision",
+        "summary",
+        "blocking_findings",
+        "evidence"
+      ],
+      "role": "REVIEWER",
+      "schema_digest": "sha256:63e1d6c9dea7971a22451d49bd62ca28ad56d3cae5d7987b34dfee0123af7b6f"
+    },
+    {
+      "conditions": [
+        {
+          "code": "REPLANNER_BASE_REVISION_ECHO",
+          "detail": "goal_id, base_goal_revision and base_plan_revision must equal the values the host issued"
+        },
+        {
+          "code": "REPLANNER_ADDITIVE_ONLY",
+          "detail": "ordinary replanning uses only the additive fields; history is never rewritten and authority is never weakened"
+        },
+        {
+          "code": "REPLANNER_RESOLVE_NEEDS_REPLAN_ARRAY",
+          "detail": "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean"
+        },
+        {
+          "code": "REPLANNER_EXCLUSIVE_PRIMITIVES",
+          "detail": "pristine_plan_supersession and replace_tasks may not be combined with the additive fields, with each other, or with a scope wider than the Task being replaced"
+        },
+        {
+          "code": "REPLANNER_HOST_REVALIDATION",
+          "detail": "the host revalidates every proposal against the complete durable Goal; a rejection changes no plan revision, no history and no file"
+        }
+      ],
+      "contract_id": "goallatch.external.response.v2/REPLANNER/replanner-proposal-v1",
+      "file": "replanner.v2.json",
+      "identity_echo_fields": [
+        "goal_id",
+        "base_goal_revision",
+        "base_plan_revision"
+      ],
+      "max_response_bytes": 262144,
+      "notes": [
+        "Return exactly one JSON object. Any additional property is refused.",
+        "Additive replanning is monotonic: add Tasks, dependencies, verification, mandatory flags, criterion bindings, or resolve needs_replan.",
+        "Replacement primitives are typed and travel with explicit request ids issued by the host."
+      ],
+      "optional_fields": [
+        "pristine_plan_supersession"
+      ],
+      "output_contract": "replanner-proposal-v1",
+      "required_fields": [
+        "goal_id",
+        "base_goal_revision",
+        "base_plan_revision",
+        "summary",
+        "add_tasks",
+        "add_dependencies",
+        "strengthen_verification",
+        "strengthen_mandatory",
+        "strengthen_criterion_bindings",
+        "resolve_needs_replan",
+        "replace_tasks"
+      ],
+      "role": "REPLANNER",
+      "schema_digest": "sha256:6791a950ef28c2764e076b01c3214d437097b147441385def134706baffd2094"
+    }
+  ]
+}

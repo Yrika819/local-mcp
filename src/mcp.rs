@@ -1743,17 +1743,18 @@ async fn codex_fallback(args: &Value, session: &config::Session) -> Result<(Valu
 ///
 /// `codex_fallback` carries no Goal id, so the session's active Goal is the
 /// authority: an EXTERNAL Goal refuses the diagnostic Codex path outright. A
-/// session with no active Goal, a CODEX Goal, or an unreadable store keeps the
-/// previous behavior exactly.
+/// session with no active Goal, or a CODEX Goal, keeps the previous behavior.
+///
+/// H5-A (independent review F4): an *unreadable* state root is not "no active
+/// Goal". It means the host cannot establish the backend policy, so the call is
+/// refused rather than allowed.
 fn ensure_codex_fallback_allowed(session: &config::Session) -> Result<()> {
-    let active = TaskStore::new()
-        .ok()
-        .and_then(|store| store.load_active_goal(&session.id).ok().flatten());
-    match external_goal_api::codex_fallback_decision(active.as_ref()) {
+    let store = TaskStore::new().ok();
+    match external_goal_api::codex_fallback_authority(store.as_ref(), &session.id).decision() {
         external_goal_api::CodexFallbackDecision::Allowed => Ok(()),
         external_goal_api::CodexFallbackDecision::RefusedForExternalBackend => {
             anyhow::bail!(
-                "codex_fallback is refused: this session's active Goal uses the EXTERNAL model backend, which never starts a Codex CLI process (ADR-08)"
+                "codex_fallback is refused: this session's active Goal uses (or may use) the EXTERNAL model backend, which never starts a Codex CLI process (ADR-08)"
             )
         }
     }

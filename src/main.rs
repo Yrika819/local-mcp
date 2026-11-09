@@ -20,6 +20,7 @@ mod external_model_store;
 mod external_model_work;
 mod external_publish;
 mod external_replanner;
+mod external_response_contract;
 mod external_writer;
 mod failure_class;
 mod fallback;
@@ -66,6 +67,8 @@ mod secure_fs;
 mod setup_preview;
 mod task;
 mod task_store;
+#[cfg(feature = "test-grant-fixture")]
+mod test_grant_fixture;
 mod verifier;
 mod verifier_git_observation;
 mod worker_capability;
@@ -94,6 +97,8 @@ mod external_goal_tests;
 mod external_h3_reliability_tests;
 #[cfg(test)]
 mod external_replanner_tests;
+#[cfg(test)]
+mod external_response_contract_tests;
 #[cfg(test)]
 mod external_reviewer_recovery_tests;
 #[cfg(test)]
@@ -165,6 +170,8 @@ mod resource_bounds_transport_tests;
 #[cfg(all(test, unix))]
 mod secure_fs_tests;
 #[cfg(test)]
+mod test_grant_fixture_tests;
+#[cfg(test)]
 mod verifier_tests;
 #[cfg(test)]
 mod windows_authority_audit_tests;
@@ -196,6 +203,18 @@ enum Command {
     Doctor(doctor::DoctorOptions),
     /// Inspect which pinned release a setup would install (read-only).
     Setup(setup_preview::SetupArgs),
+    /// H5-C: issue a disposable TEST_FIXTURE_V1 Writer grant.
+    ///
+    /// Compiled in only under the non-default `test-grant-fixture` feature, so a
+    /// release or operator build has no such command.
+    #[cfg(feature = "test-grant-fixture")]
+    #[command(name = "test-grant")]
+    TestGrant {
+        /// Session id that owns the Goal.
+        session_id: String,
+        /// Goal id to issue the fixture grant for.
+        goal_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -233,6 +252,23 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Start { session_id: None }) {
         Command::Doctor(options) => std::process::exit(doctor::execute(options).into()),
         Command::Setup(args) => std::process::exit(setup_preview::run(args).into()),
+        #[cfg(feature = "test-grant-fixture")]
+        Command::TestGrant {
+            session_id,
+            goal_id,
+        } => {
+            let store = crate::task_store::TaskStore::new()?;
+            match test_grant_fixture::run(&store, &session_id, &goal_id) {
+                Ok(line) => {
+                    println!("{line}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!("local-mcp test-grant: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
         command => {
             #[cfg(unix)]
             process_group::normalize_child_signal_policy()?;
@@ -255,5 +291,9 @@ async fn run(command: Command) -> Result<()> {
         Command::Mcp => mcp::serve().await,
         Command::Doctor(_) => unreachable!("Doctor dispatch occurs before Tokio initialization"),
         Command::Setup(_) => unreachable!("Setup dispatch occurs before Tokio initialization"),
+        #[cfg(feature = "test-grant-fixture")]
+        Command::TestGrant { .. } => {
+            unreachable!("TestGrant dispatch occurs before Tokio initialization")
+        }
     }
 }

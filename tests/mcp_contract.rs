@@ -258,6 +258,9 @@ const SUPPORTED_KEYWORDS: &[&str] = &[
     "enum",
     "default",
     "pattern",
+    "title",
+    "oneOf",
+    "x-max-bytes",
 ];
 
 fn validate_keywords(schema: &Value, path: &str, problems: &mut Vec<String>) {
@@ -277,6 +280,11 @@ fn validate_keywords(schema: &Value, path: &str, problems: &mut Vec<String>) {
     }
     if let Some(items) = object.get("items") {
         validate_keywords(items, &format!("{path}[]"), problems);
+    }
+    if let Some(branches) = object.get("oneOf").and_then(Value::as_array) {
+        for (index, branch) in branches.iter().enumerate() {
+            validate_keywords(branch, &format!("{path}.oneOf[{index}]"), problems);
+        }
     }
 }
 
@@ -311,6 +319,22 @@ fn validate(schema: &Value, instance: &Value, path: &str, problems: &mut Vec<Str
             "{path}: {instance} is outside the enum {allowed:?}"
         ));
     }
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        let mut matched = 0usize;
+        for branch in branches {
+            let mut branch_problems = Vec::new();
+            validate(branch, instance, path, &mut branch_problems);
+            if branch_problems.is_empty() {
+                matched += 1;
+            }
+        }
+        if matched != 1 {
+            problems.push(format!(
+                "{path}: {matched} oneOf branches matched, expected 1"
+            ));
+            return;
+        }
+    }
     match instance {
         Value::String(text) => {
             if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
@@ -322,6 +346,16 @@ fn validate(schema: &Value, instance: &Value, path: &str, problems: &mut Vec<Str
                 && (text.chars().count() as u64) > maximum
             {
                 problems.push(format!("{path}: longer than maxLength {maximum}"));
+            }
+            // H5-B: string bounds in this contract are UTF-8 byte counts, which is
+            // what the host validator measures. `x-max-bytes` is authoritative.
+            if let Some(maximum) = schema.get("x-max-bytes").and_then(Value::as_u64)
+                && (text.len() as u64) > maximum
+            {
+                problems.push(format!(
+                    "{path}: {}-byte string exceeds {maximum}",
+                    text.len()
+                ));
             }
             if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
                 match simple_pattern_matches(pattern, text) {
@@ -708,6 +742,208 @@ fn goal_next_work_item_fields_are_covered_by_goal_submit_schema() {
         "response": {},
     });
     assert_schema_accepts(submit_schema, &submission);
+}
+
+/// H5-B — the response contract a real MCP client sees on `goal_next`.
+///
+/// This is the executable form of finding H4-D-F1: the same real server process
+/// that hands out a `ModelWorkItem` must also hand out a machine-readable
+/// description of the answer it will accept, and the description must be the one
+/// checked into `docs/schemas/external/`.
+///
+/// It goes further than reading the schema: the WorkItem is answered twice
+/// against the same live server — once with the out-of-contract answer a real
+/// model actually produced (`"status": "COMPLETED"`), which must be refused, and
+/// once with an answer built from the published contract, which must be accepted.
+#[test]
+fn goal_next_publishes_a_machine_readable_response_contract() {
+    let fixture = Fixture::new("response-contract");
+    let mut server = McpServer::spawn(&fixture);
+
+    let view = goal_view(&server.call(
+        "goal_start",
+        start_arguments(&fixture.session_id, "EXTERNAL"),
+    ));
+    let goal_id = view["goal_id"].as_str().unwrap().to_owned();
+
+    let next = goal_view(&server.call(
+        "goal_next",
+        json!({"session_id": fixture.session_id, "goal_id": goal_id, "max_host_steps": 1}),
+    ));
+    assert_eq!(next["outcome"], "MODEL_REQUIRED", "{next}");
+    let work = next["model_work"].clone();
+    let contract = &work["response_contract"];
+
+    // 1. The contract is identified, versioned, and digest-addressed.
+    assert_eq!(
+        contract["contract_id"],
+        "goallatch.external.response.v2/PLANNER/planner-proposal-v1"
+    );
+    assert_eq!(contract["contract_version"], 2);
+    assert_eq!(contract["byte_semantics"], "UTF8_BYTES");
+    let digest = contract["schema_digest"]
+        .as_str()
+        .expect("the contract carries a digest");
+    assert!(digest.starts_with("sha256:"), "{digest}");
+    assert_eq!(digest.len(), 7 + 64);
+
+    // 2. It names the identity fields the client must echo, and they are also
+    //    required — an echo field the schema does not require is a contract bug.
+    let required: Vec<&str> = contract["required_fields"]
+        .as_array()
+        .expect("required_fields")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let echo: Vec<&str> = contract["identity_echo_fields"]
+        .as_array()
+        .expect("identity_echo_fields")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(!echo.is_empty());
+    for field in &echo {
+        assert!(echo.contains(field));
+        assert!(
+            required.contains(field),
+            "an echoed field must be required: {field}"
+        );
+    }
+
+    // 3. The schema is the checked-in artifact, byte for byte.
+    let artifact: Value = serde_json::from_slice(
+        &std::fs::read("docs/schemas/external/planner.v2.json")
+            .expect("the planner contract artifact is checked in"),
+    )
+    .expect("the artifact is JSON");
+    assert_eq!(
+        &contract["schema"], &artifact,
+        "the server must publish the reviewed schema, not a different one"
+    );
+
+    // 4. The refusal vocabulary the contract publishes is the one the runtime uses.
+    let decisions: Vec<&str> = contract["submission_decisions"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !decisions.is_empty() {
+        assert!(decisions.contains(&"REJECTED_SCHEMA"));
+        assert!(decisions.contains(&"COMMITTED"));
+        assert!(!decisions.contains(&"COMPLETED"));
+    }
+
+    // 5. Answer the PLANNER WorkItem with the out-of-contract status a real model
+    //    produced in H4, then with a contract-valid plan.
+    let bogus = json!({
+        "goal_id": goal_id,
+        "goal_revision": work["goal_revision"],
+        "status": "COMPLETED",
+        "summary": "the model declares itself finished",
+        "tasks": []
+    });
+    assert_schema_rejects(&contract["schema"], &bogus);
+    let refused = goal_view(&server.call(
+        "goal_submit",
+        json!({
+            "session_id": fixture.session_id,
+            "goal_id": goal_id,
+            "work_id": work["work_id"],
+            "submission_id": uuid::Uuid::new_v4().to_string(),
+            "expected_goal_revision": work["goal_revision"],
+            "request_digest": work["request_digest"],
+            "response": bogus,
+        }),
+    ));
+    assert_eq!(
+        refused["outcome"], "REJECTED_SCHEMA",
+        "the host must refuse a model-declared completion: {refused}"
+    );
+    assert!(
+        refused["code"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PLANNER")
+            || refused["code"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SCHEMA"),
+        "the refusal must be a schema refusal: {refused}"
+    );
+
+    // A fresh WorkItem is issued after the refusal, and a plan built from the
+    // published contract is accepted.
+    let next = goal_view(&server.call(
+        "goal_next",
+        json!({"session_id": fixture.session_id, "goal_id": goal_id, "max_host_steps": 1}),
+    ));
+    assert_eq!(next["outcome"], "MODEL_REQUIRED", "{next}");
+    let work = next["model_work"].clone();
+    let contract = &work["response_contract"];
+    let criterion = work["request"]["completion_criteria"][0]["criterion_id"]
+        .as_str()
+        .expect("the planner request carries a completion criterion")
+        .to_owned();
+    let plan = json!({
+        "goal_id": goal_id,
+        "goal_revision": work["goal_revision"],
+        "summary": "one bounded read-only survey of the fixture",
+        "tasks": [{
+            "proposal_id": "survey",
+            "title": "survey the fixture",
+            "objective": "list every file under the workspace root",
+            "mandatory": true,
+            "worker": "CODEX_READONLY",
+            "dependencies": [],
+            "scope": {
+                "allowed_paths": ["."],
+                "forbidden_paths": [],
+                "operation_kind": "READ_ONLY",
+                "replay_safety": "SAFE_READ_ONLY"
+            },
+            "verification": [{"kind": "STRUCTURED_EVIDENCE", "requirement_id": "survey"}]
+        }],
+        "criterion_bindings": [{"criterion_id": criterion, "task_refs": ["survey"]}]
+    });
+    assert_schema_accepts(&contract["schema"], &plan);
+    let accepted = goal_view(&server.call(
+        "goal_submit",
+        json!({
+            "session_id": fixture.session_id,
+            "goal_id": goal_id,
+            "work_id": work["work_id"],
+            "submission_id": uuid::Uuid::new_v4().to_string(),
+            "expected_goal_revision": work["goal_revision"],
+            "request_digest": work["request_digest"],
+            "response": plan,
+        }),
+    ));
+    assert_eq!(
+        accepted["outcome"], "COMMITTED",
+        "a contract-valid plan must be applied: {accepted}"
+    );
+
+    // And the next WorkItem is the READONLY one, whose published status
+    // vocabulary is the thing H4-D-F1 was missing.
+    let next = goal_view(&server.call(
+        "goal_next",
+        json!({"session_id": fixture.session_id, "goal_id": goal_id, "max_host_steps": 1}),
+    ));
+    let readonly_contract = &next["model_work"]["response_contract"];
+    assert_eq!(readonly_contract["role"], "READONLY", "{next}");
+    let statuses: Vec<&str> = readonly_contract["schema"]["properties"]["status"]["enum"]
+        .as_array()
+        .expect("the read-only contract publishes its status enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["candidate_complete", "blocked", "needs_replan", "failed"]
+    );
+    assert!(
+        !statuses.contains(&"COMPLETED"),
+        "the published vocabulary must not admit a model-declared completion"
+    );
 }
 
 /// Isolation evidence for H4-D: two server processes with different state roots
