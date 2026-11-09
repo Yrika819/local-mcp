@@ -1076,3 +1076,263 @@ fn at_gw_009f_supplementary_plane_format_characters_are_refused() {
     assert!(crate::authorization::is_console_unsafe('\u{1d173}'));
     assert!(crate::authorization::is_console_unsafe('\u{110bd}'));
 }
+
+// ---------------------------------------------------------------------------
+// H4-C / I-6 — the publication and revocation fence timeouts.
+//
+// The production wait is a 30 second constant; asserting only the constant
+// would prove nothing about behaviour, and waiting 30 real seconds in CI would
+// be an unusable test. Both are covered: the constant is asserted directly, and
+// the *same* code path is exercised with an injected wait so the timeout branch
+// is hit deterministically.
+// ---------------------------------------------------------------------------
+
+/// AT-GW-031 — the production fence wait is exactly the documented 30 seconds.
+#[test]
+fn at_gw_031_the_publication_fence_wait_is_thirty_seconds() {
+    assert_eq!(
+        crate::authorization::AUTHORIZATION_FENCE_TIMEOUT,
+        std::time::Duration::from_secs(30),
+        "the shipped fence bound is part of the V1 contract"
+    );
+}
+
+/// AT-GW-032 — a busy fence is a typed timeout, and a timed-out acquisition
+/// changes nothing durable.
+#[test]
+fn at_gw_032_a_busy_fence_times_out_without_changing_the_ledger() {
+    use std::time::{Duration, Instant};
+
+    let f = fixture("fence-busy");
+    let _grant = f.install();
+    let ledger_path =
+        crate::authorization_store::ledger_path(&f.store, &f.session.id, f.goal_id.as_str())
+            .unwrap();
+    let before = std::fs::read(&ledger_path).unwrap();
+
+    let held = crate::authorization_store::test_support::hold_ledger_lock(
+        &f.store,
+        &f.session.id,
+        f.goal_id.as_str(),
+    );
+    let started = Instant::now();
+    let error = crate::authorization_store::test_support::acquire_lock_with_wait(
+        &f.store,
+        &f.session.id,
+        f.goal_id.as_str(),
+        Duration::from_millis(100),
+    )
+    .expect_err("a held fence cannot be acquired");
+    assert_eq!(error, crate::authorization::GrantError::FenceTimeout);
+    assert_eq!(error.code(), "AUTHORIZATION_FENCE_BUSY");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the injected bound must be the one that applies"
+    );
+    assert_eq!(
+        std::fs::read(&ledger_path).unwrap(),
+        before,
+        "a timed-out fence acquisition must not write the ledger"
+    );
+
+    // Releasing the holder makes the same acquisition succeed, so the timeout is
+    // a bound on waiting, not a wedged lock.
+    drop(held);
+    crate::authorization_store::test_support::acquire_lock_with_wait(
+        &f.store,
+        &f.session.id,
+        f.goal_id.as_str(),
+        Duration::from_secs(5),
+    )
+    .expect("the fence is acquirable again once released");
+}
+
+/// AT-GW-033 — a revocation that cannot take the fence is DEFERRED. It is never
+/// reported as REVOKED, and the grant stays usable until the fence is released.
+#[test]
+fn at_gw_033_a_deferred_revocation_is_not_reported_as_revoked() {
+    use std::time::Duration;
+
+    let f = fixture("revoke-deferred");
+    let _grant = f.install();
+    let held = crate::authorization_store::test_support::hold_ledger_lock(
+        &f.store,
+        &f.session.id,
+        f.goal_id.as_str(),
+    );
+
+    let error = crate::authorization_store::revoke_active_within(
+        &f.store,
+        &f.session.id,
+        f.goal_id.as_str(),
+        None,
+        Duration::from_millis(100),
+    )
+    .expect_err("a held fence defers the revocation");
+    assert_eq!(error.code(), "REVOCATION_DEFERRED");
+    assert_ne!(
+        error.code(),
+        "WRITE_AUTHORIZATION_REVOKED",
+        "a deferred revocation must never be reported as completed"
+    );
+    assert_eq!(
+        f.ledger()
+            .latest_grant()
+            .expect("a grant exists")
+            .revocation()
+            .state(),
+        GrantRevocationState::NotRevoked,
+        "the durable grant state is unchanged by a deferred revocation"
+    );
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .revoked_at_epoch(),
+        None,
+        "the anchor must not record a revocation that never happened"
+    );
+
+    // Once the fence is free the same call finalizes for real.
+    drop(held);
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None)
+        .expect("the retry finalizes the revocation");
+    assert_eq!(
+        f.ledger()
+            .latest_grant()
+            .expect("a grant exists")
+            .revocation()
+            .state(),
+        GrantRevocationState::Revoked
+    );
+    assert!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .revoked_at_epoch()
+            .is_some(),
+        "the finalized revocation is anchored"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H4-B — independent-review findings (CRITICAL/HIGH: none).
+//
+// Both findings were confirmed against the source before fixing, and each has a
+// regression test here. The reviewer's line references were checked, not taken
+// on trust.
+// ---------------------------------------------------------------------------
+
+/// H4-B-MEDIUM — a stale grant generation must not clear a newer generation's
+/// usage floor.
+///
+/// Defect: `record_anchor_grant` reset the floor for *any* different grant id
+/// and only afterwards let `record_grant` refuse the stale epoch. A rolled-back
+/// ledger therefore left "newer grant identity, zero usage floor", which returns
+/// spent budget. Reproduction here is at the durable boundary: anchor the newer
+/// grant, charge one operation, then re-anchor the older generation and observe
+/// the floor.
+#[test]
+fn at_gw_034_a_stale_generation_cannot_clear_a_newer_usage_floor() {
+    let f = fixture("stale-anchor-floor");
+    let first = f.install();
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None)
+        .unwrap();
+    let second = f.install();
+    let second_binding = crate::authorization::GrantBinding::from_grant(&second);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &second_binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::authorization_store::anchor_of(&f.goal())
+            .unwrap()
+            .usage_operations(),
+        1,
+        "the charge is mirrored into the Goal anchor"
+    );
+
+    // A rolled-back ledger proposing the previous generation re-anchors it.
+    crate::authorization_store::record_anchor_grant(&f.store, &f.session.id, &f.goal_id, &first)
+        .expect("re-anchoring a stale grant is accepted but must not be honoured");
+
+    let anchor = crate::authorization_store::anchor_of(&f.goal()).unwrap();
+    assert_eq!(
+        anchor.usage_operations(),
+        1,
+        "a stale generation must not resurrect spent budget"
+    );
+    assert_eq!(
+        anchor.last_grant_id(),
+        Some(second.grant_id()),
+        "the Goal keeps the newer generation it already observed"
+    );
+    assert_eq!(anchor.highest_epoch(), second.authorization_epoch());
+}
+
+/// H4-B-LOW — `REVOKE_REQUESTED` must not be projected as `REVOKED`.
+///
+/// Both states deny publication, so this is a reporting defect, not an
+/// authorization bypass. The assertion covers both halves: the projection names
+/// the durable state, and the permission decision is still a refusal.
+#[test]
+fn at_gw_035_a_requested_revocation_is_projected_as_requested_not_revoked() {
+    let f = fixture("revoke-requested-view");
+    let grant = f.install();
+    let epoch = crate::authorization_store::test_support::request_revocation_only(
+        &f.store,
+        &f.session.id,
+        f.goal_id.as_str(),
+    );
+    assert_eq!(epoch, grant.authorization_epoch());
+
+    // The durable state really is REVOKE_REQUESTED, not REVOKED.
+    assert_eq!(
+        f.ledger()
+            .latest_grant()
+            .expect("a grant exists")
+            .revocation()
+            .state(),
+        GrantRevocationState::RevokeRequested
+    );
+
+    let view = crate::authorization_store::authorization_view(&f.store, &f.goal());
+    let view = serde_json::to_value(view).unwrap();
+    assert_eq!(
+        view["state"], "REVOKE_REQUESTED",
+        "the projection must not claim the finalization write happened: {view}"
+    );
+
+    // Publication is still refused while the revocation is only requested.
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    assert!(
+        crate::authorization_store::authorize_operation(
+            &f.store,
+            &f.goal(),
+            &binding,
+            "op#0",
+            4,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .is_err(),
+        "a requested revocation must already deny new operations"
+    );
+}
+
+/// H4-B — the finalized state is still projected as REVOKED, so the fix above is
+/// a refinement and not a blanket rename.
+#[test]
+fn at_gw_036_a_finalized_revocation_is_projected_as_revoked() {
+    let f = fixture("revoked-view");
+    let _grant = f.install();
+    crate::authorization_store::revoke_active(&f.store, &f.session.id, f.goal_id.as_str(), None)
+        .unwrap();
+    let view = crate::authorization_store::authorization_view(&f.store, &f.goal());
+    let view = serde_json::to_value(view).unwrap();
+    assert_eq!(view["state"], "REVOKED", "{view}");
+}
