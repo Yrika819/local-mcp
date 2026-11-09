@@ -1130,3 +1130,109 @@ fn at_gw_019d_a_pending_writer_work_item_is_released_when_authorization_is_lost(
         crate::task::TaskStatus::Blocked
     );
 }
+
+// ---------------------------------------------------------------------------
+// H5-A (independent review F1/F2) — revocation is not a barrier it cannot prove.
+// ---------------------------------------------------------------------------
+
+/// A publication whose helper lifetime is unproven must stop the host from
+/// *finalizing* a revocation.
+///
+/// The reachable state is the one `at_e5_037`/`at_e5_038` produce: `BeginOperation`
+/// is durable, the helper ran and its result is unknown, and the publication fence
+/// has been released. A helper that outlived its hard deadline, or a POSIX host
+/// that died before reaping the process group, leaves exactly this state. Before
+/// this test the Owner could revoke and be told `REVOKED` while a helper might
+/// still be able to write.
+#[test]
+fn at_e5_050_revocation_is_not_finalized_while_a_publication_is_unresolved() {
+    let f = fixture("revoke-unresolved");
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, "fn main() { /* unknown */ }\n");
+    let _ = run_publication(
+        &f,
+        &goal_id,
+        &task_id,
+        &operation_id,
+        &FaultyBoundary {
+            fault: BoundaryFault::WriteThenFail,
+        },
+    );
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        goal.has_unresolved_publication(),
+        "the operation intent must be APPLYING after an unknown publication"
+    );
+    assert_eq!(
+        intent(&f, &goal_id, &task_id).state(),
+        MutationIntentState::Applying
+    );
+
+    let error =
+        crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+            .expect_err("a revocation must not finalize over an unresolved publication");
+    assert_eq!(
+        error.code(),
+        "REVOCATION_BLOCKED_BY_UNRESOLVED_PUBLICATION",
+        "the refusal must be reported as a specific, honest code"
+    );
+
+    // The grant *is* denied — the important half — and the state says so
+    // without claiming the write path is closed.
+    let ledger = crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+        .unwrap()
+        .expect("a ledger exists");
+    let grant = ledger.latest_grant().expect("a grant exists");
+    assert_eq!(
+        grant.revocation().state(),
+        crate::authorization::GrantRevocationState::RevokeRequested,
+        "the durable state must be REVOKE_REQUESTED, never REVOKED"
+    );
+
+    // And no new operation can be authorized from here on.
+    let binding = crate::authorization::GrantBinding::from_grant(grant);
+    let denied = crate::authorization_store::authorize_operation(
+        &f.store,
+        &goal,
+        &binding,
+        "op#after-revoke-request",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    );
+    let denied = denied.expect_err("REVOKE_REQUESTED must deny a new charge");
+    assert_eq!(denied.code(), "WRITE_AUTHORIZATION_REVOKED");
+
+    // Once recovery reconciles the intent the host can honestly finalize.
+    // (The refused revocation still advanced the Goal's revocation anchor, so
+    // reload the authoritative revision rather than reusing the earlier one.)
+    let goal = goal_of(&f, &goal_id);
+    let reconciled = f
+        .store
+        .mutate_goal_snapshot(&f.session.id, &goal_id, goal.revision(), |goal, now| {
+            goal.task_reconcile_latest_mutation_intent(
+                &task_id,
+                &operation_id,
+                MutationIntentState::ReconciledNotPerformed,
+                "test reconciliation of an unknown publication".to_owned(),
+                now,
+            )
+        })
+        .expect("the intent reconciles");
+    assert!(!reconciled.has_unresolved_publication());
+
+    let (_grant_id, epoch) =
+        crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+            .expect("a reconciled Goal can finalize its revocation");
+    assert_eq!(epoch, 1);
+    let ledger = crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+        .unwrap()
+        .expect("a ledger exists");
+    assert_eq!(
+        ledger
+            .latest_grant()
+            .expect("a grant exists")
+            .revocation()
+            .state(),
+        crate::authorization::GrantRevocationState::Revoked
+    );
+}

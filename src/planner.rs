@@ -19,19 +19,30 @@ use crate::task::{
 use crate::task_store::TaskStore;
 use crate::worker_capability;
 
-pub(crate) const MAX_PLAN_PROPOSAL_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_PLAN_TASKS: usize = 128;
-pub(crate) const MAX_PLAN_DEPENDENCY_EDGES: usize = 1024;
-pub(crate) const MAX_PLAN_TITLE_BYTES: usize = 256;
-pub(crate) const MAX_PLAN_OBJECTIVE_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_PLAN_SUMMARY_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_PROPOSAL_ID_BYTES: usize = 64;
-pub(crate) const MAX_DEPENDENCIES_PER_TASK: usize = 64;
-pub(crate) const MAX_SCOPE_PATHS_PER_KIND: usize = 64;
-pub(crate) const MAX_SCOPE_PATHS_TOTAL: usize = 1024;
-pub(crate) const MAX_VERIFICATION_PER_TASK: usize = 32;
-pub(crate) const MAX_VERIFICATION_TOTAL: usize = 1024;
-pub(crate) const MAX_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_PLAN_PROPOSAL_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_PROPOSAL_BYTES;
+pub(crate) const MAX_PLAN_TASKS: usize = crate::external_response_contract::LIMIT_PLAN_TASKS;
+pub(crate) const MAX_PLAN_DEPENDENCY_EDGES: usize =
+    crate::external_response_contract::LIMIT_PLAN_DEPENDENCY_EDGES;
+pub(crate) const MAX_PLAN_TITLE_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_TITLE_BYTES;
+pub(crate) const MAX_PLAN_OBJECTIVE_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_OBJECTIVE_BYTES;
+pub(crate) const MAX_PLAN_SUMMARY_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_SUMMARY_BYTES;
+pub(crate) const MAX_PROPOSAL_ID_BYTES: usize =
+    crate::external_response_contract::LIMIT_PROPOSAL_ID_BYTES;
+pub(crate) const MAX_DEPENDENCIES_PER_TASK: usize =
+    crate::external_response_contract::LIMIT_DEPENDENCIES_PER_TASK;
+pub(crate) const MAX_SCOPE_PATHS_PER_KIND: usize =
+    crate::external_response_contract::LIMIT_SCOPE_PATHS_PER_KIND;
+pub(crate) const MAX_SCOPE_PATHS_TOTAL: usize =
+    crate::external_response_contract::LIMIT_SCOPE_PATHS_TOTAL;
+pub(crate) const MAX_VERIFICATION_PER_TASK: usize =
+    crate::external_response_contract::LIMIT_VERIFICATION_PER_TASK;
+pub(crate) const MAX_VERIFICATION_TOTAL: usize =
+    crate::external_response_contract::LIMIT_VERIFICATION_TOTAL;
+pub(crate) const MAX_PATH_BYTES: usize = crate::external_response_contract::LIMIT_PATH_BYTES;
 
 // Replanner Hardening V1 durable-history budgets.
 //
@@ -52,15 +63,20 @@ pub(crate) const MAX_DURABLE_SUPERSEDED_DEPENDENCY_EDGES: usize = 4096;
 pub(crate) const MAX_DURABLE_SUPERSEDED_SCOPE_PATHS: usize = 4096;
 pub(crate) const MAX_DURABLE_SUPERSEDED_VERIFICATION_ENTRIES: usize = 4096;
 
-pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize = 128;
+pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize =
+    crate::external_response_contract::LIMIT_EVIDENCE_REQUIREMENT_ID_BYTES;
 
 /// Host-visible compact read-only output contract. Reused verbatim by the
 /// read-only worker so the declared contract and the enforced bounds cannot
 /// drift apart.
-pub(crate) const MAX_READONLY_EVIDENCE_ITEMS: usize = 32;
-pub(crate) const MAX_READONLY_SUMMARY_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_READONLY_EVIDENCE_ITEMS: usize =
+    crate::external_response_contract::LIMIT_READONLY_EVIDENCE_ITEMS;
+pub(crate) const MAX_READONLY_SUMMARY_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_SUMMARY_BYTES;
+pub(crate) const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_EVIDENCE_FIELD_BYTES;
+pub(crate) const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_EVIDENCE_TOTAL_BYTES;
 pub(crate) const READONLY_OUTPUT_CONTRACT_GUIDANCE: &str = "return at most 32 compact structured evidence records, each at most 8 KiB and 64 KiB in total, with a summary of at most 16 KiB; prefer artifact/file references and short synthesis over repeated large source excerpts";
 
 /// Deterministic conservative bound on the structured records one bounded
@@ -1225,6 +1241,17 @@ fn map_store_error(error: OrchestratorError) -> PlannerError {
         }
         other => PlannerError::Store(other),
     }
+}
+
+/// H5-B: deserialize a published-contract sample into the *real* plan proposal
+/// type, with its real serde attributes (`deny_unknown_fields`, enums, types).
+///
+/// This is the shape half of the validator that the H5-B equivalence tests
+/// compare the published JSON Schema against; the byte bounds are shared
+/// constants (`external_response_contract::LIMIT_*`) rather than copies.
+#[cfg(test)]
+pub(crate) fn response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<PlanProposal>(value.clone()).is_ok()
 }
 
 #[cfg(test)]

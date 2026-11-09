@@ -1,0 +1,274 @@
+{
+  "store_format": "local-mcp-goal",
+  "schema_version": 6,
+  "revision": 10,
+  "goal_id": "e57ddcac-9965-4275-981d-955d57215d2c",
+  "session_id": "h5d-205762be-44d5-4488-8c7a-1ffb2534ca3c",
+  "cwd": "C:\\Users\\Yuta\\Desktop\\local-mcp-connector-parity\\.local\\h5-a\\tmp\\h5-d\\scenario-a-run2\\repo",
+  "objective": "Read-only survey of src/ and data/: report how many files under src/ declare a function and the total of the numeric values in data/inventory.txt. Do not modify anything.",
+  "title": null,
+  "constraints": [],
+  "completion_criteria": [
+    {
+      "id": "61ccf360-1d18-4a91-96d9-d45b28db869a",
+      "description": "Read-only survey of src/ and data/: report how many files under src/ declare a function and the total of the numeric values in data/inventory.txt. Do not modify anything.",
+      "required": true
+    }
+  ],
+  "final_verification_spec": {
+    "plan_revision": 1,
+    "criterion_bindings": [
+      {
+        "criterion_id": "61ccf360-1d18-4a91-96d9-d45b28db869a",
+        "requirements": [
+          {
+            "kind": "TASK_VERIFIED",
+            "task_id": "b1c04891-637c-4f0c-8897-ebbde4bfb4ab"
+          }
+        ]
+      }
+    ]
+  },
+  "status": "COMPLETED",
+  "plan_revision": 1,
+  "tasks": [
+    {
+      "id": "b1c04891-637c-4f0c-8897-ebbde4bfb4ab",
+      "title": "Survey src files and inventory",
+      "objective": "Read the files under src/ and count how many declare a function. Read data/inventory.txt and report the total of its numeric values. Observed during planning: both src/helper.rs and src/main.rs declare a function; inventory values total 49. Do not modify anything.",
+      "mandatory": true,
+      "status": "COMPLETED",
+      "dependencies": [],
+      "worker": "CODEX_READONLY",
+      "scope": {
+        "allowed_paths": [
+          "\\\\?\\C:\\Users\\Yuta\\Desktop\\local-mcp-connector-parity\\.local\\h5-a\\tmp\\h5-d\\scenario-a-run2\\repo\\src",
+          "\\\\?\\C:\\Users\\Yuta\\Desktop\\local-mcp-connector-parity\\.local\\h5-a\\tmp\\h5-d\\scenario-a-run2\\repo\\data\\inventory.txt"
+        ],
+        "forbidden_paths": [],
+        "operation_kind": "READ_ONLY",
+        "replay_safety": "SAFE_READ_ONLY"
+      },
+      "verification": [
+        {
+          "kind": "STRUCTURED_EVIDENCE",
+          "requirement_id": "61ccf360-1d18-4a91-96d9-d45b28db869a"
+        }
+      ],
+      "verification_results": [
+        {
+          "id": "33e98ea8-d4de-4e58-8124-945148925bb4",
+          "outcome": "PASSED",
+          "checks": [
+            {
+              "verification_index": 0,
+              "passed": true,
+              "detail": "structured requirement 61ccf360-1d18-4a91-96d9-d45b28db869a from EXTERNAL_READONLY_AGENT: Read src/helper.rs and src/main.rs; each contains a function declaration. Read data/inventory.txt: widgets=42, gadgets=7, spares=0; total=49."
+            }
+          ],
+          "started_at": "2026-11-09T16:56:59Z",
+          "finished_at": "2026-11-09T16:56:59Z"
+        }
+      ],
+      "max_attempts": 2,
+      "attempts": [
+        {
+          "id": "f937f5b6-3166-413c-8b2a-6383d42b8b83",
+          "number": 1,
+          "worker": "CODEX_READONLY",
+          "started_at": "2026-11-09T16:56:40Z",
+          "finished_at": "2026-11-09T16:56:59Z",
+          "worker_process_ref": null,
+          "codex_thread_id": null,
+          "low_level_request_ids": [],
+          "operation_id": null,
+          "scope_identity": null,
+          "side_effect_class": "NONE",
+          "side_effect_state": "CONFIRMED_NOT_PERFORMED",
+          "remaining_attempt_budget": 1,
+          "remaining_side_effect_budget": 0,
+          "worker_report": {
+            "summary": "Inspected both files under src/: helper.rs and main.rs each declare a function, for a total of 2 files. The numeric values in data/inventory.txt (42, 7, 0) total 49. No files were modified.",
+            "changed_files": []
+          },
+          "outcome": "CANDIDATE_COMPLETE"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "WORKER_REPORT",
+          "attempt_id": "f937f5b6-3166-413c-8b2a-6383d42b8b83",
+          "report_digest": "acf5fbfd4e8ea67d65726d167cb733e7d978dd244128cdf9d1a9e247443a3a44"
+        },
+        {
+          "kind": "STRUCTURED_OBSERVATION",
+          "requirement_id": "61ccf360-1d18-4a91-96d9-d45b28db869a",
+          "source": "EXTERNAL_READONLY_AGENT",
+          "passed": true,
+          "detail": "Read src/helper.rs and src/main.rs; each contains a function declaration. Read data/inventory.txt: widgets=42, gadgets=7, spares=0; total=49."
+        },
+        {
+          "kind": "VERIFICATION_OBSERVATION",
+          "verification_id": "33e98ea8-d4de-4e58-8124-945148925bb4",
+          "attempt_id": "f937f5b6-3166-413c-8b2a-6383d42b8b83",
+          "verification_index": null,
+          "verification_kind": "SIDE_EFFECT_GATE",
+          "observed_fact": "latest side-effect state is CONFIRMED_NOT_PERFORMED",
+          "passed": true,
+          "observed_at": "2026-11-09T16:56:59Z",
+          "source": "HOST_DETERMINISTIC_VERIFIER"
+        },
+        {
+          "kind": "VERIFICATION_OBSERVATION",
+          "verification_id": "33e98ea8-d4de-4e58-8124-945148925bb4",
+          "attempt_id": "f937f5b6-3166-413c-8b2a-6383d42b8b83",
+          "verification_index": 0,
+          "verification_kind": "STRUCTURED_EVIDENCE",
+          "observed_fact": "structured requirement 61ccf360-1d18-4a91-96d9-d45b28db869a from EXTERNAL_READONLY_AGENT: Read src/helper.rs and src/main.rs; each contains a function declaration. Read data/inventory.txt: widgets=42, gadgets=7, spares=0; total=49.",
+          "passed": true,
+          "observed_at": "2026-11-09T16:56:59Z",
+          "source": "HOST_DETERMINISTIC_VERIFIER"
+        },
+        {
+          "kind": "VERIFICATION",
+          "verification_id": "33e98ea8-d4de-4e58-8124-945148925bb4",
+          "passed": true
+        }
+      ],
+      "blockers": [],
+      "created_plan_revision": 1,
+      "updated_at": "2026-11-09T16:56:59Z"
+    }
+  ],
+  "blockers": [],
+  "final_verifications": [
+    {
+      "id": "101d45db-cff0-4378-aef8-35b73fd443a0",
+      "outcome": "PASSED",
+      "source": "HOST_DETERMINISTIC_GOAL_VERIFIER",
+      "goal_id": "e57ddcac-9965-4275-981d-955d57215d2c",
+      "evaluated_goal_revision": 8,
+      "committed_goal_revision": 9,
+      "plan_revision": 1,
+      "contract_digest": "e7ff65ea7a8ac6b7c228b6aa049c326f2e7a9022bdc4af9c4a971069445faaf1",
+      "criterion_results": [
+        {
+          "criterion_id": "61ccf360-1d18-4a91-96d9-d45b28db869a",
+          "outcome": "PASSED",
+          "observations": [
+            {
+              "kind": "TASK_VERIFIED",
+              "task_id": "b1c04891-637c-4f0c-8897-ebbde4bfb4ab",
+              "task_status": "COMPLETED",
+              "verification_id": "33e98ea8-d4de-4e58-8124-945148925bb4",
+              "verification_outcome": "PASSED",
+              "outcome": "PASSED"
+            }
+          ]
+        }
+      ],
+      "started_at": "2026-11-09T16:56:59Z",
+      "finished_at": "2026-11-09T16:56:59Z"
+    }
+  ],
+  "model_backend": "EXTERNAL",
+  "external_model": {
+    "schema_version": 2,
+    "work_history": [
+      {
+        "work_id": "50533365-8a9f-4a92-9104-35074bee8d04",
+        "role": "PLANNER",
+        "state": "REJECTED",
+        "goal_revision": 2,
+        "plan_revision": 0,
+        "request_digest": "4281395c1836c326471daa552653e8ec0d2aea624eaba5615aa51730c4b43dcc",
+        "issue_counter": 1,
+        "created_at": "2026-11-09T16:55:55Z",
+        "terminal_code": "PROPOSAL_SCHEMA_VIOLATION"
+      },
+      {
+        "work_id": "bfd28e6c-8728-4a6a-83cb-0bb9579ecdf5",
+        "role": "PLANNER",
+        "state": "COMMITTED",
+        "goal_revision": 4,
+        "plan_revision": 0,
+        "request_digest": "6d7d7491905b73a5d6caadb242894c243bee159ebc878a47538247523ffddf7e",
+        "issue_counter": 2,
+        "created_at": "2026-11-09T16:55:55Z"
+      },
+      {
+        "work_id": "274e4adc-ebca-46b2-9f4b-de15daa8667b",
+        "role": "READONLY",
+        "state": "COMMITTED",
+        "goal_revision": 6,
+        "plan_revision": 1,
+        "request_digest": "bae29c840407e53930ed2fbeb0ed8a48c39575f5f5b9d754403e19eabbe01705",
+        "issue_counter": 3,
+        "created_at": "2026-11-09T16:56:40Z"
+      }
+    ],
+    "receipts": [
+      {
+        "work_id": "50533365-8a9f-4a92-9104-35074bee8d04",
+        "submission_id": "3a5be287-382a-4732-99b1-ff5e5675828d",
+        "payload_sha256": "718d23e38765bad727660a967941268fc4b5d2cc2637fc54852a6a87318367c5",
+        "decision": "REJECTED_SCHEMA",
+        "code": "PROPOSAL_SCHEMA_VIOLATION",
+        "redacted_detail": "the host rejected the external proposal during schema validation",
+        "received_at": "2026-11-09T16:55:55Z"
+      },
+      {
+        "work_id": "bfd28e6c-8728-4a6a-83cb-0bb9579ecdf5",
+        "submission_id": "4e119fc8-291f-4f5d-8c42-a8bb0123a9ac",
+        "payload_sha256": "9dfce85473fc5ecafa4e47d057ad27e28c1b3a1b08a9285366d11bad68231332",
+        "decision": "COMMITTED",
+        "committed_revision": 5,
+        "code": "PLAN_APPLIED",
+        "received_at": "2026-11-09T16:56:40Z"
+      },
+      {
+        "work_id": "274e4adc-ebca-46b2-9f4b-de15daa8667b",
+        "submission_id": "c4c3b5f7-388e-4da3-a757-d41b0807e3a9",
+        "payload_sha256": "acf5fbfd4e8ea67d65726d167cb733e7d978dd244128cdf9d1a9e247443a3a44",
+        "decision": "COMMITTED",
+        "committed_revision": 7,
+        "code": "READONLY_CANDIDATE_COMPLETE",
+        "received_at": "2026-11-09T16:56:59Z"
+      }
+    ],
+    "issue_counter": 3,
+    "role_attempts": {
+      "PLANNER": 2,
+      "READONLY": 1
+    },
+    "authorization_anchor": {
+      "highest_epoch": 0,
+      "usage_operations": 0,
+      "usage_bytes": 0
+    }
+  },
+  "managed_workspace_verification_evidence": null,
+  "checkpoints": [
+    {
+      "id": "c3d81653-537b-4552-8a09-1ccc32100ed3",
+      "goal_revision": 4,
+      "plan_revision": 1,
+      "at": "2026-11-09T16:56:40Z",
+      "reason": "PLAN_COMMITTED",
+      "goal_status": "RUNNING",
+      "active_task_ids": []
+    },
+    {
+      "id": "3e86a1eb-fdff-4647-8752-8ec7667009fa",
+      "goal_revision": 9,
+      "plan_revision": 1,
+      "at": "2026-11-09T16:56:59Z",
+      "reason": "FINAL_VERIFICATION",
+      "goal_status": "VERIFYING",
+      "active_task_ids": []
+    }
+  ],
+  "created_at": "2026-11-09T16:55:55Z",
+  "updated_at": "2026-11-09T16:56:59Z",
+  "completed_at": "2026-11-09T16:56:59Z"
+}

@@ -1,0 +1,948 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "add_dependencies": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "dependency": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "ref_kind": {
+                    "enum": [
+                      "EXISTING"
+                    ],
+                    "type": "string"
+                  },
+                  "task_id": {
+                    "description": "an exact existing durable Task UUID",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ref_kind",
+                  "task_id"
+                ],
+                "title": "task_ref.0",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "proposal_id": {
+                    "maxLength": 64,
+                    "type": "string",
+                    "x-max-bytes": 64
+                  },
+                  "ref_kind": {
+                    "enum": [
+                      "NEW"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ref_kind",
+                  "proposal_id"
+                ],
+                "title": "task_ref.1",
+                "type": "object"
+              }
+            ]
+          },
+          "task": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "ref_kind": {
+                    "enum": [
+                      "EXISTING"
+                    ],
+                    "type": "string"
+                  },
+                  "task_id": {
+                    "description": "an exact existing durable Task UUID",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ref_kind",
+                  "task_id"
+                ],
+                "title": "task_ref.0",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "proposal_id": {
+                    "maxLength": 64,
+                    "type": "string",
+                    "x-max-bytes": 64
+                  },
+                  "ref_kind": {
+                    "enum": [
+                      "NEW"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ref_kind",
+                  "proposal_id"
+                ],
+                "title": "task_ref.1",
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "task",
+          "dependency"
+        ],
+        "title": "dependency_addition",
+        "type": "object"
+      },
+      "maxItems": 1024,
+      "type": "array"
+    },
+    "add_tasks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "dependencies": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "ref_kind": {
+                      "enum": [
+                        "EXISTING"
+                      ],
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "description": "an exact existing durable Task UUID",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "task_id"
+                  ],
+                  "title": "task_ref.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "proposal_id": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "ref_kind": {
+                      "enum": [
+                        "NEW"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "proposal_id"
+                  ],
+                  "title": "task_ref.1",
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "mandatory": {
+            "type": "boolean"
+          },
+          "objective": {
+            "maxLength": 16384,
+            "type": "string",
+            "x-max-bytes": 16384
+          },
+          "proposal_id": {
+            "maxLength": 64,
+            "type": "string",
+            "x-max-bytes": 64
+          },
+          "scope": {
+            "additionalProperties": false,
+            "properties": {
+              "allowed_paths": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              },
+              "forbidden_paths": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "operation_kind": {
+                "enum": [
+                  "READ_ONLY",
+                  "LOCAL_MUTATION",
+                  "HOST_NATIVE_APPROVED"
+                ],
+                "type": "string"
+              },
+              "replay_safety": {
+                "enum": [
+                  "SAFE_READ_ONLY",
+                  "VERIFY_BEFORE_RETRY",
+                  "NEVER_AUTOMATIC"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "allowed_paths",
+              "operation_kind",
+              "replay_safety"
+            ],
+            "title": "task_scope",
+            "type": "object"
+          },
+          "title": {
+            "maxLength": 256,
+            "type": "string",
+            "x-max-bytes": 256
+          },
+          "verification": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "FILE_EXISTS"
+                      ],
+                      "type": "string"
+                    },
+                    "must_be_file": {
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "maxLength": 4096,
+                      "type": "string",
+                      "x-max-bytes": 4096
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "must_be_file"
+                  ],
+                  "title": "verification_spec.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "expected_sha256": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "FILE_DIGEST"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "maxLength": 4096,
+                      "type": "string",
+                      "x-max-bytes": 4096
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "expected_sha256"
+                  ],
+                  "title": "verification_spec.1",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "allowed_changed_paths": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "GIT_SCOPE"
+                      ],
+                      "type": "string"
+                    },
+                    "require_no_other_changes": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "allowed_changed_paths",
+                    "require_no_other_changes"
+                  ],
+                  "title": "verification_spec.2",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "forbidden_paths": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "NO_FORBIDDEN_CHANGES"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "forbidden_paths"
+                  ],
+                  "title": "verification_spec.3",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "STRUCTURED_EVIDENCE"
+                      ],
+                      "type": "string"
+                    },
+                    "requirement_id": {
+                      "maxLength": 128,
+                      "type": "string",
+                      "x-max-bytes": 128
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "requirement_id"
+                  ],
+                  "title": "verification_spec.4",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "REVIEW_GATE"
+                      ],
+                      "type": "string"
+                    },
+                    "max_blocking_findings": {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "max_blocking_findings"
+                  ],
+                  "title": "verification_spec.5",
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "type": "array"
+          },
+          "worker": {
+            "description": "V1 accepts only the production-plannable worker kinds; LOCAL_OPERATION, CODEX_REVIEWER and VERIFIER are refused by the host validator",
+            "enum": [
+              "CODEX_READONLY",
+              "CODEX_WRITER"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "title",
+          "objective",
+          "mandatory",
+          "worker",
+          "scope",
+          "verification"
+        ],
+        "title": "replan_task",
+        "type": "object"
+      },
+      "maxItems": 128,
+      "type": "array"
+    },
+    "base_goal_revision": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "base_plan_revision": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "pristine_plan_supersession": {
+      "additionalProperties": false,
+      "properties": {
+        "criterion_rebindings": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "criterion_id": {
+                "type": "string"
+              },
+              "replacement_task_refs": {
+                "items": {
+                  "oneOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "ref_kind": {
+                          "enum": [
+                            "EXISTING"
+                          ],
+                          "type": "string"
+                        },
+                        "task_id": {
+                          "description": "an exact existing durable Task UUID",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "ref_kind",
+                        "task_id"
+                      ],
+                      "title": "task_ref.0",
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "proposal_id": {
+                          "maxLength": 64,
+                          "type": "string",
+                          "x-max-bytes": 64
+                        },
+                        "ref_kind": {
+                          "enum": [
+                            "NEW"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "ref_kind",
+                        "proposal_id"
+                      ],
+                      "title": "task_ref.1",
+                      "type": "object"
+                    }
+                  ]
+                },
+                "maxItems": 128,
+                "minItems": 1,
+                "type": "array"
+              }
+            },
+            "required": [
+              "criterion_id",
+              "replacement_task_refs"
+            ],
+            "title": "criterion_replacement",
+            "type": "object"
+          },
+          "maxItems": 1024,
+          "type": "array"
+        },
+        "rejection_request_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rejection_request_id",
+        "criterion_rebindings"
+      ],
+      "title": "pristine_plan_supersession",
+      "type": "object"
+    },
+    "replace_tasks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "completion_closure_task_refs": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "ref_kind": {
+                      "enum": [
+                        "EXISTING"
+                      ],
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "description": "an exact existing durable Task UUID",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "task_id"
+                  ],
+                  "title": "task_ref.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "proposal_id": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "ref_kind": {
+                      "enum": [
+                        "NEW"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "proposal_id"
+                  ],
+                  "title": "task_ref.1",
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "type": "array"
+          },
+          "criterion_rebindings": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "criterion_id": {
+                  "type": "string"
+                },
+                "replacement_task_refs": {
+                  "items": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "ref_kind": {
+                            "enum": [
+                              "EXISTING"
+                            ],
+                            "type": "string"
+                          },
+                          "task_id": {
+                            "description": "an exact existing durable Task UUID",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "ref_kind",
+                          "task_id"
+                        ],
+                        "title": "task_ref.0",
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "proposal_id": {
+                            "maxLength": 64,
+                            "type": "string",
+                            "x-max-bytes": 64
+                          },
+                          "ref_kind": {
+                            "enum": [
+                              "NEW"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "ref_kind",
+                          "proposal_id"
+                        ],
+                        "title": "task_ref.1",
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "maxItems": 128,
+                  "minItems": 1,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "criterion_id",
+                "replacement_task_refs"
+              ],
+              "title": "criterion_replacement",
+              "type": "object"
+            },
+            "maxItems": 1024,
+            "type": "array"
+          },
+          "old_task_id": {
+            "type": "string"
+          },
+          "replan_request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "replan_request_id",
+          "old_task_id",
+          "completion_closure_task_refs",
+          "criterion_rebindings"
+        ],
+        "title": "task_replacement",
+        "type": "object"
+      },
+      "maxItems": 128,
+      "type": "array"
+    },
+    "resolve_needs_replan": {
+      "description": "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 1024,
+      "type": "array"
+    },
+    "strengthen_criterion_bindings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "add_task_refs": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "ref_kind": {
+                      "enum": [
+                        "EXISTING"
+                      ],
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "description": "an exact existing durable Task UUID",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "task_id"
+                  ],
+                  "title": "task_ref.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "proposal_id": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "ref_kind": {
+                      "enum": [
+                        "NEW"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ref_kind",
+                    "proposal_id"
+                  ],
+                  "title": "task_ref.1",
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "type": "array"
+          },
+          "criterion_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "criterion_id",
+          "add_task_refs"
+        ],
+        "title": "criterion_binding_strengthening",
+        "type": "object"
+      },
+      "maxItems": 1024,
+      "type": "array"
+    },
+    "strengthen_mandatory": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "title": "mandatory_strengthening",
+        "type": "object"
+      },
+      "maxItems": 1024,
+      "type": "array"
+    },
+    "strengthen_verification": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "add": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "FILE_EXISTS"
+                      ],
+                      "type": "string"
+                    },
+                    "must_be_file": {
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "maxLength": 4096,
+                      "type": "string",
+                      "x-max-bytes": 4096
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "must_be_file"
+                  ],
+                  "title": "verification_spec.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "expected_sha256": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "FILE_DIGEST"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "maxLength": 4096,
+                      "type": "string",
+                      "x-max-bytes": 4096
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "expected_sha256"
+                  ],
+                  "title": "verification_spec.1",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "allowed_changed_paths": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "GIT_SCOPE"
+                      ],
+                      "type": "string"
+                    },
+                    "require_no_other_changes": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "allowed_changed_paths",
+                    "require_no_other_changes"
+                  ],
+                  "title": "verification_spec.2",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "forbidden_paths": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "NO_FORBIDDEN_CHANGES"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "forbidden_paths"
+                  ],
+                  "title": "verification_spec.3",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "STRUCTURED_EVIDENCE"
+                      ],
+                      "type": "string"
+                    },
+                    "requirement_id": {
+                      "maxLength": 128,
+                      "type": "string",
+                      "x-max-bytes": 128
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "requirement_id"
+                  ],
+                  "title": "verification_spec.4",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "REVIEW_GATE"
+                      ],
+                      "type": "string"
+                    },
+                    "max_blocking_findings": {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "max_blocking_findings"
+                  ],
+                  "title": "verification_spec.5",
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "type": "array"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "add"
+        ],
+        "title": "verification_strengthening",
+        "type": "object"
+      },
+      "maxItems": 1024,
+      "type": "array"
+    },
+    "summary": {
+      "maxLength": 8192,
+      "type": "string",
+      "x-max-bytes": 8192
+    }
+  },
+  "required": [
+    "goal_id",
+    "base_goal_revision",
+    "base_plan_revision",
+    "summary"
+  ],
+  "title": "REPLANNER",
+  "type": "object"
+}

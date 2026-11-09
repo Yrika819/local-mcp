@@ -259,6 +259,23 @@ pub(crate) enum SubmissionDecision {
 }
 
 impl SubmissionDecision {
+    /// Every decision the host can record for one submission.
+    ///
+    /// Single-sourced here so the published response contract can name the exact
+    /// refusal vocabulary instead of a hand-copied subset.
+    pub(crate) const ALL: &'static [SubmissionDecision] = &[
+        Self::AcceptedForHostProcessing,
+        Self::Committed,
+        Self::RejectedSchema,
+        Self::RejectedStaleRevision,
+        Self::RejectedAuthority,
+        Self::RejectedPreimage,
+        Self::ReplayOfAcceptedSubmission,
+        Self::ConflictingDuplicate,
+        Self::CancelledStale,
+        Self::BudgetExhausted,
+    ];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AcceptedForHostProcessing => "ACCEPTED_FOR_HOST_PROCESSING",

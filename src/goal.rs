@@ -2042,6 +2042,25 @@ impl Goal {
         self.tasks.values().any(Task::has_unknown_side_effect)
     }
 
+    /// H5-A (independent review F1/F2): a publication whose helper lifetime is
+    /// unproven.
+    ///
+    /// `BeginOperation` is durable before the helper starts, so an intent still in
+    /// `Applying` means "this operation may have run and the host cannot prove
+    /// the process is gone". The journal already refuses to replay it; this
+    /// predicate is what lets revocation refuse to *finalize* while it holds, so
+    /// the Owner is never told the write path is closed while a helper might
+    /// still be able to touch the workspace.
+    pub(crate) fn has_unresolved_publication(&self) -> bool {
+        self.tasks.values().any(|task| {
+            task.attempts().iter().any(|attempt| {
+                attempt
+                    .mutation_intent()
+                    .is_some_and(|intent| matches!(intent.state(), MutationIntentState::Applying))
+            })
+        })
+    }
+
     pub(crate) fn has_blocking_state(&self) -> bool {
         !self.blockers.is_empty()
             || self

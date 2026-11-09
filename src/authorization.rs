@@ -449,16 +449,26 @@ impl GrantRevocation {
 
 /// How the Owner decision was obtained. Deliberately typed, and deliberately not
 /// named "authenticated": see the ADR's residual risk R-1.
+///
+/// `TestFixtureV1` (H5-C) is **not an Owner decision**. It is the marker a
+/// disposable test fixture stamps on a grant so that every authority-granting
+/// code path refuses it outside the state root that minted it. It exists so the
+/// Writer E2E does not have to fabricate a production approval, and so a test
+/// grant can never be confused with one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum OwnerAttestation {
     ConsoleLiveNonceV1,
+    /// H5-C test-only attestation. Usable only in a state root carrying a
+    /// matching fixture marker (see `config::test_grant_fixture_id`).
+    TestFixtureV1,
 }
 
 impl OwnerAttestation {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ConsoleLiveNonceV1 => "CONSOLE_LIVE_NONCE_V1",
+            Self::TestFixtureV1 => "TEST_FIXTURE_V1",
         }
     }
 
@@ -466,6 +476,12 @@ impl OwnerAttestation {
     /// principal. It does not, and the value must be reported honestly.
     pub(crate) const fn same_uid_process_resistance(self) -> bool {
         false
+    }
+
+    /// Whether this grant came from the disposable test fixture rather than a
+    /// live Owner decision.
+    pub(crate) const fn is_test_fixture(self) -> bool {
+        matches!(self, Self::TestFixtureV1)
     }
 }
 
@@ -852,6 +868,10 @@ pub(crate) struct GoalWriteGrantV1 {
     revocation: GrantRevocation,
     usage: GrantUsage,
     owner_attestation: OwnerAttestation,
+    /// Present only on a `TEST_FIXTURE_V1` grant: the fixture root identity the
+    /// grant is confined to. Absent for every Owner-issued grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_fixture_id: Option<String>,
 }
 
 impl GoalWriteGrantV1 {
@@ -899,6 +919,22 @@ impl GoalWriteGrantV1 {
         self.owner_attestation
     }
 
+    pub(crate) fn test_fixture_id(&self) -> Option<&str> {
+        self.test_fixture_id.as_deref()
+    }
+
+    /// H5-C: stamp a grant as a disposable test-fixture grant.
+    ///
+    /// This grants nothing by itself: grant resolution refuses a
+    /// `TEST_FIXTURE_V1` grant unless the running state root carries a marker
+    /// with the same fixture id, and only the feature-gated harness can create
+    /// the marker. There is no MCP surface that reaches this.
+    pub(crate) fn stamp_test_fixture(mut self, fixture_id: String) -> Self {
+        self.owner_attestation = OwnerAttestation::TestFixtureV1;
+        self.test_fixture_id = Some(fixture_id);
+        self
+    }
+
     pub(crate) fn allowed_operations(&self) -> &[GrantOperation] {
         &self.allowed_operations
     }
@@ -944,6 +980,20 @@ impl GoalWriteGrantV1 {
             return Err(GrantError::Corrupt("grant has an invalid operation set"));
         }
         WriteBudgetV1::new(self.budget.max_operations, self.budget.max_bytes)?;
+        match (self.owner_attestation, self.test_fixture_id.as_deref()) {
+            (OwnerAttestation::TestFixtureV1, Some(id)) if !id.is_empty() && id.len() <= 64 => {}
+            (OwnerAttestation::TestFixtureV1, _) => {
+                return Err(GrantError::Corrupt(
+                    "a test-fixture grant must name its fixture root",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(GrantError::Corrupt(
+                    "an Owner-issued grant must not carry a fixture identity",
+                ));
+            }
+            (_, None) => {}
+        }
         let issued = parse_utc_rfc3339_seconds(&self.issued_at)
             .ok_or(GrantError::Corrupt("grant issue time is malformed"))?;
         let expires = parse_utc_rfc3339_seconds(&self.expires_at)
@@ -1418,6 +1468,7 @@ impl AuthorizationLedgerV1 {
             revocation: GrantRevocation::not_revoked(),
             usage: GrantUsage::default(),
             owner_attestation: OwnerAttestation::ConsoleLiveNonceV1,
+            test_fixture_id: None,
         };
         grant.validate()?;
         Ok(grant)
@@ -1431,6 +1482,30 @@ impl AuthorizationLedgerV1 {
         decision_id: String,
         nonce_sha256: &str,
         now: &str,
+    ) -> Result<(), GrantError> {
+        self.record_approved_with_attestation(
+            grant,
+            request_id,
+            decision_id,
+            nonce_sha256,
+            now,
+            OwnerAttestation::ConsoleLiveNonceV1,
+        )
+    }
+
+    /// [`Self::record_approved`] with an explicit decision attestation.
+    ///
+    /// The only caller that passes anything but `ConsoleLiveNonceV1` is the
+    /// feature-gated H5-C fixture issuance, which stamps `TestFixtureV1` so the
+    /// resulting grant is refused outside the disposable fixture root.
+    pub(crate) fn record_approved_with_attestation(
+        &mut self,
+        grant: GoalWriteGrantV1,
+        request_id: &str,
+        decision_id: String,
+        nonce_sha256: &str,
+        now: &str,
+        attestation: OwnerAttestation,
     ) -> Result<(), GrantError> {
         let pending = self.pending.take().ok_or(GrantError::NoPendingRequest)?;
         if pending.request_id != request_id {
@@ -1455,7 +1530,7 @@ impl AuthorizationLedgerV1 {
             decided_at: now.to_owned(),
             nonce_sha256: Some(nonce_sha256.to_owned()),
             reason: None,
-            owner_attestation: OwnerAttestation::ConsoleLiveNonceV1,
+            owner_attestation: attestation,
         })?;
         self.last_transition_at = Some(now.to_owned());
         Ok(())
@@ -1744,6 +1819,16 @@ impl AuthorizationLedgerV1 {
         {
             return Err(GrantRefusal::Revoked);
         }
+        // H5-C: a fixture grant is authority only inside the disposable state
+        // root that minted it. This is the single resolve path used by the
+        // issuance, stage and publication gates, so there is no second place to
+        // forget it. A fixture grant copied into a real operator state root has
+        // no marker to match and is refused here.
+        if grant.owner_attestation.is_test_fixture()
+            && crate::config::test_grant_fixture_id().as_deref() != grant.test_fixture_id.as_deref()
+        {
+            return Err(GrantRefusal::StateMismatch);
+        }
         let now_seconds = parse_utc_rfc3339_seconds(now).ok_or(GrantRefusal::Expired)?;
         let issued =
             parse_utc_rfc3339_seconds(&grant.issued_at).ok_or(GrantRefusal::StateMismatch)?;
@@ -1838,6 +1923,11 @@ pub(crate) enum GrantError {
     /// A revocation could not take the fence. It is deferred; it is **not**
     /// reported as revoked.
     RevocationDeferred,
+    /// H5-A: a Writer publication is unresolved (an operation intent is still
+    /// `APPLYING`), so the host cannot state that the write path is closed. The
+    /// grant is denied (`REVOKE_REQUESTED`), the revocation is deliberately left
+    /// unfinalized, and nothing reports it as revoked.
+    RevocationBlockedByPublication,
     Io,
 }
 
@@ -1860,6 +1950,7 @@ impl GrantError {
             Self::StateMismatch(_) => "AUTHORIZATION_STATE_MISMATCH",
             Self::FenceTimeout => "AUTHORIZATION_FENCE_BUSY",
             Self::RevocationDeferred => "REVOCATION_DEFERRED",
+            Self::RevocationBlockedByPublication => "REVOCATION_BLOCKED_BY_UNRESOLVED_PUBLICATION",
             Self::Io => "AUTHORIZATION_STATE_IO",
         }
     }
@@ -1876,6 +1967,9 @@ impl std::fmt::Display for GrantError {
                 .write_str("the authorization fence is busy; the operation was not changed"),
             Self::RevocationDeferred => formatter.write_str(
                 "the revocation fence is busy; the grant was not changed and is still active",
+            ),
+            Self::RevocationBlockedByPublication => formatter.write_str(
+                "a Writer publication is unresolved; the grant is already denied (REVOKE_REQUESTED) but the revocation is not finalized while a helper's lifetime is unproven",
             ),
             Self::Io => formatter.write_str("authorization state I/O failed"),
             other => formatter.write_str(other.code()),
@@ -1973,9 +2067,14 @@ impl AuthorizationView {
                     max_operations: grant.budget.max_operations,
                     max_bytes: grant.budget.max_bytes,
                 }),
+                // H5-A (independent review F6): report the *effective* usage the
+                // host actually enforces (the componentwise maximum of the ledger
+                // charge and the Goal anchor's monotonic floor), not the raw
+                // ledger counter. A restored ledger could otherwise make spending
+                // look smaller than it is while enforcement still used the floor.
                 usage: Some(AuthorizationUsageView {
-                    operations: grant.usage.operations,
-                    bytes: grant.usage.bytes,
+                    operations: grant.usage.operations.max(anchor.usage_operations()),
+                    bytes: grant.usage.bytes.max(anchor.usage_bytes()),
                 }),
                 owner_attestation: grant.owner_attestation.as_str(),
                 same_uid_process_resistance: grant.owner_attestation.same_uid_process_resistance(),
@@ -2010,9 +2109,17 @@ impl AuthorizationView {
                 allowed_operations: None,
                 budget: None,
                 usage: None,
-                owner_attestation: OwnerAttestation::ConsoleLiveNonceV1.as_str(),
-                same_uid_process_resistance: OwnerAttestation::ConsoleLiveNonceV1
-                    .same_uid_process_resistance(),
+                // The attestation still describes the durable grant record, so a
+                // refused fixture grant is not silently reported as an Owner
+                // decision.
+                owner_attestation: ledger
+                    .latest_grant()
+                    .map(|grant| grant.owner_attestation.as_str())
+                    .unwrap_or(OwnerAttestation::ConsoleLiveNonceV1.as_str()),
+                same_uid_process_resistance: ledger
+                    .latest_grant()
+                    .map(|grant| grant.owner_attestation.same_uid_process_resistance())
+                    .unwrap_or(false),
             },
         }
     }
