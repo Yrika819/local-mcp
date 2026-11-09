@@ -609,7 +609,21 @@ fn verify_platform_sandbox_support(
     }
 }
 
+/// Unbounded, platform-parity entry point.
+///
+/// H4-C: production publication now goes through [`run_bounded`], so this
+/// wrapper has no production caller in the `local-mcp` binary. It is kept (and
+/// exercised by the sandbox tests) as the reference shape callers use when no
+/// deadline is wanted, rather than deleting the seam and inviting an unbounded
+/// wait to be reintroduced ad hoc.
 #[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "production publication uses run_bounded; this is the no-deadline shape used by tests"
+    )
+)]
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -635,9 +649,12 @@ pub async fn run(
 /// future Windows caller keeps the same call signature as the Unix one, rather
 /// than reintroducing unbounded waits by accident.
 #[cfg(not(unix))]
-#[allow(
-    dead_code,
-    reason = "Windows keeps the unbounded shape for signature parity; the publication helper uses run_bounded"
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Windows keeps the unbounded shape for signature parity; the publication helper uses run_bounded"
+    )
 )]
 pub async fn run(
     command: &[String],
