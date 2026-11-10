@@ -29,12 +29,17 @@ const SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET: u64 = 4;
 /// inventing evidence for a Goal that never assembled one.
 const SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION: u64 = 5;
 
+/// Schema 6 is the last version without the durable publication quarantine
+/// (H5.1-B). A schema-6 Goal has no process-liveness witness, so an `APPLYING`
+/// journal intent is migrated to `UNPROVEN` and stays unresolved.
+const SCHEMA_WITHOUT_PUBLICATION_QUARANTINE: u64 = 6;
+
 /// The migration chain above is written against a specific current schema. If a
 /// future change advances `GOAL_SCHEMA_VERSION` without extending the chain,
 /// refuse to compile rather than silently routing a newer durable document
 /// through an older migration step.
 const _: () = assert!(
-    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION + 1,
+    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_PUBLICATION_QUARANTINE + 1,
     "goal schema migration chain must be extended when GOAL_SCHEMA_VERSION advances"
 );
 
@@ -417,6 +422,15 @@ impl TaskStore {
                 "managed_workspace_verification_evidence".to_owned(),
                 Value::Null,
             );
+            // A legacy terminal Goal predates the quarantine and cannot carry an
+            // unresolved publication, so the explicit value is NOT_STARTED.
+            legacy_object.insert(
+                "publication_quarantine".to_owned(),
+                serde_json::to_value(
+                    crate::publication_quarantine::PublicationQuarantine::not_started(),
+                )
+                .expect("quarantine record is serializable"),
+            );
             let goal: Goal = serde_json::from_value(legacy).map_err(|error| {
                 OrchestratorError::CorruptGoal(format!(
                     "legacy durable Goal shape is invalid: {error}"
@@ -451,6 +465,9 @@ impl TaskStore {
         if schema_version == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION {
             return Self::decode_pre_managed_workspace_verification(value);
         }
+        if schema_version == SCHEMA_WITHOUT_PUBLICATION_QUARANTINE {
+            return Self::decode_pre_publication_quarantine(value);
+        }
         if schema_version != GOAL_SCHEMA_VERSION as u64 {
             return Err(OrchestratorError::UnsupportedSchema(schema_version));
         }
@@ -465,6 +482,11 @@ impl TaskStore {
             return Err(OrchestratorError::CorruptGoal(format!(
                 "schema-{GOAL_SCHEMA_VERSION} durable Goal must state managed-workspace \
                  verification evidence"
+            )));
+        }
+        if !object.contains_key("publication_quarantine") {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{GOAL_SCHEMA_VERSION} durable Goal must state a publication quarantine"
             )));
         }
         // Authorization B added fields to the EXTERNAL sub-record only. The
@@ -641,16 +663,95 @@ impl TaskStore {
         );
         object.insert(
             "schema_version".to_owned(),
+            Value::from(SCHEMA_WITHOUT_PUBLICATION_QUARANTINE),
+        );
+        // Continue through the shared publication-quarantine step so a stored
+        // schema-5 Goal is normalized by exactly the same code as a stored
+        // schema-6 Goal.
+        Self::decode_pre_publication_quarantine(migrated)
+    }
+
+    /// Migrate a schema-6 durable Goal to schema 7 by stating its publication
+    /// quarantine.
+    ///
+    /// A schema-6 Goal armed no helper lock, so the migration has no
+    /// process-liveness witness to copy. If any Task's latest mutation intent is
+    /// still `APPLYING`, the only honest record is `UNPROVEN`: the old host may
+    /// have left a helper running. If nothing is `APPLYING`, `NOT_STARTED` is
+    /// exact. Neither branch invents quiescence.
+    fn decode_pre_publication_quarantine(value: Value) -> Result<Goal, OrchestratorError> {
+        use crate::publication_quarantine::PublicationQuarantine;
+
+        let mut migrated = value;
+        let object = migrated.as_object_mut().expect("validated object");
+        if object.contains_key("publication_quarantine") {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{SCHEMA_WITHOUT_PUBLICATION_QUARANTINE} durable Goal must not carry a \
+                 publication quarantine"
+            )));
+        }
+        let revision = object.get("revision").and_then(Value::as_u64).unwrap_or(1);
+        let updated_at = object
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .unwrap_or("1970-01-01T00:00:00Z")
+            .to_owned();
+        let quarantine = match Self::applying_intent(object) {
+            Some((operation_id, task_id, attempt_id)) => {
+                let record = PublicationQuarantine::legacy_applying(
+                    operation_id,
+                    task_id,
+                    attempt_id,
+                    revision,
+                    updated_at,
+                );
+                serde_json::to_value(record).expect("quarantine record is serializable")
+            }
+            None => serde_json::to_value(PublicationQuarantine::not_started())
+                .expect("quarantine record is serializable"),
+        };
+        object.insert("publication_quarantine".to_owned(), quarantine);
+        object.insert(
+            "schema_version".to_owned(),
             Value::from(GOAL_SCHEMA_VERSION),
         );
         let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
             OrchestratorError::CorruptGoal(format!(
-                "schema-{SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION} durable Goal shape is \
-                 invalid: {error}"
+                "schema-{SCHEMA_WITHOUT_PUBLICATION_QUARANTINE} durable Goal shape is invalid: \
+                 {error}"
             ))
         })?;
         goal.validate()?;
         Ok(goal)
+    }
+
+    /// Find the first Task attempt whose journal is still `APPLYING`.
+    ///
+    /// Used only by the schema-6 migration, which has no lock witness and must
+    /// therefore fail closed to `UNPROVEN` rather than assume the old helper
+    /// exited. The journal shape is read from the raw JSON so the migration does
+    /// not depend on the current Rust struct being able to decode a document it
+    /// is about to upgrade.
+    fn applying_intent(
+        object: &serde_json::Map<String, Value>,
+    ) -> Option<(String, crate::task::TaskId, crate::task::AttemptId)> {
+        let tasks = object.get("tasks")?.as_array()?;
+        for task in tasks {
+            let task_id = task.get("id")?.as_str()?;
+            let attempts = task.get("attempts")?.as_array()?;
+            for attempt in attempts {
+                let intent = attempt.get("mutation_intent")?;
+                if intent.get("state")?.as_str()? != "APPLYING" {
+                    continue;
+                }
+                let operation_id = intent.get("operation_id")?.as_str()?.to_owned();
+                let attempt_id = attempt.get("id")?.as_str()?;
+                let task_id = crate::task::TaskId::parse(task_id).ok()?;
+                let attempt_id = crate::task::AttemptId::parse(attempt_id).ok()?;
+                return Some((operation_id, task_id, attempt_id));
+            }
+        }
+        None
     }
 
     /// Migrate a pre-managed-worktree durable Goal (schema 3) to schema 4.
@@ -971,6 +1072,8 @@ mod tests {
         let mut value = serde_json::to_value(goal).unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("managed_workspace_verification_evidence");
+        // Schema 7's publication quarantine did not exist at these versions.
+        object.remove("publication_quarantine");
         object.insert("schema_version".to_owned(), Value::from(version));
         value
     }

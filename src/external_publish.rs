@@ -34,10 +34,14 @@ use crate::external_model_work::{
 use crate::goal::{Goal, GoalId};
 use crate::mutation::{MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
-use crate::task::{TaskId, TaskStatus, TaskTransitionContext};
+use crate::publication_lock;
+use crate::publication_quarantine::{PublicationTerminationEvidence, PublicationTerminationKind};
+use crate::secure_fs;
+use crate::task::{AttemptId, TaskId, TaskStatus, TaskTransitionContext};
 use crate::task_store::TaskStore;
-use crate::writer::{self, WriteBoundary, WriterError};
+use crate::writer::{self, PublicationLockSpec, WriteBoundary, WriterError};
 use crate::writer_stage::WriteStage;
+use uuid::Uuid;
 
 /// Progress code: every prepared operation was published and journaled.
 pub(crate) const WRITER_PUBLISHED: &str = "WRITER_PUBLISHED";
@@ -201,6 +205,12 @@ fn ensure_writer_publishable(
     attempt_id: &str,
     binding: &GrantBinding,
 ) -> Result<(), OrchestratorError> {
+    if !goal.publication_quarantine_allows_activation() {
+        return Err(OrchestratorError::InvalidDag(
+            "a previous publication quarantine is unresolved; publication is not authorized"
+                .to_owned(),
+        ));
+    }
     if goal.status() != crate::goal::GoalStatus::Running {
         return Err(OrchestratorError::InvalidDag(
             "the Goal is not RUNNING; publication is not authorized".to_owned(),
@@ -222,6 +232,30 @@ fn ensure_writer_publishable(
         ));
     }
     writer::ensure_writer_task_ready_for_attempt(goal, task_id, attempt_id)
+}
+
+/// Host-derived path for one publication's liveness lock.
+///
+/// The operation id is hashed so a client-controlled string cannot escape the
+/// state root, and the random suffix makes two concurrent publishers of the same
+/// journal operation use distinct lock files. Only the publisher that wins the
+/// `BeginOperation` CAS records its lock path in the Goal, so a losing publisher
+/// cannot erase the winner's witness.
+fn publication_lock_path(
+    store: &TaskStore,
+    session_id: &str,
+    goal_id: &GoalId,
+    operation_id: &str,
+    index: u32,
+) -> Result<std::path::PathBuf, OrchestratorError> {
+    let digest = sha256_hex(operation_id.as_bytes());
+    let root = store.state_root().join("publication-locks");
+    let session_dir = root.join(session_id);
+    let goal_dir = session_dir.join(goal_id.as_str());
+    secure_fs::ensure_private_directory(&root, Some(store.state_root()))?;
+    secure_fs::ensure_private_directory(&session_dir, Some(&root))?;
+    secure_fs::ensure_private_directory(&goal_dir, Some(&session_dir))?;
+    Ok(goal_dir.join(format!("{digest}-{index}-{}.lock", Uuid::new_v4())))
 }
 
 /// Publish one prepared external writer intent through the existing host write
@@ -392,8 +426,34 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
         // the Goal revision. Bind `BeginOperation` to the revision the fence
         // produced, not the pre-fence snapshot.
         revision = fence.goal_revision();
+        // Arm the process-liveness witness before the helper can exist. The
+        // path is host-derived and unique per publisher, so a concurrent loser
+        // cannot overwrite the winner's witness.
+        let lock_path =
+            match publication_lock_path(store, &session.id, goal_id, &operation_id, index_u32) {
+                Ok(path) => path,
+                Err(_) => {
+                    return Ok(PublishOutcome::Refused {
+                        code: "WRITER_PUBLICATION_LOCK_UNAVAILABLE",
+                    });
+                }
+            };
+        let lock_token = Uuid::new_v4().to_string();
+        let token_sha256 = sha256_hex(lock_token.as_bytes());
+        if publication_lock::arm(&lock_path, &lock_token).is_err() {
+            return Ok(PublishOutcome::Refused {
+                code: "WRITER_PUBLICATION_LOCK_UNAVAILABLE",
+            });
+        }
+        let host_generation = publication_lock::host_generation().to_owned();
+        let activation_operation_id = operation_id.clone();
+        let activation_attempt_id = attempt_id.clone();
+        let activation_lock_path = lock_path.clone();
+        let activation_token_sha256 = token_sha256.clone();
+        let activation_host_generation = host_generation.clone();
+        let activation_revision = revision;
         let mut already_advanced = false;
-        let begun = store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, _now| {
+        let begun = store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, now| {
             // Re-check Goal status and the live WorkItem binding inside the
             // same CAS as BeginOperation: a cancellation or WorkItem
             // replacement after the fence was acquired must still win.
@@ -422,6 +482,23 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                     "the operation already progressed".to_owned(),
                 ));
             }
+            let attempt_uuid = AttemptId::parse(&activation_attempt_id).map_err(|_| {
+                OrchestratorError::CorruptGoal("writer Attempt identity is malformed".to_owned())
+            })?;
+            // H5.1-B linearization point: the durable quarantine names this
+            // operation before the helper is spawned. If the host dies after
+            // this commit and before the spawn, recovery can still see an
+            // armed publication and must prove quiescence before clearing it.
+            goal.activate_publication_quarantine(
+                activation_operation_id.clone(),
+                task_id.clone(),
+                attempt_uuid,
+                activation_lock_path.clone(),
+                activation_token_sha256.clone(),
+                activation_revision,
+                activation_host_generation.clone(),
+                now,
+            )?;
             goal.task_advance_latest_mutation_intent(
                 task_id,
                 &operation_id,
@@ -433,6 +510,7 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
             // A concurrent client won the same operation, or the Task/WorkItem
             // moved on. This is a typed refusal, not a persistence failure.
             Err(error @ OrchestratorError::RevisionConflict { .. }) => {
+                let _ = publication_lock::probe_and_abort(&lock_path);
                 if already_advanced {
                     return Ok(PublishOutcome::Refused {
                         code: "WRITER_PUBLICATION_CONFLICT",
@@ -441,6 +519,7 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                 return Err(error);
             }
             Err(OrchestratorError::InvalidDag(_)) => {
+                let _ = publication_lock::probe_and_abort(&lock_path);
                 return Ok(PublishOutcome::Refused {
                     code: if already_advanced {
                         "WRITER_PUBLICATION_CONFLICT"
@@ -450,18 +529,71 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
                 });
             }
             // Genuine durable corruption is never relabelled as a conflict.
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _ = publication_lock::probe_and_abort(&lock_path);
+                return Err(error);
+            }
         }
-        let output = match boundary
+        let lock_spec = PublicationLockSpec {
+            path: lock_path.clone(),
+            token: lock_token.clone(),
+        };
+        let write_result = boundary
             .write(writer::WriterWriteRequest {
                 path: &paths[index],
                 parent: &parents[index],
                 content,
                 expected_preimage: &expected_preimages[index],
                 request_id: &request_ids[index],
+                publication_lock: Some(&lock_spec),
             })
-            .await
-        {
+            .await;
+        // The helper holds the lock for its whole lifetime. Acquiring it here is
+        // a process-liveness proof, not a file observation: success means no
+        // helper (and no descendant that inherited the descriptor) is in its
+        // publication critical section. The ABORTED write is the one-way latch
+        // that stops a helper which has not started yet.
+        let probe = publication_lock::probe_and_abort(&lock_path);
+        let (termination_kind, termination_detail) = match probe {
+            publication_lock::QuiescenceProbe::Quiescent => (
+                PublicationTerminationKind::HelperTreeQuiescent,
+                "the host acquired the helper lock and aborted its token",
+            ),
+            publication_lock::QuiescenceProbe::Active => (
+                PublicationTerminationKind::ProbeFailed,
+                "the publication lock is still held by a live process",
+            ),
+            publication_lock::QuiescenceProbe::Unproven(detail) => {
+                (PublicationTerminationKind::ProbeFailed, detail)
+            }
+        };
+        let termination = PublicationTerminationEvidence::new(
+            termination_kind,
+            crate::task_store::utc_now_rfc3339(),
+            host_generation.clone(),
+            termination_detail,
+        );
+        let termination_committed =
+            store.mutate_goal_snapshot(&session.id, goal_id, revision, |goal, now| {
+                goal.record_publication_termination(&operation_id, termination, now)
+            });
+        match termination_committed {
+            Ok(committed) => revision = committed.revision(),
+            Err(_) => {
+                // The helper may be gone, but the durable record could not be
+                // advanced. Leave ACTIVE and report UNKNOWN rather than claim
+                // quiescence that was not durably recorded.
+                return Ok(PublishOutcome::Refused {
+                    code: "WRITER_PUBLICATION_QUARANTINE_UNRECORDED",
+                });
+            }
+        }
+        if probe != publication_lock::QuiescenceProbe::Quiescent {
+            return Ok(PublishOutcome::Refused {
+                code: "WRITER_PUBLICATION_UNKNOWN",
+            });
+        }
+        let output = match write_result {
             Ok(output) => output,
             Err(_) => {
                 // The helper either could not run at all, or ran until its hard

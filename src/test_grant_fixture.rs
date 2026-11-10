@@ -36,7 +36,7 @@
 //! decision, and an honest record of any run that used it must say
 //! `TEST_FIXTURE_V1`.
 
-use crate::authorization::{GoalWriteGrantV1, OwnerAttestation, now_unix_seconds};
+use crate::authorization::GoalWriteGrantV1;
 use crate::authorization_store::{self, AuthorizationGateError};
 use crate::config;
 use crate::goal::GoalId;
@@ -113,38 +113,21 @@ pub(crate) fn issue_test_fixture_grant(
     )
     .map_err(FixtureGrantError::Goal)?;
 
-    let now_text = crate::authorization::format_utc_rfc3339(now_unix_seconds());
     let decision_id = uuid::Uuid::new_v4().to_string();
-    let mut ledger = authorization_store::load_ledger(store, session_id, goal_id.as_str())
-        .map_err(|error| FixtureGrantError::Store(error.code().to_owned()))?
-        .ok_or_else(|| {
-            FixtureGrantError::Store("the pending request was not persisted".to_owned())
-        })?;
-    let grant = ledger
-        .build_grant(&request_id, &nonce_sha256, decision_id.clone(), &now_text)
-        .map_err(|error| FixtureGrantError::Store(error.code().to_owned()))?
-        .stamp_test_fixture(fixture_id);
-    grant
-        .validate()
-        .map_err(|error| FixtureGrantError::Store(error.code().to_owned()))?;
-
-    // Same order as the Owner path: anchor first, then the ledger commit, so a
-    // crash leaves an anchor ahead of the ledger (fail closed) rather than a
-    // ledger record the Goal never observed.
-    authorization_store::record_anchor_grant(store, session_id, goal.id(), &grant)
-        .map_err(|error| FixtureGrantError::Store(error.to_string()))?;
-    ledger
-        .record_approved_with_attestation(
-            grant.clone(),
-            &request_id,
-            decision_id,
-            &nonce_sha256,
-            &now_text,
-            OwnerAttestation::TestFixtureV1,
-        )
-        .map_err(|error| FixtureGrantError::Store(error.code().to_owned()))?;
-    authorization_store::save_ledger(store, &ledger)
-        .map_err(|error| FixtureGrantError::Store(error.code().to_owned()))?;
+    // H5.1-C R2-5: use the production approval discipline (ledger lock,
+    // `matches_goal`, anchor-first write order) with only the attestation stamp
+    // differing. A fixture decision is not allowed to bypass the concurrency and
+    // identity checks the Owner path enforces.
+    let grant = authorization_store::approve_pending_fixture(
+        store,
+        session_id,
+        goal_id.as_str(),
+        &request_id,
+        &nonce,
+        decision_id,
+        fixture_id.to_owned(),
+    )
+    .map_err(FixtureGrantError::Goal)?;
     Ok(grant)
 }
 

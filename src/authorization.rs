@@ -2088,11 +2088,27 @@ impl AuthorizationView {
                     // durable states and this projection must not claim the
                     // finalization write happened. The permission decision is
                     // unchanged; only the reported state is derived from the
-                    // durable grant record.
+                    // durable records.
+                    //
+                    // H5.1-C R2-3: the ledger and the Goal anchor are two
+                    // independent writes. Reporting `REVOKED` from either one
+                    // alone would claim a completed revocation after a crash
+                    // between them. A finalized state therefore requires both:
+                    // the ledger's revocation is final AND the anchor records a
+                    // revocation epoch at or above this grant's generation.
                     GrantRefusal::Revoked => {
-                        match ledger.latest_grant().map(|grant| grant.revocation.state()) {
-                            Some(GrantRevocationState::RevokeRequested) => "REVOKE_REQUESTED",
-                            _ => "REVOKED",
+                        let ledger_finalized = ledger.latest_grant().is_some_and(|grant| {
+                            grant.revocation.state() == GrantRevocationState::Revoked
+                        });
+                        let anchor_finalized = ledger.latest_grant().is_some_and(|grant| {
+                            anchor
+                                .revoked_at_epoch()
+                                .is_some_and(|epoch| epoch >= grant.authorization_epoch)
+                        });
+                        if ledger_finalized && anchor_finalized {
+                            "REVOKED"
+                        } else {
+                            "REVOKE_REQUESTED"
                         }
                     }
                     GrantRefusal::Expired => "EXPIRED",

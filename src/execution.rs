@@ -81,13 +81,23 @@ pub(crate) async fn publish_workspace_write(
     let helper = atomic_publish_helper()?;
     let parent = request.parent.to_path_buf();
     let frame = encode_publish_frame(&request)?;
+    // The helper must be able to open its lock file. The lock directory is
+    // host-derived state, not model input, and the helper writes nothing else
+    // there. On Unix this is the only additional writable root the publication
+    // helper receives; on Windows the sandbox has no writable-root concept.
+    let mut writable_roots = vec![parent.clone()];
+    if let Some(lock) = request.publication_lock
+        && let Some(lock_dir) = lock.path.parent()
+    {
+        writable_roots.push(lock_dir.to_path_buf());
+    }
     // Bounded: a helper that stops responding is terminated and its exit is
     // confirmed instead of holding the publication fence forever.
     let deadline = tokio::time::Instant::now() + PUBLICATION_HELPER_TIMEOUT;
     sandbox::run_bounded(
         &[helper],
         request.parent,
-        std::slice::from_ref(&parent),
+        &writable_roots,
         Some(&frame),
         deadline,
     )
@@ -164,6 +174,14 @@ fn encode_publish_frame(request: &crate::writer::WriterWriteRequest<'_>) -> Resu
             preimage_kind: kind,
             preimage_digest: &digest,
             request_id: request.request_id,
+            lock_path: request
+                .publication_lock
+                .and_then(|lock| lock.path.to_str())
+                .unwrap_or(""),
+            lock_token: request
+                .publication_lock
+                .map(|lock| lock.token.as_str())
+                .unwrap_or(""),
             content: request.content.as_bytes(),
         },
     ))

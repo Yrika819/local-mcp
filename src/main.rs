@@ -57,6 +57,8 @@ mod process_blocking;
 mod process_group;
 #[cfg(windows)]
 mod process_job;
+mod publication_lock;
+mod publication_quarantine;
 mod readiness;
 mod readonly_worker;
 mod replanner;

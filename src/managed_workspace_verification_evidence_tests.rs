@@ -163,6 +163,8 @@ fn document_at_version(goal: &Goal, version: u64) -> Value {
     let mut value = serde_json::to_value(goal).unwrap();
     let object = value.as_object_mut().unwrap();
     object.remove("managed_workspace_verification_evidence");
+    // Schema 7's publication quarantine did not exist at these versions.
+    object.remove("publication_quarantine");
     object.insert("schema_version".to_owned(), json!(version));
     value
 }

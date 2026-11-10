@@ -776,11 +776,19 @@ fn at_e5_042_a_cancel_between_operations_stops_the_publication_journal() {
         },
     );
     // The revision CAS observes the cancellation commit and refuses to journal
-    // the completed operation on a Goal that is no longer RUNNING.
-    assert!(
-        outcome.is_err(),
-        "a cancelled Goal may not continue journaling publication: {outcome:?}"
-    );
+    // the completed operation on a Goal that is no longer RUNNING. The
+    // quarantine's termination evidence is committed in the same revision CAS,
+    // so a cancellation that wins the revision is reported as an honest refusal
+    // rather than a generic error.
+    match outcome {
+        Err(_) => {}
+        Ok(PublishOutcome::Refused { code }) => {
+            assert_eq!(code, "WRITER_PUBLICATION_QUARANTINE_UNRECORDED")
+        }
+        Ok(PublishOutcome::Published { .. }) => {
+            panic!("a cancelled Goal may not continue journaling publication")
+        }
+    }
     let goal = goal_of(&f, &goal_id);
     assert_eq!(goal.status(), GoalStatus::Cancelling);
     assert_ne!(goal.status(), GoalStatus::Completed);

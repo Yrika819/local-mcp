@@ -31,6 +31,7 @@ use crate::external_goal_driver as driver;
 use crate::external_goal_driver::{DriverError, DriverOutcome, DriverRefusal, DriverReport};
 use crate::external_model_store::{
     PlannerSubmissionOutcome, commit_planner_submission, commit_submission, external_state,
+    external_state_mut,
 };
 use crate::external_model_work::{
     MAX_HOST_STEPS_PER_CALL, ModelWorkItem, SubmissionDecision, SubmissionId, SubmissionReceipt,
@@ -1006,6 +1007,7 @@ pub(crate) fn goal_submit(
     if let Err(violation) = check_response_bounds(&request.response) {
         return submit_bounded_refusal(
             store,
+            session,
             &goal,
             &goal_id,
             &request,
@@ -1166,6 +1168,7 @@ fn unknown_work_id_view(
 )]
 fn submit_bounded_refusal(
     store: &TaskStore,
+    session: &config::Session,
     goal: &Goal,
     goal_id: &GoalId,
     request: &GoalSubmitRequest,
@@ -1175,6 +1178,11 @@ fn submit_bounded_refusal(
     code: &'static str,
     detail: String,
 ) -> Result<ExternalGoalSubmitView, GoalApiError> {
+    let task_id = external_state(goal)
+        .ok()
+        .and_then(|state| state.active_work())
+        .and_then(|work| work.task_id())
+        .and_then(|value| TaskId::parse(value).ok());
     let receipt = SubmissionReceipt::new(
         work_id.clone(),
         submission_id.clone(),
@@ -1182,10 +1190,20 @@ fn submit_bounded_refusal(
         SubmissionDecision::RejectedSchema,
         None,
         code,
-        Some(detail),
+        Some(detail.clone()),
         utc_now_rfc3339(),
     );
-    let committed = commit_submission(store, goal.session_id(), goal_id, goal.revision(), receipt)
+    // F3: the receipt, the WorkItem's REJECTED transition and the Task's move
+    // out of RUNNING are one durable commit. Without the Task transition the
+    // Scheduler would see a RUNNING Task with no active WorkItem forever.
+    let committed = store
+        .mutate_goal_snapshot(&session.id, goal_id, goal.revision(), |goal, now| {
+            external_state_mut(goal)?.record_submission(receipt, now)?;
+            if let Some(task_id) = task_id.as_ref() {
+                goal.record_bounded_response_refusal(task_id, code, &detail, now)?;
+            }
+            Ok(())
+        })
         .map_err(GoalApiError::from_orchestrator)?;
     let stored = external_state(&committed)
         .map_err(GoalApiError::from_orchestrator)?
