@@ -1381,3 +1381,201 @@ fn r2_1_recovery_never_clears_a_quarantine_while_the_helper_holds_the_lock() {
     );
     assert!(!quiescent.has_unresolved_publication());
 }
+
+// ---------------------------------------------------------------------------
+// H5.1-B R2-1 — a partial file change with a live helper stays unresolved.
+// ---------------------------------------------------------------------------
+
+/// A boundary that leaves a partial file and keeps the helper lock held.
+struct HoldingPartialBoundary {
+    held: std::sync::Mutex<Option<crate::publication_lock::HelperPublicationLock>>,
+}
+
+impl HoldingPartialBoundary {
+    fn new() -> Self {
+        Self {
+            held: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn release(&self) {
+        drop(self.held.lock().unwrap().take());
+    }
+}
+
+impl WriteBoundary for HoldingPartialBoundary {
+    fn write<'a>(
+        &'a self,
+        request: WriterWriteRequest<'a>,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<crate::sandbox::Output>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let spec = request
+                .publication_lock
+                .expect("the EXTERNAL publication path arms a lock");
+            let held = crate::publication_lock::claim_for_helper(&spec.path, &spec.token)
+                .expect("the helper acquires the armed publication lock");
+            *self.held.lock().unwrap() = Some(held);
+            let bytes = request.content.as_bytes();
+            let half = bytes.len() / 2;
+            std::fs::write(request.path, &bytes[..half])?;
+            anyhow::bail!("injected partial publication with a live helper")
+        })
+    }
+}
+
+#[test]
+fn r2_1_a_partial_file_change_with_a_live_helper_keeps_the_quarantine() {
+    let f = fixture("r2-1-partial");
+    let content = "fn main() { /* partial publication */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+    let boundary = HoldingPartialBoundary::new();
+
+    let outcome = run_publication(&f, &goal_id, &task_id, &operation_id, &boundary);
+    match outcome {
+        Ok(PublishOutcome::Refused { code }) => {
+            assert_eq!(code, "WRITER_PUBLICATION_UNKNOWN", "{code}")
+        }
+        other => panic!("a held helper lock must refuse the publication: {other:?}"),
+    }
+
+    // The file is neither the preimage nor the postimage. The journal must not
+    // be treated as not performed, and the quarantine must stay unresolved even
+    // though the file is now observably "different".
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        goal.has_unresolved_publication(),
+        "a partial write with a live helper must keep the quarantine unresolved"
+    );
+    assert_eq!(
+        goal.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::Unproven
+    );
+
+    // Recovery observes the mismatch and blocks the Task; it never clears the
+    // quarantine from the file observation.
+    goal_api::goal_resume(
+        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+        &f.session,
+        &f.store,
+    )
+    .expect("goal_resume observes without clearing the quarantine");
+    let recovered = goal_of(&f, &goal_id);
+    assert!(
+        recovered.has_unresolved_publication(),
+        "goal_resume must not clear a quarantine whose helper still holds the lock"
+    );
+    assert_eq!(
+        recovered.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::Unproven
+    );
+    let reconciled_intent = intent(&f, &goal_id, &task_id);
+    assert_ne!(
+        reconciled_intent.state(),
+        MutationIntentState::ReconciledPerformed,
+        "a partial file must never be reconciled as fully performed"
+    );
+
+    let error =
+        crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+            .expect_err("revocation must not finalize over a held helper lock");
+    assert_eq!(error.code(), "REVOCATION_BLOCKED_BY_UNRESOLVED_PUBLICATION");
+
+    // Releasing the lock proves quiescence, but the journal's UNKNOWN side
+    // effect still blocks completion and revocation until it is reconciled.
+    boundary.release();
+    goal_api::goal_resume(
+        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+        &f.session,
+        &f.store,
+    )
+    .expect("goal_resume probes the released lock");
+    let quiescent = goal_of(&f, &goal_id);
+    assert_eq!(
+        quiescent.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::QuiescentVerified
+    );
+    // The process is proven gone, so the publication quarantine is cleared. The
+    // mutation outcome is still UNKNOWN, which blocks the Task (and therefore
+    // completion) until explicit reconciliation. It is never guessed as
+    // NOT_PERFORMED, and it never blocks on an unproven process.
+    assert_eq!(
+        intent(&f, &goal_id, &task_id).state(),
+        MutationIntentState::Unknown
+    );
+    let task = &quiescent.tasks()[&task_id];
+    assert!(
+        task.blockers()
+            .iter()
+            .any(|blocker| blocker.code() == "MUTATION_RECONCILIATION_REQUIRED"),
+        "an UNKNOWN mutation outcome must remain blocked: {:?}",
+        task.blockers()
+    );
+    assert!(!quiescent.has_unresolved_publication());
+}
+
+#[test]
+fn r2_1_concurrent_revoke_and_resume_cannot_clear_a_held_quarantine() {
+    let f = fixture("r2-1-concurrent");
+    let content = "fn main() { /* concurrent revoke/resume */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+    let boundary = HoldingBoundary::new();
+    let _ = run_publication(&f, &goal_id, &task_id, &operation_id, &boundary);
+
+    let revoke_store = f.store.clone();
+    let revoke_session = f.session.id.clone();
+    let revoke_goal = goal_id.clone();
+    let revoke = std::thread::spawn(move || {
+        crate::authorization_store::revoke_active(
+            &revoke_store,
+            &revoke_session,
+            revoke_goal.as_str(),
+            None,
+        )
+    });
+
+    let resume_store = f.store.clone();
+    let resume_session = f.session.clone();
+    let resume_goal = goal_id.clone();
+    let resume = std::thread::spawn(move || {
+        goal_api::goal_resume(
+            &json!({"session_id": resume_session.id, "goal_id": resume_goal.as_str()}),
+            &resume_session,
+            &resume_store,
+        )
+    });
+
+    let _ = resume.join().unwrap();
+    // The revocation anchor write can make the concurrent resume's CAS stale.
+    // Re-running on the current revision must still observe the held lock.
+    goal_api::goal_resume(
+        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+        &f.session,
+        &f.store,
+    )
+    .expect("a later resume observes the held lock without clearing it");
+
+    let error = revoke
+        .join()
+        .unwrap()
+        .expect_err("revocation must not finalize over a held helper lock");
+    assert_eq!(error.code(), "REVOCATION_BLOCKED_BY_UNRESOLVED_PUBLICATION");
+    let goal = goal_of(&f, &goal_id);
+    assert_eq!(
+        goal.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::Unproven
+    );
+    let ledger = crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+        .unwrap()
+        .expect("a ledger exists");
+    assert_eq!(
+        ledger
+            .latest_grant()
+            .expect("a grant exists")
+            .revocation()
+            .state(),
+        crate::authorization::GrantRevocationState::RevokeRequested
+    );
+    boundary.release();
+}
