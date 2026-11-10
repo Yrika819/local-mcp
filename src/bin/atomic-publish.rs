@@ -18,14 +18,21 @@
 //! unambiguous and no two distinct requests share a byte stream.
 //!
 //! ```text
-//! magic      : b"local-mcp/atomic-publish/v1\n"
+//! magic      : b"local-mcp/atomic-publish/v2\n"
 //! parent     : u32 len | bytes
 //! target     : u32 len | bytes
 //! preimage   : u8 kind                  (0 = ABSENT, 1 = SHA256)
 //!               kind == 1 => u32 len | lowercase hex digest
 //! request id : u32 len | bytes
+//! lock path  : u32 len | bytes          (empty = no lock witness)
+//! lock token : u32 len | bytes          (empty = no lock witness)
 //! content    : u64 len | bytes
 //! ```
+//!
+//! The helper takes the publication lock before it reads the workspace or
+//! writes anything, and holds it until this process exits. The host proves the
+//! helper is gone by acquiring the same lock; see `publication_lock` for why a
+//! PID is not evidence.
 
 // This binary is a thin, test-free entry point: the wire format is covered by
 // `atomic_publish_frame`'s own tests and the commit itself by `workspace_publish`'s.
@@ -43,6 +50,9 @@ mod workspace_publish;
 
 #[path = "../atomic_publish_frame.rs"]
 mod atomic_publish_frame;
+
+#[path = "../publication_lock.rs"]
+mod publication_lock;
 
 fn main() {
     let mut input = Vec::new();
@@ -71,6 +81,25 @@ fn main() {
 
     let parent = std::path::PathBuf::from(&request.parent);
     let target = std::path::PathBuf::from(&request.target);
+
+    // Quiescence witness: acquire the host-armed lock *before* touching the
+    // workspace, and keep it for the whole publication. A refusal here means the
+    // host either aborted this operation or never armed it, so this process must
+    // not write anything.
+    let _publication_lock = if request.lock_path.is_empty() {
+        None
+    } else {
+        match crate::publication_lock::claim_for_helper(
+            std::path::Path::new(&request.lock_path),
+            &request.lock_token,
+        ) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("atomic-publish refused its publication lock: {error}");
+                std::process::exit(66);
+            }
+        }
+    };
 
     match workspace_publish::publish(workspace_publish::PublishRequest {
         destination: &target,

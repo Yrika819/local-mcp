@@ -557,10 +557,11 @@ fn at_e5_039b_a_failed_complete_operation_commit_keeps_the_operation_applying() 
     let content = "fn main() { /* complete */ }\n";
     let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
 
-    // The publication loop performs: anchor usage floor, BeginOperation commit,
-    // publish, CompleteOperation commit. Fault the third commit of this store
+    // The publication loop performs: anchor usage floor (1), BeginOperation
+    // commit (2), publication-lock termination evidence commit (3), and the
+    // CompleteOperation commit (4). Fault the fourth commit of this store
     // instance (CompleteOperation).
-    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(3));
+    let failing = TaskStore::with_fault(f.root.join("state"), FaultPoint::BeforeReplaceOnCommit(4));
     let goal = goal_of(&f, &goal_id);
     let stage = external_writer::verify_prepared_stage(
         &failing,
@@ -1235,4 +1236,148 @@ fn at_e5_050_revocation_is_not_finalized_while_a_publication_is_unresolved() {
             .state(),
         crate::authorization::GrantRevocationState::Revoked
     );
+}
+
+// ---------------------------------------------------------------------------
+// H5.1-B R2-1 negative control — recovery cannot clear a quarantine whose
+// helper still holds the publication lock.
+// ---------------------------------------------------------------------------
+
+/// A `WriteBoundary` that leaves the publication helper lock held.
+///
+/// The host's real helper is a separate process; this boundary models "the
+/// helper is still alive after the host's attempt returned" with an actual OS
+/// file lock held by a live open file description. The lock is dropped only when
+/// the test explicitly releases it, so every recovery path observes the same
+/// `Active` quiescence probe a live helper would produce.
+struct HoldingBoundary {
+    held: std::sync::Mutex<Option<crate::publication_lock::HelperPublicationLock>>,
+}
+
+impl HoldingBoundary {
+    fn new() -> Self {
+        Self {
+            held: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn release(&self) {
+        drop(self.held.lock().unwrap().take());
+    }
+}
+
+impl WriteBoundary for HoldingBoundary {
+    fn write<'a>(
+        &'a self,
+        request: WriterWriteRequest<'a>,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<crate::sandbox::Output>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let spec = request
+                .publication_lock
+                .expect("the EXTERNAL publication path arms a lock");
+            let held = crate::publication_lock::claim_for_helper(&spec.path, &spec.token)
+                .expect("the helper acquires the armed publication lock");
+            *self.held.lock().unwrap() = Some(held);
+            std::fs::write(request.path, request.content.as_bytes())?;
+            Ok(crate::sandbox::Output {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                command_start: crate::sandbox::CommandStart::Proven,
+            })
+        })
+    }
+}
+
+/// R2-1 negative control: an `APPLYING` publication whose helper is still alive
+/// must not lose its quarantine through `goal_resume`, and revocation must not
+/// finalize while the helper lock remains held.
+///
+/// The pre-fix failure mode was: recovery reconciled the journal from file
+/// observations, `has_unresolved_publication()` became false, and a revocation
+/// was reported `REVOKED` while the helper could still write. This test keeps a
+/// real lock held across the whole recovery path.
+#[test]
+fn r2_1_recovery_never_clears_a_quarantine_while_the_helper_holds_the_lock() {
+    let f = fixture("r2-1-holding");
+    let content = "fn main() { /* helper still alive */ }\n";
+    let (goal_id, task_id, operation_id) = prepared_writer(&f, content);
+    let boundary = HoldingBoundary::new();
+
+    let outcome = run_publication(&f, &goal_id, &task_id, &operation_id, &boundary);
+    match outcome {
+        Ok(PublishOutcome::Refused { code }) => {
+            assert_eq!(code, "WRITER_PUBLICATION_UNKNOWN", "{code}")
+        }
+        other => panic!("a held helper lock must refuse the publication: {other:?}"),
+    }
+
+    // The helper is alive: the durable quarantine is UNPROVEN and the journal is
+    // still APPLYING. File content matching the intent is irrelevant here.
+    let goal = goal_of(&f, &goal_id);
+    assert!(
+        goal.has_unresolved_publication(),
+        "the held helper lock must keep the quarantine unresolved"
+    );
+    assert_eq!(
+        goal.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::Unproven,
+        "a failed active probe must be UNPROVEN, never QUIESCENT_VERIFIED"
+    );
+    assert_eq!(file_content(&f), content);
+
+    // Recovery observes the matching file, but the quarantine stays unresolved
+    // because the process-liveness witness still says ACTIVE.
+    goal_api::goal_resume(
+        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+        &f.session,
+        &f.store,
+    )
+    .expect("goal_resume observes without clearing the quarantine");
+    let recovered = goal_of(&f, &goal_id);
+    assert!(
+        recovered.has_unresolved_publication(),
+        "goal_resume must not clear a quarantine whose helper still holds the lock"
+    );
+    assert_eq!(
+        recovered.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::Unproven
+    );
+
+    // Revocation remains blocked: the host cannot honestly claim REVOKED.
+    let error =
+        crate::authorization_store::revoke_active(&f.store, &f.session.id, goal_id.as_str(), None)
+            .expect_err("revocation must not finalize over a held helper lock");
+    assert_eq!(error.code(), "REVOCATION_BLOCKED_BY_UNRESOLVED_PUBLICATION");
+    let ledger = crate::authorization_store::load_ledger(&f.store, &f.session.id, goal_id.as_str())
+        .unwrap()
+        .expect("a ledger exists");
+    assert_eq!(
+        ledger
+            .latest_grant()
+            .expect("a grant exists")
+            .revocation()
+            .state(),
+        crate::authorization::GrantRevocationState::RevokeRequested,
+        "the durable revocation state must stay REVOKE_REQUESTED, never REVOKED"
+    );
+
+    // Only after the helper releases the lock can a later resume prove
+    // quiescence and move to QUIESCENT_VERIFIED.
+    boundary.release();
+    goal_api::goal_resume(
+        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+        &f.session,
+        &f.store,
+    )
+    .expect("goal_resume probes the released lock");
+    let quiescent = goal_of(&f, &goal_id);
+    assert_eq!(
+        quiescent.publication_quarantine().state(),
+        crate::publication_quarantine::PublicationQuiescence::QuiescentVerified,
+        "a released lock is the only proof that may clear the quarantine"
+    );
+    assert!(!quiescent.has_unresolved_publication());
 }

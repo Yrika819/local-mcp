@@ -179,11 +179,51 @@ impl DriverError {
 /// The function performs exactly one step. The API layer applies the caller's
 /// `max_host_steps` budget, so a single call can never loop unbounded, and no
 /// Session lock is held across model work (the client owns inference).
+/// Reconcile the publication quarantine from the host's process-liveness witness
+/// before the driver acts.
+///
+/// This is a *lock* probe, never a file observation. A still-held lock stays
+/// unresolved and blocks every new host step; a free, aborted lock becomes
+/// `QUIESCENT_VERIFIED`. If the probe cannot be persisted the driver refuses
+/// rather than acting on a stale in-memory view.
+fn reconcile_publication_quarantine(
+    store: &TaskStore,
+    session: &config::Session,
+    goal: &Goal,
+) -> Result<Goal, DriverError> {
+    if !goal.publication_quarantine().is_unresolved() {
+        return Ok(goal.clone());
+    }
+    match store.mutate_goal_snapshot(&session.id, goal.id(), goal.revision(), |goal, now| {
+        goal.reconcile_publication_quarantine(now, crate::publication_lock::host_generation())?;
+        Ok(())
+    }) {
+        Ok(updated) => Ok(updated),
+        // A concurrent host already advanced the Goal. Re-read it; its
+        // quarantine is the authority, not this stale snapshot.
+        Err(OrchestratorError::RevisionConflict { .. }) => store
+            .load_goal(&session.id, goal.id())
+            .map_err(DriverError::Persistence),
+        Err(error) => Err(DriverError::Persistence(error)),
+    }
+}
+
 pub(crate) async fn advance_external_step(
     store: &TaskStore,
     session: &config::Session,
     goal: &Goal,
 ) -> Result<DriverReport, DriverError> {
+    let reconciled = reconcile_publication_quarantine(store, session, goal)?;
+    if reconciled.publication_quarantine().is_unresolved() {
+        return Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code: "PUBLICATION_QUARANTINE_UNRESOLVED",
+                detail: "a publication helper's lifetime is unproven; the host will not issue or advance work until the helper lock is proven free"
+                    .to_owned(),
+            },
+        )));
+    }
+    let goal = &reconciled;
     // E5-D: an EXTERNAL managed Goal must reach ACTIVE through the same host
     // preparation path the CODEX runner uses, before any Planner/Writer work can
     // be issued. The execution-root gate then revalidates the exact worktree on
@@ -869,6 +909,15 @@ fn issue_writer_work_item(
     goal: &Goal,
     task_id: &TaskId,
 ) -> Result<DriverReport, DriverError> {
+    if goal.publication_quarantine().is_unresolved() {
+        return Ok(DriverReport::reused(DriverOutcome::Refused(
+            DriverRefusal::HostStepRefused {
+                code: "PUBLICATION_QUARANTINE_UNRESOLVED",
+                detail: "a Writer WorkItem cannot be issued while a previous publication's helper lifetime is unproven"
+                    .to_owned(),
+            },
+        )));
+    }
     match external_writer::issue_external_writer_work_item(
         store,
         session,

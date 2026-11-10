@@ -436,6 +436,59 @@ pub(crate) fn approve_pending(
     Ok(grant)
 }
 
+/// Fixture-only approval used by the H5-C disposable test-grant path.
+///
+/// H5.1-C R2-5: the fixture must not bypass the production ledger discipline.
+/// This function takes the same per-Goal ledger lock, re-reads the ledger under
+/// that lock, and runs the same `matches_goal` identity check as
+/// [`approve_pending`]. The only difference is the attestation stamp, which is
+/// what makes the grant unusable outside a marked fixture root.
+#[cfg(feature = "test-grant-fixture")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The fixture approval takes the same identity channels as the production approval plus the fixture id."
+)]
+pub(crate) fn approve_pending_fixture(
+    store: &TaskStore,
+    session_id: &str,
+    goal_id: &str,
+    request_id: &str,
+    nonce: &str,
+    decision_id: String,
+    fixture_id: String,
+) -> Result<GoalWriteGrantV1, AuthorizationGateError> {
+    let parsed_goal = GoalId::parse(goal_id)
+        .map_err(|_| GrantError::Corrupt("authorization goal id is malformed"))?;
+    let goal = store
+        .load_goal(session_id, &parsed_goal)
+        .map_err(|_| GrantError::Io)?;
+    let nonce_sha256 = crate::authorization::nonce_sha256(nonce);
+    let now = crate::authorization::format_utc_rfc3339(crate::authorization::now_unix_seconds());
+    let guard = acquire_ledger_lock(store, session_id, goal_id)?;
+    let mut ledger =
+        load_with_lock(store, session_id, goal_id, &guard)?.ok_or(GrantError::NoPendingRequest)?;
+    // The same Goal-identity binding the production approval enforces. A fixture
+    // grant must not be issued against a repurposed or transplanted Goal either.
+    ledger.matches_goal(&goal)?;
+    let grant = ledger
+        .build_grant(request_id, &nonce_sha256, decision_id.clone(), &now)?
+        .stamp_test_fixture(fixture_id);
+    grant.validate()?;
+    // Anchor first, ledger second: the same crash window as the Owner path. A
+    // crash here leaves an anchor ahead of the ledger, which fails closed.
+    record_anchor_grant(store, session_id, goal.id(), &grant).map_err(|_| GrantError::Io)?;
+    ledger.record_approved_with_attestation(
+        grant.clone(),
+        request_id,
+        decision_id,
+        &nonce_sha256,
+        &now,
+        crate::authorization::OwnerAttestation::TestFixtureV1,
+    )?;
+    save_ledger(store, &ledger)?;
+    Ok(grant)
+}
+
 /// Deny one pending request. Called only by the OCS.
 pub(crate) fn deny_pending(
     store: &TaskStore,

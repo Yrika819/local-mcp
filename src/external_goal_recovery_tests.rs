@@ -451,6 +451,11 @@ fn a_pre_e3_schema_five_document_migrates_to_codex_and_gains_no_external_state()
         .as_object_mut()
         .unwrap()
         .remove("managed_workspace_verification_evidence");
+    // Schema 7's publication quarantine did not exist at schema 5.
+    document
+        .as_object_mut()
+        .unwrap()
+        .remove("publication_quarantine");
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
 
     let reloaded = f.store.load_goal(&f.session.id, goal.id()).unwrap();

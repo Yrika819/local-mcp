@@ -1331,6 +1331,12 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
 /// The reconciliation half of a resume, shared by the ordinary resume path and
 /// the failed-task replan request path.
 fn resume_recovery_only(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
+    // H5.1-B: the publication quarantine is reconciled by a process-liveness
+    // probe only. It is deliberately ordered before the journal reconciliation
+    // so a resumed host proves (or fails to prove) helper quiescence from the
+    // lock witness rather than from whatever the file reconciliation finds.
+    let publication_quarantine_reconciled =
+        goal.reconcile_publication_quarantine(now, crate::publication_lock::host_generation())?;
     let mutation_reconciled = mutation_recovery::reconcile_goal_mutations(goal, now)?;
     goal.recover_stale_running(now)?;
     reconcile_legacy_readonly_timeout_failures(goal, now)?;
@@ -1339,7 +1345,11 @@ fn resume_recovery_only(goal: &mut Goal, now: &str) -> Result<(), OrchestratorEr
     reconcile_safe_writer_blocked_tasks(goal, now)?;
     reconcile_readonly_transport_retryable_tasks(goal, now)?;
     let readonly_plan_reconciled = reconcile_readonly_plan_contract_failures(goal, now)?;
-    if mutation_reconciled || legacy_writer_reconciled || readonly_plan_reconciled {
+    if mutation_reconciled
+        || publication_quarantine_reconciled
+        || legacy_writer_reconciled
+        || readonly_plan_reconciled
+    {
         goal.add_checkpoint(CheckpointReason::Recovery, now)?;
     }
     Ok(())

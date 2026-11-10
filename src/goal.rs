@@ -17,6 +17,9 @@ use crate::managed_worktree::{
 use crate::model_backend::ModelBackend;
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
+use crate::publication_quarantine::{
+    PublicationQuarantine, PublicationQuiescence, PublicationTerminationEvidence,
+};
 use crate::task::{
     AttemptId, Task, TaskDependency, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
     VerificationId, VerificationOutcome, VerificationResult, VerificationSpec, WorkerReport,
@@ -44,7 +47,12 @@ pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
 /// It is an explicit advance because the field is authority-bearing state: a
 /// schema-5 Goal has no evidence, and the migration must say so explicitly
 /// instead of letting a serde default stand in for a decision.
-pub(crate) const GOAL_SCHEMA_VERSION: u32 = 6;
+///
+/// Schema 7 adds the durable publication quarantine (H5.1-B). It is an explicit
+/// advance because the record decides whether a Writer helper may still be able
+/// to write. A schema-6 Goal has no lock witness, so an `APPLYING` intent is
+/// migrated to `UNPROVEN` and stays unresolved; it is never assumed quiescent.
+pub(crate) const GOAL_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1437,6 +1445,12 @@ pub(crate) struct Goal {
     /// the explicit `TaskStore` migration chain, which inserts the value rather
     /// than letting serde assume it.
     managed_workspace_verification_evidence: Option<ManagedWorkspaceVerificationEvidenceV1>,
+    /// H5.1-B durable publication quarantine. It is separate from the mutation
+    /// journal on purpose: file observations decide the mutation outcome, while
+    /// this record decides whether a helper process can still write. The field
+    /// carries no serde default; schema 7 documents state it explicitly and the
+    /// migration chain inserts it for older documents.
+    publication_quarantine: PublicationQuarantine,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -1598,6 +1612,7 @@ impl Goal {
             model_backend: ModelBackend::Codex,
             external_model: None,
             managed_workspace_verification_evidence: None,
+            publication_quarantine: PublicationQuarantine::not_started(),
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -2042,23 +2057,91 @@ impl Goal {
         self.tasks.values().any(Task::has_unknown_side_effect)
     }
 
-    /// H5-A (independent review F1/F2): a publication whose helper lifetime is
-    /// unproven.
+    /// H5.1-B: a publication whose helper lifetime is unproven.
     ///
-    /// `BeginOperation` is durable before the helper starts, so an intent still in
-    /// `Applying` means "this operation may have run and the host cannot prove
-    /// the process is gone". The journal already refuses to replay it; this
-    /// predicate is what lets revocation refuse to *finalize* while it holds, so
-    /// the Owner is never told the write path is closed while a helper might
-    /// still be able to touch the workspace.
+    /// The durable quarantine is the authority. The journal `APPLYING` check is
+    /// retained as defence in depth for a document written by an older binary or
+    /// restored mid-recovery: recovery may rewrite the journal from file
+    /// observations, but it cannot clear the quarantine without a process
+    /// liveness witness.
+    ///
+    /// File state is deliberately not consulted here. A postimage that matches
+    /// says the write happened; it says nothing about whether the process that
+    /// wrote it is gone.
     pub(crate) fn has_unresolved_publication(&self) -> bool {
-        self.tasks.values().any(|task| {
-            task.attempts().iter().any(|attempt| {
-                attempt
-                    .mutation_intent()
-                    .is_some_and(|intent| matches!(intent.state(), MutationIntentState::Applying))
+        self.publication_quarantine.is_unresolved()
+            || self.tasks.values().any(|task| {
+                task.attempts().iter().any(|attempt| {
+                    attempt.mutation_intent().is_some_and(|intent| {
+                        matches!(intent.state(), MutationIntentState::Applying)
+                    })
+                })
             })
-        })
+    }
+
+    pub(crate) fn publication_quarantine(&self) -> &PublicationQuarantine {
+        &self.publication_quarantine
+    }
+
+    /// Arm the durable quarantine in the same Goal CAS that journals
+    /// `BeginOperation`, so no side-effect-capable process can exist without a
+    /// durable record naming it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The operation, Task, Attempt, lock, revision, and host identity are independent bindings."
+    )]
+    pub(crate) fn activate_publication_quarantine(
+        &mut self,
+        operation_id: String,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        lock_path: PathBuf,
+        token_sha256: String,
+        goal_revision: u64,
+        host_generation: String,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.publication_quarantine.activate(
+            operation_id,
+            task_id,
+            attempt_id,
+            lock_path,
+            token_sha256,
+            goal_revision,
+            host_generation,
+            now,
+        )
+    }
+
+    /// Record host-owned process-liveness evidence for the active publication.
+    pub(crate) fn record_publication_termination(
+        &mut self,
+        operation_id: &str,
+        evidence: PublicationTerminationEvidence,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.publication_quarantine
+            .record_termination(operation_id, evidence, now)
+    }
+
+    /// Probe the helper lock during recovery. This is the only path that may
+    /// move an unresolved quarantine to `QUIESCENT_VERIFIED`, and it never
+    /// produces `NOT_STARTED`.
+    pub(crate) fn reconcile_publication_quarantine(
+        &mut self,
+        now: &str,
+        host_generation: &str,
+    ) -> Result<bool, OrchestratorError> {
+        self.publication_quarantine.reconcile(now, host_generation)
+    }
+
+    /// Whether a new publication may start. Only `NOT_STARTED` or a verified
+    /// quiescent record is activatable.
+    pub(crate) fn publication_quarantine_allows_activation(&self) -> bool {
+        matches!(
+            self.publication_quarantine.state(),
+            PublicationQuiescence::NotStarted | PublicationQuiescence::QuiescentVerified
+        )
     }
 
     pub(crate) fn has_blocking_state(&self) -> bool {
@@ -3758,6 +3841,46 @@ impl Goal {
             .record_latest_attempt_failure_class(class)
     }
 
+    /// H5.1-C F3: close the Task when a submission is refused for a host
+    /// response bound.
+    ///
+    /// Before this, a bounded refusal recorded the receipt and REJECTED the
+    /// WorkItem but left the Task RUNNING, so the Scheduler reported
+    /// `ACTIVE_WORK` forever. The refusal is a deterministic `HOST_OUTPUT_LIMIT`
+    /// class: an unchanged retry cannot succeed, so the Task moves to
+    /// `NEEDS_REPLAN` while budget remains, or `FAILED` when it does not.
+    /// The WorkItem and the Task move in the same durable commit as the receipt.
+    pub(crate) fn record_bounded_response_refusal(
+        &mut self,
+        task_id: &TaskId,
+        code: &str,
+        detail: &str,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        let Some(task) = self.tasks.get(task_id) else {
+            return Ok(());
+        };
+        if task.status() != TaskStatus::Running {
+            return Ok(());
+        }
+        // A report/classification may already exist on an unusual replay. The
+        // transition is the safety-critical part; metadata stays first-write
+        // only, matching the worker-boundary discipline.
+        let _ = self.task_record_latest_worker_report(
+            task_id,
+            WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
+        );
+        let _ =
+            self.task_record_latest_attempt_failure_class(task_id, FailureClass::HostOutputLimit);
+        let budget_remains = self.tasks()[task_id].semantic_attempts_remaining() > 0;
+        let next = if budget_remains {
+            TaskStatus::NeedsReplan
+        } else {
+            TaskStatus::Failed
+        };
+        self.transition_task(task_id, next, TaskTransitionContext::default(), now)
+    }
+
     pub(crate) fn task_add_evidence(
         &mut self,
         task_id: &TaskId,
@@ -4349,6 +4472,7 @@ impl Goal {
         if let Some(evidence) = &self.managed_workspace_verification_evidence {
             evidence.validate_against_goal(self)?;
         }
+        self.publication_quarantine.validate()?;
         let mut rejection_request_ids = BTreeSet::new();
         for rejection in &self.pre_execution_plan_rejections {
             if rejection.request_id.trim().is_empty()

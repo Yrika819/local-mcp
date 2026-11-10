@@ -111,6 +111,17 @@ pub(crate) struct WriterWriteRequest<'a> {
     pub content: &'a str,
     pub expected_preimage: &'a ExpectedPreimage,
     pub request_id: &'a str,
+    /// Host-derived publication lock the helper must hold for its whole
+    /// lifetime. `None` is used only by host paths that are not part of the
+    /// durable EXTERNAL Writer quarantine (the in-process CODEX writer and the
+    /// MCP edit tool); those paths keep their existing lifecycle evidence.
+    pub publication_lock: Option<&'a PublicationLockSpec>,
+}
+
+/// The exact lock identity the host armed for one helper execution.
+pub(crate) struct PublicationLockSpec {
+    pub path: PathBuf,
+    pub token: String,
 }
 
 pub(crate) trait WriteBoundary {
@@ -874,6 +885,7 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 content: &operation.content,
                 expected_preimage: &commit_preimage(&operation.expected_preimage),
                 request_id,
+                publication_lock: None,
             })
             .await
             .map_err(|error| WriterError::MutationFailed(error.to_string()))?;

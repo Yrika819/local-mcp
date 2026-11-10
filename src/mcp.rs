@@ -1475,6 +1475,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         content,
         expected_preimage: &expected_preimage,
         request_id: &request_id,
+        publication_lock: None,
     })
     .await?;
     let result = render_output(output);
