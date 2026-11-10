@@ -488,16 +488,12 @@ impl PublicationQuarantine {
             QuiescenceProbe::Active => {
                 // Still alive. Keep ACTIVE (or the existing UNPROVEN); never
                 // clear, never rewrite to a weaker state.
-                if self.state != PublicationQuiescence::Unproven {
-                    self.push_transition(
-                        PublicationQuiescence::Active,
-                        Some(operation_id),
-                        now.to_owned(),
-                        "the publication lock is still held by a live process",
-                    );
-                    self.validate()?;
-                    return Ok(true);
-                }
+                //
+                // This must not write a transition. A probe that observes the
+                // already-recorded state is not a durable change, and bumping
+                // the Goal revision here makes a concurrent publisher's
+                // termination CAS fail for no reason (the R2-1 race in
+                // at_e5_044). The state is already exactly what the probe says.
                 Ok(false)
             }
             QuiescenceProbe::Unproven(detail) => {
@@ -823,7 +819,9 @@ mod tests {
         let path = quarantine.lock_path().unwrap().clone();
         publication_lock::arm(&path, "token").unwrap();
         let held = publication_lock::claim_for_helper(&path, "token").unwrap();
-        assert!(quarantine.reconcile(NOW, "host-2").unwrap());
+        // A still-held lock is already the recorded ACTIVE state: the probe
+        // must not bump the Goal revision by writing an identical transition.
+        assert!(!quarantine.reconcile(NOW, "host-2").unwrap());
         assert_eq!(quarantine.state(), PublicationQuiescence::Active);
         assert!(quarantine.is_unresolved());
         drop(held);
