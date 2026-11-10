@@ -1336,3 +1336,54 @@ fn at_gw_036_a_finalized_revocation_is_projected_as_revoked() {
     let view = serde_json::to_value(view).unwrap();
     assert_eq!(view["state"], "REVOKED", "{view}");
 }
+
+/// H5.1-C R2-10 — `/grant status` must report the effective usage enforcement
+/// uses, not the raw ledger counter.
+///
+/// A restored ledger can under-report spending while the Goal anchor still
+/// holds the monotonic floor. The displayed number must match the number the
+/// budget gate actually applies.
+#[test]
+fn at_gw_037_grant_status_reports_the_effective_usage_floor() {
+    let f = fixture("effective-usage");
+    let grant = f.install();
+    let binding = crate::authorization::GrantBinding::from_grant(&grant);
+    crate::authorization_store::authorize_operation(
+        &f.store,
+        &f.goal(),
+        &binding,
+        "op#0",
+        4,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+
+    // Deliberately raise the anchor floor above the ledger's charge, exactly as
+    // a ledger restore can leave it after the anchor write won the race.
+    let goal = f.goal();
+    let raised = f
+        .store
+        .mutate_goal_snapshot(&f.session.id, &f.goal_id, goal.revision(), |goal, _now| {
+            let state = crate::external_model_store::external_state_mut(goal)?;
+            state.authorization_anchor_mut().record_usage_floor(3, 12);
+            Ok(())
+        })
+        .unwrap();
+    let anchor = crate::authorization_store::anchor_of(&raised).unwrap();
+    let rendered = crate::authorization_store::describe_ledger(&f.ledger(), Some(&anchor));
+    assert!(
+        rendered.contains("usage 3/") && rendered.contains("12/"),
+        "the display must use the anchor floor: {rendered}"
+    );
+    assert!(
+        !rendered.contains("usage 1/"),
+        "the raw ledger charge must not be displayed: {rendered}"
+    );
+
+    // The API projection agrees with the console: both use the effective value.
+    let view = crate::authorization_store::authorization_view(&f.store, &raised);
+    let view = serde_json::to_value(view).unwrap();
+    assert_eq!(view["usage"]["operations"], 3, "{view}");
+    assert_eq!(view["usage"]["bytes"], 12, "{view}");
+}

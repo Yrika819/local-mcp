@@ -1,3 +1,0 @@
-widgets=42
-gadgets=7
-spares=0

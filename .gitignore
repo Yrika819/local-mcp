@@ -9,3 +9,9 @@
 .vscode/
 .idea/
 .zed/
+
+# Local campaign scratch and generated evidence. Commit the evidence summary,
+# digests, and reproduction command, never a raw run directory (prompts, model
+# output, absolute host paths, disposable state roots).
+/tmp/
+__pycache__/
