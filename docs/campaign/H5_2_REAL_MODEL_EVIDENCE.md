@@ -140,7 +140,7 @@ following outcome, not a host safety defect. Scenario C is recorded as
 
 ### 5.1 Real subprocess lock-holder (new)
 
-`publication_lock::subprocess_tests::a_real_subprocess_lock_holder_blocks_quiescence_until_it_dies`
+`publication_lock_subprocess_tests::a_real_subprocess_lock_holder_blocks_quiescence_until_it_dies`
 
 * the test re-executes the real test binary as a child process;
 * the child arms/claims the real OS file lock and signals readiness;

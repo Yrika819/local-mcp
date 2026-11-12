@@ -158,6 +158,8 @@ mod process_group_ownership_tests;
 #[cfg(all(test, unix))]
 mod process_group_stress_tests;
 #[cfg(test)]
+mod publication_lock_subprocess_tests;
+#[cfg(test)]
 mod replanner_compaction_tests;
 #[cfg(test)]
 mod replanner_replacement_tests;
