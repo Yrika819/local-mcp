@@ -70,3 +70,60 @@ re-review completes. The re-review is a separate read-only task against
 | Quarantine crash tolerance | **Local controls pass**; H5.2-D subprocess evidence pending |
 | Grant / revocation consistency | **PASS** locally (R2-3/R2-5/R2-10/F3) |
 | Independent review complete on final HEAD | **PENDING** |
+
+
+## 7. Round 2 re-review (gpt-6.1-sol)
+
+The remediation at `7ceda08` was re-reviewed against `90b28e0..5158122` by
+Codex `gpt-6.1-sol` (reasoning `high`), read-only:
+
+* H51-01 High: **REMEDIATED** (scan continues past intent-less attempts;
+  the adversarial regression reconciles the journal to `ReconciledPerformed`
+  while the quarantine stays `UNPROVEN`).
+* H51-02, H51-03, H51-04: **REMEDIATED**.
+* H51-RACE-044 (new Medium): **REMEDIATED** (driver does not probe while an
+  active WorkItem exists; explicit resume still probes).
+* H51-05: **STILL_OPEN (Info)** — deferred to H5.2-D subprocess controls.
+* Verdict: **H5.1_GATE: PASS — 0 Critical and 0 High remain.**
+
+## 8. Final independent audit (gpt-6.1-terra) and H5.1 gate
+
+Owner policy for this and later GoalLatch reviews: Codex subagents are
+explicitly dispatched on **`gpt-6.1-terra`**; no silent model fallback.
+
+* **Model:** `gpt-6.1-terra`
+* **Reasoning:** `high`
+* **Audited commit:** `31540b7fe3fc82cdcc4333678399dd1d4ad642c9`
+* **Mode:** read-only static audit; the auditor explicitly did not run tests
+  or inspect CI.
+
+Findings:
+
+* H51-01 High: **REMEDIATED**
+* H51-02 / H51-03 / H51-04: **REMEDIATED**
+* H51-RACE-044 Medium: **REMEDIATED**
+* H51-05 Info: **STILL_OPEN** (subprocess host-death / late-claim evidence is
+  deferred to H5.2-D; not claimed verified)
+* Helper missing-witness behavior: **PARTIAL/Info** — the helper accepts an
+  empty lock path for non-EXTERNAL callers; the EXTERNAL publication path
+  always supplies a lock spec, and a supplied missing/unarmed/ABORTED/mismatched
+  token is refused.
+* No Critical or High defect was identified in the audited paths.
+
+Gate evidence, combined:
+
+| Requirement | Result |
+| --- | --- |
+| R2-1 root fix | **PASS** — quarantine is cleared only by a lock probe |
+| 0 unresolved Critical/High | **PASS** — both reviews: 0 Critical / 0 High |
+| Required CI 22/22 on final HEAD | **PASS** — `31540b7`, run 43222665297 + 43222656102 |
+| Quarantine crash tolerance | **PASS locally** (real OS-lock controls); H5.2-D will add subprocess evidence |
+| Grant / revocation consistency | **PASS** — R2-3 / R2-5 / R2-10 / F3 |
+| Known permanent-stop problems | **PASS** — F3 fixed |
+| Independent Security Review on final HEAD | **PASS** — `gpt-6.1-sol` round 2 + `gpt-6.1-terra` final audit |
+| Final HEAD evidence | **PASS** — `31540b7` CI 22/22 |
+
+**H5.1_GATE: PASS.** H51-05 remains an informational coverage gap for H5.2-D.
+C3 / R-1 remains unresolved: this is a process-liveness barrier, not an OS
+trust boundary, and unrestricted EXTERNAL Writer use on a normal Windows
+account is still not declared safe.

@@ -44,8 +44,8 @@ The H5.1-0 classification remains:
 | H5.1-B Durable publication quarantine | **DONE (implementation)** | PR #54; R2-1 fix + negative controls |
 | H5.1-C State consistency | **DONE for R2-3/R2-5/R2-10/F3** | PR #54 + PR #55 |
 | H5.1-D Repository hygiene | **DONE for the branch tip** | `docs/campaign/H5_1_D_EVIDENCE_SECURITY.md`; `tmp/h5-d` untracked from the tip (still in public history) |
-| H5.1-E Independent security review | **ROUND 1 FAIL / REMEDIATED / RE-REVIEW RUNNING** | review of `90b28e0..7cce959` found H51-01 High + H51-02/03/04; fixed in `7ceda08`, recorded in `H5_1_E_INDEPENDENT_REVIEW.md`, re-review of `5158122` running |
-| H5.2 Real-model validation | **BLOCKED by H5.1 gate** | not started |
+| H5.1-E Independent security review | **DONE — PASS** | round 1 FAIL (H51-01 High); `7ceda08` remediation; round 2 `gpt-6.1-sol` PASS; final `gpt-6.1-terra` audit of `31540b7` PASS (0 Critical / 0 High). H51-05 Info deferred to H5.2-D |
+| H5.2 Real-model validation | **IN PROGRESS** | branch `feat/h5-2-real-model-validation-v1` from `31540b7` |
 
 ## 3. Stacked Draft PRs
 
@@ -53,7 +53,7 @@ The H5.1-0 classification remains:
 | --- | --- | --- | --- |
 | #53 | PR #52 (`feat/h5-a-security-remediation-v1`) | `0d9ea59` | LF checkout policy and CRLF renormalization; CI/artifact recovery |
 | #54 | PR #53 | `b2f3267` | R2-1 root fix: durable publication quarantine, process-liveness latch, R2-3/R2-5/F3 |
-| #55 | PR #54 | `5158122` | R2-10 effective usage, repo hygiene, additional negative controls, H51-01..04 remediation, at_e5_044 race fix |
+| #55 | PR #54 | `31540b7` | R2-10 effective usage, repo hygiene, additional negative controls, H51-01..04 remediation, at_e5_044 race fix. **H5.1 final HEAD: CI 22/22 SUCCESS, `gpt-6.1-terra` audit PASS** |
 
 PR #54's first CI run exposed a real race: two concurrent publishers both
 observed `BLOCKED` because an ACTIVE lock probe wrote an identical quarantine
@@ -132,17 +132,18 @@ checkpoint was written. Re-check it before claiming the H5.1 gate.
 
 | Requirement | Result |
 | --- | --- |
-| R2-1 root fix | **Implemented and locally proven**; re-review pending |
-| 0 unresolved Critical/High | **Round-1 High H51-01 fixed; re-review pending** |
-| Required CI 22/22 on final HEAD | **Pending** (PR #55 running on `5158122`) |
+| R2-1 root fix | **PASS** |
+| 0 unresolved Critical/High | **PASS** — both independent reviews: 0 Critical / 0 High |
+| Required CI 22/22 on final HEAD | **PASS** — `31540b7` |
 | Quarantine crash tolerance proven | **Local negative controls pass** (incl. 40/40 at_e5_044, 100/100 concurrent revoke/resume); H5.2-D subprocess evidence pending |
 | Grant state consistency | **Implemented** (R2-3, R2-5, R2-10, F3) |
 | Known permanent-stop problems resolved | **F3 fixed** |
-| Independent Security Review complete | **Round 1 complete (FAIL); re-review running** |
-| Final HEAD evidence | **Pending CI + re-review** |
+| Independent Security Review complete | **PASS** — `gpt-6.1-sol` round 2 + `gpt-6.1-terra` final audit |
+| Final HEAD evidence | **PASS** — `31540b7` CI 22/22 |
 
-Current honest state: **PARTIAL / NOT READY FOR OWNER REVIEW** until PR #55 CI
-is green and the re-review reports 0 Critical/High.
+Current honest state: **H5.1 GATE PASS.** H5.2 started on a stacked branch.
+H51-05 (Info) remains a coverage gap to close with H5.2-D subprocess evidence.
+C3 / R-1 remains unresolved and is not claimed safe for unrestricted use.
 
 ## 9. Next work (resume plan)
 
