@@ -327,6 +327,20 @@ impl PublicationQuarantine {
         &self.history
     }
 
+    /// A schema-6 Goal that carried an `APPLYING` intent. The old binary armed no
+    /// lock, so this record has no process-liveness witness at all. It stays
+    /// `UNPROVEN` and can never be promoted to `QUIESCENT_VERIFIED`, because
+    /// nothing in the stored document distinguishes a helper that exited from one
+    /// that is still running.
+    pub(crate) fn is_witness_less_legacy(&self) -> bool {
+        self.state == PublicationQuiescence::Unproven
+            && self.lock_path.is_none()
+            && self.token_sha256.is_none()
+            && self.termination.as_ref().is_some_and(|evidence| {
+                evidence.kind() == PublicationTerminationKind::LegacyApplyingIntent
+            })
+    }
+
     fn push_transition(
         &mut self,
         state: PublicationQuiescence,
@@ -417,6 +431,16 @@ impl PublicationQuarantine {
                 "publication termination evidence requires an unresolved quarantine".to_owned(),
             ));
         }
+        // A witness-less legacy record names an operation whose helper may still
+        // be running and whose lock path was never stored. There is no probe this
+        // host could perform, so accepting termination evidence here would mint a
+        // quiescence claim the document cannot support.
+        if self.is_witness_less_legacy() {
+            return Err(OrchestratorError::CorruptGoal(
+                "a witness-less legacy publication quarantine cannot accept termination evidence"
+                    .to_owned(),
+            ));
+        }
         let quiescent = evidence.kind.proves_quiescence();
         self.state = if quiescent {
             PublicationQuiescence::QuiescentVerified
@@ -488,16 +512,12 @@ impl PublicationQuarantine {
             QuiescenceProbe::Active => {
                 // Still alive. Keep ACTIVE (or the existing UNPROVEN); never
                 // clear, never rewrite to a weaker state.
-                if self.state != PublicationQuiescence::Unproven {
-                    self.push_transition(
-                        PublicationQuiescence::Active,
-                        Some(operation_id),
-                        now.to_owned(),
-                        "the publication lock is still held by a live process",
-                    );
-                    self.validate()?;
-                    return Ok(true);
-                }
+                //
+                // This must not write a transition. A probe that observes the
+                // already-recorded state is not a durable change, and bumping
+                // the Goal revision here makes a concurrent publisher's
+                // termination CAS fail for no reason (the R2-1 race in
+                // at_e5_044). The state is already exactly what the probe says.
                 Ok(false)
             }
             QuiescenceProbe::Unproven(detail) => {
@@ -619,29 +639,36 @@ impl PublicationQuarantine {
                         "publication quarantine has no Attempt identity".to_owned(),
                     )
                 })?;
-                let lock_path = self.lock_path.as_ref().ok_or_else(|| {
-                    OrchestratorError::CorruptGoal(
-                        "publication quarantine has no lock path".to_owned(),
-                    )
-                })?;
-                if !lock_path.is_absolute() {
-                    return Err(OrchestratorError::CorruptGoal(
-                        "publication quarantine lock path is not absolute".to_owned(),
-                    ));
-                }
-                let digest = self.token_sha256.as_deref().ok_or_else(|| {
-                    OrchestratorError::CorruptGoal(
-                        "publication quarantine has no token digest".to_owned(),
-                    )
-                })?;
-                if digest.len() != 64
-                    || !digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(OrchestratorError::CorruptGoal(
-                        "publication quarantine token digest is malformed".to_owned(),
-                    ));
+                // A schema-6 migration can produce a witness-less UNPROVEN record:
+                // the old binary never armed a lock, so no lock path or token
+                // digest exists. That representation is accepted only in this
+                // exact shape; every other unresolved record must carry a real
+                // witness.
+                if !self.is_witness_less_legacy() {
+                    let lock_path = self.lock_path.as_ref().ok_or_else(|| {
+                        OrchestratorError::CorruptGoal(
+                            "publication quarantine has no lock path".to_owned(),
+                        )
+                    })?;
+                    if !lock_path.is_absolute() {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "publication quarantine lock path is not absolute".to_owned(),
+                        ));
+                    }
+                    let digest = self.token_sha256.as_deref().ok_or_else(|| {
+                        OrchestratorError::CorruptGoal(
+                            "publication quarantine has no token digest".to_owned(),
+                        )
+                    })?;
+                    if digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err(OrchestratorError::CorruptGoal(
+                            "publication quarantine token digest is malformed".to_owned(),
+                        ));
+                    }
                 }
                 self.activation.as_ref().ok_or_else(|| {
                     OrchestratorError::CorruptGoal(
@@ -823,7 +850,9 @@ mod tests {
         let path = quarantine.lock_path().unwrap().clone();
         publication_lock::arm(&path, "token").unwrap();
         let held = publication_lock::claim_for_helper(&path, "token").unwrap();
-        assert!(quarantine.reconcile(NOW, "host-2").unwrap());
+        // A still-held lock is already the recorded ACTIVE state: the probe
+        // must not bump the Goal revision by writing an identical transition.
+        assert!(!quarantine.reconcile(NOW, "host-2").unwrap());
         assert_eq!(quarantine.state(), PublicationQuiescence::Active);
         assert!(quarantine.is_unresolved());
         drop(held);
@@ -842,10 +871,49 @@ mod tests {
             4,
             NOW.to_owned(),
         );
+        // H51-02: the schema-6 migration record has no lock path or token digest.
+        // It must still validate, or every migrated applying Goal is unreadable.
+        quarantine.validate().unwrap();
+        assert!(quarantine.is_witness_less_legacy());
         assert_eq!(quarantine.state(), PublicationQuiescence::Unproven);
         assert!(!quarantine.reconcile(NOW, "host-2").unwrap());
         assert_eq!(quarantine.state(), PublicationQuiescence::Unproven);
         assert!(quarantine.is_unresolved());
+        // No amount of host-supplied evidence may promote a witness-less record:
+        // there is no probe this host could have performed.
+        let error = quarantine
+            .record_termination(
+                "legacy-operation",
+                PublicationTerminationEvidence::new(
+                    PublicationTerminationKind::HelperTreeQuiescent,
+                    NOW,
+                    "host-2",
+                    "fabricated quiescence",
+                ),
+                NOW,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("witness-less"),
+            "unexpected error: {error}"
+        );
+        assert!(quarantine.is_unresolved());
+        // Starting a new publication is refused while the record is unresolved.
+        assert!(
+            quarantine
+                .activate(
+                    Uuid::new_v4().to_string(),
+                    task_id(),
+                    attempt_id(),
+                    lock_path(),
+                    sha256_hex(b"token"),
+                    8,
+                    "host-2".to_owned(),
+                    NOW,
+                )
+                .is_err()
+        );
+        quarantine.validate().unwrap();
     }
 
     #[test]

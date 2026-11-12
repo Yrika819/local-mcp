@@ -911,7 +911,10 @@ pub(crate) fn begin_request_for_goal(
 }
 
 /// Helper for tests and for the console's `/grant status` path.
-pub(crate) fn describe_ledger(ledger: &AuthorizationLedgerV1) -> String {
+pub(crate) fn describe_ledger(
+    ledger: &AuthorizationLedgerV1,
+    anchor: Option<&crate::authorization::AuthorizationAnchor>,
+) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
         "ledger epoch {} (schema {})",
@@ -926,15 +929,26 @@ pub(crate) fn describe_ledger(ledger: &AuthorizationLedgerV1) -> String {
         ));
     }
     for grant in ledger.grants() {
+        // H5.1-C R2-10: report the effective usage enforcement uses, not the
+        // raw ledger counter. A restored ledger can under-report spending while
+        // the Goal anchor still holds the monotonic floor.
+        let effective_operations = grant.usage().operations().max(anchor.map_or(
+            0,
+            crate::authorization::AuthorizationAnchor::usage_operations,
+        ));
+        let effective_bytes = grant
+            .usage()
+            .bytes()
+            .max(anchor.map_or(0, crate::authorization::AuthorizationAnchor::usage_bytes));
         lines.push(format!(
-            "grant {} epoch {} state {} expires {} usage {}/{} ops {}/{} bytes",
+            "grant {} epoch {} state {} expires {} usage {}/{} ops {}/{} bytes (effective)",
             grant.grant_id(),
             grant.authorization_epoch(),
             grant.revocation().state().as_str(),
             grant.expires_at(),
-            grant.usage().operations(),
+            effective_operations,
             grant.budget().max_operations(),
-            grant.usage().bytes(),
+            effective_bytes,
             grant.budget().max_bytes(),
         ));
     }

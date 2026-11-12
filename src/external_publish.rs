@@ -509,14 +509,15 @@ pub(crate) async fn publish_prepared_writer_intent<B: WriteBoundary + ?Sized>(
             Ok(committed) => revision = committed.revision(),
             // A concurrent client won the same operation, or the Task/WorkItem
             // moved on. This is a typed refusal, not a persistence failure.
-            Err(error @ OrchestratorError::RevisionConflict { .. }) => {
+            Err(OrchestratorError::RevisionConflict { .. }) => {
                 let _ = publication_lock::probe_and_abort(&lock_path);
-                if already_advanced {
-                    return Ok(PublishOutcome::Refused {
-                        code: "WRITER_PUBLICATION_CONFLICT",
-                    });
-                }
-                return Err(error);
+                // A concurrent publisher advanced the Goal. This is a conflict,
+                // not a persistence failure: the caller can observe the new
+                // revision and retry. `already_advanced` is only a refinement of
+                // the same fact, so both paths report the same typed refusal.
+                return Ok(PublishOutcome::Refused {
+                    code: "WRITER_PUBLICATION_CONFLICT",
+                });
             }
             Err(OrchestratorError::InvalidDag(_)) => {
                 let _ = publication_lock::probe_and_abort(&lock_path);

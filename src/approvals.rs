@@ -1099,14 +1099,18 @@ async fn handle_grant_command(
                         "Authorization: {}",
                         authorization_store::authorization_view(store, &goal).state
                     );
+                    // H5.1-C R2-10: load the anchor first so the ledger display
+                    // reports the same effective usage enforcement uses.
+                    let anchor = authorization_store::anchor_of(&goal);
                     match authorization_store::load_ledger(store, &session.id, goal.id().as_str()) {
-                        Ok(Some(ledger)) => {
-                            eprintln!("{}", authorization_store::describe_ledger(&ledger))
-                        }
+                        Ok(Some(ledger)) => eprintln!(
+                            "{}",
+                            authorization_store::describe_ledger(&ledger, anchor.as_ref().ok())
+                        ),
                         Ok(None) => eprintln!("No authorization ledger for this Goal."),
                         Err(error) => eprintln!("Authorization state unreadable: {}", error.code()),
                     }
-                    match authorization_store::anchor_of(&goal) {
+                    match &anchor {
                         Ok(anchor) => eprintln!(
                             "Anchor: highest epoch {} revoked at {:?} last grant {:?}",
                             anchor.highest_epoch(),
