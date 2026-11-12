@@ -2,7 +2,7 @@
 """H5-D — real-model end-to-end driver for the GoalLatch external backend.
 
 This is the harness, not a fixture replay. For every `ModelWorkItem` the host
-issues, it asks a real model (Codex `gpt-6.1-sol` through `codex exec`) for an
+issues, it asks a real model (Codex `gpt-6.1-terra` through `codex exec`) for an
 answer, and submits exactly what the model produced. Nothing the model "would
 have said" is synthesised here.
 
@@ -183,6 +183,7 @@ def ask_model(
     conditions: list[dict],
     log_dir: Path,
     step: int,
+    model: str,
 ) -> tuple[dict, dict]:
     prompt = PROMPT.format(
         contract=json.dumps(contract, indent=2),
@@ -193,6 +194,9 @@ def ask_model(
     )
     (log_dir / f"step-{step}-prompt.txt").write_text(prompt, encoding="utf-8")
     started = time.time()
+    # Pass the prompt on stdin. A Replanner request carries the bounded plan
+    # history, and a Windows command line is limited to ~32 KiB; stdin has no
+    # such limit.
     completed = subprocess.run(
         [
             "codex",
@@ -200,10 +204,13 @@ def ask_model(
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
+            "-m",
+            model,
             "-C",
             str(repo),
-            prompt,
+            "-",
         ],
+        input=prompt,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -217,7 +224,7 @@ def ask_model(
     answer = json.loads(match.group(0))
     meta = {
         "step": step,
-        "model": "codex gpt-6.1-sol (codex exec, sandbox=read-only)",
+        "model": f"codex {model} (codex exec, sandbox=read-only)",
         "exit_code": completed.returncode,
         "elapsed_seconds": round(elapsed, 1),
         "prompt_bytes": len(prompt),
@@ -353,6 +360,7 @@ def drive(args: argparse.Namespace) -> int:
                     contract["conditions"],
                     log_dir,
                     model_calls,
+                    args.model,
                 )
                 model_calls += 1
                 evidence.setdefault("model_calls", []).append(meta)
@@ -427,6 +435,9 @@ def main() -> int:
     parser.add_argument("--binary", default="target/debug/local-mcp.exe")
     parser.add_argument("--work-dir", default="tmp/h5-d/scenario-a")
     parser.add_argument("--max-steps", type=int, default=24)
+    # GoalLatch policy: never rely on the default Codex model. The campaign
+    # explicitly dispatches gpt-6.1-terra; pass --model to override.
+    parser.add_argument("--model", default="gpt-6.1-terra")
     return drive(parser.parse_args())
 
 
