@@ -136,7 +136,14 @@ pub(crate) fn probe_and_abort(path: &Path) -> QuiescenceProbe {
         return QuiescenceProbe::Unproven("publication lock content is unreadable");
     }
     if content.trim_end() == ABORTED {
-        // A previous recovery already aborted this token. No helper can enter.
+        // A previous recovery already wrote ABORTED. Readable contents are not
+        // proof that the write reached durable storage: a prior attempt whose
+        // sync failed leaves the token visible in the page cache while a crash
+        // could still lose it. Re-synchronize while still holding the lock and
+        // accept the abort only if that succeeds.
+        if sync_durably(&mut file).is_err() {
+            return QuiescenceProbe::Unproven("published abort is not durable");
+        }
         return QuiescenceProbe::Quiescent;
     }
     if !content.starts_with(ARMED_PREFIX) {
@@ -152,7 +159,52 @@ fn write_aborted(file: &mut File) -> io::Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     writeln!(file, "{ABORTED}")?;
+    sync_durably(file)
+}
+
+/// Durable synchronization seam.
+///
+/// Production always calls `sync_all`. The test-only fault hook lets a unit test
+/// prove that readable `ABORTED` bytes are not accepted as quiescence when the
+/// synchronization that would make them durable failed.
+fn sync_durably(file: &mut File) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        if test_fault::take_sync_failure() {
+            return Err(io::Error::other("injected publication-lock sync failure"));
+        }
+    }
     file.sync_all()
+}
+
+/// Test-only fault injection for the durable-sync seam.
+///
+/// Thread-local so parallel tests cannot influence each other. Production builds
+/// do not compile this module into the call path's reachable state.
+#[cfg(test)]
+pub(crate) mod test_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT_SYNC: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Make the next `count` durable synchronizations fail.
+    pub(crate) fn fail_next_sync(count: usize) {
+        FAIL_NEXT_SYNC.with(|cell| cell.set(count));
+    }
+
+    pub(crate) fn take_sync_failure() -> bool {
+        FAIL_NEXT_SYNC.with(|cell| {
+            let remaining = cell.get();
+            if remaining == 0 {
+                false
+            } else {
+                cell.set(remaining - 1);
+                true
+            }
+        })
+    }
 }
 
 /// A helper-held lock. Dropping it releases the OS lock at process exit.
@@ -249,6 +301,33 @@ mod tests {
         let path = path("wrong-token");
         arm(&path, "token-3").unwrap();
         assert!(claim_for_helper(&path, "token-4").is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// H5.1-E H51-03: readable `ABORTED` bytes are not durable-abort evidence.
+    /// A retry must synchronize successfully before accepting an existing token.
+    #[test]
+    fn a_retry_cannot_accept_an_abort_whose_sync_failed() {
+        let path = path("failed-sync");
+        arm(&path, "token-5").unwrap();
+        // First probe: the abort bytes reach the page cache, but the durable
+        // synchronization fails, so the probe is Unproven.
+        test_fault::fail_next_sync(1);
+        assert_eq!(
+            probe_and_abort(&path),
+            QuiescenceProbe::Unproven("publication lock abort could not be persisted")
+        );
+        // The bytes are readable, but they are not proof of durability.
+        assert_eq!(read(&path), "ABORTED\n");
+        // A retry that re-reads ABORTED must not promote the cached bytes to
+        // quiescence unless its own synchronization succeeds.
+        test_fault::fail_next_sync(1);
+        assert_eq!(
+            probe_and_abort(&path),
+            QuiescenceProbe::Unproven("published abort is not durable")
+        );
+        // Once a retry synchronizes successfully, the abort is accepted.
+        assert_eq!(probe_and_abort(&path), QuiescenceProbe::Quiescent);
         let _ = std::fs::remove_file(path);
     }
 

@@ -213,7 +213,24 @@ pub(crate) async fn advance_external_step(
     session: &config::Session,
     goal: &Goal,
 ) -> Result<DriverReport, DriverError> {
-    let reconciled = reconcile_publication_quarantine(store, session, goal)?;
+    // Do not probe the publication lock while an active WorkItem exists.
+    //
+    // A concurrent host step may be publishing that WorkItem right now. The
+    // lock is armed just before the helper is spawned, so a probe in that
+    // window can acquire the still-free lock, write ABORTED, and make the
+    // real helper refuse. That turns a successful publication into an unknown
+    // refusal (the at_e5_044 two-client race). Recovery probing belongs to an
+    // explicit goal_resume, or to a step with no active WorkItem; the active
+    // publication path already re-checks the exact CAS and refuses a
+    // concurrent publisher.
+    let has_active_work = external_state(goal)
+        .map(|state| state.active_work().is_some())
+        .unwrap_or(true);
+    let reconciled = if has_active_work {
+        goal.clone()
+    } else {
+        reconcile_publication_quarantine(store, session, goal)?
+    };
     if reconciled.publication_quarantine().is_unresolved() {
         return Ok(DriverReport::reused(DriverOutcome::Refused(
             DriverRefusal::HostStepRefused {

@@ -657,6 +657,8 @@ fn schema_one_document(goal: &Goal) -> Value {
     object.remove("managed_worktree");
     object.remove("managed_worktree_creation_intent");
     object.remove("managed_workspace_verification_evidence");
+    // Schema 1 predates the schema-7 publication quarantine.
+    object.remove("publication_quarantine");
     object.remove("workspace_mode");
     object.remove("pre_execution_plan_rejections");
     object.remove("pristine_plan_supersessions");

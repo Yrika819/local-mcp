@@ -1547,14 +1547,28 @@ fn r2_1_concurrent_revoke_and_resume_cannot_clear_a_held_quarantine() {
     });
 
     let _ = resume.join().unwrap();
-    // The revocation anchor write can make the concurrent resume's CAS stale.
-    // Re-running on the current revision must still observe the held lock.
-    goal_api::goal_resume(
-        &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
-        &f.session,
-        &f.store,
-    )
-    .expect("a later resume observes the held lock without clearing it");
+    // The revocation anchor write can make a concurrent resume's CAS stale. A
+    // bounded retry re-reads the current revision; it must still observe the
+    // held lock and never clear the quarantine.
+    let mut resumed = false;
+    for _ in 0..10 {
+        match goal_api::goal_resume(
+            &json!({"session_id": f.session.id, "goal_id": goal_id.as_str()}),
+            &f.session,
+            &f.store,
+        ) {
+            Ok(_) => {
+                resumed = true;
+                break;
+            }
+            Err(error) if error.code() == "REVISION_CONFLICT" => continue,
+            Err(error) => panic!("a later resume failed unexpectedly: {error:?}"),
+        }
+    }
+    assert!(
+        resumed,
+        "a later resume must eventually observe the held lock without clearing it"
+    );
 
     let error = revoke
         .join()
