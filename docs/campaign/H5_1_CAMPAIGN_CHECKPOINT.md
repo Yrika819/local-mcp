@@ -44,7 +44,7 @@ The H5.1-0 classification remains:
 | H5.1-B Durable publication quarantine | **DONE (implementation)** | PR #54; R2-1 fix + negative controls |
 | H5.1-C State consistency | **DONE for R2-3/R2-5/R2-10/F3** | PR #54 + PR #55 |
 | H5.1-D Repository hygiene | **DONE for the branch tip** | `docs/campaign/H5_1_D_EVIDENCE_SECURITY.md`; `tmp/h5-d` untracked from the tip (still in public history) |
-| H5.1-E Independent security review | **RUNNING** | delegated read-only audit of `7cce959` to Codex `gpt-6.1-sol` (high) |
+| H5.1-E Independent security review | **ROUND 1 FAIL / REMEDIATED / RE-REVIEW RUNNING** | review of `90b28e0..7cce959` found H51-01 High + H51-02/03/04; fixed in `7ceda08`, recorded in `H5_1_E_INDEPENDENT_REVIEW.md`, re-review of `5158122` running |
 | H5.2 Real-model validation | **BLOCKED by H5.1 gate** | not started |
 
 ## 3. Stacked Draft PRs
@@ -53,13 +53,21 @@ The H5.1-0 classification remains:
 | --- | --- | --- | --- |
 | #53 | PR #52 (`feat/h5-a-security-remediation-v1`) | `0d9ea59` | LF checkout policy and CRLF renormalization; CI/artifact recovery |
 | #54 | PR #53 | `b2f3267` | R2-1 root fix: durable publication quarantine, process-liveness latch, R2-3/R2-5/F3 |
-| #55 | PR #54 | `7cce959` | R2-10 effective usage, repo hygiene, additional negative controls, Active-probe race fix |
+| #55 | PR #54 | `5158122` | R2-10 effective usage, repo hygiene, additional negative controls, H51-01..04 remediation, at_e5_044 race fix |
 
 PR #54's first CI run exposed a real race: two concurrent publishers both
 observed `BLOCKED` because an ACTIVE lock probe wrote an identical quarantine
 transition and bumped the Goal revision, breaking the winner's termination CAS.
-PR #55 fixes that (`reconcile` returns `Ok(false)` for an ACTIVE probe). The
-final H5.1 HEAD is PR #55's `7cce959`.
+PR #55 fixed the identical-transition part; the remaining window was the
+driver's recovery probe acquiring the still-free armed lock before the helper
+claimed it. `advance_external_step` now does not probe while an active WorkItem
+exists. The final H5.1 HEAD is PR #55's `5158122` (`7ceda08` code + review doc).
+
+Round-1 independent review (`90b28e0..7cce959`) returned FAIL on H51-01 (High).
+`7ceda08` fixes H51-01 (migration scan continues past intent-less attempts),
+H51-02 (witness-less legacy UNPROVEN validates but can never be promoted),
+H51-03 (ABORTED retry re-syncs durably), and H51-04 (schema-1 refuses a carried
+quarantine). The re-review of `5158122` is running.
 
 ## 4. R2-1 implementation
 
@@ -124,23 +132,24 @@ checkpoint was written. Re-check it before claiming the H5.1 gate.
 
 | Requirement | Result |
 | --- | --- |
-| R2-1 root fix | **Implemented and locally proven**; independent review pending |
-| 0 unresolved Critical/High | **Pending review** (local: 0 known) |
-| Required CI 22/22 on final HEAD | **Pending** (PR #55 running) |
-| Quarantine crash tolerance proven | **Local negative controls pass**; CI pending |
+| R2-1 root fix | **Implemented and locally proven**; re-review pending |
+| 0 unresolved Critical/High | **Round-1 High H51-01 fixed; re-review pending** |
+| Required CI 22/22 on final HEAD | **Pending** (PR #55 running on `5158122`) |
+| Quarantine crash tolerance proven | **Local negative controls pass** (incl. 40/40 at_e5_044, 100/100 concurrent revoke/resume); H5.2-D subprocess evidence pending |
 | Grant state consistency | **Implemented** (R2-3, R2-5, R2-10, F3) |
 | Known permanent-stop problems resolved | **F3 fixed** |
-| Independent Security Review complete | **NOT YET** |
-| Final HEAD evidence | **Pending CI + review** |
+| Independent Security Review complete | **Round 1 complete (FAIL); re-review running** |
+| Final HEAD evidence | **Pending CI + re-review** |
 
 Current honest state: **PARTIAL / NOT READY FOR OWNER REVIEW** until PR #55 CI
-is green and the independent review reports 0 Critical/High.
+is green and the re-review reports 0 Critical/High.
 
 ## 9. Next work (resume plan)
 
-1. Wait for PR #55 CI and the H5.1-E review.
-2. For every Critical/High finding: fix on `feat/h5-1-state-consistency-hygiene-v1`,
-   re-run the focused tests, and request a re-review of the new HEAD.
+1. Wait for PR #55 CI on `5158122` and the H5.1-E re-review.
+2. For every remaining Critical/High finding: fix on
+   `feat/h5-1-state-consistency-hygiene-v1`, re-run the focused tests, and
+   request another re-review of the new HEAD.
 3. Re-run the full local suite and CI after any change.
 4. Only when all H5.1 gate rows are PASS: update this checkpoint and start H5.2
    (Scenario A regression, then Writer/Reviewer, Replanner, Crash/Recovery).
