@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -324,6 +325,32 @@ class OwnerOnlyRootTests(DisposableBase):
                 "the root must not inherit a write ACE from the temporary directory",
             )
 
+    def test_a_base_whose_entries_anyone_can_replace_is_refused(self) -> None:
+        # Review round 6 (High): a private root does not protect its *name*. If the
+        # parent lets another principal delete or rename children (Windows
+        # `FILE_DELETE_CHILD`, POSIX group/other-writable and not sticky), the root
+        # can be moved aside and replaced by a link, and every later write follows
+        # the link - so that base is refused before anything is created.
+        parent = self.base / "reenterable-parent"
+        parent.mkdir()
+        self._make_root_writable_by_everyone(parent, rights="F")
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(parent, "reenter")
+        self.assertFalse((parent / "goallatch-h5d-reenter").exists())
+
+    def test_a_sticky_shared_parent_is_accepted_on_posix(self) -> None:
+        # /tmp is 1777 *with the sticky bit*: another user may create entries but
+        # may not rename or delete ours, so it stays a usable base.
+        if os.name == "nt":
+            self.skipTest("POSIX sticky semantics")
+        import private_root as pr
+
+        shared = Path(tempfile.gettempdir())
+        mode = stat.S_IMODE(shared.lstat().st_mode)
+        if not mode & 0o022 or not shared.lstat().st_mode & stat.S_ISVTX:
+            self.skipTest("this host's temporary directory is not sticky-shared")
+        pr.assert_parent_cannot_reenter(shared)
+
     def test_reusing_a_root_that_became_writable_by_others_is_refused(self) -> None:
         owned = driver.make_fixture(self.base, "tampered-root")
         self._make_root_writable_by_everyone(owned.root)
@@ -346,7 +373,49 @@ class OwnerOnlyRootTests(DisposableBase):
         again = driver.make_fixture(self.base, "owner-only-reuse")
         self.assertEqual(owned.root, again.root)
 
-    def _make_root_writable_by_everyone(self, root: Path) -> None:
+    def test_a_root_whose_write_aces_do_not_inherit_is_refused(self) -> None:
+        # Review round 6 (High): the root's own DACL proves nothing about its
+        # children unless the write ACEs carry object+container inheritance.
+        if os.name != "nt":
+            self.skipTest("Windows inheritance flags")
+        import subprocess as sp
+
+        import private_root as pr
+
+        fixture = driver.make_fixture(self.base, "non-inheritable")
+        owner = self._owner_sid()
+        completed = sp.run(
+            ["icacls", str(fixture.root), "/grant:r", f"*{owner}:(F)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.skipTest(f"icacls is unavailable: {completed.stderr.strip()}")
+        with self.assertRaises(pr.PrivateRootError):
+            pr.assert_private_root(fixture.root)
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "non-inheritable")
+
+    def test_a_child_that_became_writable_by_others_is_refused(self) -> None:
+        # Review round 6 (High): a child's DACL can diverge from the root's, so the
+        # whole tree is verified, not a sample of it.
+        import private_root as pr
+
+        fixture = driver.make_fixture(self.base, "tampered-child")
+        self._make_root_writable_by_everyone(fixture.state / "sessions")
+        with self.assertRaises(pr.PrivateRootError):
+            pr.verify_private_tree(fixture.root)
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "tampered-child")
+
+    def _make_root_writable_by_everyone(self, root: Path, rights: str = "M") -> None:
+        """Grant a real second principal (Everyone) `rights` on `root`.
+
+        `M` (Modify) gives write access but no `FILE_DELETE_CHILD`, so it cannot
+        move a protected child aside. `F` (full control) can, and is what the
+        parent-entry test needs.
+        """
         if os.name == "nt":
             import subprocess as sp
 
@@ -355,7 +424,7 @@ class OwnerOnlyRootTests(DisposableBase):
                     "icacls",
                     str(root),
                     "/grant",
-                    "*S-1-1-0:(OI)(CI)(M)",
+                    f"*S-1-1-0:(OI)(CI)({rights})",
                 ],
                 capture_output=True,
                 text=True,

@@ -48,7 +48,7 @@ works only in `.local/h53`.
 | Reviewer `NOT_READY` at `f74b805` | Answered, not overridden: R1b was still open **on Windows** because `_assert_private_fixture_root` returned early there and `Path.mkdir()` inherited the temporary directory's DACL |
 | Measurement | `%TEMP%` on the campaign host grants `Modify` to two further local SIDs and to `CodexSandboxUsers`; a plain directory created there carries four non-owner write ACEs |
 | Fix | `scripts/h5-d/private_root.py`: root created **with** an owner-only protected descriptor, DACL read back and verified, reused roots verified, owner identity checked, everything unprovable refused |
-| Tests | `test_fixture_safety.py` 30 tests OK, with positive and negative controls |
+| Tests | `test_fixture_safety.py` 32 tests OK, with positive and negative controls |
 | Rust sources | unchanged in H5.3.1 (regression check of the fused HEAD only) |
 
 ## 3. Defects found by real execution and closed in H5.3
@@ -58,7 +58,7 @@ works only in `.local/h53`.
 | H53-1 | Real-model driver deleted an arbitrary `--work-dir` with `shutil.rmtree` | Critical (data loss) | Fixed: create-only fixture, ownership marker, reparse refusal, per-attempt evidence |
 | H53-2 | `PENDING -> READY` refusal surfaced to the external client as `GOAL_PERSISTENCE_ERROR` | Medium (misdiagnosis) | Fixed: `GOAL_TASK_TRANSITION_REFUSED` |
 | H53-3 | A `WRITE_UTF8` with `expected_preimage: ABSENT` could never publish: the scope check canonicalized a not-yet-existing path | High (published capability unreachable) | Fixed: resolve through the parent, with tests |
-| H53-4 | `codex exec --sandbox read-only` makes the workspace unreadable to the model on Windows | High (evidence validity, not product safety) | Recorded as a deployment constraint; harness gained an explicit `--readonly-sandbox` with a per-call no-write proof |
+| H53-4 | `codex exec --sandbox read-only` makes the workspace unreadable to the model on Windows | High (evidence validity, not product safety) | Recorded as a deployment constraint; the harness gained an explicit `--readonly-sandbox` and now records a workspace-digest comparison **around every model call**. A digest match is not proof that nothing was written and restored, and it is never presented as OS-enforced read-only isolation |
 | H53-5 | The Replanner contract did not state the `resolve_needs_replan` -> `add_dependencies` requirement that the validator enforces | High (contract/validator drift) | Fixed in H5.3-A |
 | H53-6 | `codex` subprocess failures, oversized answers and greedy JSON extraction were unclassified | Medium (harness reliability) | Fixed: classified `ModelInvocationError` taxonomy |
 

@@ -46,7 +46,8 @@ an unusual path, this was treated as a release blocker rather than a nuisance.
 | Never target the primary repository, a worktree, or the user home | `_assert_disposable_base` refuses a relative base, the home directory, a drive root, any base reached through a reparse point, and any base with a `.git` entry in any ancestor |
 | Evidence per run | `attempts/<n>/evidence.json` and `attempts/<n>/logs/`, with `<n>` monotonically allocated per root |
 | Previous logs and evidence are never overwritten | Because `attempts/<n>` is freshly created per invocation and no file is ever truncated |
-| Only the owner can write inside the root | `private_root.create_owner_only_dir` creates the root **with** an owner-only descriptor (`SYSTEM`, `Administrators`, the creating user) on Windows and `0o700` on POSIX, then reads the DACL back and verifies it; a reused root is verified the same way and refused if it is not provably private. See §7.1 and `docs/campaign/H5_3_1_FINAL_CLOSURE.md` |
+| Only the owner can write inside the root | `private_root.create_owner_only_dir` creates the root **with** an owner-only descriptor (`SYSTEM`, `Administrators`, the creating user) on Windows and `0o700` on POSIX, then reads the DACL back and verifies it; `verify_private_tree` verifies every entry, after creation and on reuse. See §7.1 and `docs/campaign/H5_3_1_FINAL_CLOSURE.md` |
+| The root's *name* cannot be swapped | A base is refused when an untrusted trustee can delete or rename a child of it (`FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER` on Windows, group/other-writable and not sticky on POSIX) |
 
 ### 2.1 Why "never delete" rather than "delete only what I own"
 
@@ -81,7 +82,7 @@ deliberate driver decision with a recorded reason.
 
 ## 4. Tests that hold the property
 
-`scripts/h5-d/test_fixture_safety.py` — 30 tests, no model, no binary, runs in CI
+`scripts/h5-d/test_fixture_safety.py` — 32 tests, no model, no binary, runs in CI
 (the `quality` job gained a `Run real-model driver safety self-tests` step):
 
 * unique root per run, `state`/`repo` separated, marker written and correct;
@@ -101,7 +102,10 @@ deliberate driver decision with a recorded reason.
   the same temporary directory is *measurably* shared on the campaign host, so
   the check is not vacuous;
 * H5.3.1: a root that later becomes writable by `Everyone` (Windows) or
-  group/world-writable (POSIX) is refused when it is reused.
+  group/world-writable (POSIX) is refused when it is reused, and a *child* whose
+  DACL diverges from the root's is refused by the whole-tree verification;
+* H5.3.1: a root whose write ACEs lack `OI\|CI` is refused, and so is a base whose
+  other principals can rename or delete a child of it.
 
 Windows job `test (windows-x64)` runs the Rust suite that exercises the same
 publication and recovery code; the Python test above runs on the Linux

@@ -57,6 +57,8 @@ __all__ = [
     "create_owner_only_dir",
     "assert_private_root",
     "assert_private_entry",
+    "verify_private_tree",
+    "assert_parent_cannot_reenter",
     "trustee_report",
     "support_class",
 ]
@@ -86,7 +88,7 @@ def _posix_create(path: Path) -> None:
         os.chmod(path, POSIX_OWNER_ONLY_MODE)
 
 
-def _posix_assert(path: Path) -> None:
+def _posix_assert(path: Path, expect_directory: bool) -> None:
     info = path.lstat()
     if info.st_uid != os.geteuid():
         raise PrivateRootError(
@@ -100,7 +102,9 @@ def _posix_assert(path: Path) -> None:
             f"{path} is group- or world-accessible (mode {oct(mode)}); "
             "a shared fixture root cannot be proven private, so it is refused"
         )
-    if mode & POSIX_OWNER_ONLY_MODE != POSIX_OWNER_ONLY_MODE:
+    # A directory needs owner rwx; a regular file needs neither x nor, for a
+    # marker written with the default mode (0644/0600), an owner execute bit.
+    if expect_directory and mode & POSIX_OWNER_ONLY_MODE != POSIX_OWNER_ONLY_MODE:
         raise PrivateRootError(
             f"{path} is not owner-accessible (mode {oct(mode)}); "
             "the fixture root cannot be used"
@@ -164,6 +168,22 @@ _ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x2
 
 _MASK_OFFSET = 4
 _SID_OFFSET_PLAIN = 8
+_OBJECT_INHERIT_ACE = 0x01
+_CONTAINER_INHERIT_ACE = 0x02
+_INHERITED_ACE = 0x10
+_INHERIT_BOTH = _OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE
+
+#: Rights that let a trustee rename or delete an entry *in* a directory,
+#: independently of that entry's own DACL. `FILE_DELETE_CHILD` is a bypass: it
+#: deletes a child even when the child grants nothing. `WRITE_DAC` / `WRITE_OWNER`
+#: on the parent let a trustee grant itself `FILE_DELETE_CHILD` first.
+#: `Modify` (0x1301bf) contains none of them, `Full control` contains all.
+_REENTRY_RIGHTS = (
+    0x00000040  # FILE_DELETE_CHILD
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x10000000  # GENERIC_ALL
+)
 
 
 class _ACEHeader(ctypes.Structure):
@@ -455,7 +475,9 @@ def _aces(api, dacl) -> list[tuple[int, int, int, str]]:
     return entries
 
 
-def _windows_assert(path: Path, api, require_protected_dacl: bool) -> None:
+def _windows_assert(
+    path: Path, api, require_protected_dacl: bool, require_inheritable_writers: bool = False
+) -> None:
     """Refuse `path` unless its DACL grants write only to trusted trustees.
 
     `require_protected_dacl` is set for a *root*: the root must not inherit a
@@ -504,6 +526,20 @@ def _windows_assert(path: Path, api, require_protected_dacl: bool) -> None:
                     f"{path} is writable by {sid} (mask {hex(mask)}), which is "
                     "outside the owner, SYSTEM and Administrators; a root another "
                     "OS user can write cannot be proven private, so it is refused"
+                )
+            if (
+                require_inheritable_writers
+                and mask & _WRITE_RIGHTS
+                and _flags & _INHERIT_BOTH != _INHERIT_BOTH
+            ):
+                # A root's protection is only worth what its children inherit: an
+                # owner-only ACE without OI|CI leaves newly created children
+                # with an empty DACL (unusable) or whatever the parent directory
+                # would have given them (not provable here).
+                raise PrivateRootError(
+                    f"{path} grants write to {sid} without object+container "
+                    f"inheritance (flags {hex(_flags)}), so children of this root "
+                    "would not be proven private; refused"
                 )
     finally:
         kernel32.LocalFree(descriptor)
@@ -586,14 +622,20 @@ def assert_private_root(path: Path) -> None:
     """Refuse a fixture *root* unless it is provably owner-only.
 
     Stricter than `assert_private_entry`: a root may not inherit its DACL from an
-    uncontrolled parent, because that parent is the shared temporary directory.
+    uncontrolled parent, and every write ACE on it must be inheritable, or the
+    children this harness creates would not carry the same restriction.
     """
     if not path.is_dir():
         raise PrivateRootError(f"{path} is not a directory")
     if _windows_only():
-        _windows_assert(path, _load_windows_api(), require_protected_dacl=True)
+        _windows_assert(
+            path,
+            _load_windows_api(),
+            require_protected_dacl=True,
+            require_inheritable_writers=True,
+        )
         return
-    _posix_assert(path)
+    _posix_assert(path, expect_directory=True)
 
 
 def assert_private_entry(path: Path) -> None:
@@ -605,9 +647,122 @@ def assert_private_entry(path: Path) -> None:
     if not path.exists():
         raise PrivateRootError(f"{path} does not exist")
     if _windows_only():
-        _windows_assert(path, _load_windows_api(), require_protected_dacl=False)
+        _windows_assert(
+            path, _load_windows_api(), require_protected_dacl=False
+        )
         return
-    _posix_assert(path)
+    _posix_assert(path, expect_directory=path.is_dir())
+
+
+def verify_private_tree(root: Path) -> list[str]:
+    """Verify *every* entry below `root`, not a hand-picked list.
+
+    A child's DACL can diverge from the root's (an explicit ACE, a replaced
+    directory, a configuration where inheritance does not reach it), and the
+    harness writes model-influenced files into `repo/`. Checking a fixed sample
+    would leave the rest unproven, so the walk covers the whole tree and refuses
+    on the first entry it cannot read.
+
+    The walk never follows a link: an entry that is a reparse point or a symlink
+    is refused (the driver's hazard scan refuses those separately, but this
+    function must not be the weak link).
+    """
+    if not root.is_dir():
+        raise PrivateRootError(f"{root} is not a directory")
+    assert_private_root(root)
+    stack = [root]
+    checked: list[str] = []
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = list(directory.iterdir())
+        except OSError as error:
+            raise PrivateRootError(
+                f"{directory} cannot be read ({error}), so the tree cannot be "
+                "proven private; refused"
+            ) from error
+        for entry in entries:
+            try:
+                info = entry.lstat()
+            except OSError as error:
+                raise PrivateRootError(
+                    f"{entry} cannot be inspected ({error}); refused"
+                ) from error
+            if stat.S_ISLNK(info.st_mode):
+                raise PrivateRootError(f"{entry} is a symbolic link; refused")
+            if stat.S_ISDIR(info.st_mode):
+                if _windows_only():
+                    _windows_assert(
+                        entry, _load_windows_api(), require_protected_dacl=False
+                    )
+                else:
+                    _posix_assert(entry, expect_directory=True)
+                stack.append(entry)
+            elif stat.S_ISREG(info.st_mode):
+                if _windows_only():
+                    _windows_assert(
+                        entry, _load_windows_api(), require_protected_dacl=False
+                    )
+                else:
+                    _posix_assert(entry, expect_directory=False)
+            else:
+                raise PrivateRootError(
+                    f"{entry} is neither a regular file nor a directory; refused"
+                )
+            checked.append(str(entry))
+    return checked
+
+
+def assert_parent_cannot_reenter(base: Path) -> None:
+    """Refuse a base whose other principals can rename or delete a child.
+
+    A private root protects its *contents*; it does not protect its *name* in the
+    parent. An attacker who may delete or rename entries of the parent can move
+    the root aside and put a symlink/junction at the old name, and every later
+    write the harness performs through that path lands wherever the link points.
+
+    * Windows: `FILE_DELETE_CHILD` on the parent deletes a child regardless of
+      the child's own DACL, so it is the bypass that matters. `WRITE_DAC` and
+      `WRITE_OWNER` on the parent let a trustee grant itself that right first.
+      `Modify` (0x1301bf) has none of these; `Full control` has all of them.
+    * POSIX: a group/other-writable parent allows `rename(2)` of the child unless
+      the parent is sticky (the `/tmp` case, where only the owner of the entry may
+      rename or delete it).
+    """
+    if not base.is_dir():
+        raise PrivateRootError(f"{base} is not a directory")
+    if _windows_only():
+        api = _load_windows_api()
+        _advapi32, kernel32 = api
+        descriptor, dacl, control, owner_sid = _security_descriptor(api, base)
+        try:
+            if not dacl:
+                raise PrivateRootError(
+                    f"{base} has a NULL or absent DACL, so every user can rename "
+                    "or delete a fixture root in it; refused"
+                )
+            user_sid = _current_user_sid(api)
+            allowed = _TRUSTED_SIDS | {user_sid, _OWNER_RIGHTS_SID, owner_sid}
+            for ace_type, _flags, mask, sid in _aces(api, dacl):
+                if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+                    continue
+                if mask & _REENTRY_RIGHTS and sid not in allowed:
+                    raise PrivateRootError(
+                        f"{base} lets {sid} rename or delete entries in it (mask "
+                        f"{hex(mask)}); a fixture root there can be replaced by a "
+                        "link, so the base is refused"
+                    )
+        finally:
+            kernel32.LocalFree(descriptor)
+        return
+    info = base.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+        raise PrivateRootError(
+            f"{base} is group- or world-writable (mode {oct(mode)}) and not "
+            "sticky, so another user can rename a fixture root in it and replace "
+            "it with a link; refused"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - operator convenience

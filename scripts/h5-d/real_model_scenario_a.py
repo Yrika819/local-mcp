@@ -171,41 +171,87 @@ def _reparse_components(path: Path, stop: Path) -> list[Path]:
         current = current.parent
 
 
-def _assert_disposable_base(base: Path) -> Path:
-    """Canonicalise the fixture base and refuse anything that is not disposable.
+def _refuse_unsafe_base_path(base: Path) -> None:
+    """Refuse a base path before anything is created at it.
 
-    Refused: the user's home directory, a drive root, anything inside a Git work
-    tree (the primary checkout and every registered worktree carry a `.git`
-    file or directory at their root), and any reparse-pointed segment.
+    Order matters: the checks below run on the path the operator supplied, so a
+    refused base is never created first (H5.3 did `mkdir(parents=True)` before
+    validating, which created directories under the home directory and only then
+    refused them) and a symlinked segment is inspected as a segment rather than
+    disappearing into `resolve()`.
     """
     if not base.is_absolute():
         raise FixtureSafetyError(
             f"--work-dir must be absolute, got {base}; relative roots could delete "
             "an operator directory"
         )
+    if _reparse_components(base, Path(base.anchor)):
+        raise FixtureSafetyError(f"{base} is reached through a reparse point")
+    home = Path.home()
+    temporary = Path(tempfile.gettempdir())
+    if base.name in ("", base.anchor):
+        raise FixtureSafetyError(f"{base} is a drive root")
+    if base == home:
+        raise FixtureSafetyError(f"{base} is the home directory")
+    if home in base.parents and base != temporary and temporary not in base.parents:
+        # Inside the home tree is allowed only below the OS temporary directory.
+        # Ancestors are exempt: every `%TEMP%` path is inside the home tree.
+        raise FixtureSafetyError(
+            f"{base} is inside the user home directory and outside the "
+            "OS temporary directory"
+        )
+    for candidate in (base, *_existing_ancestors(base)):
+        if (candidate / ".git").exists():
+            raise FixtureSafetyError(
+                f"{candidate} is inside the Git work tree at {candidate}"
+            )
+
+
+def _existing_ancestors(path: Path) -> list[Path]:
+    """The existing ancestors of `path`, nearest first (excluding `path`)."""
+    ancestors: list[Path] = []
+    current = path.parent
+    while current != current.parent:
+        ancestors.append(current)
+        current = current.parent
+    return ancestors
+
+
+def _assert_disposable_base(base: Path) -> Path:
+    """Canonicalise the fixture base and refuse anything that is not disposable.
+
+    Refused: the user's home, a drive root, anything inside a Git work tree, any
+    reparse-pointed segment, and any base whose other principals can rename or
+    delete a child entry. The base may be created, but only when it is missing
+    *and* every existing ancestor and the base itself already passed the checks;
+    a missing intermediate directory is refused rather than created (fail closed,
+    and nothing is written outside the fixture).
+    """
     base = base.parent if base.name in ("", base.anchor) else base
-    base.mkdir(parents=True, exist_ok=True)
+    _refuse_unsafe_base_path(base)
+
+    if not base.exists():
+        if not base.parent.is_dir():
+            raise FixtureSafetyError(
+                f"{base.parent} does not exist; the driver creates only the last "
+                "component of --work-dir and refuses to build a tree"
+            )
+        base.mkdir()
     canonical = base.resolve()
 
-    home = Path.home().resolve()
-    if canonical == home or canonical == Path(canonical.anchor):
-        raise FixtureSafetyError(f"{canonical} is a home directory or drive root")
-    if home in canonical.parents:
-        # Inside the home tree is allowed only below the OS temporary directory;
-        # a home-rooted fixture is never a deliberate campaign target.
-        temporary = Path(tempfile.gettempdir()).resolve()
-        if canonical != temporary and temporary not in canonical.parents:
-            raise FixtureSafetyError(
-                f"{canonical} is inside the user home directory and outside the "
-                "OS temporary directory"
-            )
+    # Re-check the canonical form: the path above was proven free of reparse
+    # points at the time of the check, and this is the path all later writes use.
     if _reparse_components(canonical, Path(canonical.anchor)):
         raise FixtureSafetyError(f"{canonical} is reached through a reparse point")
-    for ancestor in (canonical, *canonical.parents):
-        if (ancestor / ".git").exists():
+    for candidate in (canonical, *canonical.parents):
+        if (candidate / ".git").exists():
             raise FixtureSafetyError(
-                f"{canonical} is inside the Git work tree at {ancestor}"
+                f"{canonical} is inside the Git work tree at {candidate}"
             )
+    try:
+        private_root.assert_parent_cannot_reenter(canonical)
+    except private_root.PrivateRootError as error:
+        raise FixtureSafetyError(str(error)) from error
     return canonical
 
 
@@ -378,6 +424,12 @@ def make_fixture(
         _refuse_reused_root_hazards(root)
         _assert_private_fixture_root(root)
         _claim_existing_root(root, run_id)
+        # Review round 6 (High): a child's DACL can diverge from the root's after
+        # the first run, so reuse re-proves the *whole* tree, not just the root.
+        try:
+            private_root.verify_private_tree(root)
+        except private_root.PrivateRootError as error:
+            raise FixtureSafetyError(str(error)) from error
     else:
         # Created *with* an owner-only descriptor, not created and then hardened:
         # there is no window in which the inherited, possibly shared parent ACL
@@ -414,23 +466,10 @@ def make_fixture(
         "widgets=42\ngadgets=7\nspares=0\n", encoding="utf-8"
     )
     # H5.3.1: the guarantee is about the *contents* of the root, not just its top
-    # entry, so the inheritance that carries the owner-only DACL down is verified
-    # on the entries this harness created. If the parent ACL somehow re-appeared
-    # on a child, the run stops here rather than writing a model-controlled file
-    # into it.
-    for created in (
-        root / FIXTURE_MARKER_NAME,
-        state,
-        state / "sessions",
-        repo,
-        repo / "src" / "main.rs",
-        repo / "data" / "inventory.txt",
-    ):
-        try:
-            private_root.assert_private_entry(created)
-        except private_root.PrivateRootError as error:
-            raise FixtureSafetyError(str(error)) from error
-
+    # entry. Review round 6 (High) pointed out that a hand-picked sample proves
+    # nothing about the entries it skips, so the whole tree is verified - every
+    # file and directory this harness just created - before a model-influenced
+    # file is written into it.
     session_id = f"h5d-{uuid.uuid4()}"
     record = {
         "id": session_id,
@@ -440,12 +479,17 @@ def make_fixture(
     (state / "sessions" / f"{session_id}.json").write_text(
         json.dumps(record, indent=2), encoding="utf-8"
     )
+    attempt_dir = _next_attempt_dir(root)
+    try:
+        private_root.verify_private_tree(root)
+    except private_root.PrivateRootError as error:
+        raise FixtureSafetyError(str(error)) from error
     return Fixture(
         run_id=run_id,
         root=root,
         state=state,
         workspace=repo,
-        attempt_dir=_next_attempt_dir(root),
+        attempt_dir=attempt_dir,
         session_id=session_id,
     )
 
@@ -847,6 +891,13 @@ def drive(args: argparse.Namespace) -> int:
                         }
                     )
 
+                # Per-call evidence (review round 6, Medium): the digest is taken
+                # around *each* model call, not once per run, so a write during a
+                # call is attributed to that call. A matching digest still does
+                # not prove the process did not write and restore a file, which is
+                # why the evidence records it as a digest comparison and never as
+                # OS-enforced read-only isolation.
+                workspace_before_call = workspace_digest(repo)
                 answer, meta = ask_model(
                     repo,
                     contract["schema"],
@@ -859,6 +910,17 @@ def drive(args: argparse.Namespace) -> int:
                     sandbox=getattr(args, "readonly_sandbox", "read-only"),
                 )
                 model_calls += 1
+                workspace_after_call = workspace_digest(repo)
+                meta["workspace_unchanged_around_call"] = (
+                    workspace_after_call == workspace_before_call
+                )
+                if not meta["workspace_unchanged_around_call"]:
+                    meta["workspace_diff_around_call"] = sorted(
+                        key
+                        for key in set(workspace_before_call) | set(workspace_after_call)
+                        if workspace_before_call.get(key)
+                        != workspace_after_call.get(key)
+                    )
                 evidence.setdefault("model_calls", []).append(meta)
 
                 submission = {

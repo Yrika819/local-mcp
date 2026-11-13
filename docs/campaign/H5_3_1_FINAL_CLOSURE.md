@@ -45,12 +45,12 @@ assumption is false. So R1b was still open on Windows, and the reviewer's
 | 5 | Symlink / junction / reparse point | `_is_reparse_point` (`S_ISLNK` + `FILE_ATTRIBUTE_REPARSE_POINT`), every segment from base to root, unbounded recursive scan before the marker is read | Unchanged |
 | 6 | Hard link | Any regular file with `st_nlink > 1` inside a reused root is a hazard; the digest marks files `MULTIPLY_LINKED` instead of reading them | Unchanged |
 | 7 | TOCTOU | Scan and write are separate operations; documented as a residual, classified wholesale as C3/R-1 | Re-classified by attacker (§4). With the root now owner-only, **another OS user cannot create the racing entry at all**; what remains is genuinely the same-user (A1) and administrator (A3) boundary |
-| 8 | Windows ACL | Not checked | Full DACL read (`GetNamedSecurityInfoW` + `GetAce`); write ACEs outside `{owner, SYSTEM, Administrators, OWNER RIGHTS}` refuse the root; owner must be the running user; `NULL`/absent DACL, object/callback ACEs and unmodelled ACE types are refusals |
-| 9 | POSIX permission | Mode only (`& 0o077`) | Mode **and** owner uid; creation is atomic (`mkdir(0o700)`, not `mkdir()`+`chmod()`) |
+| 8 | Windows ACL | Not checked | Full DACL read (`GetNamedSecurityInfoW` + `GetAce`); write ACEs outside `{owner, SYSTEM, Administrators, OWNER RIGHTS}` refuse the root; the owner must be the running user; a root's write ACEs must carry `OI\|CI` so children inherit them; `NULL`/absent DACL, object/callback ACEs and unmodelled ACE types are refusals. `verify_private_tree` then walks every entry |
+| 9 | POSIX permission | Mode only (`& 0o077`) | Mode **and** owner uid; creation is atomic (`mkdir(0o700)`, not `mkdir()`+`chmod()`); directories require owner `rwx`, regular files only "no group/world bits" |
 | 10 | Workspace / state separation | `root/state` and `root/repo`, separate session record | Unchanged; both are now verified to carry the owner-only DACL by inheritance |
 | 11 | Model prompt / evidence record | `attempts/<n>/logs/step-*.txt`, `evidence.json`, prompt bytes, redaction | Unchanged |
 | 12 | Test-grant isolation | `test-grant` compiled only under the non-default `test-grant-fixture` feature; issuance refuses an unmarked state root; `resolve_grant` independently refuses a `TEST_FIXTURE_V1` grant whose fixture id does not match a marker in the running state root | Unchanged — audited and confirmed, see §6 |
-| 13 | Writes outside the fixture | "Create only, never delete": no deletion primitive exists in the driver (source-grep test); `_assert_disposable_base` refuses a relative base, the home directory, a drive root, a reparse-pointed base, and any base inside a Git work tree | Unchanged, and now a *root* another user can write into also cannot be reached |
+| 13 | Writes outside the fixture | "Create only, never delete": no deletion primitive exists in the driver (source-grep test); `_assert_disposable_base` refuses a relative base, the home directory, a drive root, a reparse-pointed base, and any base inside a Git work tree | Same rules, applied **before** anything is created: a refused base is no longer `mkdir`-ed first, only the last missing component is created, and a base whose other principals can rename/delete a child is refused |
 
 ## 3. Measured on the campaign host (2026-11-14, Windows 11, not elevated)
 
@@ -95,6 +95,10 @@ Measured with the read-back check that now ships
 | `SetNamedSecurityInfoW(..., DACL=nullptr)` on a throwaway directory, then `assert_private_root` | **refused**: *"has a NULL DACL, which grants everyone full access"* |
 | `icacls <created root> /grant *S-1-1-0:(OI)(CI)(M)`, then reuse the root | **refused**: *"is writable by S-1-1-0 (mask 0x1301bf) … so it is refused"* (this runs in the test suite, `test_reusing_a_root_that_became_writable_by_others_is_refused`) |
 | a plain directory on the shared temporary root | **refused** by the same check (positive control that the check is not vacuous) |
+| `icacls <root> /grant:r <owner>:(F)` (write ACE without `OI\|CI`), then `assert_private_root` | **refused**: *"grants write … without object+container inheritance … refused"* |
+| `icacls <root>/state/sessions /grant *S-1-1-0:(OI)(CI)(M)`, then `verify_private_tree` on an otherwise valid root | **refused** on the child, before reuse |
+| `icacls <base> /grant *S-1-1-0:(OI)(CI)(F)` (a parent that can move a child aside) | **refused** before anything is created under it |
+| `icacls <base> /grant *S-1-1-0:(OI)(CI)(M)` (write but no `FILE_DELETE_CHILD`) | **accepted** — `Modify` cannot rename or delete a protected child, which is why the default `%TEMP%` remains usable |
 
 ## 4. TOCTOU is not one problem: attacker classification
 
@@ -103,16 +107,30 @@ brief, the classes are separated:
 
 | Attacker | Can it win the scan→write race in H5.3? | In H5.3.1? | Where it belongs |
 | --- | --- | --- | --- |
-| Another OS user (A2), restricted | **Yes** — inherited `Modify` on a `%TEMP%` root let them create/replace entries inside a fixture root | **No** — the root carries no ACE for them (verified by read-back), so creating, replacing, hard-linking or renaming an entry inside it is denied by the kernel | Was an H5.3 **harness defect**, now closed |
+| Another OS user (A2), restricted | **Yes** — inherited `Modify` on a `%TEMP%` root let them create/replace entries inside a fixture root | **No** for entries *inside* the root: it carries no ACE for them (verified by read-back), so creating, replacing, hard-linking or renaming an entry there is denied by the kernel. For the root's *name* in the parent: refused when the parent lets an untrusted trustee delete or rename children (round-6 finding 1) | Was an H5.3 **harness defect**, closed in two steps (root DACL, then parent entry) |
 | Another OS user in a directory the operator deliberately shared | Yes | No: such a root is refused on reuse; a new root never inherits the shared ACL | Closed by refusal |
 | Same OS user, another process (A1) | Yes | **Yes** | C3 / R-1 — genuinely unresolved, and unfixable inside one account |
 | Elevated / `SYSTEM` (A3) | Yes | **Yes** | Out of scope by design (an administrator *is* the Owner) — `C3_0` §6.1 |
 | Operator error (wrong `--work-dir`) | No — the base checks already refused home/drive/Git roots and the driver has no deletion primitive | No | Closed in H5.3-0 |
 
-So the honest statement is: **the cross-user part of R1b is fixed and provable;
-the same-user part is C3/R-1 and remains open.** The reviewer's `NOT_READY`
-concern, as written ("another user could race the harness"), no longer holds on
-either platform.
+So the honest statement is: **the cross-user part of R1b is fixed in two places
+and provable** — the root's contents (owner-only DACL, verified) and the root's
+*name* (a base whose other principals can delete or rename children is refused),
+**and the same-user part is C3/R-1 and remains open.**
+
+### 4.1 What round 6 of the independent review changed here
+
+The first fix only protected the contents. The round-6 reviewer showed that this
+was not enough, in three ways that are now closed:
+
+| Round-6 finding | Severity | Disposition |
+| --- | --- | --- |
+| A writable parent still permits cross-user replacement of the **root entry** | High | `private_root.assert_parent_cannot_reenter`: a base is refused when an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` on it (Windows) or when it is group/other-writable and not sticky (POSIX). `Modify` on the parent is *not* enough to move a protected child, which is why the default `%TEMP%` stays usable |
+| Accepted roots need not **propagate** their protection to children | High | The root check now requires every write ACE to carry `OI|CI` (Windows), and `verify_private_tree` walks and verifies **every** entry after creation and on reuse instead of a hand-picked sample |
+| POSIX creation **failed** on ordinary seeded files | High | `_posix_assert` required `0o700` of regular files, so the marker (0644/0600) could never pass. Files are now checked only for owner and for no group/world bits; directories keep the `0o700` requirement. This was a real regression introduced by the first fix |
+| Base validation created directories before refusing, and resolved before checking links | Medium | `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created, and a missing intermediate directory is refused |
+| The checkpoint claimed a per-call no-write proof that did not exist | Medium | The digest is now taken around **each** model call and recorded per call; the evidence still says "digest comparison", never "OS-enforced read-only isolation" |
+| The closure record cited a review section that did not exist yet | Low | `H5_3_EVIDENCE.md` §10 now carries round 6 verbatim with its dispositions |
 
 ## 5. What H5.3.1 changed (code)
 

@@ -293,3 +293,40 @@ Reviewer-declared `NOT_VERIFIED` in every round, carried forward here:
 | Real model inference | C1 and C2, `gpt-6.1-terra` high | `real_model_scenario_c.py`, `real_model_scenario_c2.py` |
 | Rust test suite | 1700 tests with `test-grant-fixture`, 1696 without | CI matrix + local runs |
 | Independent review | 5 read-only rounds by a separate `codex exec` context | this section |
+
+## 10. H5.3.1 — review rounds 6 and 7 (final HEAD)
+
+Rounds 1–5 reviewed `a819904 … f74b805`. `d3267bf` (POSIX root) and `b85355b`
+(docs) were never reviewed, so the H5.3 verdict did not cover the final HEAD.
+H5.3.1 continues the same record instead of restarting it.
+
+| Item | Value |
+| --- | --- |
+| Model | `gpt-6.1-terra` (explicit `-m`), reasoning `high`, no fallback |
+| Transport | `codex exec`, prompt on stdin, one fresh process per round |
+| Context | independent: no implementation history, no shared session |
+| Target | a detached worktree at the frozen commit (`.local/int-h531-review`), so the reviewer could not touch the deliverable |
+| Read capability | `--sandbox workspace-write` in that throwaway worktree, because `--sandbox read-only` cannot read the workspace on Windows (H53-4). **This is not OS-level read-only isolation**; it is a disposable copy plus a before/after `git status` and whole-tree SHA-256 comparison |
+| Modification check | `git status --short` empty and the tree digest unchanged after every round |
+
+### Round 6 — `e6c7ec3` (first H5.3.1 fix) — verdict `NOT_READY`
+
+The reviewer refused the closure and the refusal was correct. Findings and what
+was done about each:
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 1 | **High** | The root's permissions do not protect its **name in the parent**: another user who can rename/delete a child there can move the root aside and leave a link, and every later write follows the link | Fixed: `private_root.assert_parent_cannot_reenter` refuses a base where an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` (Windows) or where the base is group/other-writable and not sticky (POSIX). `Modify` on the parent is insufficient to move a protected child, which is why `%TEMP%` stays usable. Test: `test_a_base_whose_entries_anyone_can_replace_is_refused` |
+| 2 | **High** | An accepted root need not propagate its protection to children: the verifier ignored `OI\|CI`, and only a hand-picked sample of children was checked, each through the same parser | Fixed: a root's write ACEs must carry `OI\|CI`; `verify_private_tree` walks and verifies **every** entry after creation and on reuse. Tests: `test_a_root_whose_write_aces_do_not_inherit_is_refused`, `test_a_child_that_became_writable_by_others_is_refused` |
+| 3 | **High** | **POSIX fixture creation could not succeed**: `assert_private_entry` demanded `0o700` of regular files, so the marker written with the default mode never passed | Fixed: files are checked for owner and for "no group/world bits"; directories keep the `0o700` requirement. A real regression introduced by the first fix and caught only because the reviewer read the POSIX path |
+| 4 | Medium | `base.mkdir(parents=True)` ran **before** the base was validated, and `resolve()` ran before the reparse-point scan, so a refused base could still create directories and a symlinked segment disappeared from the inspected path | Fixed: `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created; a missing intermediate directory is refused |
+| 5 | Medium | `H5_3_CAMPAIGN_CHECKPOINT.md` claimed a "per-call no-write proof" that the driver did not implement (one digest before the run, one after) | Fixed: the digest is taken around **each** model call and recorded per call; the wording stays "digest comparison", never "OS-enforced read-only isolation" |
+| 6 | Low | The closure record cited `H5_3_EVIDENCE.md` §10, which did not exist | Fixed: this section |
+
+Reviewer's declared `NOT VERIFIED` for round 6 (carried forward): it executed no
+tests, no cross-user attack, no live-descriptor inspection, and no redirected or
+network `%TEMP%`, domain account or specific filesystem.
+
+### Round 7 — final HEAD — verdict recorded below this table
+
+See §10.1.
