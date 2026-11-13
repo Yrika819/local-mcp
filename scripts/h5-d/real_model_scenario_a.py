@@ -193,13 +193,32 @@ def _refuse_unsafe_base_path(base: Path) -> None:
         raise FixtureSafetyError(f"{base} is a drive root")
     if base == home:
         raise FixtureSafetyError(f"{base} is the home directory")
-    if home in base.parents and base != temporary and temporary not in base.parents:
-        # Inside the home tree is allowed only below the OS temporary directory.
-        # Ancestors are exempt: every `%TEMP%` path is inside the home tree.
-        raise FixtureSafetyError(
-            f"{base} is inside the user home directory and outside the "
-            "OS temporary directory"
-        )
+    if home in base.parents:
+        # H5.3 refused every base inside the home tree except one below the OS
+        # temporary directory. H5.3.1 measured that on this host the temporary
+        # directory is itself shared (another local account holds `DELETE` on it),
+        # so a base below it is refused by the re-entry check; the only provably
+        # private place left is a dedicated directory under the user profile.
+        # Accident protection is kept: the home root itself, the drive root and the
+        # usual shell folders are refused, so a mistyped path cannot point the
+        # harness at operator data.
+        shell_folders = {
+            "documents",
+            "desktop",
+            "downloads",
+            "pictures",
+            "music",
+            "videos",
+            "onedrive",
+            "favorites",
+        }
+        lowered = {part.lower() for part in base.relative_to(home).parts}
+        hit = lowered & shell_folders
+        if hit:
+            raise FixtureSafetyError(
+                f"{base} is inside the user shell folder {sorted(hit)[0]!r}; a "
+                "fixture root must not live among operator documents"
+            )
     for candidate in (base, *_existing_ancestors(base)):
         if (candidate / ".git").exists():
             raise FixtureSafetyError(
@@ -394,17 +413,26 @@ def _refuse_reused_root_hazards(root: Path) -> None:
         )
 
 
+def _mkdir_private(path: Path) -> None:
+    """Create a fixture directory owner-only (0o700 on POSIX)."""
+    try:
+        private_root.create_private_dir(path)
+    except (private_root.PrivateRootError, OSError) as error:
+        raise FixtureSafetyError(str(error)) from error
+
+
 def _next_attempt_dir(root: Path) -> Path:
     """A per-run, never-reused directory for logs and evidence."""
     attempts = root / "attempts"
-    attempts.mkdir(exist_ok=True)
+    if not attempts.exists():
+        _mkdir_private(attempts)
     used = [
         int(child.name)
         for child in attempts.iterdir()
         if child.is_dir() and child.name.isdigit()
     ]
     attempt = attempts / str((max(used) + 1) if used else 1)
-    attempt.mkdir()
+    _mkdir_private(attempt)
     return attempt
 
 
@@ -417,9 +445,15 @@ def make_fixture(
     its ownership marker matches `run_id`) or refused, and every run writes into
     its own `attempts/<n>` directory.
     """
-    base = _assert_disposable_base(
-        Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir())
-    )
+    if work_dir is None:
+        raise FixtureSafetyError(
+            "no fixture base was given. The OS temporary directory is no longer an "
+            "implicit default: on a machine where another local account can rename "
+            "or delete it (measured on the campaign host) a root there cannot be "
+            "proven private. Pass a private directory, for example "
+            "~/goallatch-h5d-fixtures"
+        )
+    base = _assert_disposable_base(Path(work_dir))
     if run_id is None:
         run_id = (
             time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -469,8 +503,8 @@ def make_fixture(
 
     state = root / "state"
     repo = root / "repo"
-    for path in (state / "sessions", repo / "src", repo / "data"):
-        path.mkdir(parents=True, exist_ok=True)
+    for path in (state, repo, state / "sessions", repo / "src", repo / "data"):
+        _mkdir_private(path)
     _write_private_text(
         repo / "src" / "main.rs",
         'fn main() {\n    println!("goal-latch h5-d fixture");\n}\n',
@@ -1010,7 +1044,11 @@ def main() -> int:
     parser.add_argument(
         "--work-dir",
         default=None,
-        help="absolute disposable base directory (default: the OS temp directory)",
+        help=(
+            "absolute disposable base directory. There is no default: the OS "
+            "temporary directory is refused when another local principal can "
+            "rename or delete it (a shared machine), so pass a private directory"
+        ),
     )
     parser.add_argument(
         "--run-id",

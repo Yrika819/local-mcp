@@ -295,7 +295,11 @@ def main() -> int:
     parser.add_argument(
         "--work-dir",
         default=None,
-        help="absolute disposable base directory (default: the OS temp directory)",
+        help=(
+            "absolute disposable base directory. There is no default: the OS "
+            "temporary directory is refused when another local principal can "
+            "rename or delete it (a shared machine), so pass a private directory"
+        ),
     )
     parser.add_argument(
         "--run-id",

@@ -60,6 +60,7 @@ __all__ = [
     "verify_private_tree",
     "assert_path_cannot_reenter",
     "restrict_file",
+    "create_private_dir",
     "trustee_report",
     "support_class",
 ]
@@ -176,14 +177,21 @@ _OBJECT_INHERIT_ACE = 0x01
 _CONTAINER_INHERIT_ACE = 0x02
 _INHERITED_ACE = 0x10
 _INHERIT_BOTH = _OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE
+_INHERIT_ONLY_ACE = 0x08
+#: Rights a directory needs before this harness can create the fixture in it.
+_CREATE_IN_DIRECTORY = 0x00000002 | 0x00000004  # FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY
 
-#: Rights that let a trustee rename or delete an entry *in* a directory,
-#: independently of that entry's own DACL. `FILE_DELETE_CHILD` is a bypass: it
-#: deletes a child even when the child grants nothing. `WRITE_DAC` / `WRITE_OWNER`
-#: on the parent let a trustee grant itself `FILE_DELETE_CHILD` first.
-#: `Modify` (0x1301bf) contains none of them, `Full control` contains all.
+#: Rights that let a trustee rename or delete an entry, or the component itself,
+#: independently of the child's own DACL. Two routes exist on Windows and both
+#: matter: `DELETE` on the object (a rename or delete of *that* component) and
+#: `FILE_DELETE_CHILD` on its parent (a bypass of the child's DACL).
+#: `WRITE_DAC` / `WRITE_OWNER` let a trustee grant itself either right first.
+#: `Modify` (0x1301bf) contains `DELETE` but not `FILE_DELETE_CHILD`, so a
+#: `Modify` grant on a shared temporary directory lets another account rename the
+#: temporary directory itself - which is why such a base is now refused.
 _REENTRY_RIGHTS = (
-    0x00000040  # FILE_DELETE_CHILD
+    0x00010000  # DELETE (on the object itself: rename/delete of that component)
+    | 0x00000040  # FILE_DELETE_CHILD
     | 0x00040000  # WRITE_DAC
     | 0x00080000  # WRITE_OWNER
     | 0x10000000  # GENERIC_ALL
@@ -525,8 +533,24 @@ def _windows_assert(
                     f"(type {ace_type}); it cannot be proven private, so it is refused"
                 )
             if ace_type == _ACCESS_DENIED_ACE_TYPE:
+                if require_protected_dacl:
+                    # Deny ACE ordering is not modelled here, and this harness
+                    # only ever writes DACLs without one; a root that carries a
+                    # deny ACE cannot be proven usable, so it is refused.
+                    raise PrivateRootError(
+                        f"{path} carries a deny ACE for {sid}; this check does not "
+                        "model deny ordering, so the root cannot be proven usable"
+                    )
                 continue
-            if mask & _WRITE_RIGHTS and sid in {user_sid, _OWNER_RIGHTS_SID}:
+            if (
+                mask & _WRITE_RIGHTS
+                and sid in {user_sid, _OWNER_RIGHTS_SID}
+                and not _flags & _INHERIT_ONLY_ACE
+                and mask & _CREATE_IN_DIRECTORY == _CREATE_IN_DIRECTORY
+            ):
+                # `INHERIT_ONLY` would apply to children but not to the root, and
+                # a mask without add-file/add-subdirectory would not let the
+                # harness create the fixture at all.
                 owner_can_write = True
             if mask & _WRITE_RIGHTS and sid not in allowed:
                 raise PrivateRootError(
@@ -755,6 +779,12 @@ def _windows_reentry_verdict(api, directory: Path) -> str | None:
         for ace_type, _flags, mask, sid in _aces(api, dacl):
             if ace_type == _ACCESS_DENIED_ACE_TYPE:
                 continue
+            if _flags & _INHERIT_ONLY_ACE:
+                # An inherit-only ACE does not apply to this directory itself, so it
+                # cannot grant a rename or delete of *this* component. C:\ carries
+                # exactly such an ACE for Authenticated Users, and the fixture root's
+                # own DACL is protected, so nothing is inherited into it either.
+                continue
             if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
                 # An object or callback ACE can grant the same right under a
                 # condition this code does not evaluate; refuse rather than skip.
@@ -832,6 +862,24 @@ def assert_path_cannot_reenter(path: Path) -> None:
         reason = _posix_reentry_verdict(directory)
         if reason:
             raise PrivateRootError(f"{reason}; refused")
+
+
+def create_private_dir(path: Path) -> None:
+    """Create a directory inside a verified root, owner-only on POSIX too.
+
+    `mkdir` is masked by the process umask, so on POSIX the mode is set after
+    creation. The directory belongs to this harness and sits inside its own root,
+    so tightening it is not a decision about another directory.
+    """
+    if not path.is_dir():
+        os.mkdir(path)
+    if _windows_only():
+        _windows_assert(path, _load_windows_api(), require_protected_dacl=False)
+        return
+    # An existing directory is one this harness created on an earlier attempt of
+    # the same owned root, so tightening it is still its own decision.
+    os.chmod(path, POSIX_OWNER_ONLY_MODE)
+    _posix_assert(path, expect_directory=True)
 
 
 def restrict_file(path: Path) -> None:

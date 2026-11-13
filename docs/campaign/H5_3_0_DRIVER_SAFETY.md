@@ -38,7 +38,7 @@ an unusual path, this was treated as a release blocker rather than a nuisance.
 
 | Requirement | Implementation |
 | --- | --- |
-| Unique new root under the OS temp directory | `base = work_dir or tempfile.gettempdir()`, `root = base / f"goallatch-h5d-{run_id}"`, `run_id` = UTC timestamp + 8 hex characters unless supplied |
+| Unique new root under an **operator-chosen private** base | `base = work_dir` (no implicit default: see §7.3), `root = base / f"goallatch-h5d-{run_id}"`, `run_id` = UTC timestamp + 8 hex characters unless supplied |
 | Never unconditionally delete an arbitrary path | The driver contains no deletion primitive at all; `test_no_deletion_helper_exists_in_the_driver` greps the source for `shutil.rmtree`, `os.rmdir`, `os.removedirs` and `unlink(` |
 | Reuse of an existing directory only when owned | `goallatch-fixture-owner.json` records the schema, run id, canonical root, creation time and owning pid; `_claim_existing_root` requires the schema, an exact run-id match **and** `realpath(root) == marker.canonical_root`. An unmarked or foreign root is refused and left untouched |
 | Reject symlinks, Windows junctions and reparse points | `_is_reparse_point` checks `S_ISLNK` and `FILE_ATTRIBUTE_REPARSE_POINT`; `_reparse_components` walks every existing segment from the base to the root; the resolved root must still be *inside* the resolved base |
@@ -82,7 +82,7 @@ deliberate driver decision with a recorded reason.
 
 ## 4. Tests that hold the property
 
-`scripts/h5-d/test_fixture_safety.py` — 34 tests, no model, no binary, runs in CI
+`scripts/h5-d/test_fixture_safety.py` — 38 tests, no model, no binary, runs in CI
 (the `quality` job gained a `Run real-model driver safety self-tests` step):
 
 * unique root per run, `state`/`repo` separated, marker written and correct;
@@ -186,3 +186,26 @@ So the H5.3 assumption "`%TEMP%` is already per-user" was false on real
 hardware: a plain directory there is writable by another local account and by a
 sandbox group. The evidence is reproduced by
 `test_the_os_temporary_directory_is_shared_and_the_root_does_not_inherit_it`.
+
+### 7.3 The default base had to change as well
+
+Protecting the root is not enough while the *name* of the base can be moved
+(round 6/7/8 review). Windows authorises a rename or delete of a component
+through `DELETE` on that component, and `Modify` (`0x1301bf`) contains `DELETE` —
+so on this host another local account can rename the user's `%TEMP%` itself and
+substitute a junction. The consequence is deliberate and fail-closed:
+
+* `%TEMP%` is **no longer an implicit default** (`make_fixture` refuses a call
+  with no base and says why);
+* a base is accepted only when **every** directory on the path to it is owned by
+  the running user or a trusted principal, and no untrusted trustee can rename or
+  delete a component (`DELETE`, `FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER`,
+  `GENERIC_ALL`, or any ACE type this check cannot evaluate);
+* on POSIX the equivalent rule is "not group/other-writable unless sticky, and
+  owned by the user or root", so a sticky root-owned `/tmp` is still accepted;
+* inside the home tree a **dedicated directory** is now allowed (that is the only
+  provably private place on this host), while the home root and the usual shell
+  folders (`Documents`, `Desktop`, `Downloads`, …) are still refused.
+
+The operator therefore passes `--work-dir` explicitly, for example
+`--work-dir ~/goallatch-h5d-fixtures`.

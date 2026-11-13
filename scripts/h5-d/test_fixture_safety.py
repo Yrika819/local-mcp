@@ -23,6 +23,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,13 +31,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import real_model_scenario_a as driver  # noqa: E402
 
 
+#: One private root for every fixture test. The OS temporary directory is refused
+#: as a base (another local account can rename or delete it on a shared machine),
+#: so the tests create their bases under the user profile, exactly as an operator
+#: now has to. Nothing is deleted - the same policy the driver follows.
+TEST_FIXTURE_ROOT = Path.home() / ".goallatch-h5d-test-fixtures"
+
+
 class DisposableBase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="h53-fixture-test-")
-        self.base = Path(self._tmp.name)
+        TEST_FIXTURE_ROOT.mkdir(mode=0o700, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(TEST_FIXTURE_ROOT, 0o700)
+        self.base = TEST_FIXTURE_ROOT / (
+            self._testMethodName + "-" + uuid.uuid4().hex[:8]
+        )
+        self.base.mkdir()
 
     def tearDown(self) -> None:
-        self._tmp.cleanup()
+        pass
 
 
 class FixtureCreationTests(DisposableBase):
@@ -305,6 +318,18 @@ class OwnerOnlyRootTests(DisposableBase):
             shared = [rows[0]] if rows[0]["group_or_world_bits"] else []
         if not shared:
             self.skipTest("the OS temporary directory is private on this host")
+        if os.name == "nt":
+            # `Modify` includes DELETE on the object, so another account can rename
+            # the temporary directory itself: it is refused as a base.
+            with self.assertRaises(driver.FixtureSafetyError):
+                driver.make_fixture(parent, "shared-temp")
+        else:
+            # A sticky, root-owned /tmp only lets the entry owner (and root)
+            # remove an entry, so it stays an acceptable base on POSIX.
+            fixture = driver.make_fixture(parent, "shared-temp")
+            self.assertEqual(
+                stat.S_IMODE(fixture.root.lstat().st_mode) & 0o077, 0
+            )
 
         fixture = driver.make_fixture(self.base, "shared-parent")
         if os.name != "nt":
@@ -350,6 +375,64 @@ class OwnerOnlyRootTests(DisposableBase):
         if not mode & 0o022 or not shared.lstat().st_mode & stat.S_ISVTX:
             self.skipTest("this host's temporary directory is not sticky-shared")
         pr.assert_parent_cannot_reenter(shared)
+
+    def test_a_base_with_modify_for_everyone_is_refused(self) -> None:
+        # Round 8: `Modify` carries `DELETE` on the object, so another user can
+        # rename the *base itself* and put a link in its place. It is therefore no
+        # longer an acceptable base, even though it cannot delete our child.
+        parent = self.base / "modify-parent"
+        parent.mkdir()
+        self._make_root_writable_by_everyone(parent, rights="M")
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(parent, "modify-base")
+        self.assertFalse((parent / "goallatch-h5d-modify-base").exists())
+
+    def test_an_inherit_only_owner_ace_leaves_the_root_unusable(self) -> None:
+        # Round 8 (Medium): an owner ACE that is inherit-only grants nothing on the
+        # root itself, so accepting it would declare an unusable root private. The
+        # DACL is rebuilt with only that ACE, because `icacls /grant:r` adds a
+        # second ACE instead of replacing ours.
+        if os.name != "nt":
+            self.skipTest("Windows inheritance flags")
+        import subprocess as sp
+
+        import private_root as pr
+
+        parent = self.base / "inherit-only-parent"
+        parent.mkdir()
+        root = parent / "root"
+        root.mkdir()
+        owner = self._owner_sid()
+        for arguments in (
+            ["/inheritance:r"],
+            ["/remove:g", f"*{owner}"],
+            ["/grant", f"*{owner}:(OI)(CI)(IO)(F)"],
+        ):
+            completed = sp.run(
+                ["icacls", str(root), *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                self.skipTest(f"icacls is unavailable: {completed.stderr.strip()}")
+        with self.assertRaises(pr.PrivateRootError):
+            pr.assert_private_root(root)
+
+    def test_no_fixture_base_is_offered_by_default(self) -> None:
+        # The OS temporary directory is not an implicit default any more: on a
+        # shared machine it cannot be proven private, so the operator must choose.
+        with self.assertRaises(driver.FixtureSafetyError) as raised:
+            driver.make_fixture(None, "no-base")
+        self.assertIn("private directory", str(raised.exception))
+
+    def test_a_user_shell_folder_is_refused_as_a_base(self) -> None:
+        # The home tree is now allowed for a dedicated directory, so the usual
+        # "typed path" accident is still refused where it would hurt.
+        for name in ("Documents", "Desktop", "Downloads"):
+            candidate = Path.home() / name
+            with self.assertRaises(driver.FixtureSafetyError):
+                driver.make_fixture(candidate, "shell-folder")
 
     def test_reusing_a_root_that_became_writable_by_others_is_refused(self) -> None:
         owned = driver.make_fixture(self.base, "tampered-root")

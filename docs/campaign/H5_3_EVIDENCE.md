@@ -346,4 +346,14 @@ attack, no live-descriptor inspection, no non-default filesystem, `%TEMP%`
 redirection or domain account, and no verification of the product's authority
 model.
 
-### Round 8 — final HEAD — recorded below in §10.1
+### Round 8 — `3ac0948` (round-7 remediation) — verdict `NOT_READY`
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 1 | **High** | The Windows re-entry set missed `DELETE` on the component itself; `Modify` contains it, so a shared temporary directory lets another account rename that directory and substitute a junction | Fixed: `DELETE` is in the re-entry set. Consequence, accepted: `%TEMP%` is refused as a fixture base and there is no implicit default base any more |
+| 2 | **High** | POSIX creation still failed: the fixture's own directories were created `0755` and refused by the tree check | Fixed: every fixture directory goes through `create_private_dir` (`0700` on POSIX) |
+| 3 | Medium | An owner ACE that is inherit-only, or that lacks create rights, could make an unusable root pass | Fixed: the owner needs a non-inherit-only ACE with `FILE_ADD_FILE|FILE_ADD_SUBDIRECTORY`; a deny ACE on a root is refused because deny ordering is not modelled |
+
+Reviewer's declared `NOT VERIFIED` for round 8: same list as round 7.
+
+### Round 9 — final HEAD — recorded below in §10.1

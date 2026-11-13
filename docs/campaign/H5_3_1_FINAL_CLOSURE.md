@@ -125,8 +125,10 @@ account has no write access to its contents and no ability to replace any name o
 the path to it*, **as measured at creation time**. It is a snapshot plus a
 refusal, not a kernel-enforced continuation:
 
-* the ACLs and modes of the whole path are read and refused if any of them allows
-  a stranger to write, re-ACL, or rename a component;
+* the ACLs and modes of every component are read and refused when a stranger can
+  write, re-ACL, rename or delete a component — including a Windows `DELETE` on
+  the component itself and a foreign owner (an owner can always rewrite a DACL or
+  `chmod`);
 * nothing re-checks them later, so an attacker who gains such a capability *after*
   creation is not stopped by this harness. Gaining it requires write access to an
   ancestor the driver has just refused, or administrator rights (A3);
@@ -147,6 +149,24 @@ was not enough, in three ways that are now closed:
 | Base validation created directories before refusing, and resolved before checking links | Medium | `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created, and a missing intermediate directory is refused |
 | The checkpoint claimed a per-call no-write proof that did not exist | Medium | The digest is now taken around **each** model call and recorded per call; the evidence still says "digest comparison", never "OS-enforced read-only isolation" |
 | The closure record cited a review section that did not exist yet | Low | `H5_3_EVIDENCE.md` §10 now carries round 6 verbatim with its dispositions |
+
+### 4.3 What round 8 changed
+
+Round 8 reviewed the round-7 result and refused it as well. Two of its findings
+were again real, and one of them changed the harness's default behaviour.
+
+| Round-8 finding | Severity | Disposition |
+| --- | --- | --- |
+| The Windows re-entry set missed `DELETE` **on the component itself**, which is the right Windows uses to rename or delete that component. `Modify` contains `DELETE`, so a shared temporary directory is a re-entry route | High | `DELETE` is now part of the re-entry set. The consequence is fail-closed and accepted: on this host `%TEMP%` is **refused as a fixture base**, and the driver no longer has an implicit default base |
+| Ordinary POSIX creation still failed: `state/`, `repo/`, `attempts/` were created with the umask mode `0755` and then refused by the tree check | High | Every directory inside the fixture is created through `private_root.create_private_dir`, which sets `0700` on POSIX and verifies the DACL on Windows |
+| An ineffective owner ACE (inherit-only, or without create rights) could make an unusable root pass | Medium | The owner must hold a **non-inherit-only** ACE with `FILE_ADD_FILE|FILE_ADD_SUBDIRECTORY`; a root carrying a deny ACE is refused because deny ordering is not modelled |
+
+Round 8 also produced a deliberate design consequence that the Owner should see:
+because the OS temporary directory cannot be proven private on a shared Windows
+host, **an evidence run now requires an explicit private `--work-dir`**. The
+H5.3 runs in `H5_3_EVIDENCE.md` were executed before this rule and would be
+refused today; the rule does not invalidate their *product* evidence, but a new
+harness run must choose a base such as `~/goallatch-h5d-fixtures`.
 
 ### 4.2 What round 7 changed
 
