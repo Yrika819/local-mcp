@@ -195,6 +195,30 @@ class ReparsePointTests(DisposableBase):
             "the digest must refuse to read through a link, not hash its target",
         )
 
+    def test_a_hard_linked_fixture_file_is_refused(self) -> None:
+        # Re-review round 3 (Medium): a hard link is not a reparse point, so the
+        # scan accepted it and write_text would have truncated the shared file.
+        owned = driver.make_fixture(self.base, "hard-link")
+        outside = self.base / "hard-target.txt"
+        outside.write_text("must survive\n", encoding="utf-8")
+        target = owned.root / "repo" / "src" / "main.rs"
+        try:
+            os.remove(target)
+            os.link(outside, target)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("this host cannot create hard links")
+
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "hard-link")
+
+        self.assertEqual(
+            outside.read_text(encoding="utf-8"),
+            "must survive\n",
+            "reuse must not truncate a file outside the root",
+        )
+        digest = driver.workspace_digest(owned.root / "repo")
+        self.assertEqual(digest.get("src/main.rs"), "MULTIPLY_LINKED")
+
     def test_a_symlinked_root_is_refused(self) -> None:
         outside = self.base / "outside"
         outside.mkdir()

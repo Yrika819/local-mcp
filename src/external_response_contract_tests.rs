@@ -1288,6 +1288,16 @@ fn serde_defaulted_replanner_fields_are_optional_in_the_contract() {
     );
 }
 
+/// The approved published wording, pinned by
+/// `the_published_replanner_contract_states_the_needs_replan_dependency_requirement`.
+///
+/// A contract sentence is the interface a model reads, so a silent edit is a
+/// contract change. These constants exist so an edit cannot land without a
+/// deliberate update here and a matching behavioural test.
+const APPROVED_RESOLVE_DEPENDENCY_RULE: &str = "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal, so the blocked Task gains a new hard dependency; the `dependency` is that Task's new prerequisite, which is normally a repair Task added by this same proposal (`ref_kind` `NEW`), and an existing Task (`ref_kind` `EXISTING`) is also accepted; a resolution without such an edge is refused as REPLANNER_SCHEMA_VIOLATION";
+
+const APPROVED_READONLY_REASSESSMENT_RULE: &str = "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and that rejected trigger is resolved, either the trigger's dependency chain (including dependencies this proposal adds) reaches a Task that was created after the rejected plan revision, is CODEX_READONLY with READ_ONLY scope, and is completed with no blockers, at least one evidence item, no UNKNOWN side effect and a passing latest verification result, or the chain reaches a new Task that is CODEX_READONLY with READ_ONLY scope and SAFE_READ_ONLY replay safety; in the second case every new Task whose operation_kind is not READ_ONLY must depend on one of those qualifying new READ_ONLY Tasks, and different new mutating Tasks may use different qualifying prerequisites";
+
 #[test]
 fn the_published_replanner_contract_states_the_needs_replan_dependency_requirement() {
     // H5.2-C: a real model answered `resolve_needs_replan` without the matching
@@ -1375,26 +1385,24 @@ fn the_published_replanner_contract_states_the_needs_replan_dependency_requireme
     // The conditional readonly-reassessment barrier is published in full, so a
     // model that resolves a rejected pristine plan is told about the
     // completed-task exception and the properties a new prerequisite needs.
+    //
+    // Independent review round 3 asked for the *complete approved wording* to be
+    // asserted rather than selected substrings, because "EXISTING is never
+    // accepted" would satisfy a substring check while contradicting the rule.
+    // The text below is therefore pinned exactly; changing it is a deliberate
+    // contract change that must also re-read `validate_readonly_reassessment_barrier`
+    // and `replanner::the_published_resolve_needs_replan_shape_is_accepted`.
     let barrier = replanner
         .conditions
         .iter()
         .find(|condition| condition.code == "REPLANNER_READONLY_REASSESSMENT_BARRIER")
         .expect("the conditional reassessment barrier must be published");
-    for needle in [
-        "REQUIRE_READONLY_REASSESSMENT",
-        "completed",
-        "CODEX_READONLY",
-        "SAFE_READ_ONLY",
-    ] {
-        assert!(
-            barrier.detail.contains(needle),
-            "the reassessment condition must state {needle:?}: {}",
-            barrier.detail
-        );
-    }
-    assert!(
-        barrier.detail.contains("already contain"),
-        "the completed-reassessment exception must be published, not only the new-Task rule: {}",
-        barrier.detail
+    assert_eq!(
+        barrier.detail, APPROVED_READONLY_REASSESSMENT_RULE,
+        "the published reassessment rule must be the approved wording, not merely contain it"
+    );
+    assert_eq!(
+        condition.detail, APPROVED_RESOLVE_DEPENDENCY_RULE,
+        "the published resolve rule must be the approved wording, not merely contain it"
     );
 }

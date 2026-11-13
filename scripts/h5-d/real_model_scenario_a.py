@@ -245,31 +245,48 @@ def _claim_existing_root(root: Path, run_id: str) -> None:
         )
 
 
-def _existing_reparse_points(root: Path) -> list[Path]:
-    """Every reparse point inside `root`, at any depth, without following any.
+def _reused_root_hazards(root: Path) -> list[tuple[Path, str]]:
+    """Hazards already inside `root` that reuse would write or read through.
 
-    Reuse must not be a way to smuggle a link in: an owned root whose `repo/src`
-    — or `repo/a/b/c/link` — is a link would otherwise redirect the fixture
-    writes, and the evidence digest, outside the root even though the root itself
-    is legitimate. The walk has no depth limit and never descends into a link, so
-    the answer is the same however deep the link is. An unreadable directory is
-    treated as a reparse point: the refusal is fail-closed.
+    Reuse must not be a way to smuggle an indirection in. Three kinds matter:
+
+    * a symlink or Windows junction/reparse point (write and read escape);
+    * a hard link (not a reparse point at all: `write_text` truncates the shared
+      file, so the fixture would overwrite a file outside the root);
+    * an unreadable directory (the scan cannot prove it is safe, so it is
+      refused).
+
+    The walk has no depth limit and never descends into a link, so the answer
+    does not depend on how deep the hazard is.
     """
-    flagged: list[Path] = []
+    hazards: list[tuple[Path, str]] = []
     stack: list[Path] = [root]
     while stack:
         path = stack.pop()
         try:
             entries = list(path.iterdir())
         except OSError:
-            flagged.append(path)
+            hazards.append((path, "UNREADABLE_DIRECTORY"))
             continue
         for entry in entries:
             if _is_reparse_point(entry):
-                flagged.append(entry)
-            elif entry.is_dir():
+                hazards.append((entry, "REPARSE_POINT"))
+                continue
+            try:
+                info = entry.lstat()
+            except OSError:
+                hazards.append((entry, "UNREADABLE"))
+                continue
+            if stat.S_ISDIR(info.st_mode):
                 stack.append(entry)
-    return flagged
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                hazards.append((entry, "HARD_LINK"))
+    return hazards
+
+
+def _existing_reparse_points(root: Path) -> list[Path]:
+    """Backwards-compatible view of `_reused_root_hazards` (paths only)."""
+    return [path for path, _kind in _reused_root_hazards(root)]
 
 
 def _next_attempt_dir(root: Path) -> Path:
@@ -316,11 +333,12 @@ def make_fixture(
 
     if _reparse_components(root, base):
         raise FixtureSafetyError(f"{root} is reached through a reparse point")
-    nested = _existing_reparse_points(root)
-    if nested:
+    hazards = _reused_root_hazards(root)
+    if hazards:
         raise FixtureSafetyError(
-            f"{root} already contains reparse points, so fixture writes could escape "
-            f"it: {[str(path) for path in nested]}"
+            f"{root} already contains filesystem indirections, so fixture writes "
+            f"could escape it: "
+            f"{[(str(path), kind) for path, kind in hazards]}"
         )
     if base.resolve() not in root.resolve().parents:
         raise FixtureSafetyError(f"{root} escapes the disposable base {base}")
@@ -358,24 +376,38 @@ def make_fixture(
 
 
 def workspace_digest(repo: Path) -> dict[str, str]:
-    """Hash every regular file under `repo` without following a link.
+    """Hash every regular file under `repo` without following any indirection.
 
-    `rglob` follows directory symlinks and `is_file()` follows file symlinks, so a
-    link inside a fixture could make the digest read bytes from outside it. A
-    reparse point is recorded as such instead of being read.
+    `rglob` follows directory symlinks and `is_file()`/`read_bytes()` follow file
+    symlinks, so a link inside a fixture could make the digest read bytes from
+    outside it. Links are recorded as such, and a multiply linked file is marked
+    instead of being read, because a hard link is an alias of a file elsewhere.
     """
     digests = {}
-    for path in sorted(repo.rglob("*")):
-        if _is_reparse_point(path):
-            digests[str(path.relative_to(repo)).replace("\\", "/")] = "REPARSE_POINT"
-            continue
-        try:
-            if path.is_file():
-                digests[str(path.relative_to(repo)).replace("\\", "/")] = hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
-        except OSError:
-            digests[str(path.relative_to(repo)).replace("\\", "/")] = "UNREADABLE"
+    for directory, subdirectories, filenames in os.walk(repo, followlinks=False):
+        subdirectories[:] = [
+            name
+            for name in subdirectories
+            if not _is_reparse_point(Path(directory) / name)
+        ]
+        for name in filenames:
+            path = Path(directory) / name
+            key = str(path.relative_to(repo)).replace("\\", "/")
+            if _is_reparse_point(path):
+                digests[key] = "REPARSE_POINT"
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                digests[key] = "UNREADABLE"
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                digests[key] = "MULTIPLY_LINKED"
+                continue
+            try:
+                digests[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                digests[key] = "UNREADABLE"
     return digests
 
 
