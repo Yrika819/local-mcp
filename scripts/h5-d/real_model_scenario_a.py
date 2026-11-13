@@ -890,6 +890,19 @@ def drive(args: argparse.Namespace) -> int:
     fixture = make_fixture(
         Path(args.work_dir) if args.work_dir else None, args.run_id
     )
+    try:
+        return _drive_with_fixture(args, fixture, binary_sha)
+    finally:
+        # Deterministic, not left to the destructor: a caller that keeps this
+        # frame alive (a traceback, a debugger) must not keep the run id leased
+        # (round 12, Medium).
+        fixture.release()
+
+
+def _drive_with_fixture(
+    args: argparse.Namespace, fixture: "Fixture", binary_sha: str
+) -> int:
+    binary = Path(args.binary).resolve()
     root, state, repo, session_id = (
         fixture.root,
         fixture.state,

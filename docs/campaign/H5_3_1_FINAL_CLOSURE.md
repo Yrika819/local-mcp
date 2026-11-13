@@ -150,6 +150,15 @@ was not enough, in three ways that are now closed:
 | The checkpoint claimed a per-call no-write proof that did not exist | Medium | The digest is now taken around **each** model call and recorded per call; the evidence still says "digest comparison", never "OS-enforced read-only isolation" |
 | The closure record cited a review section that did not exist yet | Low | `H5_3_EVIDENCE.md` §10 now carries round 6 verbatim with its dispositions |
 
+### 4.6 Rounds 12 and 13
+
+Round 12 returned `VERDICT: READY` with **0 Critical / 0 High**, one Medium that it
+explicitly recorded as non-blocking (the run lease was released by the destructor
+rather than deterministically by the driver) and one Low (the home-directory rule
+above). Both were addressed anyway: `drive` now releases the lease in a `finally`
+and the home rule is stated as a deliberate decision. Round 13 re-reviewed the
+resulting HEAD.
+
 ### 4.5 What round 11 changed
 
 | Round-11 finding | Severity | Disposition |

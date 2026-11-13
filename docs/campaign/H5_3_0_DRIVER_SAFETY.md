@@ -206,6 +206,13 @@ substitute a junction. The consequence is deliberate and fail-closed:
 * inside the home tree a **dedicated directory** is now allowed (that is the only
   provably private place on this host), while the home root and the usual shell
   folders (`Documents`, `Desktop`, `Downloads`, …) are still refused.
+  This is a deliberate change to the H5.3-0 accident rule, not an oversight: that
+  rule refused every base inside the home directory, which on this host also
+  refused the only base that can be proven private, and it protects against a
+  mistyped path rather than against an attacker. The protection that matters -
+  the path/ACL verification - applies there unchanged. If the Owner prefers the
+  stricter rule, the harness would need a dedicated private volume instead, since
+  a shared temporary directory cannot be used.
 
 The operator therefore passes `--work-dir` explicitly, for example
 `--work-dir ~/goallatch-h5d-fixtures`.
