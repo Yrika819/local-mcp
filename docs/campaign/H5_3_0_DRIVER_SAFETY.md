@@ -47,7 +47,7 @@ an unusual path, this was treated as a release blocker rather than a nuisance.
 | Evidence per run | `attempts/<n>/evidence.json` and `attempts/<n>/logs/`, with `<n>` monotonically allocated per root |
 | Previous logs and evidence are never overwritten | Because `attempts/<n>` is freshly created per invocation and no file is ever truncated |
 | Only the owner can write inside the root | `private_root.create_owner_only_dir` creates the root **with** an owner-only descriptor (`SYSTEM`, `Administrators`, the creating user) on Windows and `0o700` on POSIX, then reads the DACL back and verifies it; `verify_private_tree` verifies every entry, after creation and on reuse. See §7.1 and `docs/campaign/H5_3_1_FINAL_CLOSURE.md` |
-| The root's *name* cannot be swapped | A base is refused when an untrusted trustee can delete or rename a child of it (`FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER` on Windows, group/other-writable and not sticky on POSIX) |
+| The root's *name* cannot be swapped | Every directory from the base up to the filesystem root is refused when an untrusted trustee can delete or rename a child of it (`FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`, or an ACE type this check cannot evaluate, on Windows; group/other-writable and not sticky on POSIX), when the directory is owned by anyone other than the running user or a trusted principal, and when an ACE type is not a plain allow/deny |
 
 ### 2.1 Why "never delete" rather than "delete only what I own"
 
@@ -82,7 +82,7 @@ deliberate driver decision with a recorded reason.
 
 ## 4. Tests that hold the property
 
-`scripts/h5-d/test_fixture_safety.py` — 32 tests, no model, no binary, runs in CI
+`scripts/h5-d/test_fixture_safety.py` — 34 tests, no model, no binary, runs in CI
 (the `quality` job gained a `Run real-model driver safety self-tests` step):
 
 * unique root per run, `state`/`repo` separated, marker written and correct;

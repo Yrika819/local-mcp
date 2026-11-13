@@ -58,7 +58,8 @@ __all__ = [
     "assert_private_root",
     "assert_private_entry",
     "verify_private_tree",
-    "assert_parent_cannot_reenter",
+    "assert_path_cannot_reenter",
+    "restrict_file",
     "trustee_report",
     "support_class",
 ]
@@ -123,6 +124,9 @@ _TRUSTED_SIDS = frozenset(
     {
         "S-1-5-18",  # NT AUTHORITY\SYSTEM
         "S-1-5-32-544",  # BUILTIN\Administrators
+        # NT SERVICE\TrustedInstaller: the owner of C:\ on a normal Windows host.
+        # It administers the volume, so it is inside the trusted boundary.
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
     }
 )
 
@@ -513,6 +517,7 @@ def _windows_assert(
         # `OWNER RIGHTS` is the current user by the check above, so it stands in
         # for the owner's own SID.
         allowed = _TRUSTED_SIDS | {user_sid, _OWNER_RIGHTS_SID}
+        owner_can_write = False
         for ace_type, _flags, mask, sid in _aces(api, dacl):
             if ace_type not in (_ACCESS_ALLOWED_ACE_TYPE, _ACCESS_DENIED_ACE_TYPE):
                 raise PrivateRootError(
@@ -521,6 +526,8 @@ def _windows_assert(
                 )
             if ace_type == _ACCESS_DENIED_ACE_TYPE:
                 continue
+            if mask & _WRITE_RIGHTS and sid in {user_sid, _OWNER_RIGHTS_SID}:
+                owner_can_write = True
             if mask & _WRITE_RIGHTS and sid not in allowed:
                 raise PrivateRootError(
                     f"{path} is writable by {sid} (mask {hex(mask)}), which is "
@@ -541,6 +548,14 @@ def _windows_assert(
                     f"inheritance (flags {hex(_flags)}), so children of this root "
                     "would not be proven private; refused"
                 )
+        if require_protected_dacl and not owner_can_write:
+            # An empty DACL denies everyone, including this harness: it is not a
+            # private root, it is an unusable one, and declaring it private would
+            # be a false positive (review round 7, Medium).
+            raise PrivateRootError(
+                f"{path} has no write ACE for its owner, so it is unusable rather "
+                "than private; refused"
+            )
     finally:
         kernel32.LocalFree(descriptor)
 
@@ -615,7 +630,7 @@ def create_owner_only_dir(path: Path) -> None:
         _windows_assert(path, api, require_protected_dacl=True)
         return
     _posix_create(path)
-    _posix_assert(path)
+    _posix_assert(path, expect_directory=True)
 
 
 def assert_private_root(path: Path) -> None:
@@ -713,56 +728,123 @@ def verify_private_tree(root: Path) -> list[str]:
     return checked
 
 
-def assert_parent_cannot_reenter(base: Path) -> None:
-    """Refuse a base whose other principals can rename or delete a child.
+def _windows_reentry_verdict(api, directory: Path) -> str | None:
+    """Return a refusal reason when `directory` lets a stranger move a child."""
+    if not directory.is_dir():
+        return f"{directory} is not a directory"
+    _advapi32, kernel32 = api
+    descriptor, dacl, control, owner_sid = _security_descriptor(api, directory)
+    try:
+        if not dacl:
+            return (
+                f"{directory} has a NULL or absent DACL, so every user can rename "
+                "or delete entries in it"
+            )
+        user_sid = _current_user_sid(api)
+        if owner_sid != user_sid and owner_sid not in _TRUSTED_SIDS:
+            # The owner of a directory can always change its DACL (the owner is
+            # implicitly granted WRITE_DAC), so a foreign owner is a re-entry
+            # route even when the current DACL looks harmless.
+            return (
+                f"{directory} is owned by {owner_sid}, which is neither the running "
+                "user nor a trusted principal; its owner could grant itself the "
+                "right to rename a fixture root there"
+            )
+        allowed = _TRUSTED_SIDS | {user_sid, _OWNER_RIGHTS_SID}
+        owner_can_write = False
+        for ace_type, _flags, mask, sid in _aces(api, dacl):
+            if ace_type == _ACCESS_DENIED_ACE_TYPE:
+                continue
+            if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+                # An object or callback ACE can grant the same right under a
+                # condition this code does not evaluate; refuse rather than skip.
+                return (
+                    f"{directory} grants access through an object or callback ACE "
+                    f"(type {ace_type}), which this check cannot evaluate"
+                )
+            if mask & _REENTRY_RIGHTS and sid not in allowed:
+                return (
+                    f"{directory} lets {sid} rename or delete entries in it (mask "
+                    f"{hex(mask)}); a fixture root there can be replaced by a link"
+                )
+    finally:
+        kernel32.LocalFree(descriptor)
+    return None
 
-    A private root protects its *contents*; it does not protect its *name* in the
-    parent. An attacker who may delete or rename entries of the parent can move
-    the root aside and put a symlink/junction at the old name, and every later
-    write the harness performs through that path lands wherever the link points.
 
-    * Windows: `FILE_DELETE_CHILD` on the parent deletes a child regardless of
-      the child's own DACL, so it is the bypass that matters. `WRITE_DAC` and
-      `WRITE_OWNER` on the parent let a trustee grant itself that right first.
-      `Modify` (0x1301bf) has none of these; `Full control` has all of them.
-    * POSIX: a group/other-writable parent allows `rename(2)` of the child unless
-      the parent is sticky (the `/tmp` case, where only the owner of the entry may
-      rename or delete it).
+def _posix_reentry_verdict(directory: Path) -> str | None:
+    info = directory.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid not in (os.geteuid(), 0):
+        # The owner of a directory can always chmod it, so a foreign owner is a
+        # re-entry route even when the mode looks harmless.
+        return (
+            f"{directory} is owned by uid {info.st_uid}, which is neither the "
+            "running user nor root; its owner could grant itself write access and "
+            "rename a fixture root there"
+        )
+    if mode & 0o022:
+        if not info.st_mode & stat.S_ISVTX:
+            return (
+                f"{directory} is group- or world-writable (mode {oct(mode)}) and not "
+                "sticky, so another user can rename a fixture root in it"
+            )
+        if info.st_uid == 0:
+            # A sticky directory only lets the *entry* owner, the *directory*
+            # owner and root remove an entry. Root and the entry owner are both
+            # acceptable; a non-root foreign directory owner is refused above.
+            return None
+    return None
+
+
+def assert_path_cannot_reenter(path: Path) -> None:
+    """Refuse a path whose every component's *name* can be replaced by a stranger.
+
+    A private root protects its *contents*; it does not protect its *name*. An
+    attacker who may delete or rename a child of any directory on the path can
+    move that component aside and put a symlink/junction in its place, and every
+    later write the harness performs through the path lands wherever the link
+    points. Round 6 covered the base; round 7 showed that the base's own
+    *ancestors* are the same problem, so the whole chain up to the filesystem root
+    is checked.
+
+    * Windows: `FILE_DELETE_CHILD` on a directory deletes/renames a child
+      regardless of the child's own DACL, so it is the bypass that matters.
+      `WRITE_DAC` and `WRITE_OWNER` let a trustee grant itself that right first,
+      and a directory's *owner* is implicitly allowed to rewrite the DACL, so a
+      foreign owner is refused even when the current ACL looks harmless.
+      `Modify` (0x1301bf) has none of those bits; `Full control` has all of them.
+    * POSIX: a group/other-writable directory allows `rename(2)` of a child unless
+      it is sticky; a sticky directory still lets its owner remove the entry, so a
+      non-root foreign owner is refused. The directory owner can always `chmod`.
     """
-    if not base.is_dir():
-        raise PrivateRootError(f"{base} is not a directory")
+    if not path.exists():
+        raise PrivateRootError(f"{path} does not exist")
+    chain = [path, *path.parents]
     if _windows_only():
         api = _load_windows_api()
-        _advapi32, kernel32 = api
-        descriptor, dacl, control, owner_sid = _security_descriptor(api, base)
-        try:
-            if not dacl:
-                raise PrivateRootError(
-                    f"{base} has a NULL or absent DACL, so every user can rename "
-                    "or delete a fixture root in it; refused"
-                )
-            user_sid = _current_user_sid(api)
-            allowed = _TRUSTED_SIDS | {user_sid, _OWNER_RIGHTS_SID, owner_sid}
-            for ace_type, _flags, mask, sid in _aces(api, dacl):
-                if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
-                    continue
-                if mask & _REENTRY_RIGHTS and sid not in allowed:
-                    raise PrivateRootError(
-                        f"{base} lets {sid} rename or delete entries in it (mask "
-                        f"{hex(mask)}); a fixture root there can be replaced by a "
-                        "link, so the base is refused"
-                    )
-        finally:
-            kernel32.LocalFree(descriptor)
+        for directory in chain:
+            reason = _windows_reentry_verdict(api, directory)
+            if reason:
+                raise PrivateRootError(f"{reason}; refused")
         return
-    info = base.lstat()
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & 0o022 and not info.st_mode & stat.S_ISVTX:
-        raise PrivateRootError(
-            f"{base} is group- or world-writable (mode {oct(mode)}) and not "
-            "sticky, so another user can rename a fixture root in it and replace "
-            "it with a link; refused"
-        )
+    for directory in chain:
+        reason = _posix_reentry_verdict(directory)
+        if reason:
+            raise PrivateRootError(f"{reason}; refused")
+
+
+def restrict_file(path: Path) -> None:
+    """Make a file this harness just created owner-only.
+
+    On Windows the file inherits the root's protected DACL, so nothing is done.
+    On POSIX `write_text` uses the umask (0600 under a `077` umask, 0644 under the
+    usual `022`), so the mode is set explicitly - it is this harness's own file
+    inside its own root, not another directory's permission.
+    """
+    if _windows_only():
+        return
+    os.chmod(path, 0o600)
 
 
 if __name__ == "__main__":  # pragma: no cover - operator convenience

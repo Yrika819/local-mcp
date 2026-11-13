@@ -249,7 +249,7 @@ def _assert_disposable_base(base: Path) -> Path:
                 f"{canonical} is inside the Git work tree at {candidate}"
             )
     try:
-        private_root.assert_parent_cannot_reenter(canonical)
+        private_root.assert_path_cannot_reenter(canonical)
     except private_root.PrivateRootError as error:
         raise FixtureSafetyError(str(error)) from error
     return canonical
@@ -276,6 +276,23 @@ def _assert_private_fixture_root(root: Path) -> None:
         raise FixtureSafetyError(str(error)) from error
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Write a fixture file and make it owner-only on POSIX.
+
+    Round 7 (High) showed that a file written with the process umask (`0644`) is
+    refused by the whole-tree check, so creation must be followed by an explicit
+    mode. On Windows the file inherits the root's protected DACL.
+    """
+    path.write_text(text, encoding="utf-8")
+    try:
+        private_root.restrict_file(path)
+    except OSError as error:
+        raise FixtureSafetyError(
+            f"{path} cannot be restricted to its owner: {error}; the fixture root "
+            "cannot be proven private, so the run is refused"
+        ) from error
+
+
 def _write_marker(root: Path, run_id: str) -> None:
     marker = {
         "schema": FIXTURE_MARKER_SCHEMA,
@@ -285,9 +302,7 @@ def _write_marker(root: Path, run_id: str) -> None:
         "owner_pid": os.getpid(),
         "note": "H5.3-0: a root without this marker is never reused or removed",
     }
-    (root / FIXTURE_MARKER_NAME).write_text(
-        json.dumps(marker, indent=2), encoding="utf-8"
-    )
+    _write_private_text(root / FIXTURE_MARKER_NAME, json.dumps(marker, indent=2))
 
 
 def _claim_existing_root(root: Path, run_id: str) -> None:
@@ -456,14 +471,15 @@ def make_fixture(
     repo = root / "repo"
     for path in (state / "sessions", repo / "src", repo / "data"):
         path.mkdir(parents=True, exist_ok=True)
-    (repo / "src" / "main.rs").write_text(
-        'fn main() {\n    println!("goal-latch h5-d fixture");\n}\n', encoding="utf-8"
+    _write_private_text(
+        repo / "src" / "main.rs",
+        'fn main() {\n    println!("goal-latch h5-d fixture");\n}\n',
     )
-    (repo / "src" / "helper.rs").write_text(
-        "pub fn helper() -> u32 {\n    1\n}\n", encoding="utf-8"
+    _write_private_text(
+        repo / "src" / "helper.rs", "pub fn helper() -> u32 {\n    1\n}\n"
     )
-    (repo / "data" / "inventory.txt").write_text(
-        "widgets=42\ngadgets=7\nspares=0\n", encoding="utf-8"
+    _write_private_text(
+        repo / "data" / "inventory.txt", "widgets=42\ngadgets=7\nspares=0\n"
     )
     # H5.3.1: the guarantee is about the *contents* of the root, not just its top
     # entry. Review round 6 (High) pointed out that a hand-picked sample proves
@@ -476,8 +492,8 @@ def make_fixture(
         "cwd": str(repo),
         "permitted_directories": [str(repo)],
     }
-    (state / "sessions" / f"{session_id}.json").write_text(
-        json.dumps(record, indent=2), encoding="utf-8"
+    _write_private_text(
+        state / "sessions" / f"{session_id}.json", json.dumps(record, indent=2)
     )
     attempt_dir = _next_attempt_dir(root)
     try:

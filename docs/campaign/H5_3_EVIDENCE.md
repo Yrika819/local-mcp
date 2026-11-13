@@ -327,6 +327,23 @@ Reviewer's declared `NOT VERIFIED` for round 6 (carried forward): it executed no
 tests, no cross-user attack, no live-descriptor inspection, and no redirected or
 network `%TEMP%`, domain account or specific filesystem.
 
-### Round 7 — final HEAD — verdict recorded below this table
+### Round 7 — `f401b51` (round-6 remediation) — verdict `NOT_READY`
 
-See §10.1.
+Refused again, correctly. Two of the five findings were regressions introduced by
+the round-6 fix, which is why the reviewer's static read of the POSIX path was
+worth more than the Windows-only local test run.
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 1 | **High** | POSIX creation raised `TypeError`: `_posix_assert` gained `expect_directory` and `create_owner_only_dir` still called it with one argument. Seeded files written with the umask (`0644`) were then refused by the tree check, so a POSIX evidence run could not start | Fixed: the argument is passed; files are written through `_write_private_text`, which sets `0600` on POSIX |
+| 2 | **High** | A **foreign-owned** base was treated as trusted, although a Windows directory owner can rewrite its DACL and a sticky POSIX directory still lets its owner remove an entry | Fixed: only the running user or a trusted principal may own any component of the path |
+| 3 | **High** | Only the base's entry was protected; a replaceable **ancestor** could redirect the whole base after the reparse scan | Fixed: `assert_path_cannot_reenter` checks every component from the base to the filesystem root |
+| 4 | **High** | The Windows parent check ignored object and callback ACE types, which can grant the same right under a condition the code does not evaluate | Fixed: any ACE type other than plain allow/deny is a refusal there too |
+| 5 | Medium | An empty Windows DACL was accepted as a private root even though it grants nobody anything, so it is unusable rather than private | Fixed: a root must contain a write ACE for its owner |
+
+Reviewer's declared `NOT VERIFIED` for round 7: no tests executed, no cross-user
+attack, no live-descriptor inspection, no non-default filesystem, `%TEMP%`
+redirection or domain account, and no verification of the product's authority
+model.
+
+### Round 8 — final HEAD — recorded below in §10.1

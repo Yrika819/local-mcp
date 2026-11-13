@@ -48,7 +48,7 @@ works only in `.local/h53`.
 | Reviewer `NOT_READY` at `f74b805` | Answered, not overridden: R1b was still open **on Windows** because `_assert_private_fixture_root` returned early there and `Path.mkdir()` inherited the temporary directory's DACL |
 | Measurement | `%TEMP%` on the campaign host grants `Modify` to two further local SIDs and to `CodexSandboxUsers`; a plain directory created there carries four non-owner write ACEs |
 | Fix | `scripts/h5-d/private_root.py`: root created **with** an owner-only protected descriptor, DACL read back and verified, reused roots verified, owner identity checked, everything unprovable refused |
-| Tests | `test_fixture_safety.py` 32 tests OK, with positive and negative controls |
+| Tests | `test_fixture_safety.py` 34 tests OK, with positive and negative controls |
 | Rust sources | unchanged in H5.3.1 (regression check of the fused HEAD only) |
 
 ## 3. Defects found by real execution and closed in H5.3

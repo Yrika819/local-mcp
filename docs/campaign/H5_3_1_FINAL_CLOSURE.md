@@ -107,7 +107,7 @@ brief, the classes are separated:
 
 | Attacker | Can it win the scan→write race in H5.3? | In H5.3.1? | Where it belongs |
 | --- | --- | --- | --- |
-| Another OS user (A2), restricted | **Yes** — inherited `Modify` on a `%TEMP%` root let them create/replace entries inside a fixture root | **No** for entries *inside* the root: it carries no ACE for them (verified by read-back), so creating, replacing, hard-linking or renaming an entry there is denied by the kernel. For the root's *name* in the parent: refused when the parent lets an untrusted trustee delete or rename children (round-6 finding 1) | Was an H5.3 **harness defect**, closed in two steps (root DACL, then parent entry) |
+| Another OS user (A2), restricted | **Yes** — inherited `Modify` on a `%TEMP%` root let them create/replace entries inside a fixture root | **No** for entries *inside* the root: it carries no ACE for them (verified by read-back). For the root's *name* and **every directory on the path to it** (round 7): refused when an untrusted trustee holds a rename/delete bypass, when the directory is foreign-owned (an owner can always rewrite the DACL or `chmod`), or when the ACL uses an ACE type this check cannot evaluate | Was an H5.3 **harness defect**, closed in three steps: root DACL (round 6), base entry (round 6), whole ancestor chain + foreign-owner rule + ACE-type refusal (round 7) |
 | Another OS user in a directory the operator deliberately shared | Yes | No: such a root is refused on reuse; a new root never inherits the shared ACL | Closed by refusal |
 | Same OS user, another process (A1) | Yes | **Yes** | C3 / R-1 — genuinely unresolved, and unfixable inside one account |
 | Elevated / `SYSTEM` (A3) | Yes | **Yes** | Out of scope by design (an administrator *is* the Owner) — `C3_0` §6.1 |
@@ -117,6 +117,22 @@ So the honest statement is: **the cross-user part of R1b is fixed in two places
 and provable** — the root's contents (owner-only DACL, verified) and the root's
 *name* (a base whose other principals can delete or rename children is refused),
 **and the same-user part is C3/R-1 and remains open.**
+
+### 4.0 Scope of the A2 claim, stated precisely
+
+The A2 claim is: *for a fixture root created by this driver, an unrelated local
+account has no write access to its contents and no ability to replace any name on
+the path to it*, **as measured at creation time**. It is a snapshot plus a
+refusal, not a kernel-enforced continuation:
+
+* the ACLs and modes of the whole path are read and refused if any of them allows
+  a stranger to write, re-ACL, or rename a component;
+* nothing re-checks them later, so an attacker who gains such a capability *after*
+  creation is not stopped by this harness. Gaining it requires write access to an
+  ancestor the driver has just refused, or administrator rights (A3);
+* writing *through* a path that is checked and then used remains a
+  path-based-operation race for the same user (A1) — that is C3/R-1, and it is not
+  fixed here.
 
 ### 4.1 What round 6 of the independent review changed here
 
@@ -131,6 +147,19 @@ was not enough, in three ways that are now closed:
 | Base validation created directories before refusing, and resolved before checking links | Medium | `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created, and a missing intermediate directory is refused |
 | The checkpoint claimed a per-call no-write proof that did not exist | Medium | The digest is now taken around **each** model call and recorded per call; the evidence still says "digest comparison", never "OS-enforced read-only isolation" |
 | The closure record cited a review section that did not exist yet | Low | `H5_3_EVIDENCE.md` §10 now carries round 6 verbatim with its dispositions |
+
+### 4.2 What round 7 changed
+
+Round 7 reviewed the result of round 6 and refused it again. All five findings
+were correct; two were defects introduced by the round-6 fix itself.
+
+| Round-7 finding | Severity | Disposition |
+| --- | --- | --- |
+| POSIX creation raised `TypeError` (`_posix_assert` gained a parameter that `create_owner_only_dir` did not pass), and seeded files written with the umask (`0644`) were then refused by the tree check | High | `create_owner_only_dir` passes `expect_directory=True`; every fixture file is written through `_write_private_text`, which sets `0600` on POSIX (the file belongs to this harness, inside its own root) |
+| A **foreign-owned** base was treated as trusted: a Windows owner can always rewrite the DACL, and a sticky POSIX directory still lets its owner remove an entry | High | Only the running user or a trusted principal (`SYSTEM`, `Administrators`, `TrustedInstaller`, POSIX `root`) may own a component of the path; a foreign owner is refused |
+| A replaceable **ancestor** could redirect an accepted base (the round-6 check only looked at the base itself) | High | `assert_path_cannot_reenter` checks every directory from the base up to the filesystem root |
+| The Windows parent check skipped object and callback ACE types | High | Any ACE that is neither plain allow nor plain deny is a refusal there too |
+| An **empty** Windows DACL was accepted as a private root although it is unusable | Medium | A root must contain a write ACE for its owner, otherwise it is refused as unusable rather than declared private |
 
 ## 5. What H5.3.1 changed (code)
 
