@@ -309,6 +309,20 @@ pub fn resolve_path_covered_by_session_authority(
 /// placing a linked worktree in Git administrative internals.
 pub const MANAGED_WORKTREE_ROOT_ENV: &str = "LOCAL_MCP_MANAGED_WORKTREE_ROOT";
 
+/// Host-owned environment override for the durable state root.
+///
+/// The durable state root holds the Session records, the Goal store and the
+/// Authorization B ledger. It exists so an operator (and the acceptance
+/// harnesses) can run a fully isolated server instance without touching the
+/// real per-user state, which is the only way a *real* MCP server process can
+/// be exercised against a throwaway workspace.
+///
+/// Like [`MANAGED_WORKTREE_ROOT_ENV`] this is host/operator configuration: it is
+/// read from the process environment only, never from MCP arguments, model
+/// prose, or a value derived from a workspace. A relative path is refused, so
+/// the resolved root never depends on the current directory of a request.
+pub const STATE_DIR_ENV: &str = "LOCAL_MCP_STATE_DIR";
+
 /// The host-owned root under which managed linked worktrees are created
 /// (`docs/MANAGED_WORKTREES_V1_DESIGN.md` section 7).
 ///
@@ -329,6 +343,192 @@ pub fn managed_worktree_root() -> Result<PathBuf> {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
+    resolve_state_dir(std::env::var_os(STATE_DIR_ENV))
+}
+
+/// H5-C — the marker file that turns a state root into a **disposable test
+/// grant fixture root**.
+///
+/// The marker is not authority. It can only *permit* a grant whose attestation is
+/// `TEST_FIXTURE_V1`, and nothing in the production binary can mint such a grant
+/// (the issuance path is behind the non-default `test-grant-fixture` cargo
+/// feature and refuses an unmarked root). So the marker cannot create authority;
+/// it can only bound where a test grant is usable.
+pub(crate) const TEST_GRANT_FIXTURE_MARKER: &str = "test-grant-fixture.json";
+
+/// The fixture identity of the current state root, if (and only if) that root
+/// carries a marker that agrees with itself.
+///
+/// Read on the grant-resolution path, so it is deliberately cheap: one `stat`
+/// for every state root that is not a fixture root, and one small read for the
+/// roots that are.
+pub(crate) fn test_grant_fixture_id() -> Option<String> {
+    // The fixture tests run against an explicit `TaskStore::with_state_root`, so
+    // they need to point this lookup at that root without mutating the process
+    // environment of a parallel test run.
+    #[cfg(test)]
+    if let Some(root) = test_fixture_root_override() {
+        return test_grant_fixture_id_in(&root);
+    }
+    let root = state_dir().ok()?;
+    test_grant_fixture_id_in(&root)
+}
+
+/// Test-only override for the state root the fixture lookup reads.
+///
+/// Compiled only in test builds, so it cannot weaken a shipped binary, and it is
+/// what keeps the fixture tests honest without `std::env::set_var` races.
+#[cfg(test)]
+static TEST_FIXTURE_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "test-grant-fixture"))]
+pub(crate) struct TestFixtureRootGuard;
+
+#[cfg(all(test, feature = "test-grant-fixture"))]
+impl Drop for TestFixtureRootGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = TEST_FIXTURE_ROOT.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-grant-fixture"))]
+pub(crate) fn set_test_fixture_root(root: &std::path::Path) -> TestFixtureRootGuard {
+    if let Ok(mut guard) = TEST_FIXTURE_ROOT.lock() {
+        *guard = Some(root.to_path_buf());
+    }
+    TestFixtureRootGuard
+}
+
+#[cfg(test)]
+fn test_fixture_root_override() -> Option<std::path::PathBuf> {
+    TEST_FIXTURE_ROOT
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn test_grant_fixture_id_in(root: &std::path::Path) -> Option<String> {
+    let path = root.join(TEST_GRANT_FIXTURE_MARKER);
+    if !path.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let fixture_id = marker.get("fixture_id")?.as_str()?.to_owned();
+    if fixture_id.is_empty() || fixture_id.len() > 64 {
+        return None;
+    }
+    // The marker must name the root it lives in. A marker copied from another
+    // fixture root (or one that was written for a different root) does not mark
+    // this root.
+    let declared = marker.get("state_root")?.as_str()?;
+    let declared = std::path::Path::new(declared);
+    if !declared.is_absolute() {
+        return None;
+    }
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let canonical_declared = std::fs::canonicalize(declared).ok()?;
+    if canonical_root != canonical_declared {
+        return None;
+    }
+    // Disposability is enforced here, on the read path, not only when the marker
+    // was created: a marker written by hand (or imported) must not turn a real
+    // state root into a fixture root.
+    let default_root = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|path| path.join("local-mcp"));
+    if let Some(default_root) = default_root
+        && std::fs::canonicalize(&default_root).ok() == Some(canonical_root.clone())
+    {
+        return None;
+    }
+    let disposable = canonical_root.parent()?;
+    if disposable.join(".git").exists() {
+        return None;
+    }
+    // The workspace the marker names must be a sibling of the state root under
+    // that same disposable parent, which is the layout the fixture creates.
+    let declared_workspace = marker.get("workspace_root")?.as_str()?;
+    let canonical_workspace = std::fs::canonicalize(declared_workspace).ok()?;
+    if canonical_workspace.parent() != Some(disposable) {
+        return None;
+    }
+    Some(fixture_id)
+}
+
+/// Mark `root` as a disposable test-grant fixture root.
+///
+/// Refuses a root that cannot be proven disposable: it must already exist, must
+/// not be the default state root, and must not sit under a Git working tree that
+/// the host is running from. Only the feature-gated fixture harness calls this.
+#[cfg(all(feature = "test-grant-fixture", test))]
+pub(crate) fn mark_test_grant_fixture_root(
+    root: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        root.is_absolute(),
+        "a fixture root must be an absolute path"
+    );
+    anyhow::ensure!(root.is_dir(), "a fixture root must already exist");
+    anyhow::ensure!(
+        workspace_root.is_absolute(),
+        "a fixture workspace must be an absolute path"
+    );
+    // A fixture is a *pair* of throwaway directories under one disposable
+    // parent: the state root and the workspace the Goal is allowed to write to.
+    // They are siblings, not nested, so the proof is that they share a parent and
+    // that the parent is disposable rather than a repository the operator cares
+    // about.
+    let disposable = root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("a fixture root must have a parent"))?;
+    anyhow::ensure!(
+        workspace_root.parent() == Some(disposable),
+        "the fixture workspace must live beside the fixture state root, under the same disposable parent"
+    );
+    anyhow::ensure!(
+        !disposable.join(".git").exists(),
+        "a fixture root must not sit inside a Git working tree"
+    );
+    let default_root = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|path| path.join("local-mcp"));
+    if let Some(default_root) = default_root
+        && std::fs::canonicalize(&default_root).ok() == std::fs::canonicalize(root).ok()
+    {
+        anyhow::bail!("the real state root must never be marked as a test fixture");
+    }
+    let existing = test_grant_fixture_id_in(root);
+    let fixture_id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let record = serde_json::json!({
+        "fixture_id": fixture_id,
+        "state_root": std::fs::canonicalize(root)?,
+        "workspace_root": std::fs::canonicalize(workspace_root)?,
+        "created_at": crate::task_store::utc_now_rfc3339(),
+        "purpose": "H5-C isolated Writer grant fixture; never an Owner approval",
+    });
+    let path = root.join(TEST_GRANT_FIXTURE_MARKER);
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    std::fs::write(&path, bytes)?;
+    Ok(fixture_id)
+}
+
+/// Pure resolver for [`state_dir`], so the override rule is testable without
+/// mutating the process environment of a parallel test run.
+fn resolve_state_dir(override_value: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(raw) = override_value {
+        let path = PathBuf::from(raw);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "{STATE_DIR_ENV} must be an absolute path: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .map(|path| path.join("local-mcp"))
@@ -478,6 +678,25 @@ pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state-root override is host configuration. An absolute path is used
+    /// verbatim; a relative one is refused rather than resolved against the
+    /// process working directory, so the durable state root can never become a
+    /// function of where a request happened to run.
+    #[test]
+    fn state_dir_override_requires_an_absolute_path() {
+        let absolute = std::env::temp_dir().join("local-mcp-state-dir-override-test");
+        assert_eq!(
+            resolve_state_dir(Some(absolute.clone().into_os_string())).unwrap(),
+            absolute
+        );
+        let relative = std::ffi::OsString::from("relative/state");
+        let error = resolve_state_dir(Some(relative)).expect_err("a relative root is refused");
+        assert!(
+            format!("{error}").contains(STATE_DIR_ENV),
+            "the refusal names the overridden variable: {error}"
+        );
+    }
 
     #[test]
     fn validates_custom_session_ids() {

@@ -612,7 +612,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "printf ready > \"$READY\"; IFS= read -r oid; printf received > \"$RECEIVED\"",
+                "printf ready > \"$READY\"; if IFS= read -r oid; then printf received > \"$RECEIVED\"; fi",
             ])
             .env("READY", &ready)
             .env("RECEIVED", &received)

@@ -12,7 +12,10 @@
 
 use std::io;
 
-pub(crate) const MAGIC: &[u8] = b"local-mcp/atomic-publish/v1\n";
+/// Version 2 adds the host-derived publication lock path and token. The helper
+/// must hold that lock for its whole publication, which is the quiescence
+/// witness H5.1-B requires. A v1 frame is refused rather than reinterpreted.
+pub(crate) const MAGIC: &[u8] = b"local-mcp/atomic-publish/v2\n";
 
 /// Which preimage the commit requires. `0` is absence, `1` is a SHA-256 digest.
 ///
@@ -44,6 +47,11 @@ pub(crate) struct EncodedRequest<'a> {
     pub preimage_kind: u8,
     pub preimage_digest: &'a str,
     pub request_id: &'a str,
+    /// Empty means "no publication lock witness". Only host paths that are not
+    /// part of the durable EXTERNAL Writer quarantine may omit it.
+    pub lock_path: &'a str,
+    /// Empty means "no publication lock witness".
+    pub lock_token: &'a str,
     pub content: &'a [u8],
 }
 
@@ -57,6 +65,8 @@ pub(crate) struct DecodedRequest {
     pub preimage_kind: u8,
     pub preimage_digest: String,
     pub request_id: String,
+    pub lock_path: String,
+    pub lock_token: String,
     pub content: Vec<u8>,
 }
 
@@ -71,6 +81,8 @@ pub(crate) fn encode(request: EncodedRequest<'_>) -> Vec<u8> {
         preimage_kind,
         preimage_digest,
         request_id,
+        lock_path,
+        lock_token,
         content,
     } = request;
     let mut out = Vec::new();
@@ -80,6 +92,8 @@ pub(crate) fn encode(request: EncodedRequest<'_>) -> Vec<u8> {
     out.push(preimage_kind);
     push_bytes(&mut out, preimage_digest.as_bytes());
     push_bytes(&mut out, request_id.as_bytes());
+    push_bytes(&mut out, lock_path.as_bytes());
+    push_bytes(&mut out, lock_token.as_bytes());
     out.extend_from_slice(&(content.len() as u64).to_le_bytes());
     out.extend_from_slice(content);
     out
@@ -133,6 +147,8 @@ pub(crate) fn decode(mut input: &[u8]) -> io::Result<DecodedRequest> {
     let preimage_kind = take(&mut input, 1)?[0];
     let preimage_digest = take_bytes(&mut input)?.to_vec();
     let request_id = take_bytes(&mut input)?.to_vec();
+    let lock_path = take_bytes(&mut input)?.to_vec();
+    let lock_token = take_bytes(&mut input)?.to_vec();
     let content_len = u64::from_le_bytes(
         take(&mut input, 8)?
             .try_into()
@@ -160,6 +176,8 @@ pub(crate) fn decode(mut input: &[u8]) -> io::Result<DecodedRequest> {
         preimage_kind,
         preimage_digest: text(preimage_digest, "atomic-publish digest is not valid UTF-8")?,
         request_id: text(request_id, "atomic-publish request id is not valid UTF-8")?,
+        lock_path: text(lock_path, "atomic-publish lock path is not valid UTF-8")?,
+        lock_token: text(lock_token, "atomic-publish lock token is not valid UTF-8")?,
         content,
     })
 }
@@ -175,6 +193,8 @@ mod tests {
             preimage_kind: PREIMAGE_SHA256,
             preimage_digest: &"ab".repeat(32),
             request_id,
+            lock_path: "",
+            lock_token: "",
             content,
         })
     }
@@ -188,7 +208,29 @@ mod tests {
         assert_eq!(decoded.preimage_kind, PREIMAGE_SHA256);
         assert_eq!(decoded.preimage_digest, "ab".repeat(32));
         assert_eq!(decoded.request_id, "req-1");
+        assert_eq!(decoded.lock_path, "");
+        assert_eq!(decoded.lock_token, "");
         assert_eq!(decoded.content, b"hello");
+    }
+
+    #[test]
+    fn a_frame_carries_the_publication_lock_witness() {
+        let bytes = encode(EncodedRequest {
+            parent: "/p",
+            target: "/p/a.txt",
+            preimage_kind: PREIMAGE_ABSENT,
+            preimage_digest: "",
+            request_id: "req-2",
+            lock_path: "/state/publication-locks/session/goal/op.lock",
+            lock_token: "token-2",
+            content: b"body",
+        });
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.lock_path,
+            "/state/publication-locks/session/goal/op.lock"
+        );
+        assert_eq!(decoded.lock_token, "token-2");
     }
 
     #[test]
@@ -253,6 +295,8 @@ mod tests {
             preimage_kind: PREIMAGE_ABSENT,
             preimage_digest: "",
             request_id: "req",
+            lock_path: "",
+            lock_token: "",
             content: b"",
         });
         assert_eq!(decode(&absent).unwrap().preimage_kind, PREIMAGE_ABSENT);

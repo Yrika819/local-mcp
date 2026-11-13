@@ -16,6 +16,7 @@ use tokio::io::BufReader;
 use uuid::Uuid;
 
 use crate::execution::ExecutionPolicy;
+use crate::external_goal_api;
 use crate::goal::{GoalId, GoalStatus};
 use crate::goal_backends::ProductionGoalBackends;
 use crate::goal_runner::{self, GoalRunLimits, GoalRunResult, GoalRunStopReason};
@@ -744,12 +745,14 @@ pub(crate) fn tools() -> Value {
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"codex_fallback","description":"Diagnose-only Codex fallback. The host may invoke Codex read-only for bounded diagnosis; public callers cannot supply execution authority, lifecycle evidence, side-effect state, or a host-native command. Platform/safety blocks are terminal.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1},"blocker":{"type":"string","minLength":1},"phase":{"type":"string"},"failure_class":{"type":"string","enum":["SANDBOX_PERMISSION","HOST_ENVIRONMENT","TOOL_MISSING","NETWORK_REMOTE","SEMANTIC_FAILURE","PLATFORM_SAFETY","TRANSPORT_FAILURE","UNKNOWN"]},"cwd":{"type":"string"},"requires_code_change":{"type":"boolean","default":false}},"required":["session_id","task","blocker"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode. Returns normally when it finishes within 20 seconds; longer commands continue as a background job and return a job_id for poll_job/stop_job.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"goal_start","description":"Create one durable non-terminal Goal for this Local MCP session. This does not execute tasks or repository work in Phase 3.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"objective":{"type":"string","minLength":1,"maxLength":131072},"title":{"type":"string","maxLength":256},"constraints":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"completion_criteria":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"idempotency_key":{"type":"string","maxLength":128},"workspace_mode":{"type":"string","enum":["PRIMARY","MANAGED_WORKTREE"],"default":"PRIMARY","description":"Workspace isolation policy. PRIMARY (the default) is the existing behavior. MANAGED_WORKTREE asks the host to create one host-managed Git linked worktree for this Goal before planning. It is isolation policy only: the worktree path, branch, base commit, and permission roots remain host-derived and cannot be supplied here, and the target must already be covered by the session's permitted directories."}},"required":["session_id","objective"]}},
+        {"name":"goal_start","description":"Create one durable non-terminal Goal for this Local MCP session. This does not execute tasks or repository work in Phase 3.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"objective":{"type":"string","minLength":1,"maxLength":131072},"title":{"type":"string","maxLength":256},"constraints":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"completion_criteria":{"type":"array","items":{"type":"string","maxLength":8192},"maxItems":64},"idempotency_key":{"type":"string","maxLength":128},"workspace_mode":{"type":"string","enum":["PRIMARY","MANAGED_WORKTREE"],"default":"PRIMARY","description":"Workspace isolation policy. PRIMARY (the default) is the existing behavior. MANAGED_WORKTREE asks the host to create one host-managed Git linked worktree for this Goal before planning. It is isolation policy only: the worktree path, branch, base commit, and permission roots remain host-derived and cannot be supplied here, and the target must already be covered by the session's permitted directories."},"model_backend":{"type":"string","enum":["CODEX","EXTERNAL"],"default":"CODEX","description":"Host-owned model backend policy, decided once at creation and immutable afterwards. CODEX (the default) keeps the existing Codex CLI orchestration. EXTERNAL drives the Goal through goal_next / goal_submit and never launches a Codex CLI process for it. HYBRID is not implemented in V1 and is refused rather than downgraded."}},"required":["session_id","objective"]}},
         {"name":"goal_status","description":"Read the current durable Goal status without recovery, execution, or mutation. Omit goal_id to resolve the unique non-terminal Goal for the session.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"}},"required":["session_id"]}},
         {"name":"goal_pause","description":"Request the durable Goal pause transition only. No legacy Job or execution worker is stopped by this tool.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"reason":{"type":"string","maxLength":8192}},"required":["session_id"]}},
         {"name":"goal_resume","description":"Recover stale durable Goal task state and make resumable state ready for future orchestration. This does not execute work in Phase 3. An optional explicit pre-execution plan rejection may durably enter the existing Replanner path without executing a Worker. An optional failed_task_replan_requests array durably requests replacement of structurally invalid Tasks with bounded replacement closures; it never executes a Worker and never consumes the trigger's remaining retry.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"pre_execution_plan_rejection":{"type":"object","additionalProperties":false,"properties":{"request_id":{"type":"string","minLength":1,"maxLength":128},"expected_goal_revision":{"type":"integer","minimum":1},"expected_plan_revision":{"type":"integer","minimum":1},"trigger_task_id":{"type":"string","format":"uuid","maxLength":36},"reason":{"type":"string","minLength":1,"maxLength":8192},"replan_policy":{"type":"string","enum":["NORMAL","REQUIRE_READONLY_REASSESSMENT"],"default":"NORMAL"}},"required":["request_id","expected_goal_revision","expected_plan_revision","trigger_task_id","reason"]}},"required":["session_id"]}},
         {"name":"goal_cancel","description":"Request cancellation of durable Goal authority only. This does not stop unrelated legacy Local MCP Jobs or revert repository state.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"reason":{"type":"string","maxLength":8192}},"required":["session_id"]}},
         {"name":"goal_result","description":"Return the best durable result state for one explicit Goal ID. Non-terminal Goals return NOT_TERMINAL rather than fabricated success.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"}},"required":["session_id","goal_id"]}}
+        ,{"name":"goal_next","description":"Advance an EXTERNAL Goal by up to max_host_steps (default and maximum 8) host-owned steps: the existing Scheduler selects each step, which is either one bounded ModelWorkItem (outcome MODEL_REQUIRED, with the exact output contract the client must answer), a host verification step (Task Verifier, Goal Verifier, Goal Finalizer) reported as HOST_PROGRESS, or a typed stop reason (BLOCKED / NO_ACTION_WITH_REASON / TERMINAL). It never launches a model and never claims completion: Goal completion is decided only by the host Goal Verifier and Finalizer. A CODEX Goal returns NO_ACTION_WITH_REASON / MODEL_BACKEND_CODEX. A re-issued request keeps the same work_id and request_digest.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"max_host_steps":{"type":"integer","minimum":1,"maximum":8}},"required":["session_id"]}}
+        ,{"name":"goal_submit","description":"Submit one untrusted external model response for a host-issued ModelWorkItem. The host validates it against the same role validators the Codex path uses and applies it in one durable commit: a valid PLANNER proposal materializes the Task DAG and a valid READONLY answer is recorded as Task evidence, in both cases together with the receipt (outcome COMMITTED, code PLAN_APPLIED or READONLY_*). COMMITTED never means completed; Goal success requires the host Task Verifier, Goal Verifier, and Finalizer. Idempotency is keyed on (work_id, submission_id, payload): a byte-identical replay returns the stored receipt without new side effects, the same submission_id on a different work_id is refused as SUBMISSION_WORK_ID_MISMATCH, and a different payload under the same submission_id is refused as CONFLICTING_DUPLICATE.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"work_id":{"type":"string","format":"uuid"},"submission_id":{"type":"string","format":"uuid"},"expected_goal_revision":{"type":"integer","minimum":1},"request_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"response":{"type":"object"}},"required":["session_id","goal_id","work_id","submission_id","expected_goal_revision","request_digest","response"]}}
         ,{"name":"goal_run","description":"Run one existing Goal in the foreground for a bounded number of host-controlled Scheduler/Finalizer steps. Model calls, if needed, use the host-configured read-only Codex model. A Goal started with workspace_mode MANAGED_WORKTREE causes the host to create one host-managed Git linked worktree and a local branch under the host managed root before planning; that root must already be covered by the session's permitted directories, and on Windows each host-native creation invocation additionally requires explicit local approval. A Goal that has not yet been authorized is refused without creating anything, and creation is limited to a small durable number of attempts for the lifetime of that workspace.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"string"},"goal_id":{"type":"string","format":"uuid"},"max_steps":{"type":"integer","minimum":1,"maximum":256}},"required":["session_id","goal_id","max_steps"]}}
     ]);
     let operation_schema = json!({
@@ -818,6 +821,62 @@ pub(crate) fn tools() -> Value {
         "maxItems": 8,
         "items": failed_task_replan_request_schema
     });
+    // The published EXTERNAL write-scope proposal. It mirrors
+    // `authorization::RequestedWriteScopeV1` field for field: the same five
+    // required keys, `deny_unknown_fields` as `additionalProperties: false`, and
+    // the same host bounds (`MAX_GRANT_PATH_RULES`, `MAX_GRANT_PATH_BYTES`,
+    // `MAX_GRANT_OPERATIONS`, `MAX_GRANT_BYTES`, `MIN_GRANT_TTL_SECONDS`,
+    // `MAX_GRANT_TTL_SECONDS`). A client that follows this schema therefore
+    // reaches exactly the values the runtime parser accepts, and the schema
+    // never advertises a field the parser refuses.
+    //
+    // This is a *proposal* the Owner Control Surface must still approve. It is
+    // host policy that it is refused for any non-EXTERNAL backend, which JSON
+    // Schema cannot express without conditional keywords, so it is documented
+    // here and enforced by the runtime parser.
+    let requested_write_scope_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Untrusted Owner write-scope proposal for an EXTERNAL Goal only. Creating a Goal with a scope authorizes nothing: a durable GoalWriteGrantV1 must still be issued and approved through the Owner Control Surface before any file is written. Refused for the CODEX backend.",
+        "properties": {
+            "allowed_paths": {
+                "type": "array",
+                "description": "Workspace-root-relative path rules (literal paths or bounded globs), e.g. 'src/lib.rs'.",
+                "items": {"type": "string", "minLength": 1, "maxLength": crate::authorization::MAX_GRANT_PATH_BYTES},
+                "minItems": 1,
+                "maxItems": crate::authorization::MAX_GRANT_PATH_RULES
+            },
+            "allowed_operations": {
+                "type": "array",
+                "description": "WRITE_UTF8 is the only operation V1 can authorize; exactly one entry is accepted.",
+                "items": {"type": "string", "enum": ["WRITE_UTF8"]},
+                "minItems": 1,
+                "maxItems": 1
+            },
+            "max_operations": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::authorization::MAX_GRANT_OPERATIONS
+            },
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::authorization::MAX_GRANT_BYTES
+            },
+            "expires_in_seconds": {
+                "type": "integer",
+                "minimum": crate::authorization::MIN_GRANT_TTL_SECONDS,
+                "maximum": crate::authorization::MAX_GRANT_TTL_SECONDS
+            }
+        },
+        "required": [
+            "allowed_paths",
+            "allowed_operations",
+            "max_operations",
+            "max_bytes",
+            "expires_in_seconds"
+        ]
+    });
     for tool in tools.as_array_mut().unwrap() {
         if matches!(
             tool.get("name").and_then(Value::as_str),
@@ -839,6 +898,21 @@ pub(crate) fn tools() -> Value {
             properties.insert(
                 "failed_task_replan_requests".to_owned(),
                 failed_task_replan_requests_schema.clone(),
+            );
+        }
+        // `write_scope` is parsed by `goal_start` for EXTERNAL Goals, so it must
+        // be advertised. Without it `additionalProperties:false` makes the whole
+        // field unreachable through any schema-following MCP client, and a
+        // standard client that validates before calling can never request a
+        // Writer grant at all.
+        if matches!(tool.get("name").and_then(Value::as_str), Some("goal_start"))
+            && let Some(properties) = tool
+                .pointer_mut("/inputSchema/properties")
+                .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "write_scope".to_owned(),
+                requested_write_scope_schema.clone(),
             );
         }
         if let Some(session_id) = tool
@@ -1062,6 +1136,28 @@ async fn call_tool_with_outcome(params: &Value) -> Result<DispatchOutcome> {
                 new_job: None,
             })
         }
+        "goal_next" => {
+            // `goal_next` is async because its host steps include the existing
+            // Task Verifier, Goal Verifier, and Goal Finalizer, which await host
+            // observations. It still runs no model work, so it takes no job.
+            let result = goal_next_tool(&args, &session).await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
+        "goal_submit" => {
+            let args = args.clone();
+            let session = session.clone();
+            let result = with_goal_store(move |store| {
+                external_goal_api::goal_submit(&args, &session, store)
+            })
+            .await?;
+            Ok(DispatchOutcome {
+                result,
+                new_job: None,
+            })
+        }
         "goal_run" => {
             let result = goal_run(&args, &session).await?;
             Ok(DispatchOutcome {
@@ -1071,6 +1167,14 @@ async fn call_tool_with_outcome(params: &Value) -> Result<DispatchOutcome> {
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
+}
+
+async fn goal_next_tool(args: &Value, session: &config::Session) -> Result<Value> {
+    let result = match TaskStore::new() {
+        Ok(store) => external_goal_api::goal_next(args, session, &store).await,
+        Err(error) => Err(goal_api::GoalApiError::from_orchestrator(error)),
+    };
+    goal_tool_result(result)
 }
 
 async fn goal_result_tool(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1371,6 +1475,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         content,
         expected_preimage: &expected_preimage,
         request_id: &request_id,
+        publication_lock: None,
     })
     .await?;
     let result = render_output(output);
@@ -1628,8 +1733,32 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
 }
 
 async fn codex_fallback(args: &Value, session: &config::Session) -> Result<(Value, Uuid)> {
+    // ADR-08: a session driving an EXTERNAL Goal must never reach the Codex
+    // diagnostic path. Refuse before a job is created or a process is spawned.
+    ensure_codex_fallback_allowed(session)?;
     let job = execution::codex_fallback(args, session).await?;
     store_execution_job(session, job).await
+}
+
+/// Enforce the ADR-08 Codex-fallback gate for the session's active Goal.
+///
+/// `codex_fallback` carries no Goal id, so the session's active Goal is the
+/// authority: an EXTERNAL Goal refuses the diagnostic Codex path outright. A
+/// session with no active Goal, or a CODEX Goal, keeps the previous behavior.
+///
+/// H5-A (independent review F4): an *unreadable* state root is not "no active
+/// Goal". It means the host cannot establish the backend policy, so the call is
+/// refused rather than allowed.
+fn ensure_codex_fallback_allowed(session: &config::Session) -> Result<()> {
+    let store = TaskStore::new().ok();
+    match external_goal_api::codex_fallback_authority(store.as_ref(), &session.id).decision() {
+        external_goal_api::CodexFallbackDecision::Allowed => Ok(()),
+        external_goal_api::CodexFallbackDecision::RefusedForExternalBackend => {
+            anyhow::bail!(
+                "codex_fallback is refused: this session's active Goal uses (or may use) the EXTERNAL model backend, which never starts a Codex CLI process (ADR-08)"
+            )
+        }
+    }
 }
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<(Value, Option<Uuid>)> {
@@ -1674,9 +1803,18 @@ async fn goal_run(args: &Value, session: &config::Session) -> Result<Value> {
     // per-session lock and optimistic revision checks in `TaskStore`.
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
         let store = TaskStore::new().map_err(|error| anyhow::anyhow!(error))?;
-        store
+        let goal = store
             .load_goal(&session_id, &goal_id)
             .map_err(|error| anyhow::anyhow!(error))?;
+
+        // ADR-08: an EXTERNAL Goal must never reach a Codex CLI process. The
+        // decision is taken before any backend is constructed or any runtime
+        // is started, so the refusal cannot be reached *after* a spawn.
+        if external_goal_api::goal_run_backend_decision(&goal)
+            == external_goal_api::GoalRunBackendDecision::ExternalModelRequired
+        {
+            return text_result(external_goal_api::external_goal_run_outcome(&goal));
+        }
 
         let backends = ProductionGoalBackends::production(&session);
         // The runner is `async` only because lower authority boundaries

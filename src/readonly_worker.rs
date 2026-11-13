@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::AgentError;
 use crate::config;
+use crate::external_model_work::{
+    IssueBlock, ModelWorkItem, OUTPUT_CONTRACT_READONLY_V1, SubmissionDecision, SubmissionId,
+    SubmissionReceipt, WorkId, WorkItemState, WorkRole,
+};
 use crate::failure_class::FailureClass;
 use crate::fallback::{SideEffectClass, SideEffectState};
 use crate::goal::{Goal, GoalId, GoalStatus};
@@ -17,7 +21,18 @@ use crate::task::{
 };
 use crate::task_store::TaskStore;
 
-const MAX_READONLY_RESULT_BYTES: usize = 256 * 1024;
+/// Provenance recorded on evidence produced by the Codex readonly worker.
+pub(crate) const CODEX_READONLY_SOURCE: &str = "CODEX_READONLY";
+
+/// Provenance recorded on evidence produced by an external agent.
+///
+/// Kept distinct on purpose: host verification and any later audit must be able
+/// to tell a host-launched worker's observation from an untrusted external
+/// agent's claim, even though both pass the same validators.
+pub(crate) const EXTERNAL_READONLY_SOURCE: &str = "EXTERNAL_READONLY_AGENT";
+
+const MAX_READONLY_RESULT_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_RESULT_BYTES;
 const MAX_READONLY_SUMMARY_BYTES: usize = crate::planner::MAX_READONLY_SUMMARY_BYTES;
 const MAX_READONLY_EVIDENCE_ITEMS: usize = crate::planner::MAX_READONLY_EVIDENCE_ITEMS;
 const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = crate::planner::MAX_READONLY_EVIDENCE_FIELD_BYTES;
@@ -119,7 +134,7 @@ struct ReadonlyEvidence {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadonlyResult {
+pub(crate) struct ReadonlyResult {
     goal_id: String,
     task_id: String,
     attempt_id: String,
@@ -167,36 +182,7 @@ pub(crate) fn begin_readonly_attempt(
                     "readonly execution-root gate refused: {error}"
                 ))
             })?;
-            if goal.status() != GoalStatus::Running {
-                return Err(OrchestratorError::InvalidDag(
-                    "readonly attempt requires a RUNNING Goal".to_owned(),
-                ));
-            }
-            let task = goal.tasks().get(task_id).ok_or_else(|| {
-                OrchestratorError::InvalidDag("readonly Task is missing".to_owned())
-            })?;
-            if task.status() != TaskStatus::Ready || task.worker() != WorkerKind::CodexReadonly {
-                return Err(OrchestratorError::InvalidDag(
-                    "readonly attempt requires a READY CODEX_READONLY Task".to_owned(),
-                ));
-            }
-            if task.scope().operation_kind() != TaskOperationKind::ReadOnly
-                || task.scope().replay_safety() != ReplaySafety::SafeReadOnly
-            {
-                return Err(OrchestratorError::InvalidDag(
-                    "CODEX_READONLY requires READ_ONLY + SAFE_READ_ONLY scope".to_owned(),
-                ));
-            }
-            if task.semantic_attempts_remaining() == 0 {
-                return Err(OrchestratorError::InvalidDag(
-                    "readonly Task semantic attempt budget is exhausted".to_owned(),
-                ));
-            }
-            if !task.readonly_transport_retry_available() {
-                return Err(OrchestratorError::InvalidDag(
-                    "readonly Task transport interruption budget is exhausted".to_owned(),
-                ));
-            }
+            ensure_readonly_task_ready(goal, task_id)?;
             goal.transition_task(
                 task_id,
                 TaskStatus::Running,
@@ -281,6 +267,20 @@ fn build_request(
     task_id: &TaskId,
     session: &config::Session,
 ) -> Result<ReadonlyRequest, ReadonlyError> {
+    build_request_at_revision(goal, task_id, session, goal.revision())
+}
+
+/// Build the host-authored readonly request with an explicit goal revision.
+///
+/// The external backend issues a WorkItem inside a commit that advances the Goal
+/// revision, so the request must be bound to the revision the client will
+/// actually submit against, not to the pre-commit one.
+fn build_request_at_revision(
+    goal: &Goal,
+    task_id: &TaskId,
+    session: &config::Session,
+    goal_revision: u64,
+) -> Result<ReadonlyRequest, ReadonlyError> {
     let task = goal.tasks().get(task_id).ok_or_else(|| {
         ReadonlyError::AuthorityViolation("readonly Task disappeared after checkpoint".to_owned())
     })?;
@@ -293,7 +293,7 @@ fn build_request(
         goal_id: goal.id().as_str().to_owned(),
         task_id: task_id.as_str().to_owned(),
         attempt_id: attempt.id().as_str().to_owned(),
-        goal_revision: goal.revision(),
+        goal_revision,
         plan_revision: goal.plan_revision(),
         goal_cwd: execution_root,
         task_title: task.title().to_owned(),
@@ -304,7 +304,7 @@ fn build_request(
     })
 }
 
-fn parse_and_validate(
+pub(crate) fn parse_and_validate(
     raw: &[u8],
     request: &ReadonlyRequest,
 ) -> Result<ReadonlyResult, ReadonlyError> {
@@ -383,69 +383,132 @@ fn persist_valid_result(
     store
         .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
             ensure_active_attempt(goal, task_id, request)?;
-            record_non_mutating_metadata(goal, task_id, false)?;
-            goal.task_record_latest_worker_report(
+            apply_readonly_result_to_goal(
+                goal,
                 task_id,
-                WorkerReport::new(result.summary.clone(), Vec::new()),
-            )?;
-            let attempt_id = goal.tasks()[task_id]
-                .latest_attempt()
-                .expect("active attempt checked")
-                .id()
-                .clone();
-            goal.task_add_evidence(
-                task_id,
-                TaskEvidence::WorkerReport {
-                    attempt_id,
-                    report_digest: report_digest.to_owned(),
-                },
-            )?;
-            for evidence in &result.evidence {
-                goal.task_add_evidence(
-                    task_id,
-                    TaskEvidence::StructuredObservation {
-                        requirement_id: evidence.kind.clone(),
-                        source: "CODEX_READONLY".to_owned(),
-                        passed: true,
-                        detail: evidence.value.clone(),
-                    },
-                )?;
-            }
-            match result.status {
-                ReadonlyStatus::CandidateComplete => goal.transition_task(
-                    task_id,
-                    TaskStatus::Verifying,
-                    TaskTransitionContext::default(),
-                    now,
-                )?,
-                ReadonlyStatus::Blocked => {
-                    goal.task_add_blocker(
-                        task_id,
-                        TaskBlocker::new("READONLY_BLOCKED", result.summary.clone(), true),
-                    )?;
-                    goal.transition_task(
-                        task_id,
-                        TaskStatus::Blocked,
-                        TaskTransitionContext::default(),
-                        now,
-                    )?;
-                }
-                ReadonlyStatus::NeedsReplan => goal.transition_task(
-                    task_id,
-                    TaskStatus::NeedsReplan,
-                    TaskTransitionContext::default(),
-                    now,
-                )?,
-                ReadonlyStatus::Failed => goal.transition_task(
-                    task_id,
-                    TaskStatus::Failed,
-                    TaskTransitionContext::default(),
-                    now,
-                )?,
-            }
-            Ok(())
+                result,
+                report_digest,
+                CODEX_READONLY_SOURCE,
+                now,
+            )
         })
         .map_err(ReadonlyError::from)
+}
+
+/// Host-owned application of one already-validated readonly result.
+///
+/// Extracted so the Codex readonly path and the external readonly path cannot
+/// diverge: both record the same evidence shape, consult the same Task state
+/// table, and hand the final verdict to the same host Task Verifier. The only
+/// difference is the evidence provenance string, which stays explicit so an
+/// audit can tell which worker produced an observation.
+fn apply_readonly_result_to_goal(
+    goal: &mut Goal,
+    task_id: &TaskId,
+    result: &ReadonlyResult,
+    report_digest: &str,
+    evidence_source: &str,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    record_non_mutating_metadata(goal, task_id, false)?;
+    goal.task_record_latest_worker_report(
+        task_id,
+        WorkerReport::new(result.summary.clone(), Vec::new()),
+    )?;
+    let attempt_id = goal.tasks()[task_id]
+        .latest_attempt()
+        .ok_or_else(|| OrchestratorError::CorruptGoal("readonly Task lacks an Attempt".to_owned()))?
+        .id()
+        .clone();
+    goal.task_add_evidence(
+        task_id,
+        TaskEvidence::WorkerReport {
+            attempt_id,
+            report_digest: report_digest.to_owned(),
+        },
+    )?;
+    for evidence in &result.evidence {
+        goal.task_add_evidence(
+            task_id,
+            TaskEvidence::StructuredObservation {
+                requirement_id: evidence.kind.clone(),
+                source: evidence_source.to_owned(),
+                passed: true,
+                detail: evidence.value.clone(),
+            },
+        )?;
+    }
+    match result.status {
+        ReadonlyStatus::CandidateComplete => goal.transition_task(
+            task_id,
+            TaskStatus::Verifying,
+            TaskTransitionContext::default(),
+            now,
+        ),
+        ReadonlyStatus::Blocked => {
+            goal.task_add_blocker(
+                task_id,
+                TaskBlocker::new("READONLY_BLOCKED", result.summary.clone(), true),
+            )?;
+            goal.transition_task(
+                task_id,
+                TaskStatus::Blocked,
+                TaskTransitionContext::default(),
+                now,
+            )
+        }
+        ReadonlyStatus::NeedsReplan => goal.transition_task(
+            task_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            now,
+        ),
+        ReadonlyStatus::Failed => goal.transition_task(
+            task_id,
+            TaskStatus::Failed,
+            TaskTransitionContext::default(),
+            now,
+        ),
+    }
+}
+
+/// The host gates every readonly attempt passes before an Attempt begins.
+///
+/// Shared by the Codex path and the external WorkItem issuance so a WorkItem can
+/// never be issued for a Task the host would refuse to run.
+fn ensure_readonly_task_ready(goal: &Goal, task_id: &TaskId) -> Result<(), OrchestratorError> {
+    if goal.status() != GoalStatus::Running {
+        return Err(OrchestratorError::InvalidDag(
+            "readonly attempt requires a RUNNING Goal".to_owned(),
+        ));
+    }
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| OrchestratorError::InvalidDag("readonly Task is missing".to_owned()))?;
+    if task.status() != TaskStatus::Ready || task.worker() != WorkerKind::CodexReadonly {
+        return Err(OrchestratorError::InvalidDag(
+            "readonly attempt requires a READY CODEX_READONLY Task".to_owned(),
+        ));
+    }
+    if task.scope().operation_kind() != TaskOperationKind::ReadOnly
+        || task.scope().replay_safety() != ReplaySafety::SafeReadOnly
+    {
+        return Err(OrchestratorError::InvalidDag(
+            "CODEX_READONLY requires READ_ONLY + SAFE_READ_ONLY scope".to_owned(),
+        ));
+    }
+    if task.semantic_attempts_remaining() == 0 {
+        return Err(OrchestratorError::InvalidDag(
+            "readonly Task semantic attempt budget is exhausted".to_owned(),
+        ));
+    }
+    if !task.readonly_transport_retry_available() {
+        return Err(OrchestratorError::InvalidDag(
+            "readonly Task transport interruption budget is exhausted".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -541,26 +604,42 @@ fn persist_retryable_failure(
     store
         .mutate_goal_snapshot(&session.id, goal_id, request.goal_revision, |goal, now| {
             ensure_active_attempt(goal, task_id, request)?;
-            record_non_mutating_metadata(goal, task_id, false)?;
-            goal.task_record_latest_worker_report(
-                task_id,
-                WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
-            )?;
-            if let Some(class) = failure_class {
-                goal.task_record_latest_attempt_failure_class(task_id, class)?;
-            }
-            let budget_remains = goal.tasks()[task_id].semantic_attempts_remaining() > 0;
-            let unchanged_retry_permitted = goal.tasks()[task_id].unchanged_retry_permitted();
-            let next = if !budget_remains {
-                TaskStatus::Failed
-            } else if unchanged_retry_permitted {
-                TaskStatus::Retryable
-            } else {
-                TaskStatus::NeedsReplan
-            };
-            goal.transition_task(task_id, next, TaskTransitionContext::default(), now)
+            apply_readonly_failure_to_goal(goal, task_id, code, detail, failure_class, now)
         })
         .map_err(ReadonlyError::from)
+}
+
+/// Host-owned failure handling for one readonly attempt.
+///
+/// The next Task state is chosen from the structured failure class and the
+/// remaining budgets, never from model prose, so an external worker's claim
+/// cannot widen the retry policy.
+fn apply_readonly_failure_to_goal(
+    goal: &mut Goal,
+    task_id: &TaskId,
+    code: &str,
+    detail: &str,
+    failure_class: Option<FailureClass>,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    record_non_mutating_metadata(goal, task_id, false)?;
+    goal.task_record_latest_worker_report(
+        task_id,
+        WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
+    )?;
+    if let Some(class) = failure_class {
+        goal.task_record_latest_attempt_failure_class(task_id, class)?;
+    }
+    let budget_remains = goal.tasks()[task_id].semantic_attempts_remaining() > 0;
+    let unchanged_retry_permitted = goal.tasks()[task_id].unchanged_retry_permitted();
+    let next = if !budget_remains {
+        TaskStatus::Failed
+    } else if unchanged_retry_permitted {
+        TaskStatus::Retryable
+    } else {
+        TaskStatus::NeedsReplan
+    };
+    goal.transition_task(task_id, next, TaskTransitionContext::default(), now)
 }
 
 fn record_non_mutating_metadata(
@@ -649,6 +728,485 @@ fn validate_goal_session_binding(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// E4-B — external readonly integration.
+//
+// The three functions below are the whole external readonly surface. They reuse
+// the request builder, the response parser, the schema checks, the evidence
+// checks, and the Task state application above, so an external agent's answer
+// travels the same path as a host-launched worker's answer. What differs is
+// only *when* the host acts: issuance begins the Attempt in the same commit that
+// registers the WorkItem, and submission applies the result and its receipt in
+// one commit. No lock is ever held while a model runs.
+// ---------------------------------------------------------------------------
+
+/// A bounded, model-free diagnostic for a refused external readonly submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadonlyValidationRefusal {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ReadonlyValidationRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        self.detail
+    }
+}
+
+/// An untrusted readonly response that passed every host check.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedReadonlyOutput {
+    result: ReadonlyResult,
+    report_digest: String,
+}
+
+impl ValidatedReadonlyOutput {
+    pub(crate) fn command_summary_for_receipt(&self) -> &'static str {
+        match self.result.status {
+            ReadonlyStatus::CandidateComplete => "READONLY_CANDIDATE_COMPLETE",
+            ReadonlyStatus::Blocked => "READONLY_BLOCKED",
+            ReadonlyStatus::NeedsReplan => "READONLY_NEEDS_REPLAN",
+            ReadonlyStatus::Failed => "READONLY_FAILED",
+        }
+    }
+}
+
+/// Result of issuing one external readonly WorkItem.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The issuance result is short-lived; handing back the durable WorkItem is the point."
+)]
+pub(crate) enum ReadonlyIssueOutcome {
+    /// The Attempt was begun and the WorkItem was durably registered in the same
+    /// commit. Only after this returns may a client see the request.
+    Issued { item: ModelWorkItem },
+    /// A host budget refused the WorkItem. Nothing was written and no Attempt
+    /// was begun.
+    Refused(IssueBlock),
+}
+
+/// Result of applying one external readonly submission.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The outcome is a short-lived local value; carrying the committed Goal snapshot is the point."
+)]
+pub(crate) enum ReadonlyApplyOutcome {
+    /// The result, its receipt, and the WorkItem's COMMITTED transition are one
+    /// commit.
+    Committed {
+        goal: Goal,
+        receipt: SubmissionReceipt,
+    },
+    /// The host refused the answer: the refusal receipt, the WorkItem's REJECTED
+    /// transition, and the Attempt's structured failure classification are one
+    /// commit.
+    Rejected {
+        goal: Goal,
+        receipt: SubmissionReceipt,
+    },
+    /// Nothing was written: the durable binding no longer matched.
+    Refused { code: &'static str },
+}
+
+/// Begin one readonly Attempt and register its host-authored request as a
+/// durable `ModelWorkItem`, atomically.
+///
+/// The single commit is what prevents the classic half-issued state: a Task left
+/// RUNNING with an Attempt but no WorkItem (which would wedge the Goal), or a
+/// WorkItem whose Attempt does not exist (which would make every answer fail
+/// attempt identity). The WorkItem is bound to the revision this commit
+/// produces, because that is the revision the client will submit against.
+pub(crate) fn issue_external_readonly_work_item(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    task_id: &TaskId,
+    expected_revision: u64,
+) -> Result<ReadonlyIssueOutcome, OrchestratorError> {
+    use crate::external_model_store::{external_state, external_state_mut};
+    use crate::external_model_work::{MAX_REQUEST_PAYLOAD_BYTES, sha256_hex as work_digest};
+
+    let mut slot: Option<Result<ModelWorkItem, IssueBlock>> = None;
+    let _committed =
+        store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
+            if let Err(block) = external_state(goal)?.check_issue_budget(WorkRole::Readonly) {
+                slot = Some(Err(block));
+                return Ok(());
+            }
+            ensure_readonly_task_ready(goal, task_id)?;
+            let bound_revision = goal.revision().checked_add(1).ok_or_else(|| {
+                OrchestratorError::CorruptGoal("goal revision overflow".to_owned())
+            })?;
+            let issue_counter = external_state(goal)?
+                .issue_counter()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal("external work item counter overflow".to_owned())
+                })?;
+            let plan_revision = goal.plan_revision();
+            // The Attempt must exist before the request can name it, so the
+            // transition happens first inside this same commit. A failure after this
+            // point aborts the whole commit, so no half-started Attempt survives.
+            goal.transition_task(
+                task_id,
+                TaskStatus::Running,
+                TaskTransitionContext::default(),
+                now,
+            )?;
+            let request = build_request_at_revision(goal, task_id, session, bound_revision)
+                .map_err(|_| {
+                    OrchestratorError::InvalidDag(
+                        "external readonly request could not be built".to_owned(),
+                    )
+                })?;
+            let attempt_id = goal.tasks()[task_id]
+                .latest_attempt()
+                .ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "readonly Attempt was not created for the external request".to_owned(),
+                    )
+                })?
+                .id()
+                .as_str()
+                .to_owned();
+            let payload = serde_json::to_string(&request).map_err(|_| {
+                OrchestratorError::InvalidDag(
+                    "external readonly request could not be serialized".to_owned(),
+                )
+            })?;
+            if payload.len() > MAX_REQUEST_PAYLOAD_BYTES {
+                return Err(OrchestratorError::InvalidDag(
+                    "external readonly request exceeds the durable WorkItem bound".to_owned(),
+                ));
+            }
+            let item = ModelWorkItem::pending(
+                WorkId::new(),
+                session.id.clone(),
+                goal_id.as_str().to_owned(),
+                WorkRole::Readonly,
+                Some(task_id.as_str().to_owned()),
+                Some(attempt_id),
+                bound_revision,
+                plan_revision,
+                work_digest(payload.as_bytes()),
+                payload,
+                OUTPUT_CONTRACT_READONLY_V1,
+                issue_counter,
+                now,
+            )?;
+            external_state_mut(goal)?.record_issued(item.clone())?;
+            slot = Some(Ok(item));
+            Ok(())
+        })?;
+
+    match slot {
+        Some(Ok(item)) => Ok(ReadonlyIssueOutcome::Issued { item }),
+        Some(Err(block)) => Ok(ReadonlyIssueOutcome::Refused(block)),
+        None => Err(OrchestratorError::CorruptGoal(
+            "external readonly issuance committed without a WorkItem".to_owned(),
+        )),
+    }
+}
+
+/// Validate one untrusted external readonly response against a host request
+/// rebuilt from the durable Goal.
+///
+/// The request is *not* trusted from the WorkItem payload: it is rebuilt from the
+/// current durable Task so a WorkItem that has been superseded cannot be
+/// answered into a newer Attempt. Identity, revision, size, schema, and evidence
+/// bounds are all checked here, before any durable write.
+pub(crate) fn validate_external_readonly_output(
+    goal: &Goal,
+    session: &config::Session,
+    task_id: &TaskId,
+    attempt_id: &str,
+    raw: &[u8],
+) -> Result<ValidatedReadonlyOutput, ReadonlyValidationRefusal> {
+    let request = build_request(goal, task_id, session).map_err(|_| ReadonlyValidationRefusal {
+        code: "READONLY_REQUEST_UNAVAILABLE",
+        detail: "the host could not rebuild the readonly request for this Task",
+    })?;
+    if request.attempt_id != attempt_id {
+        return Err(ReadonlyValidationRefusal {
+            code: "READONLY_ATTEMPT_STALE",
+            detail: "the readonly Attempt this WorkItem was bound to is no longer current",
+        });
+    }
+    if raw.len() > MAX_READONLY_RESULT_BYTES {
+        return Err(ReadonlyValidationRefusal {
+            code: "READONLY_OUTPUT_TOO_LARGE",
+            detail: "the readonly result exceeds the 256 KiB host limit",
+        });
+    }
+    let result = parse_and_validate(raw, &request).map_err(|error| match error {
+        ReadonlyError::AuthorityViolation(_) => ReadonlyValidationRefusal {
+            code: "READONLY_IDENTITY_MISMATCH",
+            detail: "the readonly result identity or revision does not match the host request",
+        },
+        _ => ReadonlyValidationRefusal {
+            code: "READONLY_OUTPUT_INVALID",
+            detail: "the readonly result failed the host schema or evidence checks",
+        },
+    })?;
+    Ok(ValidatedReadonlyOutput {
+        result,
+        report_digest: sha256_hex(raw),
+    })
+}
+
+/// Apply one validated external readonly result, its receipt, and the WorkItem's
+/// COMMITTED transition in a single durable commit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Goal, work identity, digest, and the validated result are independent authority channels."
+)]
+pub(crate) fn commit_external_readonly_result(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    expected_revision: u64,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+    output: ValidatedReadonlyOutput,
+) -> Result<ReadonlyApplyOutcome, OrchestratorError> {
+    use crate::external_model_store::{external_state, external_state_mut};
+
+    let mut applied: Option<SubmissionReceipt> = None;
+    let mut refused: Option<&'static str> = None;
+    let committed =
+        store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
+            let binding_ok = {
+                let state = external_state(goal)?;
+                match state.active_work() {
+                    Some(active)
+                        if active.work_id() == work_id
+                            && active.state() == WorkItemState::Pending
+                            && active.goal_revision() == goal.revision()
+                            && active.plan_revision() == goal.plan_revision()
+                            && active.task_id().is_some() =>
+                    {
+                        Some(active.clone())
+                    }
+                    _ => None,
+                }
+            };
+            let Some(active) = binding_ok else {
+                refused = Some("WORK_ITEM_NOT_PENDING");
+                return Ok(());
+            };
+            let Some(task_id) = active.task_id().and_then(|value| TaskId::parse(value).ok()) else {
+                refused = Some("WORK_ITEM_TASK_INVALID");
+                return Ok(());
+            };
+            let Some(attempt_id) = active.attempt_id() else {
+                refused = Some("WORK_ITEM_ATTEMPT_INVALID");
+                return Ok(());
+            };
+            let request = match build_request(goal, &task_id, session) {
+                Ok(request) => request,
+                Err(_) => {
+                    refused = Some("READONLY_REQUEST_UNAVAILABLE");
+                    return Ok(());
+                }
+            };
+            if request.attempt_id != attempt_id {
+                refused = Some("READONLY_ATTEMPT_STALE");
+                return Ok(());
+            }
+            ensure_active_attempt(goal, &task_id, &request)?;
+            apply_readonly_result_to_goal(
+                goal,
+                &task_id,
+                &output.result,
+                &output.report_digest,
+                EXTERNAL_READONLY_SOURCE,
+                now,
+            )?;
+            let committed_revision = goal.revision().checked_add(1).ok_or_else(|| {
+                OrchestratorError::CorruptGoal("goal revision overflow".to_owned())
+            })?;
+            let receipt = SubmissionReceipt::new(
+                work_id.clone(),
+                submission_id.clone(),
+                payload_sha256.to_owned(),
+                SubmissionDecision::Committed,
+                Some(committed_revision),
+                output.command_summary_for_receipt(),
+                None,
+                now,
+            );
+            external_state_mut(goal)?.record_submission(receipt.clone(), now)?;
+            applied = Some(receipt);
+            Ok(())
+        });
+
+    match committed {
+        Ok(goal) => {
+            if let Some(code) = refused {
+                return Ok(ReadonlyApplyOutcome::Refused { code });
+            }
+            let receipt = applied.ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "readonly submission committed without a receipt".to_owned(),
+                )
+            })?;
+            Ok(ReadonlyApplyOutcome::Committed { goal, receipt })
+        }
+        Err(OrchestratorError::RevisionConflict { .. }) => Ok(ReadonlyApplyOutcome::Refused {
+            code: "GOAL_REVISION_STALE",
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// Record one schema-invalid external readonly answer.
+///
+/// The refusal receipt, the WorkItem's REJECTED transition, and the host's
+/// structured failure classification for the Attempt are one commit. The Task
+/// therefore never sits RUNNING with no owner, and the ModelWorkItem is not left
+/// PENDING forever behind an answer the host already rejected.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The refusal keeps Goal, work identity, digest, and bounded verdict channels explicit."
+)]
+pub(crate) fn commit_external_readonly_refusal(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    expected_revision: u64,
+    work_id: &WorkId,
+    submission_id: &SubmissionId,
+    payload_sha256: &str,
+    code: &'static str,
+    detail: &'static str,
+) -> Result<ReadonlyApplyOutcome, OrchestratorError> {
+    use crate::external_model_store::{external_state, external_state_mut};
+
+    let mut applied: Option<SubmissionReceipt> = None;
+    let mut refused: Option<&'static str> = None;
+    let committed =
+        store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
+            let binding_ok = {
+                let state = external_state(goal)?;
+                match state.active_work() {
+                    Some(active)
+                        if active.work_id() == work_id
+                            && active.state() == WorkItemState::Pending
+                            && active.goal_revision() == goal.revision() =>
+                    {
+                        Some(active.clone())
+                    }
+                    _ => None,
+                }
+            };
+            let Some(active) = binding_ok else {
+                refused = Some("WORK_ITEM_NOT_PENDING");
+                return Ok(());
+            };
+            let Some(task_id) = active.task_id().and_then(|value| TaskId::parse(value).ok()) else {
+                refused = Some("WORK_ITEM_TASK_INVALID");
+                return Ok(());
+            };
+            let Some(attempt_id) = active.attempt_id() else {
+                refused = Some("WORK_ITEM_ATTEMPT_INVALID");
+                return Ok(());
+            };
+            let request = match build_request(goal, &task_id, session) {
+                Ok(request) => request,
+                Err(_) => {
+                    refused = Some("READONLY_REQUEST_UNAVAILABLE");
+                    return Ok(());
+                }
+            };
+            if request.attempt_id != attempt_id {
+                refused = Some("READONLY_ATTEMPT_STALE");
+                return Ok(());
+            }
+            ensure_active_attempt(goal, &task_id, &request)?;
+            apply_readonly_failure_to_goal(
+                goal,
+                &task_id,
+                code,
+                detail,
+                Some(FailureClass::SemanticFailure),
+                now,
+            )?;
+            let receipt = SubmissionReceipt::new(
+                work_id.clone(),
+                submission_id.clone(),
+                payload_sha256.to_owned(),
+                SubmissionDecision::RejectedSchema,
+                None,
+                code,
+                Some(detail.to_owned()),
+                now,
+            );
+            external_state_mut(goal)?.record_submission(receipt.clone(), now)?;
+            applied = Some(receipt);
+            Ok(())
+        });
+
+    match committed {
+        Ok(goal) => {
+            if let Some(code) = refused {
+                return Ok(ReadonlyApplyOutcome::Refused { code });
+            }
+            let receipt = applied.ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "readonly refusal committed without a receipt".to_owned(),
+                )
+            })?;
+            Ok(ReadonlyApplyOutcome::Rejected { goal, receipt })
+        }
+        Err(OrchestratorError::RevisionConflict { .. }) => Ok(ReadonlyApplyOutcome::Refused {
+            code: "GOAL_REVISION_STALE",
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// Re-arm one RETRYABLE readonly Task when the host retry policy allows it.
+///
+/// `SchedulerNoActionReason::RetryPolicyDeferred` means "a host policy step owns
+/// this decision". For the external backend that step is this function, and it
+/// only ever executes the transition the Task state table already permits
+/// (RETRYABLE -> READY), gated by the Task's own attempt budget and unchanged-
+/// retry permission. Nothing here can grant an extra attempt.
+pub(crate) fn rearm_retryable_readonly_task(
+    store: &TaskStore,
+    session: &config::Session,
+    goal_id: &GoalId,
+    expected_revision: u64,
+    task_id: &TaskId,
+) -> Result<Goal, OrchestratorError> {
+    store.mutate_goal_snapshot(&session.id, goal_id, expected_revision, |goal, now| {
+        let task = goal.tasks().get(task_id).ok_or_else(|| {
+            OrchestratorError::InvalidDag("retryable readonly Task is missing".to_owned())
+        })?;
+        if task.status() != TaskStatus::Retryable || task.worker() != WorkerKind::CodexReadonly {
+            return Err(OrchestratorError::InvalidDag(
+                "only a RETRYABLE readonly Task may be re-armed".to_owned(),
+            ));
+        }
+        if !task.verification_retry_allowed() || !task.unchanged_retry_permitted() {
+            return Err(OrchestratorError::InvalidDag(
+                "the readonly retry policy does not permit another identical attempt".to_owned(),
+            ));
+        }
+        goal.transition_task(
+            task_id,
+            TaskStatus::Ready,
+            TaskTransitionContext::default(),
+            now,
+        )
+    })
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(64);
@@ -657,6 +1215,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+/// H5-B: shape half of the read-only validator, for the contract equivalence tests.
+#[cfg(test)]
+pub(crate) fn readonly_response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<ReadonlyResult>(value.clone()).is_ok()
 }
 
 #[cfg(test)]

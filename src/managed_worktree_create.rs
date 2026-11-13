@@ -219,7 +219,7 @@ impl ManagedWorktreeCreation {
 }
 
 /// The single mutating Git operation Managed Worktrees V1 authorizes.
-pub(crate) trait ManagedWorktreeCreator {
+pub(crate) trait ManagedWorktreeCreator: Send + Sync {
     /// Create the one linked worktree described by `creation`, running Git with
     /// `primary_root` as the working directory.
     ///

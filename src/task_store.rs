@@ -29,12 +29,17 @@ const SCHEMA_WITHOUT_DURABLE_ATTEMPT_BUDGET: u64 = 4;
 /// inventing evidence for a Goal that never assembled one.
 const SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION: u64 = 5;
 
+/// Schema 6 is the last version without the durable publication quarantine
+/// (H5.1-B). A schema-6 Goal has no process-liveness witness, so an `APPLYING`
+/// journal intent is migrated to `UNPROVEN` and stays unresolved.
+const SCHEMA_WITHOUT_PUBLICATION_QUARANTINE: u64 = 6;
+
 /// The migration chain above is written against a specific current schema. If a
 /// future change advances `GOAL_SCHEMA_VERSION` without extending the chain,
 /// refuse to compile rather than silently routing a newer durable document
 /// through an older migration step.
 const _: () = assert!(
-    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION + 1,
+    GOAL_SCHEMA_VERSION as u64 == SCHEMA_WITHOUT_PUBLICATION_QUARANTINE + 1,
     "goal schema migration chain must be extended when GOAL_SCHEMA_VERSION advances"
 );
 
@@ -43,9 +48,19 @@ const SESSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Every fault point names the exact commit phase it interrupts, which is the contract."
+)]
 pub(crate) enum FaultPoint {
     BeforeTempWrite,
     BeforeReplace,
+    /// Fail the Nth durable commit (1-based) instead of every commit.
+    ///
+    /// Used by the E5 writer failure matrix to interrupt a multi-commit
+    /// publication at an exact step (for example after the postimage was written
+    /// but before `CompleteOperation` is journaled).
+    BeforeReplaceOnCommit(u32),
 }
 
 #[derive(Clone)]
@@ -53,6 +68,9 @@ pub(crate) struct TaskStore {
     state_root: PathBuf,
     #[cfg(test)]
     fault: Option<FaultPoint>,
+    /// Number of commit attempts observed, for [`FaultPoint::BeforeReplaceOnCommit`].
+    #[cfg(test)]
+    fault_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl TaskStore {
@@ -63,7 +81,15 @@ impl TaskStore {
             })?,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            fault_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
+    }
+
+    /// Root of the durable host state. Used by the private Writer stage, which
+    /// must live outside the Goal workspace.
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
     }
 
     #[cfg(test)]
@@ -71,6 +97,7 @@ impl TaskStore {
         Self {
             state_root,
             fault: None,
+            fault_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -88,6 +115,7 @@ impl TaskStore {
         Self {
             state_root,
             fault: Some(fault),
+            fault_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -394,6 +422,25 @@ impl TaskStore {
                 "managed_workspace_verification_evidence".to_owned(),
                 Value::Null,
             );
+            // A legacy terminal Goal predates the quarantine and cannot carry an
+            // unresolved publication, so the explicit value is NOT_STARTED. A
+            // document that already carries the field is not a legacy document:
+            // silently overwriting a supplied ACTIVE/UNPROVEN record would drop
+            // the only record of a possibly live helper without probing, so it is
+            // refused like the sibling migrations.
+            if legacy_object.contains_key("publication_quarantine") {
+                return Err(OrchestratorError::CorruptGoal(
+                    "legacy schema-1 durable Goal must not carry a publication quarantine"
+                        .to_owned(),
+                ));
+            }
+            legacy_object.insert(
+                "publication_quarantine".to_owned(),
+                serde_json::to_value(
+                    crate::publication_quarantine::PublicationQuarantine::not_started(),
+                )
+                .expect("quarantine record is serializable"),
+            );
             let goal: Goal = serde_json::from_value(legacy).map_err(|error| {
                 OrchestratorError::CorruptGoal(format!(
                     "legacy durable Goal shape is invalid: {error}"
@@ -428,6 +475,9 @@ impl TaskStore {
         if schema_version == SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION {
             return Self::decode_pre_managed_workspace_verification(value);
         }
+        if schema_version == SCHEMA_WITHOUT_PUBLICATION_QUARANTINE {
+            return Self::decode_pre_publication_quarantine(value);
+        }
         if schema_version != GOAL_SCHEMA_VERSION as u64 {
             return Err(OrchestratorError::UnsupportedSchema(schema_version));
         }
@@ -444,11 +494,72 @@ impl TaskStore {
                  verification evidence"
             )));
         }
+        if !object.contains_key("publication_quarantine") {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{GOAL_SCHEMA_VERSION} durable Goal must state a publication quarantine"
+            )));
+        }
+        // Authorization B added fields to the EXTERNAL sub-record only. The
+        // Goal schema is unchanged, so the nested record is normalized here:
+        // a schema-1 EXTERNAL record becomes schema 2 with an empty scope and a
+        // zero anchor, which means "no grant" and therefore fails closed for
+        // Writer issuance. Nothing invents authority during migration.
+        let mut value = value;
+        Self::normalize_external_model_schema(&mut value)?;
         let goal: Goal = serde_json::from_value(value).map_err(|error| {
             OrchestratorError::CorruptGoal(format!("durable Goal shape is invalid: {error}"))
         })?;
         goal.validate()?;
         Ok(goal)
+    }
+
+    /// Normalize the EXTERNAL sub-record schema in place.
+    fn normalize_external_model_schema(value: &mut Value) -> Result<(), OrchestratorError> {
+        let Some(object) = value.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(external) = object.get_mut("external_model") else {
+            return Ok(());
+        };
+        if external.is_null() {
+            return Ok(());
+        }
+        let Some(record) = external.as_object_mut() else {
+            return Err(OrchestratorError::CorruptGoal(
+                "durable external model state is not an object".to_owned(),
+            ));
+        };
+        let version = record
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OrchestratorError::CorruptGoal(
+                    "durable external model state has no schema_version".to_owned(),
+                )
+            })?;
+        match version {
+            v if v
+                == u64::from(
+                    crate::external_model_work::EXTERNAL_MODEL_SCHEMA_WITHOUT_AUTHORIZATION,
+                ) =>
+            {
+                record.insert(
+                    "schema_version".to_owned(),
+                    Value::from(crate::external_model_work::EXTERNAL_MODEL_SCHEMA_VERSION),
+                );
+                record
+                    .entry("write_scope".to_owned())
+                    .or_insert(Value::Null);
+                record
+                    .entry("authorization_anchor".to_owned())
+                    .or_insert_with(|| serde_json::json!({}));
+                Ok(())
+            }
+            v if v == u64::from(crate::external_model_work::EXTERNAL_MODEL_SCHEMA_VERSION) => {
+                Ok(())
+            }
+            other => Err(OrchestratorError::UnsupportedSchema(other)),
+        }
     }
 
     /// Migrate a schema-4 durable Goal to schema 5 by deciding its durable
@@ -562,16 +673,137 @@ impl TaskStore {
         );
         object.insert(
             "schema_version".to_owned(),
+            Value::from(SCHEMA_WITHOUT_PUBLICATION_QUARANTINE),
+        );
+        // Continue through the shared publication-quarantine step so a stored
+        // schema-5 Goal is normalized by exactly the same code as a stored
+        // schema-6 Goal.
+        Self::decode_pre_publication_quarantine(migrated)
+    }
+
+    /// Migrate a schema-6 durable Goal to schema 7 by stating its publication
+    /// quarantine.
+    ///
+    /// A schema-6 Goal armed no helper lock, so the migration has no
+    /// process-liveness witness to copy. If any Task's latest mutation intent is
+    /// still `APPLYING`, the only honest record is `UNPROVEN`: the old host may
+    /// have left a helper running. If nothing is `APPLYING`, `NOT_STARTED` is
+    /// exact. Neither branch invents quiescence.
+    fn decode_pre_publication_quarantine(value: Value) -> Result<Goal, OrchestratorError> {
+        use crate::publication_quarantine::PublicationQuarantine;
+
+        let mut migrated = value;
+        let object = migrated.as_object_mut().expect("validated object");
+        if object.contains_key("publication_quarantine") {
+            return Err(OrchestratorError::CorruptGoal(format!(
+                "schema-{SCHEMA_WITHOUT_PUBLICATION_QUARANTINE} durable Goal must not carry a \
+                 publication quarantine"
+            )));
+        }
+        let revision = object.get("revision").and_then(Value::as_u64).unwrap_or(1);
+        let updated_at = object
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .unwrap_or("1970-01-01T00:00:00Z")
+            .to_owned();
+        let quarantine = match Self::applying_intent(object)? {
+            Some((operation_id, task_id, attempt_id)) => {
+                let record = PublicationQuarantine::legacy_applying(
+                    operation_id,
+                    task_id,
+                    attempt_id,
+                    revision,
+                    updated_at,
+                );
+                serde_json::to_value(record).expect("quarantine record is serializable")
+            }
+            None => serde_json::to_value(PublicationQuarantine::not_started())
+                .expect("quarantine record is serializable"),
+        };
+        object.insert("publication_quarantine".to_owned(), quarantine);
+        object.insert(
+            "schema_version".to_owned(),
             Value::from(GOAL_SCHEMA_VERSION),
         );
         let goal: Goal = serde_json::from_value(migrated).map_err(|error| {
             OrchestratorError::CorruptGoal(format!(
-                "schema-{SCHEMA_WITHOUT_MANAGED_WORKSPACE_VERIFICATION} durable Goal shape is \
-                 invalid: {error}"
+                "schema-{SCHEMA_WITHOUT_PUBLICATION_QUARANTINE} durable Goal shape is invalid: \
+                 {error}"
             ))
         })?;
         goal.validate()?;
         Ok(goal)
+    }
+
+    /// Find the first Task attempt whose journal is still `APPLYING`.
+    ///
+    /// Used only by the schema-6 migration, which has no lock witness and must
+    /// therefore fail closed to `UNPROVEN` rather than assume the old helper
+    /// exited. The journal shape is read from the raw JSON so the migration does
+    /// not depend on the current Rust struct being able to decode a document it
+    /// is about to upgrade.
+    fn applying_intent(
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<Option<(String, crate::task::TaskId, crate::task::AttemptId)>, OrchestratorError>
+    {
+        let Some(tasks) = object.get("tasks").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        for task in tasks {
+            let Some(task_id) = task.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(attempts) = task.get("attempts").and_then(Value::as_array) else {
+                continue;
+            };
+            for attempt in attempts {
+                // An attempt with no mutation intent is an ordinary readonly or
+                // unsuccessful attempt and is legitimate. It must not terminate
+                // the scan: a later attempt may be the applying Writer. Ending the
+                // scan here would initialize the quarantine as NOT_STARTED and
+                // reopen R2-1.
+                let Some(intent) = attempt
+                    .get("mutation_intent")
+                    .filter(|intent| !intent.is_null())
+                else {
+                    continue;
+                };
+                if intent.get("state").and_then(Value::as_str) != Some("APPLYING") {
+                    continue;
+                }
+                // An APPLYING intent without usable identity cannot be downgraded
+                // to NOT_STARTED without discarding the only evidence that a
+                // helper may still be running, so it fails closed.
+                let operation_id = intent
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        OrchestratorError::CorruptGoal(
+                            "schema-6 APPLYING mutation intent has no operation identity"
+                                .to_owned(),
+                        )
+                    })?;
+                let attempt_id = attempt.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    OrchestratorError::CorruptGoal(
+                        "schema-6 APPLYING mutation intent has no Attempt identity".to_owned(),
+                    )
+                })?;
+                let task_id = crate::task::TaskId::parse(task_id).map_err(|_| {
+                    OrchestratorError::CorruptGoal(
+                        "schema-6 APPLYING mutation intent has a malformed Task identity"
+                            .to_owned(),
+                    )
+                })?;
+                let attempt_id = crate::task::AttemptId::parse(attempt_id).map_err(|_| {
+                    OrchestratorError::CorruptGoal(
+                        "schema-6 APPLYING mutation intent has a malformed Attempt identity"
+                            .to_owned(),
+                    )
+                })?;
+                return Ok(Some((operation_id.to_owned(), task_id, attempt_id)));
+            }
+        }
+        Ok(None)
     }
 
     /// Migrate a pre-managed-worktree durable Goal (schema 3) to schema 4.
@@ -642,11 +874,22 @@ impl TaskStore {
         }
 
         #[cfg(test)]
-        if self.fault == Some(FaultPoint::BeforeReplace) {
-            let _ = secure_fs::remove_private_temp(&temporary);
-            return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
-                "injected atomic replace failure",
-            )));
+        {
+            let attempt = self
+                .fault_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let fail = match self.fault {
+                Some(FaultPoint::BeforeReplace) => true,
+                Some(FaultPoint::BeforeReplaceOnCommit(nth)) => attempt == nth,
+                _ => false,
+            };
+            if fail {
+                let _ = secure_fs::remove_private_temp(&temporary);
+                return Err(OrchestratorError::PersistenceIo(std::io::Error::other(
+                    "injected atomic replace failure",
+                )));
+            }
         }
 
         if let Err(error) = secure_fs::atomic_replace(&temporary, &path) {
@@ -881,6 +1124,8 @@ mod tests {
         let mut value = serde_json::to_value(goal).unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("managed_workspace_verification_evidence");
+        // Schema 7's publication quarantine did not exist at these versions.
+        object.remove("publication_quarantine");
         object.insert("schema_version".to_owned(), Value::from(version));
         value
     }
@@ -1255,6 +1500,221 @@ mod tests {
         assert_eq!(loaded.execution_root(), Some(loaded.cwd()));
         // Loading must not rewrite the durable file.
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A document as a schema-6 Goal would have stored it: the current Goal shape
+    /// with the schema-7 publication quarantine removed and the schema-6 version
+    /// stamped. The managed-workspace verification evidence field is kept because
+    /// schema 6 is the version that introduced it.
+    fn document_at_schema_six(goal: &Goal) -> Value {
+        let mut value = serde_json::to_value(goal).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("publication_quarantine");
+        object.insert(
+            "schema_version".to_owned(),
+            Value::from(SCHEMA_WITHOUT_PUBLICATION_QUARANTINE),
+        );
+        value
+    }
+
+    /// Move the named Task to the front of the serialized Task array.
+    ///
+    /// `Goal.tasks` is a `BTreeMap`, so its serialized order is UUID order. The
+    /// regression this exercises depends on scan order: an intent-less attempt
+    /// encountered before the applying Writer must not stop the scan. Reordering
+    /// the array makes that precondition deterministic instead of UUID-dependent.
+    fn move_task_to_front(value: &mut Value, task_id: &crate::task::TaskId) {
+        let tasks = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tasks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let index = tasks
+            .iter()
+            .position(|task| task.get("id").and_then(Value::as_str) == Some(task_id.as_str()))
+            .expect("Task is present in the serialized Goal");
+        let task = tasks.remove(index);
+        tasks.insert(0, task);
+    }
+
+    /// H5.1-E H51-01: a schema-6 Goal whose earlier attempt carries no
+    /// `MutationIntent` must not stop the migration scan at that attempt. The
+    /// applying Writer's intent must still be found and the migration must record
+    /// an `UNPROVEN` quarantine instead of `NOT_STARTED`.
+    ///
+    /// H51-02: that `UNPROVEN` record has no lock witness (the schema-6 binary
+    /// armed no lock), so it must validate, stay unresolved, and refuse recovery.
+    #[test]
+    fn schema_six_applying_intent_after_an_intentless_attempt_stays_quarantined() {
+        use crate::mutation::{
+            FileObservation, MutationIntent, MutationIntentState, MutationIntentUpdate,
+            MutationOperationIntent, MutationPreimage,
+        };
+        use crate::publication_quarantine::PublicationQuiescence;
+
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session = "schema-six-applying";
+        let mut goal = goal(session);
+        // The intent-less attempt comes first in the serialized order. It is an
+        // ordinary readonly attempt that never prepared a MutationIntent.
+        let readonly = goal
+            .add_task(
+                "readonly",
+                "read the workspace",
+                true,
+                WorkerKind::CodexReadonly,
+                read_only_scope(),
+                vec![],
+                2,
+                NOW,
+            )
+            .unwrap();
+        let writer = goal
+            .add_task(
+                "writer",
+                "publish the workspace change",
+                true,
+                WorkerKind::CodexWriter,
+                mutation_scope(),
+                vec![],
+                2,
+                NOW,
+            )
+            .unwrap();
+        goal.transition_to(GoalStatus::Running, NOW).unwrap();
+        for task in [&readonly, &writer] {
+            goal.transition_task(
+                task,
+                TaskStatus::Ready,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+            goal.transition_task(
+                task,
+                TaskStatus::Running,
+                TaskTransitionContext::default(),
+                NOW,
+            )
+            .unwrap();
+        }
+        // The strongest adversarial shape: the target already contains exactly the
+        // intended postimage, so journal reconciliation will conclude PERFORMED
+        // from file observation alone. The quarantine must survive that.
+        let target =
+            std::env::temp_dir().join(format!("local-mcp-schema-six-{}.txt", Uuid::new_v4()));
+        let published = b"published
+";
+        std::fs::write(&target, published).unwrap();
+        let operation_id = "operation-schema-six";
+        let intent = MutationIntent::new(
+            operation_id.to_owned(),
+            "scope-schema-six".to_owned(),
+            vec![MutationOperationIntent::new(
+                0,
+                target.clone(),
+                MutationPreimage::Absent,
+                FileObservation::absent(),
+                crate::external_model_work::sha256_hex(published),
+                "request-schema-six".to_owned(),
+            )],
+        )
+        .unwrap();
+        goal.task_prepare_latest_mutation_intent(&writer, intent)
+            .unwrap();
+        goal.task_advance_latest_mutation_intent(
+            &writer,
+            operation_id,
+            MutationIntentUpdate::BeginOperation { index: 0 },
+        )
+        .unwrap();
+
+        let mut value = document_at_schema_six(&goal);
+        move_task_to_front(&mut value, &readonly);
+        let path = store.goal_path(session, goal.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut loaded = store.load_goal(session, goal.id()).unwrap();
+        assert_eq!(loaded.schema_version(), GOAL_SCHEMA_VERSION);
+        let quarantine = loaded.publication_quarantine();
+        assert!(
+            quarantine.is_witness_less_legacy(),
+            "migration must not treat an intent-less attempt as the end of the scan"
+        );
+        assert_eq!(quarantine.state(), PublicationQuiescence::Unproven);
+        assert_eq!(quarantine.operation_id(), Some(operation_id));
+        assert_eq!(quarantine.task_id(), Some(&writer));
+        assert!(quarantine.is_unresolved());
+        assert!(!loaded.publication_quarantine_allows_activation());
+        // Loading is a decode-time view: the durable bytes are not rewritten.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // Recovery has no lock witness to probe, so it cannot clear the record.
+        assert!(
+            !loaded
+                .reconcile_publication_quarantine(NOW, "host-2")
+                .unwrap()
+        );
+        assert!(loaded.publication_quarantine().is_unresolved());
+        assert!(loaded.publication_quarantine().is_witness_less_legacy());
+        // Mutation recovery may rewrite the journal, but it must not clear the
+        // process-liveness barrier.
+        crate::mutation_recovery::reconcile_goal_mutations(&mut loaded, NOW).unwrap();
+        assert!(loaded.publication_quarantine().is_unresolved());
+        assert_eq!(
+            loaded.publication_quarantine().state(),
+            PublicationQuiescence::Unproven
+        );
+        // The journal now says the mutation was performed, but file state is not
+        // process lifetime: the quarantine stays unresolved.
+        assert_eq!(
+            loaded
+                .tasks()
+                .get(&writer)
+                .unwrap()
+                .latest_attempt()
+                .unwrap()
+                .mutation_intent()
+                .unwrap()
+                .state(),
+            MutationIntentState::ReconciledPerformed
+        );
+        let _ = std::fs::remove_file(target);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// H5.1-E H51-04: a legacy schema-1 document that already carries a
+    /// publication quarantine is corruption, not an upgrade path. Silently
+    /// replacing a supplied ACTIVE/UNPROVEN record would drop the only record of a
+    /// possibly live helper without probing.
+    #[test]
+    fn legacy_schema_one_cannot_carry_a_publication_quarantine() {
+        let root = state_root();
+        let store = TaskStore::with_state_root(root.clone());
+        let session = "legacy-quarantine";
+        let mut goal = goal(session);
+        goal.transition_to(GoalStatus::Failed, NOW).unwrap();
+        let path = store.goal_path(session, goal.id()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut value = document_at_version(&goal, 1);
+        value.as_object_mut().unwrap().insert(
+            "publication_quarantine".to_owned(),
+            serde_json::to_value(
+                crate::publication_quarantine::PublicationQuarantine::not_started(),
+            )
+            .unwrap(),
+        );
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let error = store.load_goal(session, goal.id()).unwrap_err();
+        assert!(
+            matches!(error, OrchestratorError::CorruptGoal(_)),
+            "schema-1 accepted a carried publication quarantine: {error}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

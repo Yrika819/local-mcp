@@ -89,6 +89,8 @@ mod shared_tests {
             preimage_kind: kind,
             preimage_digest: digest,
             request_id,
+            lock_path: "",
+            lock_token: "",
             content,
         });
         sandbox::run(
@@ -201,6 +203,8 @@ mod unix_tests {
             preimage_kind: kind,
             preimage_digest: digest,
             request_id,
+            lock_path: "",
+            lock_token: "",
             content,
         });
         sandbox::run(

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::authorization::{AuthorizationView, RequestedWriteScopeV1};
+use crate::authorization_store;
 use crate::config;
 use crate::failure_class::{FailureClass, LEGACY_READONLY_RESPONSE_LIMIT_REPORT};
 use crate::fallback::{SideEffectClass, SideEffectState};
@@ -23,6 +25,7 @@ use crate::managed_worktree_snapshot_coherence::{
 };
 use crate::managed_worktree_snapshot_manifest::assemble_workspace_snapshot_manifest;
 use crate::managed_worktree_writer_paths::derive_writer_mutated_paths;
+use crate::model_backend::ModelBackend;
 use crate::mutation_recovery;
 use crate::orchestrator_error::OrchestratorError;
 use crate::task::{
@@ -136,6 +139,19 @@ impl GoalApiError {
         }
     }
 
+    /// Host-side contract refusal that is not an orchestrator state error.
+    ///
+    /// Used by the External Agent Backend API surface (`goal_next` /
+    /// `goal_submit`) for bounded argument, backend, and budget refusals. The
+    /// message must be host-authored and bounded: it never carries model text.
+    pub(crate) fn external(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            active_goal: None,
+        }
+    }
+
     pub(crate) fn from_orchestrator(error: OrchestratorError) -> Self {
         Self::from_orchestrator_with_active(error, None)
     }
@@ -228,6 +244,20 @@ struct GoalStartRequest {
     /// host configuration.
     #[serde(default)]
     workspace_mode: WorkspaceMode,
+    /// Additive External Agent Backend V1 opt-in (ADR-01).
+    ///
+    /// `None` (or `"CODEX"`) keeps the existing Codex path. `"EXTERNAL"` selects
+    /// the MCP client-driven `goal_next`/`goal_submit` path. `"HYBRID"` and any
+    /// unknown spelling are refused rather than downgraded, so a caller can
+    /// never be handed Codex while believing it asked for another backend.
+    ///
+    /// This is host policy, decided once at creation and immutable afterwards.
+    #[serde(default)]
+    model_backend: Option<String>,
+    /// Untrusted Owner write-scope proposal for an EXTERNAL Goal. Data only:
+    /// the Owner Control Surface must still issue a grant before any write.
+    #[serde(default)]
+    write_scope: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +336,11 @@ pub(crate) struct GoalStartView {
     revision: u64,
     created_at: String,
     idempotent_replay: bool,
+    /// Additive host-owned backend policy. Existing fields are unchanged.
+    model_backend: ModelBackend,
+    /// Additive Authorization B projection. `NOT_REQUESTED` for every Goal that
+    /// supplied no `write_scope` (which includes every CODEX Goal).
+    authorization: AuthorizationView,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -383,6 +418,19 @@ pub(crate) struct GoalStatusView {
     blockers: Vec<BlockerView>,
     verification: VerificationSummaryView,
     latest_checkpoint: Option<CheckpointSummaryView>,
+    /// Additive External Agent Backend projection. Always present (`CODEX`
+    /// stays the default and keeps every previous field identical).
+    model_backend: &'static str,
+    execution_wait: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_work_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_budget: Option<ExternalBudgetView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_external_stop: Option<ExternalStopView>,
+    /// Additive Authorization B projection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization: Option<AuthorizationView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -392,6 +440,10 @@ pub(crate) struct GoalResultView {
     status: GoalStatus,
     terminal: bool,
     result_state: &'static str,
+    /// Additive outcome discriminator: COMPLETED / FAILED / CANCELLED /
+    /// BLOCKED / NONTERMINAL. `result_state` keeps its frozen
+    /// TERMINAL/NOT_TERMINAL contract.
+    result_kind: &'static str,
     objective: String,
     revision: u64,
     plan_revision: u32,
@@ -404,6 +456,10 @@ pub(crate) struct GoalResultView {
     latest_checkpoint: Option<CheckpointSummaryView>,
     created_at: String,
     completed_at: Option<String>,
+    /// Additive External Agent Backend projection; never changes
+    /// `result_state` or `result_kind`.
+    model_backend: &'static str,
+    execution_wait: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -490,6 +546,22 @@ pub(crate) fn goal_start_with_managed_root(
     let request: GoalStartRequest = parse_request(args)?;
     validate_session_binding(&request.session_id, session)?;
     validate_start_request(&request)?;
+    let backend = requested_backend(&request)?;
+    // The write scope is a proposal to the Owner, never an authorization. It is
+    // accepted only for an EXTERNAL Goal; CODEX behavior is unchanged.
+    let write_scope = match (backend.is_external(), request.write_scope.as_ref()) {
+        (true, Some(value)) => Some(
+            RequestedWriteScopeV1::from_mcp_value(value)
+                .map_err(|error| GoalApiError::invalid(error.code()))?,
+        ),
+        (true, None) => None,
+        (false, Some(_)) => {
+            return Err(GoalApiError::invalid(
+                "write_scope is only accepted for the EXTERNAL model backend",
+            ));
+        }
+        (false, None) => None,
+    };
 
     let deterministic_id = request
         .idempotency_key
@@ -500,7 +572,11 @@ pub(crate) fn goal_start_with_managed_root(
         match store.load_goal(&session.id, goal_id) {
             Ok(existing) => {
                 if same_start_payload(&existing, &request) {
-                    return Ok(start_view(&existing, true));
+                    return Ok(start_view(
+                        &existing,
+                        true,
+                        authorization_store::authorization_view(store, &existing),
+                    ));
                 }
                 return Err(GoalApiError::idempotency_conflict(&existing));
             }
@@ -559,6 +635,12 @@ pub(crate) fn goal_start_with_managed_root(
         )
         .map_err(GoalApiError::from_orchestrator)?
     };
+    // The backend policy is applied once, here, before the first durable write.
+    let mut goal = goal.with_creation_backend(backend);
+    if let Some(scope) = write_scope {
+        goal.set_external_write_scope(scope)
+            .map_err(GoalApiError::from_orchestrator)?;
+    }
 
     if let Err(error) = store.create_goal(&goal) {
         if matches!(error, OrchestratorError::ActiveGoalAlreadyExists)
@@ -566,7 +648,11 @@ pub(crate) fn goal_start_with_managed_root(
         {
             match store.load_goal(&session.id, goal_id) {
                 Ok(existing) if same_start_payload(&existing, &request) => {
-                    return Ok(start_view(&existing, true));
+                    return Ok(start_view(
+                        &existing,
+                        true,
+                        authorization_store::authorization_view(store, &existing),
+                    ));
                 }
                 Ok(existing) => return Err(GoalApiError::idempotency_conflict(&existing)),
                 Err(OrchestratorError::GoalNotFound) => {}
@@ -591,7 +677,8 @@ pub(crate) fn goal_start_with_managed_root(
     let durable = store
         .load_goal(&session.id, goal.id())
         .map_err(GoalApiError::from_orchestrator)?;
-    Ok(start_view(&durable, false))
+    let authorization = authorization_store::authorization_view(store, &durable);
+    Ok(start_view(&durable, false, authorization))
 }
 
 pub(crate) fn goal_status(
@@ -602,7 +689,9 @@ pub(crate) fn goal_status(
     let request: GoalLookupRequest = parse_request(args)?;
     validate_session_binding(&request.session_id, session)?;
     let goal = resolve_goal(store, &session.id, request.goal_id.as_deref())?;
-    Ok(status_view(&goal))
+    let mut view = status_view(&goal);
+    view.authorization = Some(authorization_store::authorization_view(store, &goal));
+    Ok(view)
 }
 
 pub(crate) fn goal_pause(
@@ -1061,7 +1150,7 @@ fn parse_request<T: DeserializeOwned>(args: &Value) -> Result<T, GoalApiError> {
         .map_err(|error| GoalApiError::invalid(format!("invalid goal tool arguments: {error}")))
 }
 
-fn validate_session_binding(
+pub(crate) fn validate_session_binding(
     request_session_id: &str,
     session: &config::Session,
 ) -> Result<(), GoalApiError> {
@@ -1093,6 +1182,7 @@ fn validate_start_request(request: &GoalStartRequest) -> Result<(), GoalApiError
     if let Some(key) = request.idempotency_key.as_deref() {
         ensure_max_chars("idempotency_key", key, 128)?;
     }
+    requested_backend(request)?;
     Ok(())
 }
 
@@ -1129,7 +1219,7 @@ fn validate_string_list(
     Ok(())
 }
 
-fn parse_goal_id(value: &str) -> Result<GoalId, GoalApiError> {
+pub(crate) fn parse_goal_id(value: &str) -> Result<GoalId, GoalApiError> {
     let parsed = GoalId::parse(value).map_err(GoalApiError::from_orchestrator)?;
     if parsed.as_str() != value {
         return Err(GoalApiError::invalid(
@@ -1139,7 +1229,7 @@ fn parse_goal_id(value: &str) -> Result<GoalId, GoalApiError> {
     Ok(parsed)
 }
 
-fn resolve_goal(
+pub(crate) fn resolve_goal(
     store: &TaskStore,
     session_id: &str,
     goal_id: Option<&str>,
@@ -1241,6 +1331,12 @@ fn resume_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
 /// The reconciliation half of a resume, shared by the ordinary resume path and
 /// the failed-task replan request path.
 fn resume_recovery_only(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
+    // H5.1-B: the publication quarantine is reconciled by a process-liveness
+    // probe only. It is deliberately ordered before the journal reconciliation
+    // so a resumed host proves (or fails to prove) helper quiescence from the
+    // lock witness rather than from whatever the file reconciliation finds.
+    let publication_quarantine_reconciled =
+        goal.reconcile_publication_quarantine(now, crate::publication_lock::host_generation())?;
     let mutation_reconciled = mutation_recovery::reconcile_goal_mutations(goal, now)?;
     goal.recover_stale_running(now)?;
     reconcile_legacy_readonly_timeout_failures(goal, now)?;
@@ -1249,7 +1345,11 @@ fn resume_recovery_only(goal: &mut Goal, now: &str) -> Result<(), OrchestratorEr
     reconcile_safe_writer_blocked_tasks(goal, now)?;
     reconcile_readonly_transport_retryable_tasks(goal, now)?;
     let readonly_plan_reconciled = reconcile_readonly_plan_contract_failures(goal, now)?;
-    if mutation_reconciled || legacy_writer_reconciled || readonly_plan_reconciled {
+    if mutation_reconciled
+        || publication_quarantine_reconciled
+        || legacy_writer_reconciled
+        || readonly_plan_reconciled
+    {
         goal.add_checkpoint(CheckpointReason::Recovery, now)?;
     }
     Ok(())
@@ -1547,10 +1647,18 @@ fn cancel_goal(goal: &mut Goal, now: &str) -> Result<(), OrchestratorError> {
     } else if !goal.has_active_tasks() {
         goal.transition_to(GoalStatus::Cancelled, now)?;
     }
+    // Invariant 10: cancellation and external WorkItem invalidation are one
+    // durable commit. A cancelled Goal can never be revived by a delayed
+    // submission, and no outstanding request survives the cancellation.
+    crate::external_model_store::cancel_active_work_in_place(goal, "GOAL_CANCELLED");
     Ok(())
 }
 
-fn start_view(goal: &Goal, idempotent_replay: bool) -> GoalStartView {
+fn start_view(
+    goal: &Goal,
+    idempotent_replay: bool,
+    authorization: AuthorizationView,
+) -> GoalStartView {
     GoalStartView {
         goal_id: goal.id().as_str().to_owned(),
         session_id: goal.session_id().to_owned(),
@@ -1559,6 +1667,8 @@ fn start_view(goal: &Goal, idempotent_replay: bool) -> GoalStartView {
         revision: goal.revision(),
         created_at: goal.created_at().to_owned(),
         idempotent_replay,
+        model_backend: goal.model_backend(),
+        authorization,
     }
 }
 
@@ -1603,7 +1713,109 @@ fn status_view(goal: &Goal) -> GoalStatusView {
         blockers: blocker_views(goal),
         verification: verification_summary(goal),
         latest_checkpoint: latest_checkpoint(goal),
+        model_backend: goal.model_backend().as_str(),
+        execution_wait: execution_wait_for(goal),
+        pending_work_id: pending_work_id_for(goal),
+        external_budget: budget_view_for(goal),
+        last_external_stop: last_stop_view_for(goal),
+        authorization: None,
     }
+}
+
+/// Additive outcome discriminator for `goal_result`.
+///
+/// The frozen `result_state` field keeps its TERMINAL/NOT_TERMINAL contract;
+/// this mapping adds the five-way distinction (COMPLETED / FAILED / CANCELLED /
+/// BLOCKED / NONTERMINAL) that External Agent Backend consumers need without
+/// changing any existing field.
+pub(crate) fn result_kind_for_status(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Completed => "COMPLETED",
+        GoalStatus::Failed => "FAILED",
+        GoalStatus::Cancelled => "CANCELLED",
+        GoalStatus::Blocked => "BLOCKED",
+        _ => "NONTERMINAL",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additive External Agent Backend projection (B-01 / ADR-06).
+//
+// These helpers are read-only. They never change `GoalStatus`, and they return
+// `NONE`/`None` for a CODEX Goal so every existing response stays byte-for-byte
+// identical apart from the additive keys.
+// ---------------------------------------------------------------------------
+
+/// Additive `execution_wait` projection of the durable external WorkItem state.
+pub(crate) fn execution_wait_for(goal: &Goal) -> &'static str {
+    use crate::external_model_work::WorkItemState;
+
+    if !goal.model_backend().is_external() {
+        return "NONE";
+    }
+    match goal.external_model().and_then(|state| state.active_work()) {
+        Some(item) => match item.state() {
+            WorkItemState::Pending => "WAITING_FOR_EXTERNAL_MODEL",
+            WorkItemState::Submitted => "WAITING_FOR_HOST_APPLICATION",
+            _ => "NONE",
+        },
+        None => "NONE",
+    }
+}
+
+pub(crate) fn pending_work_id_for(goal: &Goal) -> Option<String> {
+    goal.external_model()
+        .and_then(|state| state.active_work())
+        .map(|item| item.work_id().as_str().to_owned())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ExternalBudgetView {
+    pending_work_items: usize,
+    max_pending_work_items: usize,
+    issued_work_items: u32,
+    max_work_items: u32,
+    role_attempts: u32,
+    max_role_attempts: u32,
+    submission_receipts: usize,
+    max_submission_receipts: usize,
+}
+
+pub(crate) fn budget_view_for(goal: &Goal) -> Option<ExternalBudgetView> {
+    use crate::external_model_work::{
+        MAX_ACTIVE_WORK_ITEMS_PER_GOAL, MAX_MODEL_WORK_ITEMS_PER_GOAL, MAX_ROLE_ATTEMPTS,
+        MAX_SUBMISSION_RECEIPTS, WorkRole,
+    };
+
+    let state = goal.external_model()?;
+    Some(ExternalBudgetView {
+        pending_work_items: usize::from(state.active_work().is_some()),
+        max_pending_work_items: MAX_ACTIVE_WORK_ITEMS_PER_GOAL,
+        issued_work_items: state.issue_counter(),
+        max_work_items: MAX_MODEL_WORK_ITEMS_PER_GOAL,
+        role_attempts: state.role_attempts(WorkRole::Planner),
+        max_role_attempts: MAX_ROLE_ATTEMPTS,
+        submission_receipts: state.receipts().len(),
+        max_submission_receipts: MAX_SUBMISSION_RECEIPTS,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ExternalStopView {
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    at: String,
+}
+
+pub(crate) fn last_stop_view_for(goal: &Goal) -> Option<ExternalStopView> {
+    goal.external_model()
+        .and_then(|state| state.last_stop())
+        .map(|stop| ExternalStopView {
+            code: stop.code().to_owned(),
+            detail: stop.detail().map(str::to_owned),
+            at: stop.at().to_owned(),
+        })
 }
 
 fn result_view(goal: &Goal) -> GoalResultView {
@@ -1660,6 +1872,7 @@ fn result_view(goal: &Goal) -> GoalResultView {
         } else {
             "NOT_TERMINAL"
         },
+        result_kind: result_kind_for_status(goal.status()),
         objective: goal.objective().to_owned(),
         revision: goal.revision(),
         plan_revision: goal.plan_revision(),
@@ -1671,6 +1884,8 @@ fn result_view(goal: &Goal) -> GoalResultView {
         latest_checkpoint: latest_checkpoint(goal),
         created_at: goal.created_at().to_owned(),
         completed_at: goal.completed_at().map(str::to_owned),
+        model_backend: goal.model_backend().as_str(),
+        execution_wait: execution_wait_for(goal),
     }
 }
 
@@ -1836,6 +2051,38 @@ fn same_start_payload(goal: &Goal, request: &GoalStartRequest) -> bool {
         // reusing one idempotency key across modes must not silently replay the
         // other mode's Goal.
         && goal.workspace_mode() == request.workspace_mode
+        // The backend is host policy and part of the request identity for the
+        // same reason: a replay must never hand back a Codex Goal when the
+        // caller asked for the External backend (or the reverse).
+        && requested_backend(request)
+            .map(|backend| goal.model_backend() == backend)
+            .unwrap_or(false)
+        // The write-scope proposal is part of the request identity: a replay
+        // must not silently hand back a Goal proposing a different scope.
+        && goal
+            .external_model()
+            .and_then(|state| state.write_scope())
+            .cloned()
+            == request
+                .write_scope
+                .as_ref()
+                .and_then(|value| RequestedWriteScopeV1::from_mcp_value(value).ok())
+}
+
+/// Resolve the caller's requested backend spelling.
+///
+/// Validated in `validate_start_request` before any durable work; this second
+/// call is the single place that turns the request into the typed policy so
+/// validation and identity cannot drift.
+fn requested_backend(request: &GoalStartRequest) -> Result<ModelBackend, GoalApiError> {
+    match request.model_backend.as_deref() {
+        None => Ok(ModelBackend::default()),
+        Some(value) => ModelBackend::parse_requested(value).map_err(|error| GoalApiError {
+            code: error.code(),
+            message: error.message(),
+            active_goal: None,
+        }),
+    }
 }
 
 /// A managed `goal_start` that cannot derive host state fails closed and creates
@@ -1869,7 +2116,7 @@ fn idempotent_goal_id(session_id: &str, key: &str) -> GoalId {
     GoalId::parse(&Uuid::from_bytes(bytes).to_string()).expect("generated UUID is canonical")
 }
 
-fn goal_status_name(status: GoalStatus) -> &'static str {
+pub(crate) fn goal_status_name(status: GoalStatus) -> &'static str {
     match status {
         GoalStatus::Planning => "PLANNING",
         GoalStatus::Running => "RUNNING",

@@ -28,17 +28,28 @@ use crate::task::{
 use crate::task_store::TaskStore;
 use crate::workspace_publish::{self, ExpectedPreimage};
 
-pub(crate) const MAX_WRITER_RESULT_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_WRITER_OPERATIONS: usize = 32;
-pub(crate) const MAX_WRITER_PATH_BYTES: usize = 4096;
-pub(crate) const MAX_WRITE_CONTENT_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_TOTAL_WRITE_CONTENT_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_WRITER_SUMMARY_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_WORKER_EVIDENCE_ITEMS: usize = 64;
-pub(crate) const MAX_WORKER_EVIDENCE_KIND_BYTES: usize = 128;
-pub(crate) const MAX_WORKER_EVIDENCE_VALUE_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_WORKER_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_REVIEW_RESULT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_WRITER_RESULT_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITER_RESULT_BYTES;
+pub(crate) const MAX_WRITER_OPERATIONS: usize =
+    crate::external_response_contract::LIMIT_WRITER_OPERATIONS;
+pub(crate) const MAX_WRITER_PATH_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITER_PATH_BYTES;
+pub(crate) const MAX_WRITE_CONTENT_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITE_CONTENT_BYTES;
+pub(crate) const MAX_TOTAL_WRITE_CONTENT_BYTES: usize =
+    crate::external_response_contract::LIMIT_TOTAL_WRITE_CONTENT_BYTES;
+pub(crate) const MAX_WRITER_SUMMARY_BYTES: usize =
+    crate::external_response_contract::LIMIT_WRITER_SUMMARY_BYTES;
+pub(crate) const MAX_WORKER_EVIDENCE_ITEMS: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_ITEMS;
+pub(crate) const MAX_WORKER_EVIDENCE_KIND_BYTES: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_KIND_BYTES;
+pub(crate) const MAX_WORKER_EVIDENCE_VALUE_BYTES: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_VALUE_BYTES;
+pub(crate) const MAX_WORKER_EVIDENCE_TOTAL_BYTES: usize =
+    crate::external_response_contract::LIMIT_WORKER_EVIDENCE_TOTAL_BYTES;
+pub(crate) const MAX_REVIEW_RESULT_BYTES: usize =
+    crate::external_response_contract::LIMIT_REVIEW_RESULT_BYTES;
 
 #[derive(Debug)]
 #[expect(
@@ -100,6 +111,17 @@ pub(crate) struct WriterWriteRequest<'a> {
     pub content: &'a str,
     pub expected_preimage: &'a ExpectedPreimage,
     pub request_id: &'a str,
+    /// Host-derived publication lock the helper must hold for its whole
+    /// lifetime. `None` is used only by host paths that are not part of the
+    /// durable EXTERNAL Writer quarantine (the in-process CODEX writer and the
+    /// MCP edit tool); those paths keep their existing lifecycle evidence.
+    pub publication_lock: Option<&'a PublicationLockSpec>,
+}
+
+/// The exact lock identity the host armed for one helper execution.
+pub(crate) struct PublicationLockSpec {
+    pub path: PathBuf,
+    pub token: String,
 }
 
 pub(crate) trait WriteBoundary {
@@ -109,7 +131,8 @@ pub(crate) trait WriteBoundary {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<sandbox::Output>> + Send + 'a>>;
 }
 
-struct ExecutionWriteBoundary;
+/// The production write boundary: the sandboxed atomic publication helper.
+pub(crate) struct ExecutionWriteBoundary;
 
 impl WriteBoundary for ExecutionWriteBoundary {
     fn write<'a>(
@@ -295,7 +318,7 @@ pub(crate) enum WriterStatus {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriterResult {
+pub(crate) struct WriterResult {
     goal_id: String,
     task_id: String,
     attempt_id: String,
@@ -309,14 +332,14 @@ struct WriterResult {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriterEvidence {
+pub(crate) struct WriterEvidence {
     kind: String,
     value: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-enum WriterOperation {
+pub(crate) enum WriterOperation {
     WriteUtf8 {
         path: String,
         expected_preimage: PreimageExpectation,
@@ -326,14 +349,14 @@ enum WriterOperation {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-enum PreimageExpectation {
+pub(crate) enum PreimageExpectation {
     Sha256 { sha256: String },
     Absent,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewerResult {
+pub(crate) struct ReviewerResult {
     goal_id: String,
     task_id: String,
     attempt_id: String,
@@ -344,20 +367,165 @@ struct ReviewerResult {
     evidence: Vec<WriterEvidence>,
 }
 
+#[expect(
+    dead_code,
+    reason = "External Writer validation reads the same validated proposal the Codex path applies."
+)]
+impl WriterResult {
+    pub(crate) fn status(&self) -> WriterStatus {
+        self.status
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn operations_ref(&self) -> &[WriterOperation] {
+        &self.proposed_operations
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "External Writer validation consumes the host-materialized write plan."
+)]
+impl MaterializedWrite {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub(crate) fn expected_preimage(&self) -> &PreimageExpectation {
+        &self.expected_preimage
+    }
+
+    pub(crate) fn before(&self) -> &FileState {
+        &self.before
+    }
+
+    pub(crate) fn parent(&self) -> &Path {
+        &self.parent
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "External publication reads the same postimage observation the Codex path records."
+)]
+impl FileState {
+    pub(crate) fn exists(&self) -> bool {
+        self.exists
+    }
+
+    pub(crate) fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    pub(crate) fn sha256(&self) -> Option<&str> {
+        self.sha256.as_deref()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FileState {
+pub(crate) struct FileState {
     exists: bool,
     size: Option<u64>,
     sha256: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-struct MaterializedWrite {
+pub(crate) struct MaterializedWrite {
     path: PathBuf,
     parent: PathBuf,
     expected_preimage: PreimageExpectation,
     content: String,
     before: FileState,
+}
+
+/// Re-check, inside a commit closure, that the Writer Attempt is still the one
+/// the WorkItem was bound to.
+///
+/// Used by the external Writer path: validation happens outside the lock, so the
+/// commit itself must prove the Task is still RUNNING on this exact Attempt
+/// (which also still holds the workspace mutation lease).
+pub(crate) fn ensure_writer_task_ready_for_attempt(
+    goal: &Goal,
+    task_id: &TaskId,
+    attempt_id: &str,
+) -> Result<(), OrchestratorError> {
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| OrchestratorError::InvalidDag("writer Task is missing".to_owned()))?;
+    if task.status() != TaskStatus::Running || task.worker() != WorkerKind::CodexWriter {
+        return Err(OrchestratorError::InvalidDag(
+            "writer Task is no longer the active CODEX_WRITER attempt".to_owned(),
+        ));
+    }
+    let attempt = task.latest_attempt().ok_or_else(|| {
+        OrchestratorError::CorruptGoal("RUNNING writer Task lacks an Attempt".to_owned())
+    })?;
+    if attempt.id().as_str() != attempt_id {
+        return Err(OrchestratorError::InvalidDag(
+            "writer Attempt identity changed".to_owned(),
+        ));
+    }
+    if task.scope().operation_kind() == TaskOperationKind::ReadOnly {
+        return Err(OrchestratorError::InvalidDag(
+            "writer mutation requires a mutating TaskScope".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Host gates every writer attempt passes before an Attempt begins.
+///
+/// Shared by the Codex writer path and external Writer WorkItem issuance so a
+/// WorkItem can never be issued for a Task the host would refuse to run.
+pub(crate) fn ensure_writer_task_ready(
+    goal: &Goal,
+    task_id: &TaskId,
+) -> Result<(), OrchestratorError> {
+    if goal.status() != GoalStatus::Running {
+        return Err(OrchestratorError::InvalidDag(
+            "writer attempt requires a RUNNING Goal".to_owned(),
+        ));
+    }
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| OrchestratorError::InvalidDag("writer Task is missing".to_owned()))?;
+    if task.status() != TaskStatus::Ready {
+        return Err(OrchestratorError::InvalidDag(
+            "writer attempt requires a READY Task".to_owned(),
+        ));
+    }
+    if task.worker() != WorkerKind::CodexWriter {
+        return Err(OrchestratorError::InvalidDag(
+            "writer mutation requires CODEX_WRITER".to_owned(),
+        ));
+    }
+    if task.scope().operation_kind() == TaskOperationKind::ReadOnly {
+        return Err(OrchestratorError::InvalidDag(
+            "writer mutation requires a mutating TaskScope".to_owned(),
+        ));
+    }
+    if task.semantic_attempts_remaining() == 0 {
+        return Err(OrchestratorError::InvalidDag(
+            "writer Task attempt budget is exhausted".to_owned(),
+        ));
+    }
+    if goal.tasks().iter().any(|(candidate_id, candidate)| {
+        candidate_id != task_id && holds_workspace_mutation_lease(candidate)
+    }) {
+        return Err(OrchestratorError::InvalidDag(
+            "WORKSPACE_MUTATION lease is already held".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn begin_writer_attempt(
@@ -375,41 +543,7 @@ pub(crate) fn begin_writer_attempt(
                     "writer execution-root gate refused: {error}"
                 ))
             })?;
-            if goal.status() != GoalStatus::Running {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer attempt requires a RUNNING Goal".to_owned(),
-                ));
-            }
-            let task = goal.tasks().get(task_id).ok_or_else(|| {
-                OrchestratorError::InvalidDag("writer Task is missing".to_owned())
-            })?;
-            if task.status() != TaskStatus::Ready {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer attempt requires a READY Task".to_owned(),
-                ));
-            }
-            if task.worker() != WorkerKind::CodexWriter {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer mutation requires CODEX_WRITER".to_owned(),
-                ));
-            }
-            if task.scope().operation_kind() == TaskOperationKind::ReadOnly {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer mutation requires a mutating TaskScope".to_owned(),
-                ));
-            }
-            if task.semantic_attempts_remaining() == 0 {
-                return Err(OrchestratorError::InvalidDag(
-                    "writer Task attempt budget is exhausted".to_owned(),
-                ));
-            }
-            if goal.tasks().iter().any(|(candidate_id, candidate)| {
-                candidate_id != task_id && holds_workspace_mutation_lease(candidate)
-            }) {
-                return Err(OrchestratorError::InvalidDag(
-                    "WORKSPACE_MUTATION lease is already held".to_owned(),
-                ));
-            }
+            ensure_writer_task_ready(goal, task_id)?;
             goal.transition_task(
                 task_id,
                 TaskStatus::Running,
@@ -751,6 +885,7 @@ pub(crate) async fn run_writer_attempt_with_boundary<
                 content: &operation.content,
                 expected_preimage: &commit_preimage(&operation.expected_preimage),
                 request_id,
+                publication_lock: None,
             })
             .await
             .map_err(|error| WriterError::MutationFailed(error.to_string()))?;
@@ -970,6 +1105,66 @@ pub(crate) async fn run_writer_attempt_with_boundary<
             },
         )
         .map_err(WriterError::from)
+}
+
+/// Apply one validated reviewer verdict to the Task (ReviewGate).
+///
+/// The gate reads the Task's own `REVIEW_GATE` verification specs; the model only
+/// supplies the finding count. A pass moves the Task to VERIFYING (never to
+/// COMPLETED); a failure blocks it with review evidence preserved.
+pub(crate) fn apply_reviewer_verdict_to_goal(
+    goal: &mut Goal,
+    task_id: &TaskId,
+    operation_id: &str,
+    summary: &str,
+    blocking_findings: u32,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    let gate_exceeded = goal.tasks()[task_id]
+        .verification_specs()
+        .iter()
+        .any(|spec| {
+            matches!(
+                spec,
+                VerificationSpec::ReviewGate { max_blocking_findings }
+                    if blocking_findings > *max_blocking_findings
+            )
+        });
+    goal.task_add_evidence(
+        task_id,
+        TaskEvidence::ReviewResult {
+            summary: summary.to_owned(),
+            blocking_findings,
+        },
+    )?;
+    goal.task_advance_latest_mutation_intent(
+        task_id,
+        operation_id,
+        MutationIntentUpdate::CompleteReviewer,
+    )?;
+    if gate_exceeded {
+        goal.task_add_blocker(
+            task_id,
+            TaskBlocker::new(
+                "REVIEW_GATE_BLOCKED",
+                format!("reviewer reported {blocking_findings} blocking finding(s)"),
+                true,
+            ),
+        )?;
+        goal.transition_task(
+            task_id,
+            TaskStatus::Blocked,
+            TaskTransitionContext::default(),
+            now,
+        )
+    } else {
+        goal.transition_task(
+            task_id,
+            TaskStatus::Verifying,
+            TaskTransitionContext::default(),
+            now,
+        )
+    }
 }
 
 /// Continue the reviewer leg of a Writer attempt whose filesystem mutation was
@@ -1194,6 +1389,20 @@ fn build_writer_request(
     task_id: &TaskId,
     session: &config::Session,
 ) -> Result<WriterRequest, WriterError> {
+    build_writer_request_at_revision(goal, task_id, session, goal.revision())
+}
+
+/// Build the host-authored writer request with an explicit goal revision.
+///
+/// The external backend issues a Writer WorkItem inside the same commit that
+/// starts the Attempt, so the request must be bound to the revision that commit
+/// produces — the revision the client will submit against.
+pub(crate) fn build_writer_request_at_revision(
+    goal: &Goal,
+    task_id: &TaskId,
+    session: &config::Session,
+    goal_revision: u64,
+) -> Result<WriterRequest, WriterError> {
     let task = goal.tasks().get(task_id).ok_or_else(|| {
         WriterError::AuthorityViolation("writer Task disappeared after checkpoint".to_owned())
     })?;
@@ -1206,7 +1415,7 @@ fn build_writer_request(
         goal_id: goal.id().as_str().to_owned(),
         task_id: task_id.as_str().to_owned(),
         attempt_id: attempt.id().as_str().to_owned(),
-        goal_revision: goal.revision(),
+        goal_revision,
         plan_revision: goal.plan_revision(),
         goal_cwd: execution_root,
         task_title: task.title().to_owned(),
@@ -1216,7 +1425,7 @@ fn build_writer_request(
     })
 }
 
-fn parse_and_validate_writer_result(
+pub(crate) fn parse_and_validate_writer_result(
     raw: &[u8],
     request: &WriterRequest,
 ) -> Result<WriterResult, WriterError> {
@@ -1296,7 +1505,7 @@ fn parse_and_validate_writer_result(
     Ok(result)
 }
 
-fn parse_and_validate_reviewer_result(
+pub(crate) fn parse_and_validate_reviewer_result(
     raw: &[u8],
     request: &ReviewerRequest,
 ) -> Result<ReviewerResult, WriterError> {
@@ -1380,7 +1589,7 @@ fn is_canonical_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn materialize_operations(
+pub(crate) fn materialize_operations(
     goal: &Goal,
     session: &config::Session,
     task_id: &TaskId,
@@ -1613,7 +1822,7 @@ fn contains_git_internal(path: &Path) -> bool {
         .any(|component| matches!(component, Component::Normal(value) if value == ".git"))
 }
 
-fn observe_file_state(path: &Path) -> Result<FileState, WriterError> {
+pub(crate) fn observe_file_state(path: &Path) -> Result<FileState, WriterError> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(FileState {
             exists: false,
@@ -1663,7 +1872,7 @@ fn preimage_matches(state: &FileState, expectation: &PreimageExpectation) -> boo
 
 /// Translate the Writer's durable expectation into the publication primitive's
 /// expectation. These are two views of one fact, not two independent decisions.
-fn commit_preimage(expectation: &PreimageExpectation) -> ExpectedPreimage {
+pub(crate) fn commit_preimage(expectation: &PreimageExpectation) -> ExpectedPreimage {
     match expectation {
         PreimageExpectation::Absent => ExpectedPreimage::Absent,
         PreimageExpectation::Sha256 { sha256 } => ExpectedPreimage::Sha256(sha256.clone()),
@@ -1900,6 +2109,249 @@ fn ensure_active_attempt_store(
     Ok(())
 }
 
+/// Re-check one durable intent operation against current host authority.
+///
+/// Publication calls this for every operation *before* the first write, so a
+/// stale path authority or a changed preimage stops the whole set instead of
+/// half-applying it.
+pub(crate) fn revalidate_intent_operation_before_publish(
+    goal: &Goal,
+    session: &config::Session,
+    task_id: &TaskId,
+    path: &Path,
+    expected_preimage: &crate::mutation::MutationPreimage,
+) -> Result<(), WriterError> {
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| WriterError::AuthorityViolation("writer Task is missing".to_owned()))?;
+    let goal_root = crate::planner::execution_root_for_goal(goal, session)
+        .map_err(|error| WriterError::AuthorityViolation(error.to_string()))?;
+    let goal_root = fs::canonicalize(goal_root).map_err(|_| {
+        WriterError::AuthorityViolation("execution root cannot be canonicalized".to_owned())
+    })?;
+    let (resolved, _parent) = resolve_absolute_write_path(
+        path,
+        &goal_root,
+        task.scope().allowed_paths(),
+        task.scope().forbidden_paths(),
+    )?;
+    if resolved != path {
+        return Err(WriterError::AuthorityViolation(
+            "writer path authority changed before publication".to_owned(),
+        ));
+    }
+    let expectation = mutation_to_preimage_expectation(expected_preimage);
+    let observed = observe_file_state(path)?;
+    if !preimage_matches(&observed, &expectation) {
+        return Err(WriterError::PreimageMismatch(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Convert a durable intent preimage into the publication expectation.
+pub(crate) fn mutation_to_commit_preimage(
+    preimage: &crate::mutation::MutationPreimage,
+) -> ExpectedPreimage {
+    match preimage {
+        crate::mutation::MutationPreimage::Absent => ExpectedPreimage::Absent,
+        crate::mutation::MutationPreimage::Sha256 { sha256 } => {
+            ExpectedPreimage::Sha256(sha256.clone())
+        }
+    }
+}
+
+/// Convert a durable intent preimage into the Writer's own expectation view.
+pub(crate) fn mutation_to_preimage_expectation(
+    preimage: &crate::mutation::MutationPreimage,
+) -> PreimageExpectation {
+    match preimage {
+        crate::mutation::MutationPreimage::Absent => PreimageExpectation::Absent,
+        crate::mutation::MutationPreimage::Sha256 { sha256 } => PreimageExpectation::Sha256 {
+            sha256: sha256.clone(),
+        },
+    }
+}
+
+/// Build the host-authored reviewer request from durable state (external Reviewer).
+///
+/// The files, before/after digests, and workspace identity come from the durable
+/// MutationIntent and the current postimage observation, never from a model.
+pub(crate) fn build_external_reviewer_request(
+    goal: &Goal,
+    task_id: &TaskId,
+) -> Result<ReviewerRequest, WriterError> {
+    build_external_reviewer_request_at_revision(goal, task_id, goal.revision())
+}
+
+/// Same builder, bound to an explicit goal revision.
+///
+/// The external Reviewer WorkItem is issued inside a commit that advances the
+/// revision, so its request must name the revision the client will submit
+/// against; otherwise every valid verdict would look stale.
+pub(crate) fn build_external_reviewer_request_at_revision(
+    goal: &Goal,
+    task_id: &TaskId,
+    goal_revision: u64,
+) -> Result<ReviewerRequest, WriterError> {
+    let task = goal
+        .tasks()
+        .get(task_id)
+        .ok_or_else(|| WriterError::AuthorityViolation("reviewer Task is missing".to_owned()))?;
+    if task.status() != TaskStatus::Running || task.worker() != WorkerKind::CodexWriter {
+        return Err(WriterError::AuthorityViolation(
+            "reviewer request requires the active writer Task".to_owned(),
+        ));
+    }
+    let attempt = task.latest_attempt().ok_or_else(|| {
+        WriterError::AuthorityViolation("reviewer Task lacks an Attempt".to_owned())
+    })?;
+    let intent = attempt.mutation_intent().ok_or_else(|| {
+        WriterError::AuthorityViolation("reviewer request lacks MutationIntent".to_owned())
+    })?;
+    if !matches!(
+        intent.state(),
+        crate::mutation::MutationIntentState::Applied
+            | crate::mutation::MutationIntentState::ReconciledPerformed
+    ) {
+        return Err(WriterError::AuthorityViolation(
+            "reviewer request requires a fully applied writer intent".to_owned(),
+        ));
+    }
+    let files = intent
+        .operations()
+        .iter()
+        .map(|operation| {
+            let current = observe_file_state(operation.path())?;
+            Ok(ReviewFileEvidence {
+                path: operation.path().to_path_buf(),
+                before_sha256: match operation.expected_preimage() {
+                    crate::mutation::MutationPreimage::Absent => None,
+                    crate::mutation::MutationPreimage::Sha256 { sha256 } => Some(sha256.clone()),
+                },
+                // The expected postimage is the digest the host *published*, not a
+                // fresh observation: otherwise a file changed after publication
+                // would silently become the thing under review.
+                after_sha256: Some(operation.intended_after_sha256().to_owned()),
+                size: current.size,
+            })
+        })
+        .collect::<Result<Vec<_>, WriterError>>()?;
+    Ok(ReviewerRequest {
+        goal_id: goal.id().as_str().to_owned(),
+        task_id: task_id.as_str().to_owned(),
+        attempt_id: attempt.id().as_str().to_owned(),
+        goal_revision,
+        plan_revision: goal.plan_revision(),
+        writer_summary: attempt
+            .worker_report()
+            .map(|report| report.summary().to_owned())
+            .unwrap_or_else(|| "host-observed external writer mutation".to_owned()),
+        files,
+    })
+}
+
+/// Serialize the reviewer request for a WorkItem payload.
+pub(crate) fn reviewer_request_payload(request: &ReviewerRequest) -> Result<String, WriterError> {
+    serde_json::to_string(request)
+        .map_err(|_| WriterError::OutputInvalid("reviewer request serialization failed".to_owned()))
+}
+
+/// A bounded, model-free refusal for one external Reviewer submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewerValidationRefusal {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ReviewerValidationRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        self.detail
+    }
+}
+
+/// An untrusted reviewer response that passed every host check.
+pub(crate) struct ValidatedReviewerOutput {
+    summary: String,
+    blocking_findings: u32,
+}
+
+impl ValidatedReviewerOutput {
+    pub(crate) fn blocking_findings(&self) -> u32 {
+        self.blocking_findings
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
+/// Whether any file in a reviewer request no longer matches its published digest.
+///
+/// The expected digest is the one the host published (recorded in the durable
+/// intent), so this detects drift rather than comparing a value to itself.
+pub(crate) fn reviewer_request_postimage_is_stale(request: &ReviewerRequest) -> bool {
+    request.files.iter().any(|file| {
+        observe_file_state(&file.path)
+            .map(|current| current.sha256 != file.after_sha256)
+            .unwrap_or(true)
+    })
+}
+
+/// Validate one untrusted external Reviewer response against the durable request.
+///
+/// The request is rebuilt from durable state (never from the WorkItem payload), so
+/// a Reviewer cannot review a different postimage than the one the host recorded.
+pub(crate) fn validate_external_reviewer_output(
+    goal: &Goal,
+    task_id: &TaskId,
+    attempt_id: &str,
+    raw: &[u8],
+) -> Result<ValidatedReviewerOutput, ReviewerValidationRefusal> {
+    let request =
+        build_external_reviewer_request(goal, task_id).map_err(|_| ReviewerValidationRefusal {
+            code: "REVIEWER_REQUEST_UNAVAILABLE",
+            detail: "the host could not rebuild the reviewer request for this Task",
+        })?;
+    if request.attempt_id() != attempt_id {
+        return Err(ReviewerValidationRefusal {
+            code: "REVIEWER_ATTEMPT_STALE",
+            detail: "the Writer Attempt this review was bound to is no longer current",
+        });
+    }
+    // A changed postimage invalidates the review request entirely.
+    let stale = request.files.iter().any(|file| {
+        observe_file_state(&file.path)
+            .map(|current| current.sha256 != file.after_sha256 || current.size != file.size)
+            .unwrap_or(true)
+    });
+    if stale {
+        return Err(ReviewerValidationRefusal {
+            code: "REVIEWER_STALE_POSTIMAGE",
+            detail: "a reviewed file changed after the host published it",
+        });
+    }
+    let review =
+        parse_and_validate_reviewer_result(raw, &request).map_err(|error| match error {
+            WriterError::AuthorityViolation(_) => ReviewerValidationRefusal {
+                code: "REVIEWER_IDENTITY_MISMATCH",
+                detail: "the reviewer result identity or revision does not match the host request",
+            },
+            _ => ReviewerValidationRefusal {
+                code: "REVIEWER_OUTPUT_INVALID",
+                detail: "the reviewer result failed the host schema checks",
+            },
+        })?;
+    Ok(ValidatedReviewerOutput {
+        summary: review.summary,
+        blocking_findings: review.blocking_findings,
+    })
+}
+
 fn ensure_reviewer_context_store(
     goal: &Goal,
     task_id: &TaskId,
@@ -1940,7 +2392,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
+pub(crate) fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
     match preimage {
         PreimageExpectation::Absent => MutationPreimage::Absent,
         PreimageExpectation::Sha256 { sha256 } => MutationPreimage::Sha256 {
@@ -1949,7 +2401,7 @@ fn mutation_preimage(preimage: &PreimageExpectation) -> MutationPreimage {
     }
 }
 
-fn mutation_observation(state: &FileState) -> FileObservation {
+pub(crate) fn mutation_observation(state: &FileState) -> FileObservation {
     if state.exists {
         FileObservation::exists(
             state.size.unwrap_or(0),
@@ -1963,6 +2415,18 @@ fn mutation_observation(state: &FileState) -> FileObservation {
 #[cfg(test)]
 fn parse_writer_result_for_test(raw: &[u8]) -> Result<WriterResult, String> {
     serde_json::from_slice(raw).map_err(|error| error.to_string())
+}
+
+/// H5-B: shape half of the writer validator, for the contract equivalence tests.
+#[cfg(test)]
+pub(crate) fn writer_response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<WriterResult>(value.clone()).is_ok()
+}
+
+/// H5-B: shape half of the reviewer validator, for the contract equivalence tests.
+#[cfg(test)]
+pub(crate) fn reviewer_response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<ReviewerResult>(value.clone()).is_ok()
 }
 
 #[cfg(test)]

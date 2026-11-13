@@ -184,6 +184,12 @@ pub(crate) struct MutationIntent {
     replay_safety: ReplaySafety,
     state: MutationIntentState,
     reviewer: ReviewerInvocation,
+    /// Authorization B binding for an EXTERNAL Writer intent. Absent for every
+    /// CODEX intent and for pre-authorization durable state, which is why the
+    /// presence of this field is a fail-closed requirement for external
+    /// publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization: Option<crate::authorization::GrantBinding>,
     operations: Vec<MutationOperationIntent>,
 }
 
@@ -204,6 +210,7 @@ impl MutationIntent {
             replay_safety: ReplaySafety::VerifyBeforeRetry,
             state: MutationIntentState::Prepared,
             reviewer: ReviewerInvocation::not_started(),
+            authorization: None,
             operations,
         };
         intent.validate()?;
@@ -212,6 +219,27 @@ impl MutationIntent {
 
     pub(crate) fn state(&self) -> MutationIntentState {
         self.state
+    }
+
+    pub(crate) fn authorization(&self) -> Option<&crate::authorization::GrantBinding> {
+        self.authorization.as_ref()
+    }
+
+    /// Bind this intent to the Owner grant that authorized it.
+    pub(crate) fn with_authorization(
+        mut self,
+        binding: crate::authorization::GrantBinding,
+    ) -> Result<Self, OrchestratorError> {
+        if self.authorization.is_some() {
+            return Err(corrupt(
+                "MutationIntent already carries an authorization binding",
+            ));
+        }
+        binding
+            .validate()
+            .map_err(|_| corrupt("MutationIntent authorization binding is malformed"))?;
+        self.authorization = Some(binding);
+        Ok(self)
     }
 
     pub(crate) fn operation_id(&self) -> &str {
@@ -330,6 +358,11 @@ impl MutationIntent {
         }
         if self.operations.is_empty() || self.operations.len() > MAX_MUTATION_OPERATIONS {
             return Err(corrupt("MutationIntent operation count is out of bounds"));
+        }
+        if let Some(binding) = self.authorization.as_ref() {
+            binding
+                .validate()
+                .map_err(|_| corrupt("MutationIntent authorization binding is malformed"))?;
         }
         let mut indices = BTreeSet::new();
         let mut paths = BTreeSet::new();

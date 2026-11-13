@@ -10,6 +10,15 @@ repository = "https://github.com/Yrika819/local-mcp"
 readme = "README.md"
 default-run = "local-mcp"
 
+[features]
+default = []
+# H5-C: enables the disposable test-grant fixture command. This feature is
+# deliberately NOT default and MUST NOT be enabled for a release, packaging or
+# normal operator build: it is the only code that can mint a grant whose
+# attestation is `TEST_FIXTURE_V1`. Even when compiled in, the command refuses
+# any state root that is not a marked, disposable fixture root.
+test-grant-fixture = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

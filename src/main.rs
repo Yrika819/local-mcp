@@ -6,12 +6,22 @@
 mod agent;
 mod approvals;
 mod atomic_publish_frame;
+mod authorization;
+mod authorization_store;
 #[cfg(target_os = "linux")]
 mod bubblewrap_support;
 mod config;
 mod doctor;
 mod exec_ready;
 mod execution;
+mod external_goal_api;
+mod external_goal_driver;
+mod external_model_store;
+mod external_model_work;
+mod external_publish;
+mod external_replanner;
+mod external_response_contract;
+mod external_writer;
 mod failure_class;
 mod fallback;
 mod git_command_class;
@@ -35,6 +45,8 @@ mod managed_worktree_snapshot_object;
 mod managed_worktree_snapshot_observe;
 mod managed_worktree_writer_paths;
 mod mcp;
+mod model_accounting;
+mod model_backend;
 mod mutation;
 mod mutation_recovery;
 mod orchestrator_error;
@@ -45,6 +57,9 @@ mod process_blocking;
 mod process_group;
 #[cfg(windows)]
 mod process_job;
+mod publication_lock;
+mod publication_quarantine;
+mod readiness;
 mod readonly_worker;
 mod replanner;
 mod resource_limits;
@@ -54,23 +69,54 @@ mod secure_fs;
 mod setup_preview;
 mod task;
 mod task_store;
+#[cfg(feature = "test-grant-fixture")]
+mod test_grant_fixture;
 mod verifier;
 mod verifier_git_observation;
 mod worker_capability;
 mod workspace_publish;
 mod workspace_snapshot;
 mod writer;
+mod writer_stage;
 
 #[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
 mod atomic_publish_tests;
 #[cfg(test)]
+mod authorization_tests;
+#[cfg(test)]
+mod external_dag_tests;
+#[cfg(test)]
+mod external_flow_tests;
+#[cfg(test)]
+mod external_goal_api_tests;
+#[cfg(test)]
+mod external_goal_recovery_tests;
+#[cfg(test)]
+mod external_goal_tests;
+#[cfg(test)]
+mod external_h3_reliability_tests;
+#[cfg(test)]
+mod external_replanner_tests;
+#[cfg(test)]
+mod external_response_contract_tests;
+#[cfg(test)]
+mod external_reviewer_recovery_tests;
+#[cfg(test)]
+mod external_writer_failure_tests;
+#[cfg(test)]
+mod external_writer_race_tests;
+#[cfg(test)]
+mod external_writer_tests;
+#[cfg(test)]
 mod goal_backends_tests;
 #[cfg(test)]
 mod goal_finalizer_tests;
 #[cfg(test)]
 mod goal_hardening_tests;
+#[cfg(test)]
+mod goal_orchestration_regression_tests;
 #[cfg(test)]
 mod goal_runner_tests;
 #[cfg(test)]
@@ -112,6 +158,8 @@ mod process_group_ownership_tests;
 #[cfg(all(test, unix))]
 mod process_group_stress_tests;
 #[cfg(test)]
+mod publication_lock_subprocess_tests;
+#[cfg(test)]
 mod replanner_compaction_tests;
 #[cfg(test)]
 mod replanner_replacement_tests;
@@ -126,7 +174,11 @@ mod resource_bounds_transport_tests;
 #[cfg(all(test, unix))]
 mod secure_fs_tests;
 #[cfg(test)]
+mod test_grant_fixture_tests;
+#[cfg(test)]
 mod verifier_tests;
+#[cfg(test)]
+mod windows_authority_audit_tests;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 #[cfg(test)]
@@ -155,6 +207,18 @@ enum Command {
     Doctor(doctor::DoctorOptions),
     /// Inspect which pinned release a setup would install (read-only).
     Setup(setup_preview::SetupArgs),
+    /// H5-C: issue a disposable TEST_FIXTURE_V1 Writer grant.
+    ///
+    /// Compiled in only under the non-default `test-grant-fixture` feature, so a
+    /// release or operator build has no such command.
+    #[cfg(feature = "test-grant-fixture")]
+    #[command(name = "test-grant")]
+    TestGrant {
+        /// Session id that owns the Goal.
+        session_id: String,
+        /// Goal id to issue the fixture grant for.
+        goal_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -192,12 +256,33 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Start { session_id: None }) {
         Command::Doctor(options) => std::process::exit(doctor::execute(options).into()),
         Command::Setup(args) => std::process::exit(setup_preview::run(args).into()),
+        #[cfg(feature = "test-grant-fixture")]
+        Command::TestGrant {
+            session_id,
+            goal_id,
+        } => {
+            let store = crate::task_store::TaskStore::new()?;
+            match test_grant_fixture::run(&store, &session_id, &goal_id) {
+                Ok(line) => {
+                    println!("{line}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!("local-mcp test-grant: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
         command => {
             #[cfg(unix)]
             process_group::normalize_child_signal_policy()?;
 
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                // The external host-step chain (managed-workspace evidence
+                // observation included) is deep enough that the platform's
+                // default worker stack is not a safe bound.
+                .thread_stack_size(8 * 1024 * 1024)
                 .build()?
                 .block_on(run(command))
         }
@@ -210,5 +295,9 @@ async fn run(command: Command) -> Result<()> {
         Command::Mcp => mcp::serve().await,
         Command::Doctor(_) => unreachable!("Doctor dispatch occurs before Tokio initialization"),
         Command::Setup(_) => unreachable!("Setup dispatch occurs before Tokio initialization"),
+        #[cfg(feature = "test-grant-fixture")]
+        Command::TestGrant { .. } => {
+            unreachable!("TestGrant dispatch occurs before Tokio initialization")
+        }
     }
 }

@@ -1,0 +1,13 @@
+# GoalLatch line-ending policy.
+#
+# The repository, every checkout on every OS, and every tool that reads the
+# working tree must observe the same bytes. CI extracts the crate version with
+# `sed` and compares generated JSON Schema artifacts byte-for-byte, so a
+# checkout that silently rewrites LF as CRLF turns a valid tree into a failing
+# one. Git's `core.autocrlf` is a per-machine preference and cannot be part of a
+# cross-platform contract, so the policy lives here instead.
+#
+# `text=auto` lets Git classify files, and `eol=lf` forces the checkout form on
+# Windows as well as Unix. No tracked file in this repository is a binary
+# artifact, so the blanket rule is the whole policy.
+* text=auto eol=lf

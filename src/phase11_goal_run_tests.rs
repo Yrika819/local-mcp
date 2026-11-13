@@ -28,8 +28,14 @@ fn phase11_catalog_has_exactly_one_additive_goal_run_tool() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 18);
+    // 18 pre-E3 tools plus goal_next and goal_submit.
+    assert_eq!(names.len(), 20);
     assert_eq!(names.iter().filter(|name| **name == "goal_run").count(), 1);
+    assert_eq!(names.iter().filter(|name| **name == "goal_next").count(), 1);
+    assert_eq!(
+        names.iter().filter(|name| **name == "goal_submit").count(),
+        1
+    );
     let goal_run = catalog
         .as_array()
         .unwrap()

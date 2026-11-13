@@ -8,13 +8,18 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config;
+use crate::external_model_work::ExternalModelState;
 use crate::failure_class::FailureClass;
 use crate::fallback::SideEffectState;
 use crate::managed_worktree::{
     ManagedWorktreeCreationIntent, ManagedWorktreeRecord, WorkspaceMode, WorktreeId,
 };
+use crate::model_backend::ModelBackend;
 use crate::mutation::{MutationIntent, MutationIntentState, MutationIntentUpdate};
 use crate::orchestrator_error::OrchestratorError;
+use crate::publication_quarantine::{
+    PublicationQuarantine, PublicationQuiescence, PublicationTerminationEvidence,
+};
 use crate::task::{
     AttemptId, Task, TaskDependency, TaskId, TaskOperationKind, TaskStatus, TaskTransitionContext,
     VerificationId, VerificationOutcome, VerificationResult, VerificationSpec, WorkerReport,
@@ -42,7 +47,12 @@ pub(crate) const GOAL_STORE_FORMAT: &str = "local-mcp-goal";
 /// It is an explicit advance because the field is authority-bearing state: a
 /// schema-5 Goal has no evidence, and the migration must say so explicitly
 /// instead of letting a serde default stand in for a decision.
-pub(crate) const GOAL_SCHEMA_VERSION: u32 = 6;
+///
+/// Schema 7 adds the durable publication quarantine (H5.1-B). It is an explicit
+/// advance because the record decides whether a Writer helper may still be able
+/// to write. A schema-6 Goal has no lock witness, so an `APPLYING` intent is
+/// migrated to `UNPROVEN` and stays unresolved; it is never assumed quiescent.
+pub(crate) const GOAL_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1401,6 +1411,26 @@ pub(crate) struct Goal {
     managed_worktree: Option<ManagedWorktreeRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_worktree_creation_intent: Option<ManagedWorktreeCreationIntent>,
+    /// External Agent Backend V1 backend policy (ADR-01).
+    ///
+    /// This is a creation-time, immutable host policy. Omitted means `CODEX`,
+    /// which keeps every Goal written before E3 byte-identical and readable by
+    /// binaries that predate the field.
+    ///
+    /// A `CODEX` Goal serializes this field away entirely, so an older binary
+    /// can still read and rewrite a `CODEX` Goal. An `EXTERNAL` Goal states it
+    /// explicitly; a binary that does not know the field refuses the whole
+    /// document through `deny_unknown_fields`. That is the required fail-closed
+    /// downgrade (B-04): stale code must not silently discard durable external
+    /// state and then rewrite the Goal without it.
+    #[serde(default, skip_serializing_if = "ModelBackend::is_default")]
+    model_backend: ModelBackend,
+    /// Durable External Agent Backend state. `None` for every `CODEX` Goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Boxed deliberately: the aggregate is large and absent for every CODEX
+    /// Goal, so keeping it out of line avoids inflating every `Goal` value that
+    /// the existing orchestration clones and moves on the stack.
+    external_model: Option<Box<ExternalModelState>>,
     /// Post-verification managed-workspace snapshot evidence (freeze note J7).
     ///
     /// Absent means "no evidence has been assembled yet", which is the correct
@@ -1415,6 +1445,12 @@ pub(crate) struct Goal {
     /// the explicit `TaskStore` migration chain, which inserts the value rather
     /// than letting serde assume it.
     managed_workspace_verification_evidence: Option<ManagedWorkspaceVerificationEvidenceV1>,
+    /// H5.1-B durable publication quarantine. It is separate from the mutation
+    /// journal on purpose: file observations decide the mutation outcome, while
+    /// this record decides whether a helper process can still write. The field
+    /// carries no serde default; schema 7 documents state it explicitly and the
+    /// migration chain inserts it for older documents.
+    publication_quarantine: PublicationQuarantine,
     checkpoints: Vec<GoalCheckpoint>,
     created_at: String,
     updated_at: String,
@@ -1573,7 +1609,10 @@ impl Goal {
             },
             managed_worktree,
             managed_worktree_creation_intent: None,
+            model_backend: ModelBackend::Codex,
+            external_model: None,
             managed_workspace_verification_evidence: None,
+            publication_quarantine: PublicationQuarantine::not_started(),
             checkpoints: Vec::new(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -1581,6 +1620,52 @@ impl Goal {
         };
         goal.validate()?;
         Ok(goal)
+    }
+
+    /// Apply the creation-time backend policy.
+    ///
+    /// Only `goal_start` may call this, and only before the Goal is persisted:
+    /// the mode is immutable for the lifetime of the Goal (ADR-01/ADR-11), so
+    /// there is deliberately no setter that a running Goal could reach.
+    pub(crate) fn with_creation_backend(mut self, backend: ModelBackend) -> Self {
+        self.model_backend = backend;
+        if backend.is_external() {
+            self.external_model = Some(Box::new(ExternalModelState::new()));
+        } else {
+            self.external_model = None;
+        }
+        self
+    }
+
+    /// The host-owned backend policy for this Goal.
+    pub(crate) fn model_backend(&self) -> ModelBackend {
+        self.model_backend
+    }
+
+    pub(crate) fn external_model(&self) -> Option<&ExternalModelState> {
+        self.external_model.as_deref()
+    }
+
+    pub(crate) fn external_model_mut(&mut self) -> Option<&mut ExternalModelState> {
+        self.external_model.as_deref_mut()
+    }
+
+    /// Attach the untrusted Owner write-scope proposal to a new EXTERNAL Goal.
+    ///
+    /// This creates no authority: it records what the Owner will be asked to
+    /// approve. Only the Owner Control Surface can turn it into a grant.
+    pub(crate) fn set_external_write_scope(
+        &mut self,
+        scope: crate::authorization::RequestedWriteScopeV1,
+    ) -> Result<(), OrchestratorError> {
+        let state = self.external_model_mut().ok_or_else(|| {
+            OrchestratorError::CorruptGoal(
+                "write_scope requires an EXTERNAL model backend".to_owned(),
+            )
+        })?;
+        state.set_write_scope(scope);
+        self.validate_external_authorization_state()?;
+        Ok(())
     }
 
     pub(crate) fn id(&self) -> &GoalId {
@@ -1970,6 +2055,93 @@ impl Goal {
 
     pub(crate) fn has_unknown_side_effects(&self) -> bool {
         self.tasks.values().any(Task::has_unknown_side_effect)
+    }
+
+    /// H5.1-B: a publication whose helper lifetime is unproven.
+    ///
+    /// The durable quarantine is the authority. The journal `APPLYING` check is
+    /// retained as defence in depth for a document written by an older binary or
+    /// restored mid-recovery: recovery may rewrite the journal from file
+    /// observations, but it cannot clear the quarantine without a process
+    /// liveness witness.
+    ///
+    /// File state is deliberately not consulted here. A postimage that matches
+    /// says the write happened; it says nothing about whether the process that
+    /// wrote it is gone.
+    pub(crate) fn has_unresolved_publication(&self) -> bool {
+        self.publication_quarantine.is_unresolved()
+            || self.tasks.values().any(|task| {
+                task.attempts().iter().any(|attempt| {
+                    attempt.mutation_intent().is_some_and(|intent| {
+                        matches!(intent.state(), MutationIntentState::Applying)
+                    })
+                })
+            })
+    }
+
+    pub(crate) fn publication_quarantine(&self) -> &PublicationQuarantine {
+        &self.publication_quarantine
+    }
+
+    /// Arm the durable quarantine in the same Goal CAS that journals
+    /// `BeginOperation`, so no side-effect-capable process can exist without a
+    /// durable record naming it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The operation, Task, Attempt, lock, revision, and host identity are independent bindings."
+    )]
+    pub(crate) fn activate_publication_quarantine(
+        &mut self,
+        operation_id: String,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        lock_path: PathBuf,
+        token_sha256: String,
+        goal_revision: u64,
+        host_generation: String,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.publication_quarantine.activate(
+            operation_id,
+            task_id,
+            attempt_id,
+            lock_path,
+            token_sha256,
+            goal_revision,
+            host_generation,
+            now,
+        )
+    }
+
+    /// Record host-owned process-liveness evidence for the active publication.
+    pub(crate) fn record_publication_termination(
+        &mut self,
+        operation_id: &str,
+        evidence: PublicationTerminationEvidence,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.publication_quarantine
+            .record_termination(operation_id, evidence, now)
+    }
+
+    /// Probe the helper lock during recovery. This is the only path that may
+    /// move an unresolved quarantine to `QUIESCENT_VERIFIED`, and it never
+    /// produces `NOT_STARTED`.
+    pub(crate) fn reconcile_publication_quarantine(
+        &mut self,
+        now: &str,
+        host_generation: &str,
+    ) -> Result<bool, OrchestratorError> {
+        self.publication_quarantine.reconcile(now, host_generation)
+    }
+
+    /// Whether a new publication may start. Only `NOT_STARTED` or a verified
+    /// quiescent record is activatable.
+    pub(crate) fn publication_quarantine_allows_activation(&self) -> bool {
+        matches!(
+            self.publication_quarantine.state(),
+            PublicationQuiescence::NotStarted | PublicationQuiescence::QuiescentVerified
+        )
     }
 
     pub(crate) fn has_blocking_state(&self) -> bool {
@@ -3669,6 +3841,46 @@ impl Goal {
             .record_latest_attempt_failure_class(class)
     }
 
+    /// H5.1-C F3: close the Task when a submission is refused for a host
+    /// response bound.
+    ///
+    /// Before this, a bounded refusal recorded the receipt and REJECTED the
+    /// WorkItem but left the Task RUNNING, so the Scheduler reported
+    /// `ACTIVE_WORK` forever. The refusal is a deterministic `HOST_OUTPUT_LIMIT`
+    /// class: an unchanged retry cannot succeed, so the Task moves to
+    /// `NEEDS_REPLAN` while budget remains, or `FAILED` when it does not.
+    /// The WorkItem and the Task move in the same durable commit as the receipt.
+    pub(crate) fn record_bounded_response_refusal(
+        &mut self,
+        task_id: &TaskId,
+        code: &str,
+        detail: &str,
+        now: &str,
+    ) -> Result<(), OrchestratorError> {
+        let Some(task) = self.tasks.get(task_id) else {
+            return Ok(());
+        };
+        if task.status() != TaskStatus::Running {
+            return Ok(());
+        }
+        // A report/classification may already exist on an unusual replay. The
+        // transition is the safety-critical part; metadata stays first-write
+        // only, matching the worker-boundary discipline.
+        let _ = self.task_record_latest_worker_report(
+            task_id,
+            WorkerReport::new(format!("{code}: {detail}"), Vec::new()),
+        );
+        let _ =
+            self.task_record_latest_attempt_failure_class(task_id, FailureClass::HostOutputLimit);
+        let budget_remains = self.tasks()[task_id].semantic_attempts_remaining() > 0;
+        let next = if budget_remains {
+            TaskStatus::NeedsReplan
+        } else {
+            TaskStatus::Failed
+        };
+        self.transition_task(task_id, next, TaskTransitionContext::default(), now)
+    }
+
     pub(crate) fn task_add_evidence(
         &mut self,
         task_id: &TaskId,
@@ -4143,6 +4355,43 @@ impl Goal {
         }
     }
 
+    /// Validate the additive Authorization B fields on the EXTERNAL sub-record.
+    fn validate_external_authorization_state(&self) -> Result<(), OrchestratorError> {
+        let Some(state) = self.external_model.as_deref() else {
+            return Ok(());
+        };
+        if state.write_scope().is_some() && !self.model_backend.is_external() {
+            return Err(OrchestratorError::CorruptGoal(
+                "a write-scope proposal requires the EXTERNAL model backend".to_owned(),
+            ));
+        }
+        state.authorization_anchor().validate().map_err(|_| {
+            OrchestratorError::CorruptGoal("external authorization anchor is malformed".to_owned())
+        })?;
+        Ok(())
+    }
+
+    /// Validate the additive External Agent Backend fields.
+    ///
+    /// The pairing is the invariant: `EXTERNAL` requires durable external state
+    /// and `CODEX` must not carry any. A partially written external record fails
+    /// the Goal load instead of silently decoding as "no pending work".
+    fn validate_model_backend_state(&self) -> Result<(), OrchestratorError> {
+        match (
+            self.model_backend.is_external(),
+            self.external_model.as_deref(),
+        ) {
+            (true, Some(state)) => state.validate_for_goal(self.id.as_str(), &self.session_id),
+            (true, None) => Err(OrchestratorError::CorruptGoal(
+                "EXTERNAL goal requires durable external model state".to_owned(),
+            )),
+            (false, Some(_)) => Err(OrchestratorError::CorruptGoal(
+                "CODEX goal must not carry durable external model state".to_owned(),
+            )),
+            (false, None) => Ok(()),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), OrchestratorError> {
         if self.store_format != GOAL_STORE_FORMAT {
             return Err(OrchestratorError::CorruptGoal(
@@ -4177,6 +4426,8 @@ impl Goal {
             ));
         }
         self.validate_managed_workspace_state()?;
+        self.validate_model_backend_state()?;
+        self.validate_external_authorization_state()?;
         let mut criterion_ids = BTreeSet::new();
         for criterion in &self.completion_criteria {
             criterion.id.validate()?;
@@ -4221,6 +4472,7 @@ impl Goal {
         if let Some(evidence) = &self.managed_workspace_verification_evidence {
             evidence.validate_against_goal(self)?;
         }
+        self.publication_quarantine.validate()?;
         let mut rejection_request_ids = BTreeSet::new();
         for rejection in &self.pre_execution_plan_rejections {
             if rejection.request_id.trim().is_empty()
@@ -4807,6 +5059,96 @@ impl Goal {
             ));
         }
         Ok(())
+    }
+
+    /// Host-owned lookup of one Task's dependency closure.
+    ///
+    /// Exposed so a host readiness step can decide, on a snapshot it has already
+    /// loaded and validated, whether a PENDING Task may be armed. The rule is the
+    /// same one `transition_task` enforces: every dependency must be an active
+    /// (non-superseded) Task that reached host-verified COMPLETED.
+    pub(crate) fn dependencies_satisfied_for_host(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<bool, OrchestratorError> {
+        self.dependencies_satisfied(task_id)
+    }
+
+    /// PENDING Tasks that may be armed right now, in deterministic order.
+    ///
+    /// A Task is eligible only when it is PENDING, still carries active plan
+    /// authority, has no unresolved blocker, and every dependency is an active
+    /// Task at host-verified COMPLETED. Mandatory-first then
+    /// (created_plan_revision, TaskId) keeps the ordering stable and independent
+    /// of map iteration order.
+    pub(crate) fn ready_candidates(&self) -> Result<Vec<TaskId>, OrchestratorError> {
+        let mut eligible = Vec::new();
+        for (task_id, task) in &self.tasks {
+            if task.status() != TaskStatus::Pending
+                || !task.is_active_plan_authority()
+                || !task.blockers().is_empty()
+            {
+                continue;
+            }
+            if self.dependencies_satisfied(task_id)? {
+                eligible.push(task_id.clone());
+            }
+        }
+        eligible.sort_by(|left, right| {
+            let left_task = &self.tasks[left];
+            let right_task = &self.tasks[right];
+            right_task
+                .mandatory()
+                .cmp(&left_task.mandatory())
+                .then_with(|| {
+                    left_task
+                        .created_plan_revision()
+                        .cmp(&right_task.created_plan_revision())
+                })
+                .then_with(|| left.as_str().cmp(right.as_str()))
+        });
+        Ok(eligible)
+    }
+
+    /// Arm every eligible PENDING Task in one durable transition set.
+    ///
+    /// All transitions are applied to a private candidate and published only
+    /// after `validate()` passes, so a partially armed DAG is never committed.
+    /// The caller's `TaskStore` CAS then makes the whole set one snapshot commit.
+    pub(crate) fn propagate_ready_tasks(
+        &mut self,
+        now: &str,
+    ) -> Result<Vec<TaskId>, OrchestratorError> {
+        if !matches!(self.status, GoalStatus::Running | GoalStatus::Replanning) {
+            return Err(OrchestratorError::InvalidDag(
+                "readiness propagation requires a RUNNING or REPLANNING Goal".to_owned(),
+            ));
+        }
+        let candidates = self.ready_candidates()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut candidate = self.clone();
+        let mut armed = Vec::new();
+        for task_id in candidates {
+            let dependencies_satisfied = candidate.dependencies_satisfied(&task_id)?;
+            candidate
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidDag("readiness target disappeared".to_owned())
+                })?
+                .transition_to(
+                    TaskStatus::Ready,
+                    dependencies_satisfied,
+                    TaskTransitionContext::default(),
+                    now,
+                )?;
+            armed.push(task_id);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(armed)
     }
 
     fn dependencies_satisfied(&self, task_id: &TaskId) -> Result<bool, OrchestratorError> {

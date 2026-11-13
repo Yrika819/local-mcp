@@ -14,6 +14,19 @@ use crate::{
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEX_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard execution deadline for the host-owned `atomic-publish` helper.
+///
+/// H4-C R2-M3: publication previously had no deadline at all, so a helper that
+/// never exited held the publication fence, the Goal CAS and the MCP request
+/// open indefinitely. The value is far above any real single-file commit
+/// (the helper is a bounded, single-frame program) and far below any human
+/// timeout, so it only fires on a genuinely stuck helper.
+///
+/// Expiry is a *stop request plus exit confirmation*, not evidence that the
+/// write did not happen: `publish_prepared_writer_intent` maps the resulting
+/// error to `WRITER_PUBLICATION_UNKNOWN` and leaves the journal in APPLYING for
+/// recovery to reconcile.
+pub(crate) const PUBLICATION_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct BackgroundExecution {
     pub(crate) rendered_command: String,
@@ -68,11 +81,25 @@ pub(crate) async fn publish_workspace_write(
     let helper = atomic_publish_helper()?;
     let parent = request.parent.to_path_buf();
     let frame = encode_publish_frame(&request)?;
-    sandbox::run(
+    // The helper must be able to open its lock file. The lock directory is
+    // host-derived state, not model input, and the helper writes nothing else
+    // there. On Unix this is the only additional writable root the publication
+    // helper receives; on Windows the sandbox has no writable-root concept.
+    let mut writable_roots = vec![parent.clone()];
+    if let Some(lock) = request.publication_lock
+        && let Some(lock_dir) = lock.path.parent()
+    {
+        writable_roots.push(lock_dir.to_path_buf());
+    }
+    // Bounded: a helper that stops responding is terminated and its exit is
+    // confirmed instead of holding the publication fence forever.
+    let deadline = tokio::time::Instant::now() + PUBLICATION_HELPER_TIMEOUT;
+    sandbox::run_bounded(
         &[helper],
         request.parent,
-        std::slice::from_ref(&parent),
+        &writable_roots,
         Some(&frame),
+        deadline,
     )
     .await
 }
@@ -147,6 +174,14 @@ fn encode_publish_frame(request: &crate::writer::WriterWriteRequest<'_>) -> Resu
             preimage_kind: kind,
             preimage_digest: &digest,
             request_id: request.request_id,
+            lock_path: request
+                .publication_lock
+                .and_then(|lock| lock.path.to_str())
+                .unwrap_or(""),
+            lock_token: request
+                .publication_lock
+                .map(|lock| lock.token.as_str())
+                .unwrap_or(""),
             content: request.content.as_bytes(),
         },
     ))

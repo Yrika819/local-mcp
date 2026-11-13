@@ -36,13 +36,15 @@ const LEGACY_TOOL_NAMES: [&str; 11] = [
     "without_sandbox",
 ];
 
-const GOAL_TOOL_NAMES: [&str; 7] = [
+const GOAL_TOOL_NAMES: [&str; 9] = [
     "goal_start",
     "goal_status",
     "goal_pause",
     "goal_resume",
     "goal_cancel",
     "goal_result",
+    "goal_next",
+    "goal_submit",
     "goal_run",
 ];
 
@@ -72,7 +74,7 @@ fn goal_tool_catalog_is_exactly_additive() {
         .copied()
         .collect::<Vec<_>>();
     assert_eq!(names, expected);
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 20);
 
     for forbidden in [
         "task_create",

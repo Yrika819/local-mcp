@@ -19,19 +19,30 @@ use crate::task::{
 use crate::task_store::TaskStore;
 use crate::worker_capability;
 
-pub(crate) const MAX_PLAN_PROPOSAL_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_PLAN_TASKS: usize = 128;
-pub(crate) const MAX_PLAN_DEPENDENCY_EDGES: usize = 1024;
-pub(crate) const MAX_PLAN_TITLE_BYTES: usize = 256;
-pub(crate) const MAX_PLAN_OBJECTIVE_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_PLAN_SUMMARY_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_PROPOSAL_ID_BYTES: usize = 64;
-pub(crate) const MAX_DEPENDENCIES_PER_TASK: usize = 64;
-pub(crate) const MAX_SCOPE_PATHS_PER_KIND: usize = 64;
-pub(crate) const MAX_SCOPE_PATHS_TOTAL: usize = 1024;
-pub(crate) const MAX_VERIFICATION_PER_TASK: usize = 32;
-pub(crate) const MAX_VERIFICATION_TOTAL: usize = 1024;
-pub(crate) const MAX_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_PLAN_PROPOSAL_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_PROPOSAL_BYTES;
+pub(crate) const MAX_PLAN_TASKS: usize = crate::external_response_contract::LIMIT_PLAN_TASKS;
+pub(crate) const MAX_PLAN_DEPENDENCY_EDGES: usize =
+    crate::external_response_contract::LIMIT_PLAN_DEPENDENCY_EDGES;
+pub(crate) const MAX_PLAN_TITLE_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_TITLE_BYTES;
+pub(crate) const MAX_PLAN_OBJECTIVE_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_OBJECTIVE_BYTES;
+pub(crate) const MAX_PLAN_SUMMARY_BYTES: usize =
+    crate::external_response_contract::LIMIT_PLAN_SUMMARY_BYTES;
+pub(crate) const MAX_PROPOSAL_ID_BYTES: usize =
+    crate::external_response_contract::LIMIT_PROPOSAL_ID_BYTES;
+pub(crate) const MAX_DEPENDENCIES_PER_TASK: usize =
+    crate::external_response_contract::LIMIT_DEPENDENCIES_PER_TASK;
+pub(crate) const MAX_SCOPE_PATHS_PER_KIND: usize =
+    crate::external_response_contract::LIMIT_SCOPE_PATHS_PER_KIND;
+pub(crate) const MAX_SCOPE_PATHS_TOTAL: usize =
+    crate::external_response_contract::LIMIT_SCOPE_PATHS_TOTAL;
+pub(crate) const MAX_VERIFICATION_PER_TASK: usize =
+    crate::external_response_contract::LIMIT_VERIFICATION_PER_TASK;
+pub(crate) const MAX_VERIFICATION_TOTAL: usize =
+    crate::external_response_contract::LIMIT_VERIFICATION_TOTAL;
+pub(crate) const MAX_PATH_BYTES: usize = crate::external_response_contract::LIMIT_PATH_BYTES;
 
 // Replanner Hardening V1 durable-history budgets.
 //
@@ -52,15 +63,20 @@ pub(crate) const MAX_DURABLE_SUPERSEDED_DEPENDENCY_EDGES: usize = 4096;
 pub(crate) const MAX_DURABLE_SUPERSEDED_SCOPE_PATHS: usize = 4096;
 pub(crate) const MAX_DURABLE_SUPERSEDED_VERIFICATION_ENTRIES: usize = 4096;
 
-pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize = 128;
+pub(crate) const MAX_EVIDENCE_REQUIREMENT_ID_BYTES: usize =
+    crate::external_response_contract::LIMIT_EVIDENCE_REQUIREMENT_ID_BYTES;
 
 /// Host-visible compact read-only output contract. Reused verbatim by the
 /// read-only worker so the declared contract and the enforced bounds cannot
 /// drift apart.
-pub(crate) const MAX_READONLY_EVIDENCE_ITEMS: usize = 32;
-pub(crate) const MAX_READONLY_SUMMARY_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_READONLY_EVIDENCE_ITEMS: usize =
+    crate::external_response_contract::LIMIT_READONLY_EVIDENCE_ITEMS;
+pub(crate) const MAX_READONLY_SUMMARY_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_SUMMARY_BYTES;
+pub(crate) const MAX_READONLY_EVIDENCE_FIELD_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_EVIDENCE_FIELD_BYTES;
+pub(crate) const MAX_READONLY_EVIDENCE_TOTAL_BYTES: usize =
+    crate::external_response_contract::LIMIT_READONLY_EVIDENCE_TOTAL_BYTES;
 pub(crate) const READONLY_OUTPUT_CONTRACT_GUIDANCE: &str = "return at most 32 compact structured evidence records, each at most 8 KiB and 64 KiB in total, with a summary of at most 16 KiB; prefer artifact/file references and short synthesis over repeated large source excerpts";
 
 /// Deterministic conservative bound on the structured records one bounded
@@ -215,7 +231,7 @@ pub(crate) struct TaskScopeProposal {
 }
 
 #[derive(Clone, Debug)]
-struct ValidatedPlan {
+pub(crate) struct ValidatedPlan {
     tasks: Vec<ValidatedTask>,
     criterion_bindings: Vec<(CompletionCriterionId, Vec<String>)>,
 }
@@ -420,6 +436,92 @@ fn ensure_initial_planning_state(goal: &Goal) -> Result<(), PlannerError> {
     // The caller immediately derives and validates the execution root before
     // constructing a request or materializing any model-proposed paths.
     Ok(())
+}
+
+/// Bounded, redacted outcome of validating one untrusted external Planner
+/// response against the existing Phase 4 proposal validator.
+///
+/// The underlying [`PlannerError`] text can quote model-authored content (a
+/// rejected field value, for example), so the external path never propagates it.
+/// A code plus a fixed detail string is all a receipt may carry (B-07 / TM-10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProposalValidationRefusal {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ProposalValidationRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        self.detail
+    }
+}
+
+/// Validate one external Planner output and hand back the normalized plan the
+/// host is willing to apply.
+///
+/// The returned [`ValidatedPlan`] is opaque: it carries only host-normalized
+/// values (canonical paths, bounded text, re-derived attempt budgets), so the
+/// caller can apply exactly the plan it validated. That is what makes a
+/// single-transaction application possible — one validation pass in the Codex
+/// path and the external path alike, and no second parse (which could disagree
+/// with the first) at commit time.
+pub(crate) fn validate_plan_output_for_apply(
+    output: &[u8],
+    goal: &Goal,
+    goal_root: &Path,
+) -> Result<ValidatedPlan, ProposalValidationRefusal> {
+    if output.len() > MAX_PLAN_PROPOSAL_BYTES {
+        return Err(ProposalValidationRefusal {
+            code: "PROPOSAL_TOO_LARGE",
+            detail: "the proposal exceeds the 256 KiB host limit",
+        });
+    }
+    parse_and_validate_proposal(output, goal, goal_root).map_err(|error| {
+        ProposalValidationRefusal {
+            code: planner_failure_code(&error),
+            detail: "the host rejected the external proposal during schema validation",
+        }
+    })
+}
+
+/// Apply a validated initial plan inside a caller-owned durable mutation.
+///
+/// The planning preconditions are re-checked against the *current* durable
+/// snapshot, so a plan that was validated earlier can be applied at most once
+/// even if two writers race: the second either loses the `TaskStore` revision
+/// CAS or observes `plan_revision` 1 and is refused here. Neither outcome can
+/// produce a second Task DAG, a plan without its receipt, or a receipt without
+/// its plan.
+pub(crate) fn apply_validated_plan_to_goal(
+    goal: &mut Goal,
+    plan: ValidatedPlan,
+    now: &str,
+) -> Result<(), OrchestratorError> {
+    ensure_initial_planning_state(goal).map_err(|_| {
+        OrchestratorError::InvalidDag(
+            "initial plan application requires a PLANNING Goal with plan_revision 0 and no Tasks"
+                .to_owned(),
+        )
+    })?;
+    materialize_validated_plan(goal, plan, now)
+}
+
+/// Bounded failure code for a [`PlannerError`]. Never carries error text.
+pub(crate) fn planner_failure_code(error: &PlannerError) -> &'static str {
+    match error {
+        PlannerError::PlannerUnavailable => "PLANNER_UNAVAILABLE",
+        PlannerError::Model(_) => "PLANNER_MODEL_FAILED",
+        PlannerError::PlannerOutputInvalid(_) => "PROPOSAL_INVALID_JSON",
+        PlannerError::PlannerSchemaViolation(_) => "PROPOSAL_SCHEMA_VIOLATION",
+        PlannerError::PlanConflict { .. } => "PROPOSAL_REVISION_CONFLICT",
+        PlannerError::PlanNotApplicable(_) => "PROPOSAL_NOT_APPLICABLE",
+        PlannerError::PlanAuthorityViolation(_) => "PROPOSAL_AUTHORITY_VIOLATION",
+        PlannerError::Store(_) => "PROPOSAL_HOST_FAILURE",
+    }
 }
 
 /// Managed execution-root derivation is separate from primary Session identity.
@@ -766,6 +868,15 @@ pub(crate) fn validate_and_normalize_scope(
         return Err(PlannerError::PlanAuthorityViolation(
             "read-only/reviewer/verifier WorkerKind cannot carry mutation scope in Phase 4"
                 .to_owned(),
+        ));
+    }
+    // A Writer Task that declares a READ_ONLY scope can never be executed: the
+    // writer gate requires a mutating scope and the readonly gate requires a
+    // read-only worker. Refusing it at plan time keeps such a Goal from
+    // materializing a Task no host step could ever run.
+    if worker == WorkerKind::CodexWriter && proposal.operation_kind == TaskOperationKind::ReadOnly {
+        return Err(PlannerError::PlanAuthorityViolation(
+            "CODEX_WRITER requires a mutating TaskScope".to_owned(),
         ));
     }
 
@@ -1130,6 +1241,17 @@ fn map_store_error(error: OrchestratorError) -> PlannerError {
         }
         other => PlannerError::Store(other),
     }
+}
+
+/// H5-B: deserialize a published-contract sample into the *real* plan proposal
+/// type, with its real serde attributes (`deny_unknown_fields`, enums, types).
+///
+/// This is the shape half of the validator that the H5-B equivalence tests
+/// compare the published JSON Schema against; the byte bounds are shared
+/// constants (`external_response_contract::LIMIT_*`) rather than copies.
+#[cfg(test)]
+pub(crate) fn response_shape_accepts(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<PlanProposal>(value.clone()).is_ok()
 }
 
 #[cfg(test)]

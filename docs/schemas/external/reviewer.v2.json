@@ -1,0 +1,71 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "attempt_id": {
+      "type": "string"
+    },
+    "blocking_findings": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "evidence": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "maxLength": 128,
+            "type": "string",
+            "x-max-bytes": 128
+          },
+          "value": {
+            "maxLength": 16384,
+            "type": "string",
+            "x-max-bytes": 16384
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "title": "evidence_item_worker",
+        "type": "object"
+      },
+      "maxItems": 64,
+      "type": "array"
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "goal_revision": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "plan_revision": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "summary": {
+      "maxLength": 8192,
+      "type": "string",
+      "x-max-bytes": 8192
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "goal_id",
+    "task_id",
+    "attempt_id",
+    "goal_revision",
+    "plan_revision",
+    "summary",
+    "blocking_findings",
+    "evidence"
+  ],
+  "title": "REVIEWER",
+  "type": "object"
+}

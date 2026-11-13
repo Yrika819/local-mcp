@@ -1,0 +1,316 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "criterion_bindings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "criterion_id": {
+            "description": "must be an exact host CompletionCriterionId from request.completion_criteria",
+            "type": "string"
+          },
+          "task_refs": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "criterion_id",
+          "task_refs"
+        ],
+        "title": "plan_criterion_binding",
+        "type": "object"
+      },
+      "maxItems": 128,
+      "type": "array"
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "goal_revision": {
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "summary": {
+      "maxLength": 8192,
+      "type": "string",
+      "x-max-bytes": 8192
+    },
+    "tasks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "dependencies": {
+            "items": {
+              "maxLength": 64,
+              "type": "string",
+              "x-max-bytes": 64
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "mandatory": {
+            "type": "boolean"
+          },
+          "objective": {
+            "maxLength": 16384,
+            "type": "string",
+            "x-max-bytes": 16384
+          },
+          "proposal_id": {
+            "maxLength": 64,
+            "type": "string",
+            "x-max-bytes": 64
+          },
+          "scope": {
+            "additionalProperties": false,
+            "properties": {
+              "allowed_paths": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              },
+              "forbidden_paths": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "operation_kind": {
+                "enum": [
+                  "READ_ONLY",
+                  "LOCAL_MUTATION",
+                  "HOST_NATIVE_APPROVED"
+                ],
+                "type": "string"
+              },
+              "replay_safety": {
+                "enum": [
+                  "SAFE_READ_ONLY",
+                  "VERIFY_BEFORE_RETRY",
+                  "NEVER_AUTOMATIC"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "allowed_paths",
+              "operation_kind",
+              "replay_safety"
+            ],
+            "title": "task_scope",
+            "type": "object"
+          },
+          "title": {
+            "maxLength": 256,
+            "type": "string",
+            "x-max-bytes": 256
+          },
+          "verification": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "FILE_EXISTS"
+                      ],
+                      "type": "string"
+                    },
+                    "must_be_file": {
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "maxLength": 4096,
+                      "type": "string",
+                      "x-max-bytes": 4096
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "must_be_file"
+                  ],
+                  "title": "verification_spec.0",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "expected_sha256": {
+                      "maxLength": 64,
+                      "type": "string",
+                      "x-max-bytes": 64
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "FILE_DIGEST"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "maxLength": 4096,
+                      "type": "string",
+                      "x-max-bytes": 4096
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "expected_sha256"
+                  ],
+                  "title": "verification_spec.1",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "allowed_changed_paths": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "GIT_SCOPE"
+                      ],
+                      "type": "string"
+                    },
+                    "require_no_other_changes": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "allowed_changed_paths",
+                    "require_no_other_changes"
+                  ],
+                  "title": "verification_spec.2",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "forbidden_paths": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "NO_FORBIDDEN_CHANGES"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "forbidden_paths"
+                  ],
+                  "title": "verification_spec.3",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "STRUCTURED_EVIDENCE"
+                      ],
+                      "type": "string"
+                    },
+                    "requirement_id": {
+                      "maxLength": 128,
+                      "type": "string",
+                      "x-max-bytes": 128
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "requirement_id"
+                  ],
+                  "title": "verification_spec.4",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "description": "discriminator",
+                      "enum": [
+                        "REVIEW_GATE"
+                      ],
+                      "type": "string"
+                    },
+                    "max_blocking_findings": {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "max_blocking_findings"
+                  ],
+                  "title": "verification_spec.5",
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "type": "array"
+          },
+          "worker": {
+            "description": "V1 accepts only the production-plannable worker kinds; LOCAL_OPERATION, CODEX_REVIEWER and VERIFIER are refused by the host validator",
+            "enum": [
+              "CODEX_READONLY",
+              "CODEX_WRITER"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "title",
+          "objective",
+          "mandatory",
+          "worker",
+          "scope",
+          "verification"
+        ],
+        "title": "plan_task",
+        "type": "object"
+      },
+      "maxItems": 128,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "goal_id",
+    "goal_revision",
+    "summary",
+    "tasks",
+    "criterion_bindings"
+  ],
+  "title": "PLANNER",
+  "type": "object"
+}

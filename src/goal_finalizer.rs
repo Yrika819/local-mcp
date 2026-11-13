@@ -365,6 +365,16 @@ fn evaluate_goal(goal: &Goal) -> Result<GoalFinalizationDecision, OrchestratorEr
             "unreconciled side-effect state remains",
         ));
     }
+    // H5.1-B: a Goal cannot be finalized while a publication helper's lifetime
+    // is unproven. File reconciliation does not clear this; only a lock probe
+    // (or a migration that honestly records UNPROVEN) decides it.
+    if goal.publication_quarantine().is_unresolved() {
+        blockers.push(GoalFinalizationBlocker::new(
+            "PUBLICATION_QUARANTINE_UNRESOLVED",
+            None,
+            "a publication helper's lifetime is unproven; finalization is refused",
+        ));
+    }
     match goal
         .latest_applicable_final_verification()
         .map(|r| r.outcome())

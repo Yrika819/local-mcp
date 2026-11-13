@@ -163,6 +163,8 @@ fn document_at_version(goal: &Goal, version: u64) -> Value {
     let mut value = serde_json::to_value(goal).unwrap();
     let object = value.as_object_mut().unwrap();
     object.remove("managed_workspace_verification_evidence");
+    // Schema 7's publication quarantine did not exist at these versions.
+    object.remove("publication_quarantine");
     object.insert("schema_version".to_owned(), json!(version));
     value
 }
@@ -655,6 +657,8 @@ fn schema_one_document(goal: &Goal) -> Value {
     object.remove("managed_worktree");
     object.remove("managed_worktree_creation_intent");
     object.remove("managed_workspace_verification_evidence");
+    // Schema 1 predates the schema-7 publication quarantine.
+    object.remove("publication_quarantine");
     object.remove("workspace_mode");
     object.remove("pre_execution_plan_rejections");
     object.remove("pristine_plan_supersessions");

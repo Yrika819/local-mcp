@@ -1717,6 +1717,8 @@ fn schema_four_document(goal: &Goal) -> Value {
     // A schema-4 document has no managed-workspace verification evidence field,
     // so removing it is what makes the stored bytes faithful to that schema.
     object.remove("managed_workspace_verification_evidence");
+    // Schema 7's publication quarantine did not exist at schema 4 either.
+    object.remove("publication_quarantine");
     if let Some(record) = goal.managed_worktree() {
         let mut record_value = serde_json::to_value(record).unwrap();
         // A schema-4 record has no attempt counter at all.
