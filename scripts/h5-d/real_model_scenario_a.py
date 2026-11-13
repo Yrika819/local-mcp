@@ -289,6 +289,25 @@ def _existing_reparse_points(root: Path) -> list[Path]:
     return [path for path, _kind in _reused_root_hazards(root)]
 
 
+def _refuse_reused_root_hazards(root: Path) -> None:
+    """Fail closed when a reused root already contains an indirection.
+
+    The check and the fixture writes are still separate filesystem operations, so
+    a process that can create entries inside this root *between* the two could
+    still race them. That is not defended against here and cannot be: a writer
+    inside a fixture root on the same OS user is the same-uid boundary recorded as
+    C3/R-1. What this does guarantee is that an operator cannot point the harness
+    at a root that already redirects somewhere else.
+    """
+    hazards = _reused_root_hazards(root)
+    if hazards:
+        raise FixtureSafetyError(
+            f"{root} already contains filesystem indirections, so fixture writes "
+            f"could escape it: "
+            f"{[(str(path), kind) for path, kind in hazards]}"
+        )
+
+
 def _next_attempt_dir(root: Path) -> Path:
     """A per-run, never-reused directory for logs and evidence."""
     attempts = root / "attempts"
@@ -326,6 +345,12 @@ def make_fixture(
 
     root = base / f"goallatch-h5d-{run_id}"
     if root.exists():
+        # Prove the root is a plain, indirection-free tree *before* reading the
+        # ownership marker: the marker itself must not be reachable through a
+        # hard link or a reparse point, or a foreign file could impersonate it.
+        if _reparse_components(root, base):
+            raise FixtureSafetyError(f"{root} is reached through a reparse point")
+        _refuse_reused_root_hazards(root)
         _claim_existing_root(root, run_id)
     else:
         root.mkdir()

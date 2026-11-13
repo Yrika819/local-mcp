@@ -109,3 +109,23 @@ publication and recovery code; the Python test above runs on the Linux
   explicit `--work-dir` on a plain directory. Failing closed is intentional.
 * Retained fixture roots are not garbage-collected. An operator removes them
   deliberately; the driver never will.
+
+## 6. Residual: harness TOCTOU (documented, not defended)
+
+The independent review noted that the hazard scan and the fixture writes are
+separate filesystem operations, so a process that can create entries inside an
+*owned* fixture root between the two could still win the race. This is recorded
+rather than defended, for a specific reason:
+
+* the fixture root is already owned by the invoking user and lives under the OS
+  temporary directory; a process that can create entries there is running as the
+  same OS user and already has the operator's authority. That is exactly the
+  C3/R-1 same-user boundary that this program does not solve;
+* what the scan does guarantee is the property that mattered: an operator cannot
+  point the harness at a root that *already* redirects somewhere else. The scan
+  runs before the ownership marker is read, so a marker reachable through a hard
+  link cannot impersonate ownership either.
+
+Making the check atomic would require opening every file with
+`O_NOFOLLOW`-equivalent semantics and keeping the descriptors, which is not
+portable to Windows for directories. Recording the limit is the honest option.
