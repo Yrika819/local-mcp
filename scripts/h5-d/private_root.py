@@ -60,6 +60,8 @@ __all__ = [
     "verify_private_tree",
     "assert_path_cannot_reenter",
     "restrict_file",
+    "RunLease",
+    "acquire_run_lease",
     "create_private_dir",
     "create_private_dir_exclusive",
     "trustee_report",
@@ -179,6 +181,7 @@ _CONTAINER_INHERIT_ACE = 0x02
 _INHERITED_ACE = 0x10
 _INHERIT_BOTH = _OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE
 _INHERIT_ONLY_ACE = 0x08
+_NO_PROPAGATE_INHERIT_ACE = 0x04
 #: Rights a directory needs before this harness can create the fixture in it.
 _CREATE_IN_DIRECTORY = 0x00000002 | 0x00000004  # FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY
 
@@ -562,6 +565,18 @@ def _windows_assert(
             if (
                 require_inheritable_writers
                 and mask & _WRITE_RIGHTS
+                and _flags & _NO_PROPAGATE_INHERIT_ACE
+            ):
+                # `NO_PROPAGATE_INHERIT` stops the ACE after one generation, so a
+                # grandchild would fall back to whatever the environment provides.
+                raise PrivateRootError(
+                    f"{path} grants write to {sid} with NO_PROPAGATE_INHERIT "
+                    f"(flags {hex(_flags)}), so deeper entries would not carry the "
+                    "restriction; refused"
+                )
+            if (
+                require_inheritable_writers
+                and mask & _WRITE_RIGHTS
                 and _flags & _INHERIT_BOTH != _INHERIT_BOTH
             ):
                 # A root's protection is only worth what its children inherit: an
@@ -863,6 +878,63 @@ def assert_path_cannot_reenter(path: Path) -> None:
         reason = _posix_reentry_verdict(directory)
         if reason:
             raise PrivateRootError(f"{reason}; refused")
+
+
+class RunLease:
+    """An exclusive advisory lock on a fixture root, held for the whole run.
+
+    Two runs that reuse one run id would otherwise share `repo/` and `state/`,
+    and the second would rewrite the seeded files while the first is asking a
+    model about them - which contaminate the first run's evidence even though the
+    attempt directories themselves are separate. The lock is released by
+    `release()` or by process exit.
+    """
+
+    def __init__(self, path: Path, handle: int):
+        self.path = path
+        self._handle: int | None = handle
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            if _windows_only():
+                import msvcrt
+
+                msvcrt.locking(self._handle, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle, fcntl.LOCK_UN)
+        except OSError:
+            # Closing the handle below releases the lock in every case that
+            # matters; an explicit unlock failure is not worth failing a run.
+            pass
+        finally:
+            os.close(self._handle)
+            self._handle = None
+
+
+def acquire_run_lease(root: Path) -> RunLease:
+    """Take the exclusive lease on `root`, or refuse because another run has it."""
+    path = root / "run-lease"
+    handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if _windows_only():
+            import msvcrt
+
+            msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(handle)
+        raise PrivateRootError(
+            f"{root} is already in use by another run ({error}); two runs must not "
+            "share one fixture root"
+        ) from error
+    return RunLease(path, handle)
 
 
 def create_private_dir(path: Path) -> None:

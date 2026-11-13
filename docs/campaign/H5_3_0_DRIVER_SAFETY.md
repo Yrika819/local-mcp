@@ -82,7 +82,7 @@ deliberate driver decision with a recorded reason.
 
 ## 4. Tests that hold the property
 
-`scripts/h5-d/test_fixture_safety.py` — 40 tests, no model, no binary, runs in CI
+`scripts/h5-d/test_fixture_safety.py` — 41 tests, no model, no binary, runs in CI
 (the `quality` job gained a `Run real-model driver safety self-tests` step):
 
 * unique root per run, `state`/`repo` separated, marker written and correct;
@@ -160,7 +160,7 @@ portable to Windows for directories. Recording the limit is the honest option.
 | `root.mkdir()` — inherits the parent DACL on Windows | `private_root.create_owner_only_dir()` — `CreateDirectoryW` with an owner-only, *protected* security descriptor, so the descriptor is in place at creation and there is no hardening window |
 | `_assert_private_fixture_root` returned immediately on Windows | The DACL is read back (`GetNamedSecurityInfoW` + `GetAce`), and any write ACE for a trustee outside `{owner, SYSTEM, Administrators, OWNER RIGHTS}` refuses the root |
 | Ownership of the root was never checked | The descriptor's owner must be the running user, otherwise the root is refused |
-| Only the root itself was checked | The marker, `state/`, `state/sessions/`, `repo/` and the seeded files are verified after creation, so inheritance is proven to have carried the descriptor down |
+| Only the root itself was checked | Every entry is verified after creation and on reuse, and the directory skeleton is verified *before* the first seeded file is written. The check proves the resulting property (write access only for the owner and trusted principals); it does not compare each child's ACEs with the root's, so it does not prove the mechanism was inheritance |
 | Verification could not be exercised negatively | `test_fixture_safety.py` gains a positive control (the OS temporary directory *is* shared on the campaign host) and a negative control (`icacls … *S-1-1-0:(M)` on a created root is refused on reuse) |
 
 Everything is fail-closed: an unreadable descriptor, a `NULL` DACL, a

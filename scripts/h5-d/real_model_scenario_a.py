@@ -44,6 +44,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -138,6 +139,14 @@ class Fixture:
     workspace: Path
     attempt_dir: Path
     session_id: str
+    lease: object = dataclass_field(default=None, repr=False, compare=False)
+
+    def release(self) -> None:
+        """Drop the exclusive run lease (process exit does this too)."""
+        lease = self.lease
+        if lease is not None:
+            lease.release()
+            object.__setattr__(self, "lease", None)
 
     @property
     def logs(self) -> Path:
@@ -530,10 +539,25 @@ def make_fixture(
     if base.resolve() not in root.resolve().parents:
         raise FixtureSafetyError(f"{root} escapes the disposable base {base}")
 
+    # A single run may hold a fixture root. Without this, two runs that reuse one
+    # run id share `state/` and `repo/` and rewrite the seeded files while the
+    # other is asking a model about them (round 10, Medium).
+    try:
+        lease = private_root.acquire_run_lease(root)
+    except private_root.PrivateRootError as error:
+        raise FixtureSafetyError(str(error)) from error
+
     state = root / "state"
     repo = root / "repo"
     for path in (state, repo, state / "sessions", repo / "src", repo / "data"):
         _mkdir_private(path)
+    # Verify the skeleton before a single seeded file is written, so a child that
+    # does not carry the restriction is refused before it can hold model-influenced
+    # content (round 10, High).
+    try:
+        private_root.verify_private_tree(root)
+    except private_root.PrivateRootError as error:
+        raise FixtureSafetyError(str(error)) from error
     _write_private_text(
         repo / "src" / "main.rs",
         'fn main() {\n    println!("goal-latch h5-d fixture");\n}\n',
@@ -570,6 +594,7 @@ def make_fixture(
         workspace=repo,
         attempt_dir=attempt_dir,
         session_id=session_id,
+        lease=lease,
     )
 
 
@@ -1097,7 +1122,9 @@ def main() -> int:
             "makes the workspace unreadable to the model (see "
             "docs/campaign/H5_3_EVIDENCE.md); 'workspace-write' is an explicit, "
             "recorded deviation and every read-only call is followed by a "
-            "workspace-digest check that proves the model wrote nothing."
+            "workspace-digest comparison. A matching digest shows the workspace ended "
+            "where it started; it does not prove the model wrote nothing, because a "
+            "write followed by a restore leaves the same digest."
         ),
     )
     return drive(parser.parse_args())

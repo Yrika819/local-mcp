@@ -98,7 +98,7 @@ Measured with the read-back check that now ships
 | `icacls <root> /grant:r <owner>:(F)` (write ACE without `OI\|CI`), then `assert_private_root` | **refused**: *"grants write … without object+container inheritance … refused"* |
 | `icacls <root>/state/sessions /grant *S-1-1-0:(OI)(CI)(M)`, then `verify_private_tree` on an otherwise valid root | **refused** on the child, before reuse |
 | `icacls <base> /grant *S-1-1-0:(OI)(CI)(F)` (a parent that can move a child aside) | **refused** before anything is created under it |
-| `icacls <base> /grant *S-1-1-0:(OI)(CI)(M)` (write but no `FILE_DELETE_CHILD`) | **accepted** — `Modify` cannot rename or delete a protected child, which is why the default `%TEMP%` remains usable |
+| `icacls <base> /grant *S-1-1-0:(OI)(CI)(M)` | **refused** (round 8) — `Modify` contains `DELETE` on the base itself, so the base can be renamed and replaced by a link. This is why `%TEMP%` is no longer usable as a base on this host |
 
 ## 4. TOCTOU is not one problem: attacker classification
 
@@ -143,12 +143,22 @@ was not enough, in three ways that are now closed:
 
 | Round-6 finding | Severity | Disposition |
 | --- | --- | --- |
-| A writable parent still permits cross-user replacement of the **root entry** | High | `private_root.assert_parent_cannot_reenter`: a base is refused when an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` on it (Windows) or when it is group/other-writable and not sticky (POSIX). `Modify` on the parent is *not* enough to move a protected child, which is why the default `%TEMP%` stays usable |
+| A writable parent still permits cross-user replacement of the **root entry** | High | `private_root.assert_parent_cannot_reenter`: a base is refused when an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` on it (Windows) or when it is group/other-writable and not sticky (POSIX). `Modify` on the parent is not enough to move a protected *child*, but it does contain `DELETE` on the parent itself (see §4.3), which is why the base must be private all the way up |
 | Accepted roots need not **propagate** their protection to children | High | The root check now requires every write ACE to carry `OI|CI` (Windows), and `verify_private_tree` walks and verifies **every** entry after creation and on reuse instead of a hand-picked sample |
 | POSIX creation **failed** on ordinary seeded files | High | `_posix_assert` required `0o700` of regular files, so the marker (0644/0600) could never pass. Files are now checked only for owner and for no group/world bits; directories keep the `0o700` requirement. This was a real regression introduced by the first fix |
 | Base validation created directories before refusing, and resolved before checking links | Medium | `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created, and a missing intermediate directory is refused |
 | The checkpoint claimed a per-call no-write proof that did not exist | Medium | The digest is now taken around **each** model call and recorded per call; the evidence still says "digest comparison", never "OS-enforced read-only isolation" |
 | The closure record cited a review section that did not exist yet | Low | `H5_3_EVIDENCE.md` §10 now carries round 6 verbatim with its dispositions |
+
+### 4.4 What round 10 changed
+
+| Round-10 finding | Severity | Disposition |
+| --- | --- | --- |
+| `NO_PROPAGATE_INHERIT` on a root write ACE was accepted, so a grandchild could fall back to the environment's default DACL | High | Refused, and the directory skeleton is now verified *before* the first seeded file is written, so no model-influenced content exists before the check |
+| The Windows test setup wrote beneath a pre-existing shared test root without verifying it | Medium | The setup now refuses a reparse point and requires `assert_private_root` on the shared root |
+| Two runs on one root still shared `repo/` and `state/` and rewrote each other's seeded files, even with exclusive attempt directories | Medium | The root is leased exclusively for the whole run (`msvcrt.locking` / `flock`); a second live run on the same run id is refused |
+| A POSIX-only test called a function that no longer exists | Medium | Fixed; the test now calls `assert_path_cannot_reenter` |
+| Three documents and the CLI help overstated what the digest and per-entry checks prove | Low | Corrected: a matching digest does not prove nothing was written, and per-entry verification proves the property, not the inheritance mechanism |
 
 ### 4.3 What round 8 changed
 

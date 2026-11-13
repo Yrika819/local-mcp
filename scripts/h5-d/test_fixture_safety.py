@@ -50,6 +50,18 @@ class DisposableBase(unittest.TestCase):
         if not root.exists():
             root.mkdir(mode=0o700)
         info = root.lstat()
+        if os.name == "nt":
+            # A junction/reparse point or a foreign ACL on a pre-existing shared
+            # test root would redirect or expose everything created beneath it,
+            # and the driver's own checks only cover the base it is given.
+            import private_root as pr
+
+            if getattr(info, "st_file_attributes", 0) & 0x400:
+                self.fail(f"{root} is a reparse point; refusing to use it")
+            try:
+                pr.assert_private_root(root)
+            except pr.PrivateRootError as error:
+                self.fail(f"{root} is not private: {error}")
         if os.name != "nt":
             if info.st_uid != os.geteuid():
                 self.fail(f"{root} is owned by uid {info.st_uid}, not by this user")
@@ -152,6 +164,9 @@ class ReuseTests(DisposableBase):
         first.logs.mkdir(parents=True, exist_ok=True)
         first.evidence_path.write_text('{"attempt": 1}\n', encoding="utf-8")
         (first.logs / "step-0-prompt.txt").write_text("first", encoding="utf-8")
+        # The first run holds the exclusive lease; reuse is what happens after it
+        # is finished, so the lease is released here.
+        first.release()
 
         second = driver.make_fixture(self.base, "reused-run")
 
@@ -387,7 +402,7 @@ class OwnerOnlyRootTests(DisposableBase):
         mode = stat.S_IMODE(shared.lstat().st_mode)
         if not mode & 0o022 or not shared.lstat().st_mode & stat.S_ISVTX:
             self.skipTest("this host's temporary directory is not sticky-shared")
-        pr.assert_parent_cannot_reenter(shared)
+        pr.assert_path_cannot_reenter(shared)
 
     def test_a_base_with_modify_for_everyone_is_refused(self) -> None:
         # Round 8: `Modify` carries `DELETE` on the object, so another user can
@@ -440,6 +455,16 @@ class OwnerOnlyRootTests(DisposableBase):
         with self.assertRaises(driver.FixtureSafetyError):
             driver.make_fixture(sneaky, "resolve-to-home")
 
+    def test_a_live_run_keeps_its_root_to_itself(self) -> None:
+        # Round 10 (Medium): a second run on the same run id would rewrite the
+        # seeded workspace under the first one, so the root is leased exclusively.
+        fixture = driver.make_fixture(self.base, "live-lease")
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "live-lease")
+        fixture.release()
+        again = driver.make_fixture(self.base, "live-lease")
+        self.assertEqual(fixture.root, again.root)
+
     def test_an_attempt_directory_is_never_shared(self) -> None:
         # Round 9 (Medium): two runs reusing one root must not land in the same
         # attempt directory and interleave their evidence.
@@ -483,6 +508,7 @@ class OwnerOnlyRootTests(DisposableBase):
         import private_root as pr
 
         pr.assert_private_root(owned.root)
+        owned.release()
         again = driver.make_fixture(self.base, "owner-only-reuse")
         self.assertEqual(owned.root, again.root)
 

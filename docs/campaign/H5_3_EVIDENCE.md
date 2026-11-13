@@ -316,7 +316,7 @@ was done about each:
 
 | # | Severity | Finding | Disposition |
 | --- | --- | --- | --- |
-| 1 | **High** | The root's permissions do not protect its **name in the parent**: another user who can rename/delete a child there can move the root aside and leave a link, and every later write follows the link | Fixed: `private_root.assert_parent_cannot_reenter` refuses a base where an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` (Windows) or where the base is group/other-writable and not sticky (POSIX). `Modify` on the parent is insufficient to move a protected child, which is why `%TEMP%` stays usable. Test: `test_a_base_whose_entries_anyone_can_replace_is_refused` |
+| 1 | **High** | The root's permissions do not protect its **name in the parent**: another user who can rename/delete a child there can move the root aside and leave a link, and every later write follows the link | Fixed: `private_root.assert_parent_cannot_reenter` refuses a base where an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` (Windows) or where the base is group/other-writable and not sticky (POSIX). Round 8 then established that `Modify` contains `DELETE` on the component itself, so this rule is now applied to every component and `%TEMP%` is refused as a base. Test: `test_a_base_whose_entries_anyone_can_replace_is_refused` |
 | 2 | **High** | An accepted root need not propagate its protection to children: the verifier ignored `OI\|CI`, and only a hand-picked sample of children was checked, each through the same parser | Fixed: a root's write ACEs must carry `OI\|CI`; `verify_private_tree` walks and verifies **every** entry after creation and on reuse. Tests: `test_a_root_whose_write_aces_do_not_inherit_is_refused`, `test_a_child_that_became_writable_by_others_is_refused` |
 | 3 | **High** | **POSIX fixture creation could not succeed**: `assert_private_entry` demanded `0o700` of regular files, so the marker written with the default mode never passed | Fixed: files are checked for owner and for "no group/world bits"; directories keep the `0o700` requirement. A real regression introduced by the first fix and caught only because the reviewer read the POSIX path |
 | 4 | Medium | `base.mkdir(parents=True)` ran **before** the base was validated, and `resolve()` ran before the reparse-point scan, so a refused base could still create directories and a symlinked segment disappeared from the inspected path | Fixed: `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created; a missing intermediate directory is refused |
@@ -367,4 +367,14 @@ Reviewer's declared `NOT VERIFIED` for round 8: same list as round 7.
 
 Reviewer's declared `NOT VERIFIED` for round 9: same list, plus it did not execute the concurrent-attempt race or the path-bypass examples.
 
-### Round 10 — final HEAD — recorded below in §10.1
+### Round 10 — `568db3c` (round-9 remediation) — verdict `NOT_READY`
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 1 | **High** | `NO_PROPAGATE_INHERIT` on a root write ACE was accepted, so a deeper entry could fall back to the environment's default DACL; the seeded files were written before the tree was checked | Fixed: such an ACE is refused, and the directory skeleton is verified before the first file is written |
+| 2 | Medium | The Windows test setup created its base under a pre-existing shared root without verifying that root | Fixed: reparse point refused, `assert_private_root` required |
+| 3 | Medium | Two runs on one root still shared `repo/` and `state/` and rewrote each other's seeded files | Fixed: an exclusive run lease is held for the whole run |
+| 4 | Medium | A POSIX-only test called a removed function | Fixed |
+| 5 | Low | Documents and CLI help overstated the digest and per-entry checks | Fixed |
+
+### Round 11 — final HEAD — recorded below in §10.1
