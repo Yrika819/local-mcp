@@ -4890,6 +4890,95 @@ mod tests {
         assert_eq!(bytes(&fixture), before);
     }
 
+    /// H5.2-C / H5.3-A: the exact answer a real model produced — a valid
+    /// `resolve_needs_replan` array with no matching `add_dependencies` edge —
+    /// must stay refused, and the refusal must not mutate the durable Goal.
+    ///
+    /// The published contract now states this pairing explicitly
+    /// (`REPLANNER_RESOLVE_REQUIRES_NEW_DEPENDENCY`); this test is the
+    /// behavioural half of that pair and must never be relaxed to make a model
+    /// answer succeed.
+    #[test]
+    fn resolving_needs_replan_without_a_new_dependency_is_refused_nonmutating() {
+        let fixture = fixture();
+        let before = bytes(&fixture);
+        let mut value = proposal_value(&fixture);
+        value["add_tasks"] = json!([]);
+        value["add_dependencies"] = json!([]);
+        assert_eq!(
+            value["resolve_needs_replan"],
+            json!([fixture.trigger_id.as_str()])
+        );
+        let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(reason))
+                if reason == "resolving NEEDS_REPLAN requires a committed new hard dependency"
+        ));
+        assert_eq!(bytes(&fixture), before);
+        assert_eq!(
+            fixture
+                .store
+                .load_goal(&fixture.session.id, &fixture.goal_id)
+                .unwrap()
+                .tasks()[&fixture.trigger_id]
+                .status(),
+            TaskStatus::NeedsReplan
+        );
+    }
+
+    /// H5.3-A: the published resolution shape must be the shape the validator
+    /// accepts. This builds a proposal whose relationship fields are exactly the
+    /// fragment published in `REPLANNER_RESOLVE_EXAMPLE` and asserts acceptance.
+    #[test]
+    fn the_published_resolve_needs_replan_shape_is_accepted() {
+        let fixture = fixture();
+        let mut value = proposal_value(&fixture);
+        // The `add_dependencies` entry and the `resolve_needs_replan` array below
+        // are the published fragment verbatim, in the same direction.
+        value["add_dependencies"] = json!([{
+            "task": {"ref_kind": "EXISTING", "task_id": fixture.trigger_id.as_str()},
+            "dependency": {"ref_kind": "NEW", "proposal_id": "repair"}
+        }]);
+        value["resolve_needs_replan"] = json!([fixture.trigger_id.as_str()]);
+
+        let result = apply(&fixture, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(result.plan_revision(), 2);
+        let trigger = &result.tasks()[&fixture.trigger_id];
+        assert_eq!(trigger.status(), TaskStatus::Pending);
+        let repair = result
+            .tasks()
+            .values()
+            .find(|task| task.title() == "Task repair")
+            .expect("the new repair Task must be materialised");
+        assert!(
+            trigger
+                .dependencies()
+                .iter()
+                .any(|dependency| dependency.task_id() == repair.id()),
+            "the blocked Task must depend on the new repair Task"
+        );
+    }
+
+    /// The reverse edge is not equivalent: depending the repair Task on the
+    /// blocked Task does not resolve the blocked Task.
+    #[test]
+    fn the_reverse_dependency_direction_does_not_resolve_a_needs_replan_task() {
+        let fixture = fixture();
+        let before = bytes(&fixture);
+        let mut value = proposal_value(&fixture);
+        value["add_dependencies"][0] = json!({
+            "task": {"ref_kind": "NEW", "proposal_id": "repair"},
+            "dependency": existing_ref(&fixture.trigger_id)
+        });
+        let result = apply(&fixture, &serde_json::to_vec(&value).unwrap());
+        assert!(matches!(
+            result,
+            Err(ReplannerError::ReplannerSchemaViolation(_))
+        ));
+        assert_eq!(bytes(&fixture), before);
+    }
+
     #[test]
     fn duplicate_dependency_edge_is_rejected_nonmutating() {
         let fixture = fixture();

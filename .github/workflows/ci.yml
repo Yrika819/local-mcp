@@ -99,6 +99,15 @@ jobs:
           # network; native execution is covered by the test matrix below.
           python3 scripts/release/test_install_contract.py
 
+      - name: Run real-model driver safety self-tests
+        run: |
+          set -euo pipefail
+          # H5.3-0: the real-model driver must be unable to destroy operator
+          # data. No model is called and no binary is needed; the fixture root
+          # is only ever created, never deleted, and an unowned or
+          # reparse-pointed root is refused.
+          python3 scripts/h5-d/test_fixture_safety.py
+
       - name: Validate the Doctor JSON schema and fixtures
         run: |
           set -euo pipefail

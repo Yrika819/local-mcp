@@ -122,13 +122,24 @@ def drive(args: argparse.Namespace) -> int:
     assert binary.is_file(), f"binary not found: {binary}"
     binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
 
-    root, state, repo, session_id = base.make_fixture(Path(args.work_dir))
+    fixture = base.make_fixture(
+        Path(args.work_dir) if args.work_dir else None, args.run_id
+    )
+    root, state, repo, session_id = (
+        fixture.root,
+        fixture.state,
+        fixture.workspace,
+        fixture.session_id,
+    )
     fixture_id = write_fixture_marker(root, state, repo)
-    log_dir = root / "logs"
-    log_dir.mkdir()
+    log_dir = fixture.logs
+    log_dir.mkdir(parents=True, exist_ok=True)
     evidence: dict = {
         "scenario": "H5.2-B Writer/Reviewer (real model, isolated test grant)",
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "run_id": fixture.run_id,
+        "fixture_root": str(root),
+        "attempt_dir": str(fixture.attempt_dir),
         "binary": str(binary),
         "binary_sha256": binary_sha,
         "state_root": str(state),
@@ -200,6 +211,8 @@ def drive(args: argparse.Namespace) -> int:
                     log_dir,
                     model_calls,
                     args.model,
+                    notes=contract.get("notes"),
+                    sandbox=getattr(args, "readonly_sandbox", "read-only"),
                 )
                 model_calls += 1
                 evidence.setdefault("model_calls", []).append(meta)
@@ -249,14 +262,14 @@ def drive(args: argparse.Namespace) -> int:
     finally:
         server.close()
         evidence["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        (root / "evidence.json").write_text(
+        fixture.evidence_path.write_text(
             json.dumps(evidence, indent=2), encoding="utf-8"
         )
 
     print(
         json.dumps(
             {
-                "evidence": str(root / "evidence.json"),
+                "evidence": str(fixture.evidence_path),
                 "goal_id": evidence.get("goal_id"),
                 "final_status": (evidence.get("final") or {}).get("status"),
                 "model_calls": evidence.get("model_call_count"),
@@ -279,7 +292,26 @@ def drive(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/local-mcp.exe")
-    parser.add_argument("--work-dir", default="tmp/h5d/scenario-b")
+    parser.add_argument(
+        "--work-dir",
+        default=None,
+        help="absolute disposable base directory (default: the OS temp directory)",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="reuse an owned run root; a colliding unowned root is refused",
+    )
+    parser.add_argument(
+        "--readonly-sandbox",
+        choices=("read-only", "workspace-write"),
+        default="read-only",
+        help=(
+            "codex --sandbox for model calls. 'read-only' blinds the model on "
+            "Windows; 'workspace-write' is a recorded deviation whose no-write "
+            "property is proven by a workspace digest check after every call."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--max-model-calls", type=int, default=3)
     parser.add_argument("--model", default="gpt-6.1-terra")

@@ -137,8 +137,25 @@ pub(crate) const LIMIT_SHA256_HEX: usize = 64;
 pub(crate) const READONLY_STATUS_VALUES: &[&str] =
     &["candidate_complete", "blocked", "needs_replan", "failed"];
 
-pub(crate) const REPLANNER_RESOLVE_NOTE: &str =
-    "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean";
+pub(crate) const REPLANNER_RESOLVE_NOTE: &str = "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean; each listed Task must also gain a new hard dependency in this proposal's add_dependencies";
+
+/// The exact pairing `replanner.rs` enforces when it applies a resolution.
+///
+/// H5.2-C: a real model repeatedly answered `resolve_needs_replan` without the
+/// matching `add_dependencies` edge. The host was right to refuse it, but the
+/// published contract did not say so. The wording below is derived from, and
+/// must stay equivalent to, the `dependency_targets` check in
+/// `src/replanner.rs::validate`.
+pub(crate) const REPLANNER_RESOLVE_DEPENDENCY_RULE: &str = "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal whose `dependency` is the new repair Task; the blocked Task depends on the repair Task, and a resolution without that committed new hard dependency is refused as REPLANNER_SCHEMA_VIOLATION";
+
+/// A short, valid JSON fragment of the resolution relationship.
+///
+/// It is a fragment on purpose: the identity echo is published by
+/// `REPLANNER_BASE_REVISION_ECHO` and the full repair Task object by the
+/// `replanner_task` definition. `the_published_resolve_needs_replan_shape_is_accepted`
+/// in `src/replanner.rs` proves that a complete proposal carrying exactly this
+/// relationship is accepted, so the published shape is not aspirational.
+pub(crate) const REPLANNER_RESOLVE_EXAMPLE: &str = r#"resolve a NEEDS_REPLAN Task by adding the repair Task and pointing the blocked Task at it in the same proposal (a fragment of the full replanner object, not a complete answer): {"add_dependencies":[{"task":{"ref_kind":"EXISTING","task_id":"<blocked-task-id>"},"dependency":{"ref_kind":"NEW","proposal_id":"<new-repair-proposal_id>"}}],"resolve_needs_replan":["<blocked-task-id>"]}"#;
 
 // ---------------------------------------------------------------------------
 // Field contract.
@@ -687,6 +704,10 @@ const REPLANNER_CONDITIONS: &[Condition] = &[
         detail: REPLANNER_RESOLVE_NOTE,
     },
     Condition {
+        code: "REPLANNER_RESOLVE_REQUIRES_NEW_DEPENDENCY",
+        detail: REPLANNER_RESOLVE_DEPENDENCY_RULE,
+    },
+    Condition {
         code: "REPLANNER_EXCLUSIVE_PRIMITIVES",
         detail: "pristine_plan_supersession and replace_tasks may not be combined with the additive fields, with each other, or with a scope wider than the Task being replaced",
     },
@@ -813,6 +834,8 @@ const REPLANNER_NOTES: &[&str] = &[
     "Return exactly one JSON object. Any additional property is refused.",
     "Additive replanning is monotonic: add Tasks, dependencies, verification, mandatory flags, criterion bindings, or resolve needs_replan.",
     "Replacement primitives are typed and travel with explicit request ids issued by the host.",
+    REPLANNER_RESOLVE_EXAMPLE,
+    "A Task whose own shape was already too large, too broad, or outside its budget can never succeed on an unchanged replay: resolving it adds the repair prerequisite but the host will never re-arm that Task, so it can only be finalised through replace_tasks.",
 ];
 
 pub(crate) const CONTRACTS: &[ResponseContract] = &[

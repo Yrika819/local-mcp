@@ -1579,6 +1579,17 @@ fn safe_environment_with_path(path: Option<&std::ffi::OsStr>) -> HashMap<String,
             environment.insert(name, value);
         }
     }
+    #[cfg(feature = "test-grant-fixture")]
+    {
+        // H5.3-C crash-recovery harness seam. The publication helper's environment
+        // is deliberately sanitised, so the harness needs one explicit, named
+        // passthrough to park the helper inside its critical section. It exists
+        // only in the non-default `test-grant-fixture` build; a shipped binary
+        // compiles this block out and forwards nothing.
+        if let Ok(value) = std::env::var("LOCAL_MCP_TEST_HELPER_HOLD") {
+            environment.insert("LOCAL_MCP_TEST_HELPER_HOLD".to_owned(), value);
+        }
+    }
     if let Some(path) = path {
         environment.insert("PATH".to_owned(), path.to_string_lossy().into_owned());
     }

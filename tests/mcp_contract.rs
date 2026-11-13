@@ -992,3 +992,103 @@ fn read_all(mut reader: impl Read) -> String {
     let _ = reader.read_to_string(&mut buffer);
     buffer
 }
+
+/// F5 (H5.3-D): the published Goal tool schemas and the runtime parsers must
+/// agree about *unknown* arguments.
+///
+/// The suite already proved that each published schema is well formed and
+/// satisfiable; it never asserted that an argument outside the published property
+/// set is refused by both sides. A schema that silently allowed an extra field
+/// would let a client believe it configured something the runtime ignores.
+///
+/// Scope note: this is asserted for the Goal tools, which are what H5 owns. The
+/// core file tools (`read_file`, `list_directory`, `write_file`, …) publish no
+/// `additionalProperties` and the runtime reads only the keys it knows, so the
+/// two agree by both being permissive. That is a recorded residual
+/// (`known_loose_tool_schemas_are_recorded_not_silently_widened`), not something
+/// this test may paper over by adding a constraint the runtime does not enforce.
+#[test]
+fn every_published_goal_tool_schema_and_the_runtime_both_refuse_an_unknown_argument() {
+    let fixture = Fixture::new("unknown-argument");
+    let mut server = McpServer::spawn(&fixture);
+    let tools = server.tools();
+
+    let strict = [
+        "goal_start",
+        "goal_status",
+        "goal_pause",
+        "goal_resume",
+        "goal_cancel",
+        "goal_result",
+        "goal_next",
+        "goal_submit",
+        "goal_run",
+    ];
+    for name in strict {
+        let entry = tool(&tools, name);
+        let schema = &entry["inputSchema"];
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{name} must publish additionalProperties:false"
+        );
+        let mut instance = instance_for(schema, None);
+        instance["definitely_not_a_published_field"] = json!(1);
+        let mut violations = Vec::new();
+        validate(schema, &instance, name, &mut violations);
+        assert!(
+            !violations.is_empty(),
+            "{name} accepted an undeclared argument at the schema level: {instance}"
+        );
+    }
+
+    // The runtime side: each Goal tool must refuse the same extra field with a
+    // typed error rather than ignoring it.
+    let probes = ["goal_status", "goal_next", "goal_resume", "goal_result"];
+    for name in probes {
+        let mut arguments = start_arguments(&fixture.session_id, "EXTERNAL");
+        arguments["definitely_not_a_published_field"] = json!(1);
+        let result = server.call(name, arguments);
+        let code = goal_error_code(&result)
+            .unwrap_or_else(|| panic!("{name} ignored an undeclared argument: {result}"));
+        assert_eq!(
+            code, "INVALID_ARGUMENT",
+            "{name} refused an undeclared argument with an unexpected code"
+        );
+    }
+}
+
+/// The known-loose published schemas, pinned so the set cannot grow silently.
+///
+/// These tools publish no `additionalProperties`, so a schema-validating client
+/// may send an undeclared field and the runtime will ignore it. Closing that is a
+/// change to the core file tools, outside the External Backend contract; H5.3
+/// records it rather than widening or silently tightening it.
+#[test]
+fn known_loose_tool_schemas_are_recorded_not_silently_widened() {
+    let fixture = Fixture::new("loose-schema");
+    let mut server = McpServer::spawn(&fixture);
+    let tools = server.tools();
+
+    let mut loose = Vec::new();
+    for entry in &tools {
+        let name = entry["name"].as_str().expect("every tool has a name");
+        let schema = &entry["inputSchema"];
+        if schema.get("additionalProperties") != Some(&json!(false)) {
+            loose.push(name.to_owned());
+        }
+    }
+    loose.sort();
+    assert_eq!(
+        loose,
+        vec![
+            "execute".to_owned(),
+            "list_directory".to_owned(),
+            "read_file".to_owned(),
+            "start_command".to_owned(),
+            "without_sandbox".to_owned(),
+            "write_file".to_owned(),
+        ],
+        "the set of tools that do not publish additionalProperties:false changed;          decide deliberately whether to tighten the runtime and the schema together"
+    );
+}

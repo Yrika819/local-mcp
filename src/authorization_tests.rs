@@ -1387,3 +1387,49 @@ fn at_gw_037_grant_status_reports_the_effective_usage_floor() {
     assert_eq!(view["usage"]["operations"], 3, "{view}");
     assert_eq!(view["usage"]["bytes"], 12, "{view}");
 }
+
+/// H5.3: a `WRITE_UTF8` operation with `expected_preimage: ABSENT` names a file
+/// that does not exist yet. Until this fix the workspace-relative conversion
+/// canonicalized the target itself, which fails on a missing path, so the
+/// external Writer could never create a file even though the published response
+/// contract offers `{kind: ABSENT}`.
+#[test]
+fn a_new_file_inside_the_workspace_resolves_through_its_parent() {
+    let f = fixture("new-file");
+    let grant = f.install();
+    let root = grant.workspace().root();
+    let target = root.join("data").join("ledger.csv");
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    assert!(
+        !target.exists(),
+        "the probe must name a file that does not exist"
+    );
+
+    let relative = relative_workspace_path(&target, root)
+        .expect("a new file inside the workspace must resolve");
+    assert_eq!(relative.as_str(), "data/ledger.csv");
+    // Resolution is not authorization: this grant does not cover the path, and
+    // the scope check must still refuse it.
+    assert!(!grant.permits_path(&relative));
+}
+
+/// The fix must not widen the grant: a new file whose parent is outside the
+/// workspace is still refused, and a missing parent is refused too.
+#[test]
+fn a_new_file_outside_the_workspace_or_without_a_parent_is_refused() {
+    let f = fixture("new-file-outside");
+    let grant = f.install();
+    let root = grant.workspace().root();
+
+    let outside_parent = root.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&outside_parent).unwrap();
+    assert_eq!(
+        relative_workspace_path(&outside_parent.join("escape.txt"), root),
+        Err(GrantRefusal::ScopeMismatch)
+    );
+
+    assert_eq!(
+        relative_workspace_path(&root.join("no-such-directory").join("file.txt"), root),
+        Err(GrantRefusal::ScopeMismatch)
+    );
+}
