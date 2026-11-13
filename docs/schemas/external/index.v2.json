@@ -240,7 +240,7 @@
         },
         {
           "code": "REPLANNER_READONLY_REASSESSMENT_BARRIER",
-          "detail": "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and the rejected trigger is resolved, the chain must contain a new READ_ONLY Task, and every new mutating Task in the proposal must depend on that new READ_ONLY Task"
+          "detail": "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and that rejected trigger is resolved, the trigger's dependency chain must either already contain a READ_ONLY Task created after the rejected plan revision that is completed with a passed verification, no blockers, at least one evidence item and no UNKNOWN side effect, or contain a new Task that is CODEX_READONLY with READ_ONLY scope and SAFE_READ_ONLY replay safety; when the new prerequisite is used, every new Task whose operation_kind is not READ_ONLY must also depend on it"
         },
         {
           "code": "REPLANNER_HOST_REVALIDATION",

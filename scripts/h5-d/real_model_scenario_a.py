@@ -245,28 +245,30 @@ def _claim_existing_root(root: Path, run_id: str) -> None:
         )
 
 
-def _existing_reparse_points(root: Path, max_depth: int = 4) -> list[Path]:
-    """Every reparse point already inside `root`, without following any of them.
+def _existing_reparse_points(root: Path) -> list[Path]:
+    """Every reparse point inside `root`, at any depth, without following any.
 
-    Reuse must not be a way to smuggle a junction in: an owned root whose
-    `repo/src` is a link would otherwise redirect the fixture writes outside the
-    root even though the root itself is legitimate.
+    Reuse must not be a way to smuggle a link in: an owned root whose `repo/src`
+    — or `repo/a/b/c/link` — is a link would otherwise redirect the fixture
+    writes, and the evidence digest, outside the root even though the root itself
+    is legitimate. The walk has no depth limit and never descends into a link, so
+    the answer is the same however deep the link is. An unreadable directory is
+    treated as a reparse point: the refusal is fail-closed.
     """
     flagged: list[Path] = []
-    stack: list[tuple[Path, int]] = [(root, 0)]
+    stack: list[Path] = [root]
     while stack:
-        path, depth = stack.pop()
-        if depth >= max_depth:
-            continue
+        path = stack.pop()
         try:
             entries = list(path.iterdir())
         except OSError:
+            flagged.append(path)
             continue
         for entry in entries:
             if _is_reparse_point(entry):
                 flagged.append(entry)
             elif entry.is_dir():
-                stack.append((entry, depth + 1))
+                stack.append(entry)
     return flagged
 
 
@@ -356,12 +358,24 @@ def make_fixture(
 
 
 def workspace_digest(repo: Path) -> dict[str, str]:
+    """Hash every regular file under `repo` without following a link.
+
+    `rglob` follows directory symlinks and `is_file()` follows file symlinks, so a
+    link inside a fixture could make the digest read bytes from outside it. A
+    reparse point is recorded as such instead of being read.
+    """
     digests = {}
     for path in sorted(repo.rglob("*")):
-        if path.is_file():
-            digests[str(path.relative_to(repo)).replace("\\", "/")] = hashlib.sha256(
-                path.read_bytes()
-            ).hexdigest()
+        if _is_reparse_point(path):
+            digests[str(path.relative_to(repo)).replace("\\", "/")] = "REPARSE_POINT"
+            continue
+        try:
+            if path.is_file():
+                digests[str(path.relative_to(repo)).replace("\\", "/")] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+        except OSError:
+            digests[str(path.relative_to(repo)).replace("\\", "/")] = "UNREADABLE"
     return digests
 
 

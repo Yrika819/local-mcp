@@ -4962,6 +4962,133 @@ mod tests {
 
     /// The reverse edge is not equivalent: depending the repair Task on the
     /// blocked Task does not resolve the blocked Task.
+    /// R2 of the H5.3 independent review: the published rule says the new
+    /// prerequisite may be `EXISTING` as well as `NEW`. That claim is only worth
+    /// publishing if the validator actually accepts it, so this test resolves a
+    /// NEEDS_REPLAN Task against a pre-existing sibling Task that it did not
+    /// depend on before.
+    #[test]
+    fn resolving_against_a_preexisting_prerequisite_is_accepted() {
+        let root = std::env::temp_dir().join(format!("local-mcp-h53-existing-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let state = root.join("state");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("sentinel.txt"),
+            b"unchanged
+",
+        )
+        .unwrap();
+        let session = config::Session {
+            id: format!("h53-existing-{}", Uuid::new_v4()),
+            cwd: repo.clone(),
+            permitted_directories: vec![repo.clone()],
+        };
+        let store = TaskStore::with_state_root(state.clone());
+        let mut goal = Goal::new(
+            session.id.clone(),
+            repo.clone(),
+            "resolve against an existing prerequisite",
+            None,
+            vec!["stay inside repository authority".to_owned()],
+            vec!["repair prerequisite is durably verified".to_owned()],
+            NOW,
+        )
+        .unwrap();
+        let trigger = Task::new(
+            "trigger",
+            "original immutable task objective",
+            true,
+            WorkerKind::CodexReadonly,
+            scope(&repo, TaskOperationKind::ReadOnly),
+            verification("trigger.base"),
+            2,
+            1,
+            NOW,
+        )
+        .unwrap();
+        let prerequisite = Task::new(
+            "prerequisite",
+            "an already planned read-only Task",
+            true,
+            WorkerKind::CodexReadonly,
+            scope(&repo, TaskOperationKind::ReadOnly),
+            verification("prerequisite.base"),
+            2,
+            1,
+            NOW,
+        )
+        .unwrap();
+        let trigger_id = trigger.id().clone();
+        let prerequisite_id = prerequisite.id().clone();
+        goal.materialize_initial_plan(vec![trigger, prerequisite], NOW)
+            .unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::Running,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        goal.task_bind_latest_attempt_execution(
+            &trigger_id,
+            None,
+            None,
+            None,
+            Some(SideEffectClass::None),
+            Some(SideEffectState::ConfirmedNotPerformed),
+            Some(1),
+            Some(0),
+        )
+        .unwrap();
+        goal.transition_task(
+            &trigger_id,
+            TaskStatus::NeedsReplan,
+            TaskTransitionContext::default(),
+            NOW,
+        )
+        .unwrap();
+        let goal_id = goal.id().clone();
+        store.create_goal(&goal).unwrap();
+        let fixture = Fixture {
+            root,
+            state,
+            repo,
+            session,
+            store,
+            goal_id,
+            trigger_id: trigger_id.clone(),
+        };
+
+        let current = fixture
+            .store
+            .load_goal(&fixture.session.id, &fixture.goal_id)
+            .unwrap();
+        let proposal = json!({
+            "goal_id": fixture.goal_id.as_str(),
+            "base_goal_revision": current.revision(),
+            "base_plan_revision": current.plan_revision(),
+            "summary": "resolve the blocked task against a Task that already exists",
+            "add_dependencies": [{
+                "task": existing_ref(&trigger_id),
+                "dependency": existing_ref(&prerequisite_id)
+            }],
+            "resolve_needs_replan": [trigger_id.as_str()]
+        });
+        let result = apply(&fixture, &serde_json::to_vec(&proposal).unwrap())
+            .expect("an existing prerequisite is a published and accepted form");
+        assert_eq!(result.plan_revision(), 2);
+        let blocked = &result.tasks()[&trigger_id];
+        assert_eq!(blocked.status(), TaskStatus::Pending);
+        assert!(
+            blocked
+                .dependencies()
+                .iter()
+                .any(|dependency| dependency.task_id() == &prerequisite_id),
+            "the resolved Task must now depend on the existing prerequisite"
+        );
+    }
+
     #[test]
     fn the_reverse_dependency_direction_does_not_resolve_a_needs_replan_task() {
         let fixture = fixture();

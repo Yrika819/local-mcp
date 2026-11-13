@@ -124,3 +124,87 @@ the H5 commit, released as one integrated change. Nothing smaller is coherent.
 4. Confirm that C3/R-1 stays a documented deployment constraint (no unlimited
    Writer operation on a normal Windows profile) until an OS-level trust boundary
    exists.
+
+---
+
+# 7. H5.3 update (External Backend V1 closure)
+
+Re-derived on the H5.3 branch `feat/h5-3-external-backend-closure-v1`
+(base `0dcab4a` = PR #56 HEAD) after the H5.3 campaign. `main` is still
+`e6950fdc3bab72982285888a81cce822743fbba5`.
+
+## 7.1 Stack shape after H5.3
+
+| Fact | Value |
+| --- | --- |
+| Open Draft PRs | **30** (#26–#56 plus #15, #25, #29) |
+| PR #56 state | OPEN / Draft / MERGEABLE, CI 22/22 SUCCESS at `0dcab4a` |
+| H5.3 branch commits above `main` | 76 (the same linear chain plus H5.3) |
+| `main..H5.3` diff | **121 files, +47 568 / −268** |
+| H5.3 diff (`0dcab4a..H5.3 HEAD`) | 21 files, +2 744 / −75 |
+| H5.3 adds to the stack | one Draft PR based on `feat/h5-2-real-model-validation-v1` |
+
+The H5.3 branch remains fast-forwardable onto `main` (`merge-base == main`), so
+option C is unchanged and still the only recommended shape. **No main-based
+integration PR was created and none should be created without the Owner's
+explicit approval** — the campaign brief forbids it, and this packet only
+prepares the decision.
+
+## 7.2 What H5.3 changes about the integration decision
+
+1. **The integration unit is unchanged** (#30–#34 base + #35–#56 + H5.3), but
+   H5.3 adds no new authorization surface. It changes one path-resolution
+   function, one error-code mapping, one published contract text, two test-only
+   seams and the test harnesses.
+2. **H5.3 closed contract/validator drift** in the Replanner's
+   `resolve_needs_replan` requirement, and published the conditional
+   readonly-reassessment barrier. A Serea-side adapter can now rely on the
+   published conditions instead of reverse-engineering the validator.
+3. **H5.3 removed a data-loss hazard in the test harness.** The real-model driver
+   previously deleted an operator-supplied `--work-dir`; it now only creates.
+   This matters for the Owner because *running the supplied evidence drivers* was
+   itself hazardous before this change.
+4. **Two production defects were found by running the stack for real**, and are
+   fixed here: a `WRITE_UTF8` with `expected_preimage: ABSENT` could never
+   publish (the published capability was unreachable), and a durable
+   `PENDING -> READY` refusal was reported as `GOAL_PERSISTENCE_ERROR`.
+5. **A platform constraint is now recorded, not hidden.** On Windows,
+   `codex exec --sandbox read-only` makes the workspace unreadable to the model.
+   Any real-model "read-only investigation" evidence produced with that sandbox
+   is evidence about the model's reasoning, not about the workspace. H5.3's C2
+   run uses `--sandbox workspace-write` and proves, per call, that the model
+   wrote nothing.
+
+## 7.3 Intermediate CI status the Owner should expect
+
+The PRs below H5.3 keep whatever CI state they had when they were opened; they
+are **not** re-run by pushing H5.3. Only two HEADs matter for acceptance:
+
+| HEAD | Meaning | CI |
+| --- | --- | --- |
+| `0dcab4a` (PR #56) | H5.2 PARTIAL, the H5.3 base | 22/22 SUCCESS |
+| H5.3 PR HEAD | the integrated technical result | see the H5.3 PR |
+
+A red CI on an intermediate PR in the chain (for example #53, which was opened to
+fix CRLF before the later renormalisation landed) is **not** evidence that the
+integrated HEAD is red. The integration PR is the only place where a single CI
+result describes the whole change.
+
+## 7.4 Residual constraints carried into the Owner decision
+
+| Constraint | Effect on integration |
+| --- | --- |
+| **C3 / R-1** same-OS-user impersonation | Unresolved. Landing the stack does not make an unrestricted EXTERNAL Writer safe against production data on a normal Windows account. Must ship as a documented deployment constraint. |
+| POSIX detached descendants | `NOT_VERIFIED`. The Windows Job Object guarantee does not generalise to Linux/macOS process groups. |
+| `codex --sandbox read-only` on Windows | Broken for reads (H53-4). Blocks real-model read-only dogfooding, not the product. |
+| Core file tools publish no `additionalProperties` | Recorded residual (F5), pinned by a test so the set cannot grow silently. |
+| R2-11 boundary probes | Partially covered; unchanged from H5.2. |
+
+## 7.5 Owner decisions (unchanged, restated)
+
+1. Approve option **C** and name the integration PR owner.
+2. Confirm the integration unit (§4) — nothing ships below it.
+3. Decide whether #30–#34 are reviewed inside the integration PR.
+4. Confirm C3/R-1 ships as a documented deployment constraint.
+5. Separately decide main merge, Draft clearance, Release/Tag and V1 Beta GO.
+   None of these is requested or performed here.

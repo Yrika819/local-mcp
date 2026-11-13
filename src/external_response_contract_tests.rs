@@ -1367,13 +1367,34 @@ fn the_published_replanner_contract_states_the_needs_replan_dependency_requireme
         condition.detail
     );
 
-    // The conditional readonly-reassessment barrier is published too, so a model
-    // that resolves a rejected pristine plan is told what else is required.
+    // The published claim that an EXISTING prerequisite is accepted must be true
+    // of the validator, not merely written down:
+    // `replanner::resolving_against_a_preexisting_prerequisite_is_accepted` builds
+    // exactly that proposal and asserts it is applied.
+
+    // The conditional readonly-reassessment barrier is published in full, so a
+    // model that resolves a rejected pristine plan is told about the
+    // completed-task exception and the properties a new prerequisite needs.
     let barrier = replanner
         .conditions
         .iter()
         .find(|condition| condition.code == "REPLANNER_READONLY_REASSESSMENT_BARRIER")
         .expect("the conditional reassessment barrier must be published");
-    assert!(barrier.detail.contains("REQUIRE_READONLY_REASSESSMENT"));
-    assert!(barrier.detail.contains("READ_ONLY"));
+    for needle in [
+        "REQUIRE_READONLY_REASSESSMENT",
+        "completed",
+        "CODEX_READONLY",
+        "SAFE_READ_ONLY",
+    ] {
+        assert!(
+            barrier.detail.contains(needle),
+            "the reassessment condition must state {needle:?}: {}",
+            barrier.detail
+        );
+    }
+    assert!(
+        barrier.detail.contains("already contain"),
+        "the completed-reassessment exception must be published, not only the new-Task rule: {}",
+        barrier.detail
+    );
 }

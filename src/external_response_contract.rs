@@ -148,6 +148,15 @@ pub(crate) const REPLANNER_RESOLVE_NOTE: &str = "resolve_needs_replan is a JSON 
 /// `src/replanner.rs::validate`.
 pub(crate) const REPLANNER_RESOLVE_DEPENDENCY_RULE: &str = "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal, so the blocked Task gains a new hard dependency; the `dependency` is that Task's new prerequisite, which is normally a repair Task added by this same proposal (`ref_kind` `NEW`), and an existing Task (`ref_kind` `EXISTING`) is also accepted; a resolution without such an edge is refused as REPLANNER_SCHEMA_VIOLATION";
 
+/// What `validate_readonly_reassessment_barrier` actually enforces.
+///
+/// Published because the rule is conditional: it applies only when the host
+/// recorded a pre-execution plan rejection with the `REQUIRE_READONLY_REASSESSMENT`
+/// policy. It is deliberately stated in full, including the completed-task
+/// exception and the worker and replay-safety qualifiers, because a partial
+/// statement is as misleading as no statement.
+pub(crate) const REPLANNER_READONLY_REASSESSMENT_RULE: &str = "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and that rejected trigger is resolved, the trigger's dependency chain must either already contain a READ_ONLY Task created after the rejected plan revision that is completed with a passed verification, no blockers, at least one evidence item and no UNKNOWN side effect, or contain a new Task that is CODEX_READONLY with READ_ONLY scope and SAFE_READ_ONLY replay safety; when the new prerequisite is used, every new Task whose operation_kind is not READ_ONLY must also depend on it";
+
 /// A short, valid JSON fragment of the resolution relationship.
 ///
 /// It is a fragment on purpose: the identity echo is published by
@@ -713,7 +722,7 @@ const REPLANNER_CONDITIONS: &[Condition] = &[
     },
     Condition {
         code: "REPLANNER_READONLY_REASSESSMENT_BARRIER",
-        detail: "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and the rejected trigger is resolved, the chain must contain a new READ_ONLY Task, and every new mutating Task in the proposal must depend on that new READ_ONLY Task",
+        detail: REPLANNER_READONLY_REASSESSMENT_RULE,
     },
     Condition {
         code: "REPLANNER_HOST_REVALIDATION",

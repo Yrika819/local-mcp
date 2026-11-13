@@ -170,6 +170,31 @@ class ReparsePointTests(DisposableBase):
         )
         self.assertFalse((outside / "src" / "main.rs").exists())
 
+    def test_a_deep_nested_symlink_is_refused_and_never_digested(self) -> None:
+        # Re-review R1 (Low): a depth-limited scan accepted a link deeper than the
+        # limit, and the workspace digest then read the link target's bytes.
+        owned = driver.make_fixture(self.base, "deep-link")
+        outside = self.base / "deep-target"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside\n", encoding="utf-8")
+        deep = owned.root / "repo" / "a" / "b" / "c" / "d" / "e"
+        deep.mkdir(parents=True)
+        link = deep / "link.txt"
+        try:
+            os.symlink(outside / "secret.txt", link)
+        except (OSError, NotImplementedError):
+            self.skipTest("this host cannot create file symlinks")
+
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "deep-link")
+
+        digest = driver.workspace_digest(owned.root / "repo")
+        self.assertEqual(
+            digest.get("a/b/c/d/e/link.txt"),
+            "REPARSE_POINT",
+            "the digest must refuse to read through a link, not hash its target",
+        )
+
     def test_a_symlinked_root_is_refused(self) -> None:
         outside = self.base / "outside"
         outside.mkdir()
