@@ -30,7 +30,7 @@ works only in `.local/h53`.
 
 | Phase | Status | Evidence |
 | --- | --- | --- |
-| H5.3-0 driver safety | **DONE** | `docs/campaign/H5_3_0_DRIVER_SAFETY.md`; 22 Python safety tests; CI step added |
+| H5.3-0 driver safety | **DONE** | `docs/campaign/H5_3_0_DRIVER_SAFETY.md`; 30 Python safety tests; CI step added |
 | H5.3-A Replanner contract | **DONE** | published condition + notes example, regenerated artifacts, drift test, 2 new replanner tests |
 | H5.3-B C1 host path (real model) | **PASS** | `docs/campaign/H5_3_EVIDENCE.md` §2 |
 | H5.3-B C2 real-task replan to completion | **PASS** | §3 — `COMPLETED`, 6 model calls |
@@ -39,6 +39,17 @@ works only in `.local/h53`.
 | H5.3-D R2-11 / F5 | **PARTIAL** | §4 below |
 | H5.3-E independent review | **DONE** | 5 rounds, `gpt-6.1-terra` high, 0 Critical / 0 High; H5_3_EVIDENCE.md §8 |
 | H5.3-F CI / integration readiness | see §6 and the PR #57 checks | |
+| **H5.3.1 final review closure** | **DONE** | `docs/campaign/H5_3_1_FINAL_CLOSURE.md`; the Windows half of review finding R1b is fixed and measured; round 6 recorded in `H5_3_EVIDENCE.md` §10 |
+
+### H5.3.1 (integration campaign phase I)
+
+| Item | Result |
+| --- | --- |
+| Reviewer `NOT_READY` at `f74b805` | Answered, not overridden: R1b was still open **on Windows** because `_assert_private_fixture_root` returned early there and `Path.mkdir()` inherited the temporary directory's DACL |
+| Measurement | `%TEMP%` on the campaign host grants `Modify` to two further local SIDs and to `CodexSandboxUsers`; a plain directory created there carries four non-owner write ACEs |
+| Fix | `scripts/h5-d/private_root.py`: root created **with** an owner-only protected descriptor, DACL read back and verified, reused roots verified, owner identity checked, everything unprovable refused |
+| Tests | `test_fixture_safety.py` 30 tests OK, with positive and negative controls |
+| Rust sources | unchanged in H5.3.1 (regression check of the fused HEAD only) |
 
 ## 3. Defects found by real execution and closed in H5.3
 

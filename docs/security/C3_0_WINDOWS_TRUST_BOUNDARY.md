@@ -46,6 +46,26 @@ Host facts verified read-only on this machine (2026-11-09):
   already creates dedicated local users for its own sandboxing. A per-product
   service/worker account is therefore *precedented* on this host, not exotic.
 
+Measured later, during H5.3.1 (2026-11-14, read-only `Get-Acl`):
+
+* the user's `%TEMP%` (`C:\Users\Yuta\AppData\Local\Temp`) grants `Modify`
+  (`0x1301bf`) to two further local SIDs and to a sandbox group
+  (`…-1008` resolves to `CodexSandboxUsers`), in addition to `SYSTEM`,
+  `Administrators` and the owner.
+* consequence for **A2**: another restricted local user can write into any
+  directory this user creates under `%TEMP%` with an *inherited* ACL. That is a
+  live, measured A2 capability on the default temporary directory — it is not a
+  theoretical one.
+* consequence for the **H5.3.1 test harness only**: its fixture root is now
+  created with an explicit owner-only, protected DACL and verified by reading the
+  DACL back, so a fixture root is no longer an A2-writable object
+  (`docs/campaign/H5_3_1_FINAL_CLOSURE.md` §3–§4).
+* consequence for **C3**: none of this changes the verdict. `%TEMP%` is not where
+  grants or the ledger live, and C3 is about the Owner decision surface, which
+  stays in the user session until a Broker exists. It does mean that any future
+  Broker/Worker state placed under `%TEMP%` would inherit the same exposure, and
+  that "per-user temporary directory" must not be used as a security argument.
+
 ## 3. Trust boundary (target shape)
 
 ```

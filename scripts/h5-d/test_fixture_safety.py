@@ -248,6 +248,126 @@ class ProtectedBaseTests(DisposableBase):
             driver.make_fixture(Path.home())
 
 
+class OwnerOnlyRootTests(DisposableBase):
+    """H5.3.1: the root, not just its top entry, must resist another OS user.
+
+    The parent used here is `tempfile.TemporaryDirectory`, i.e. the real OS
+    temporary directory. On the campaign host that parent grants `Modify` to
+    further local principals (measured with `Get-Acl`), which is exactly why the
+    root can no longer rely on inheritance.
+    """
+
+    _WRITE_ALLOWED = {"S-1-5-18", "S-1-5-32-544", "S-1-3-4"}
+
+    def _owner_sid(self) -> str:
+        import private_root as pr  # local import: only needed on Windows
+
+        api = pr._load_windows_api()
+        return pr._current_user_sid(api)
+
+    def test_a_created_root_names_only_the_owner_and_trusted_principals(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows DACL check")
+        fixture = driver.make_fixture(self.base, "owner-only")
+        import private_root as pr
+
+        owner = self._owner_sid()
+        allowed = self._WRITE_ALLOWED | {owner}
+        for row in pr.trustee_report(fixture.root):
+            if row["write_rights"]:
+                self.assertIn(
+                    row["trustee"],
+                    allowed,
+                    f"the root must not be writable by {row['trustee']} ({row['mask']})",
+                )
+            self.assertTrue(row["dacl_protected"], "a root must not inherit ACEs")
+            self.assertEqual(row["owner"], owner)
+
+    def test_the_os_temporary_directory_is_shared_and_the_root_does_not_inherit_it(
+        self,
+    ) -> None:
+        # Positive control for the check above: the parent the harness defaults to
+        # is measurably shared, and none of those trustees appear on the root.
+        import private_root as pr
+
+        parent = Path(tempfile.gettempdir())
+        rows = pr.trustee_report(parent)
+        if os.name == "nt":
+            owner = self._owner_sid()
+            shared = [
+                row
+                for row in rows
+                if row.get("write_rights")
+                and row["trustee"] not in self._WRITE_ALLOWED | {owner}
+            ]
+        else:
+            shared = [rows[0]] if rows[0]["group_or_world_bits"] else []
+        if not shared:
+            self.skipTest("the OS temporary directory is private on this host")
+
+        fixture = driver.make_fixture(self.base, "shared-parent")
+        if os.name != "nt":
+            mode = stat.S_IMODE(fixture.root.lstat().st_mode)
+            self.assertEqual(
+                mode & 0o077, 0, f"the root must be owner-only, got {oct(mode)}"
+            )
+            return
+        root_trustees = {
+            row.get("trustee")
+            for row in pr.trustee_report(fixture.root)
+            if row.get("write_rights")
+        }
+        for row in shared:
+            self.assertNotIn(
+                row.get("trustee"),
+                root_trustees,
+                "the root must not inherit a write ACE from the temporary directory",
+            )
+
+    def test_reusing_a_root_that_became_writable_by_others_is_refused(self) -> None:
+        owned = driver.make_fixture(self.base, "tampered-root")
+        self._make_root_writable_by_everyone(owned.root)
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "tampered-root")
+
+    def test_a_group_writable_root_is_refused_on_posix(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX mode check; Windows uses the DACL")
+        owned = driver.make_fixture(self.base, "group-writable")
+        os.chmod(owned.root, 0o750)
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "group-writable")
+
+    def test_an_owner_only_root_is_accepted_on_every_platform(self) -> None:
+        owned = driver.make_fixture(self.base, "owner-only-reuse")
+        import private_root as pr
+
+        pr.assert_private_root(owned.root)
+        again = driver.make_fixture(self.base, "owner-only-reuse")
+        self.assertEqual(owned.root, again.root)
+
+    def _make_root_writable_by_everyone(self, root: Path) -> None:
+        if os.name == "nt":
+            import subprocess as sp
+
+            completed = sp.run(
+                [
+                    "icacls",
+                    str(root),
+                    "/grant",
+                    "*S-1-1-0:(OI)(CI)(M)",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                self.skipTest(f"icacls is unavailable: {completed.stderr.strip()}")
+            return
+        os.chmod(root, 0o777)
+
+
+
 class AnswerParsingTests(unittest.TestCase):
     def test_the_first_balanced_object_is_extracted(self) -> None:
         answer = driver.extract_answer('prefix {"a": {"b": 1}} suffix {"c": 2}')

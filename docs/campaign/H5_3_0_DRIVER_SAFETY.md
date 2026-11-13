@@ -46,6 +46,7 @@ an unusual path, this was treated as a release blocker rather than a nuisance.
 | Never target the primary repository, a worktree, or the user home | `_assert_disposable_base` refuses a relative base, the home directory, a drive root, any base reached through a reparse point, and any base with a `.git` entry in any ancestor |
 | Evidence per run | `attempts/<n>/evidence.json` and `attempts/<n>/logs/`, with `<n>` monotonically allocated per root |
 | Previous logs and evidence are never overwritten | Because `attempts/<n>` is freshly created per invocation and no file is ever truncated |
+| Only the owner can write inside the root | `private_root.create_owner_only_dir` creates the root **with** an owner-only descriptor (`SYSTEM`, `Administrators`, the creating user) on Windows and `0o700` on POSIX, then reads the DACL back and verifies it; a reused root is verified the same way and refused if it is not provably private. See §7.1 and `docs/campaign/H5_3_1_FINAL_CLOSURE.md` |
 
 ### 2.1 Why "never delete" rather than "delete only what I own"
 
@@ -80,7 +81,7 @@ deliberate driver decision with a recorded reason.
 
 ## 4. Tests that hold the property
 
-`scripts/h5-d/test_fixture_safety.py` — 22 tests, no model, no binary, runs in CI
+`scripts/h5-d/test_fixture_safety.py` — 30 tests, no model, no binary, runs in CI
 (the `quality` job gained a `Run real-model driver safety self-tests` step):
 
 * unique root per run, `state`/`repo` separated, marker written and correct;
@@ -94,7 +95,13 @@ deliberate driver decision with a recorded reason.
 * the answer parser handles nested braces, braces inside strings, escaped quotes
   and two objects in one answer, and classifies every failure mode;
 * redaction masks credential shapes and leaves ordinary text alone;
-* `notes` reach the prompt, and an empty note list is stated explicitly.
+* `notes` reach the prompt, and an empty note list is stated explicitly;
+* H5.3.1: a created root names only the owner, `SYSTEM` and `Administrators` in
+  its write ACEs and does not inherit any ACE of the OS temporary directory;
+  the same temporary directory is *measurably* shared on the campaign host, so
+  the check is not vacuous;
+* H5.3.1: a root that later becomes writable by `Everyone` (Windows) or
+  group/world-writable (POSIX) is refused when it is reused.
 
 Windows job `test (windows-x64)` runs the Rust suite that exercises the same
 publication and recovery code; the Python test above runs on the Linux
@@ -109,6 +116,11 @@ publication and recovery code; the Python test above runs on the Linux
   explicit `--work-dir` on a plain directory. Failing closed is intentional.
 * Retained fixture roots are not garbage-collected. An operator removes them
   deliberately; the driver never will.
+* A root created by an *older* driver version inherits the temporary
+  directory's DACL, so it is no longer reusable: reuse refuses it (fail closed)
+  and the operator starts a new run id. Nothing is deleted.
+
+
 
 ## 6. Residual: harness TOCTOU (documented, not defended)
 
@@ -117,12 +129,15 @@ separate filesystem operations, so a process that can create entries inside an
 *owned* fixture root between the two could still win the race. This is recorded
 rather than defended, for a specific reason:
 
-* the fixture root is created with owner-only permissions on POSIX (`0o700`) and
-  a reused root that is group- or world-accessible is refused, so another user
-  cannot create entries in it at all. Where the root is nevertheless writable by
-  a second user (a deliberately shared parent with permissive ACLs), the residual
-  is the C3/R-1 same-user/shared-directory boundary that this program does not
-  solve;
+* H5.3 claimed that the root was owner-only, but that was only true on POSIX:
+  `_assert_private_fixture_root` returned early on Windows and `Path.mkdir()`
+  inherited the parent DACL. H5.3.1 corrected this — the root is now created
+  with an owner-only descriptor on both platforms and verified by reading the
+  DACL/mode back (§7.1) — so **another OS user can no longer create entries in a
+  fixture root**, and the race is out of reach for that attacker. What remains is
+  a process running as the *same* OS user (or as an administrator), which is the
+  C3/R-1 boundary this program does not solve; the fixture-root DACL is not a
+  defence against the account that owns it.
 * what the scan does guarantee is the property that mattered: an operator cannot
   point the harness at a root that *already* redirects somewhere else. The scan
   runs before the ownership marker is read, so a marker reachable through a hard
@@ -131,3 +146,39 @@ rather than defended, for a specific reason:
 Making the check atomic would require opening every file with
 `O_NOFOLLOW`-equivalent semantics and keeping the descriptors, which is not
 portable to Windows for directories. Recording the limit is the honest option.
+
+## 7. H5.3.1 — the root is private on Windows too
+
+### 7.1 What changed
+
+| Before (H5.3) | After (H5.3.1) |
+| --- | --- |
+| `root.mkdir()` — inherits the parent DACL on Windows | `private_root.create_owner_only_dir()` — `CreateDirectoryW` with an owner-only, *protected* security descriptor, so the descriptor is in place at creation and there is no hardening window |
+| `_assert_private_fixture_root` returned immediately on Windows | The DACL is read back (`GetNamedSecurityInfoW` + `GetAce`), and any write ACE for a trustee outside `{owner, SYSTEM, Administrators, OWNER RIGHTS}` refuses the root |
+| Ownership of the root was never checked | The descriptor's owner must be the running user, otherwise the root is refused |
+| Only the root itself was checked | The marker, `state/`, `state/sessions/`, `repo/` and the seeded files are verified after creation, so inheritance is proven to have carried the descriptor down |
+| Verification could not be exercised negatively | `test_fixture_safety.py` gains a positive control (the OS temporary directory *is* shared on the campaign host) and a negative control (`icacls … *S-1-1-0:(M)` on a created root is refused on reuse) |
+
+Everything is fail-closed: an unreadable descriptor, a `NULL` DACL, a
+non-protected root DACL, an object/callback ACE, an unmodelled ACE type, an
+unexpected trustee or a different owner is a *refusal*, never a warning. No ACL
+outside the root the harness just created is modified.
+
+### 7.2 Measured on the campaign host (2026-11-14)
+
+```
+%TEMP%  D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)
+        (A;OICI;0x1301bf;;;S-1-5-21-...-1002)
+        (A;OICI;0x1301bf;;;S-1-5-21-...-1008) -> <host>\CodexSandboxUsers
+        (A;OICI;0x1301bf;;;S-1-5-21-...)
+        (A;OICI;FA;;;S-1-5-21-...-1001)       -> the owner
+
+plain mkdir under %TEMP%   7 ACEs, four non-owner write ACEs (Modify)
+root created by H5.3.1     3 ACEs: SYSTEM, Administrators, the owner; protected
+state/, marker             inherited from the root: the same three
+```
+
+So the H5.3 assumption "`%TEMP%` is already per-user" was false on real
+hardware: a plain directory there is writable by another local account and by a
+sandbox group. The evidence is reproduced by
+`test_the_os_temporary_directory_is_shared_and_the_root_does_not_inherit_it`.

@@ -46,6 +46,10 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import private_root  # noqa: E402  (H5.3.1 owner-only root creation)
+
 
 # ---------------------------------------------------------------------------
 # MCP transport
@@ -210,19 +214,20 @@ def _assert_private_fixture_root(root: Path) -> None:
 
     Review round 5 (R1b): a group- or world-writable root lets another user
     replace a fixture file with a link between the hazard scan and the write, and
-    the harness would then write with the operator's authority. Windows `%TEMP%`
-    is already per-user, so this is a POSIX check; a root that fails it is
-    refused rather than silently chmod-ed, because changing another directory's
-    permissions is not this harness's decision.
+    the harness would then write with the operator's authority. H5.3 answered
+    this on POSIX only and returned early on Windows, because `%TEMP%` was
+    assumed to be per-user. H5.3.1 measured the campaign host and found the
+    assumption false (another local SID and a sandbox group hold `Modify` on
+    `%TEMP%`), so Windows is now checked too: the whole DACL is read and any
+    writer outside the owner, SYSTEM and Administrators refuses the root.
+
+    A root that fails the check is refused rather than repaired, because
+    changing another directory's permissions is not this harness's decision.
     """
-    if os.name == "nt":
-        return
-    mode = stat.S_IMODE(root.lstat().st_mode)
-    if mode & 0o077:
-        raise FixtureSafetyError(
-            f"{root} is group- or world-accessible (mode {oct(mode)}); "
-            "a shared fixture root cannot be proven private, so it is refused"
-        )
+    try:
+        private_root.assert_private_root(root)
+    except private_root.PrivateRootError as error:
+        raise FixtureSafetyError(str(error)) from error
 
 
 def _write_marker(root: Path, run_id: str) -> None:
@@ -374,9 +379,13 @@ def make_fixture(
         _assert_private_fixture_root(root)
         _claim_existing_root(root, run_id)
     else:
-        root.mkdir()
-        if os.name != "nt":
-            os.chmod(root, 0o700)
+        # Created *with* an owner-only descriptor, not created and then hardened:
+        # there is no window in which the inherited, possibly shared parent ACL
+        # applies. A failure to apply or verify it refuses the root (fail closed).
+        try:
+            private_root.create_owner_only_dir(root)
+        except private_root.PrivateRootError as error:
+            raise FixtureSafetyError(str(error)) from error
         _write_marker(root, run_id)
 
     if _reparse_components(root, base):
@@ -404,6 +413,24 @@ def make_fixture(
     (repo / "data" / "inventory.txt").write_text(
         "widgets=42\ngadgets=7\nspares=0\n", encoding="utf-8"
     )
+    # H5.3.1: the guarantee is about the *contents* of the root, not just its top
+    # entry, so the inheritance that carries the owner-only DACL down is verified
+    # on the entries this harness created. If the parent ACL somehow re-appeared
+    # on a child, the run stops here rather than writing a model-controlled file
+    # into it.
+    for created in (
+        root / FIXTURE_MARKER_NAME,
+        state,
+        state / "sessions",
+        repo,
+        repo / "src" / "main.rs",
+        repo / "data" / "inventory.txt",
+    ):
+        try:
+            private_root.assert_private_entry(created)
+        except private_root.PrivateRootError as error:
+            raise FixtureSafetyError(str(error)) from error
+
     session_id = f"h5d-{uuid.uuid4()}"
     record = {
         "id": session_id,
