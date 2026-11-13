@@ -150,6 +150,26 @@ class ReparsePointTests(DisposableBase):
         except (OSError, NotImplementedError):
             return False
 
+    def test_an_owned_root_containing_a_nested_symlink_is_refused(self) -> None:
+        # Independent review R1 (Medium): reuse validated the root and marker but
+        # not its descendants, so an owned root whose `repo` was a junction would
+        # have redirected the fixture writes outside the root.
+        owned = driver.make_fixture(self.base, "nested-link")
+        outside = self.base / "nested-target"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
+        link = owned.root / "linked"
+        if not self._make_link(outside, link):
+            self.skipTest("this host cannot create directory symlinks")
+
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "nested-link")
+
+        self.assertEqual(
+            (outside / "keep.txt").read_text(encoding="utf-8"), "keep\n"
+        )
+        self.assertFalse((outside / "src" / "main.rs").exists())
+
     def test_a_symlinked_root_is_refused(self) -> None:
         outside = self.base / "outside"
         outside.mkdir()

@@ -232,11 +232,15 @@
         },
         {
           "code": "REPLANNER_RESOLVE_REQUIRES_NEW_DEPENDENCY",
-          "detail": "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal whose `dependency` is the new repair Task; the blocked Task depends on the repair Task, and a resolution without that committed new hard dependency is refused as REPLANNER_SCHEMA_VIOLATION"
+          "detail": "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal, so the blocked Task gains a new hard dependency; the `dependency` is that Task's new prerequisite, which is normally a repair Task added by this same proposal (`ref_kind` `NEW`), and an existing Task (`ref_kind` `EXISTING`) is also accepted; a resolution without such an edge is refused as REPLANNER_SCHEMA_VIOLATION"
         },
         {
           "code": "REPLANNER_EXCLUSIVE_PRIMITIVES",
           "detail": "pristine_plan_supersession and replace_tasks may not be combined with the additive fields, with each other, or with a scope wider than the Task being replaced"
+        },
+        {
+          "code": "REPLANNER_READONLY_REASSESSMENT_BARRIER",
+          "detail": "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and the rejected trigger is resolved, the chain must contain a new READ_ONLY Task, and every new mutating Task in the proposal must depend on that new READ_ONLY Task"
         },
         {
           "code": "REPLANNER_HOST_REVALIDATION",

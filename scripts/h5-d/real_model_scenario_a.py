@@ -245,6 +245,31 @@ def _claim_existing_root(root: Path, run_id: str) -> None:
         )
 
 
+def _existing_reparse_points(root: Path, max_depth: int = 4) -> list[Path]:
+    """Every reparse point already inside `root`, without following any of them.
+
+    Reuse must not be a way to smuggle a junction in: an owned root whose
+    `repo/src` is a link would otherwise redirect the fixture writes outside the
+    root even though the root itself is legitimate.
+    """
+    flagged: list[Path] = []
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        path, depth = stack.pop()
+        if depth >= max_depth:
+            continue
+        try:
+            entries = list(path.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if _is_reparse_point(entry):
+                flagged.append(entry)
+            elif entry.is_dir():
+                stack.append((entry, depth + 1))
+    return flagged
+
+
 def _next_attempt_dir(root: Path) -> Path:
     """A per-run, never-reused directory for logs and evidence."""
     attempts = root / "attempts"
@@ -289,6 +314,12 @@ def make_fixture(
 
     if _reparse_components(root, base):
         raise FixtureSafetyError(f"{root} is reached through a reparse point")
+    nested = _existing_reparse_points(root)
+    if nested:
+        raise FixtureSafetyError(
+            f"{root} already contains reparse points, so fixture writes could escape "
+            f"it: {[str(path) for path in nested]}"
+        )
     if base.resolve() not in root.resolve().parents:
         raise FixtureSafetyError(f"{root} escapes the disposable base {base}")
 

@@ -1351,4 +1351,29 @@ fn the_published_replanner_contract_states_the_needs_replan_dependency_requireme
         fragment["resolve_needs_replan"][0], edge["task"]["task_id"],
         "the resolved Task must be the edge target, not the edge dependency"
     );
+
+    // The published rule must not claim more than the validator enforces: the
+    // validator only requires the resolved Task to be an edge *target*, so the
+    // prerequisite may be a NEW repair Task or an EXISTING Task. Publishing the
+    // stricter claim would be the same drift in the other direction.
+    assert!(
+        condition.detail.contains("task") && condition.detail.contains("dependency"),
+        "the rule must name both ends of the edge: {}",
+        condition.detail
+    );
+    assert!(
+        condition.detail.contains("EXISTING") && condition.detail.contains("NEW"),
+        "the rule must state that both prerequisite kinds are accepted: {}",
+        condition.detail
+    );
+
+    // The conditional readonly-reassessment barrier is published too, so a model
+    // that resolves a rejected pristine plan is told what else is required.
+    let barrier = replanner
+        .conditions
+        .iter()
+        .find(|condition| condition.code == "REPLANNER_READONLY_REASSESSMENT_BARRIER")
+        .expect("the conditional reassessment barrier must be published");
+    assert!(barrier.detail.contains("REQUIRE_READONLY_REASSESSMENT"));
+    assert!(barrier.detail.contains("READ_ONLY"));
 }
