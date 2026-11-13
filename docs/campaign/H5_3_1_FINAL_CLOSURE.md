@@ -265,6 +265,22 @@ of the fused HEAD, not a new-code check.
 
 ## 9. Independent review of this HEAD
 
-Recorded in `H5_3_EVIDENCE.md` §10 (round 6) with the model id, reasoning
-setting, reviewed SHA, scope, findings by severity and the reviewer's verdict.
-The implementer's opinion of its own work is not a verdict.
+Recorded in `H5_3_EVIDENCE.md` §10 with the model id, reasoning setting, reviewed
+SHA, scope, findings by severity and the reviewer's verdict for every round.
+
+| Round | Target | Verdict | High | Medium | Low |
+| --- | --- | --- | --- | --- | --- |
+| 6 | `e6c7ec3` | `NOT_READY` | 3 | 2 | 1 |
+| 7 | `f401b51` | `NOT_READY` | 4 | 1 | 0 |
+| 8 | `3ac0948` | `NOT_READY` | 2 | 1 | 0 |
+| 9 | `1c9d7a7` | `NOT_READY` | 1 | 2 | 1 |
+| 10 | `568db3c` | `NOT_READY` | 1 | 3 | 1 |
+| 11 | `ffa38b2` | `NOT_READY` | 1 | 3 | 1 |
+| 12 | `450e80f` | **`READY`** | 0 | 1 (non-blocking) | 1 (non-blocking) |
+| 13 | `cf66941` | **`READY`** | 0 | 0 | 0 |
+
+The reviewer's verdict was never overridden: rounds 6–11 were remediated, not
+argued with, and two of the findings were regressions introduced by the
+remediation itself (the POSIX creation path in rounds 7 and 8). The implementer's
+opinion of its own work is not a verdict, and no earlier `NOT_READY` was
+reclassified as `READY` without a new review of a new commit.

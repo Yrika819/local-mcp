@@ -387,4 +387,37 @@ Reviewer's declared `NOT VERIFIED` for round 9: same list, plus it did not execu
 | 4 | Medium | No regression test for `NO_PROPAGATE_INHERIT`, and no control proving verification happens before seeding | Fixed: both added |
 | 5 | Low | The digest help and two document statements still overstated the checks | Fixed |
 
-### Round 12 — final HEAD — recorded below in §10.1
+### Round 12 — `450e80f` (round-11 remediation) — verdict `READY`
+
+| Item | Value |
+| --- | --- |
+| Findings | **0 Critical / 0 High**; 1 Medium (the run lease was released by a destructor, not deterministically) and 1 Low (the home-base rule differs from the H5.3-0 wording) |
+| Reviewer's own calibration | both recorded as **not blocking** Owner review of a test-only harness |
+| Reviewer's NOT VERIFIED | did not run tests, the harness, a model or a binary; no cross-user attack; no live descriptor inspection; no filesystem/configuration variation |
+
+Both non-blocking findings were nevertheless fixed (`cf66941`), because a
+deterministic lease release is a three-line change and the home rule needed to be
+stated rather than implied.
+
+### Round 13 — `cf66941` (final HEAD of this phase) — verdict `READY`, findings `none`
+
+| Item | Value |
+| --- | --- |
+| Model | `gpt-6.1-terra` (explicit `-m`), reasoning `high` |
+| Target | detached worktree `.local/int-h531-review8` at `cf66941`, `--sandbox workspace-write` in that copy only |
+| Modification check | `git status --short` empty afterwards; every review worktree in this phase ended with `dirty_files=0` |
+| Findings | **none** (0 Critical / 0 High / 0 Medium / 0 Low) |
+| Reviewer's residual risk | path checks and writes remain separate operations, so the same OS user, an administrator or another trusted principal can still race the fixture; **C3/R-1 remains open**; the Owner must decide whether that boundary and the deliberate home-base rule are acceptable for test-only evidence runs |
+
+The reviewer's declared limits (rounds 6–13, unchanged in substance): it never ran
+the tests or the harness, never executed a cross-user attack, never inspected a
+live Security Descriptor, never reproduced the Windows measurements, and never
+verified a non-default filesystem, redirected profile or domain configuration. All
+of those remain `NOT_VERIFIED` for this phase; the implementation-side evidence for
+them is §3 of `H5_3_1_FINAL_CLOSURE.md` and the test suite it names.
+
+### Reviewed code versus final branch HEAD
+
+The code reviewed in round 13 is `cf66941`. The commits after it are documentation
+only (this record and the checkpoint), and `git diff --stat cf66941..<head>` lists
+nothing outside `docs/`.
