@@ -747,8 +747,15 @@ def verify_private_tree(root: Path) -> list[str]:
                 raise PrivateRootError(f"{entry} is a symbolic link; refused")
             if stat.S_ISDIR(info.st_mode):
                 if _windows_only():
+                    # A directory is a *propagation point*: files created inside it
+                    # later inherit from it, not from the root. Its write ACEs must
+                    # therefore be inheritable too, or a new file could fall back to
+                    # the environment's default DACL (round 11, High).
                     _windows_assert(
-                        entry, _load_windows_api(), require_protected_dacl=False
+                        entry,
+                        _load_windows_api(),
+                        require_protected_dacl=False,
+                        require_inheritable_writers=True,
                     )
                 else:
                     _posix_assert(entry, expect_directory=True)
@@ -893,6 +900,12 @@ class RunLease:
     def __init__(self, path: Path, handle: int):
         self.path = path
         self._handle: int | None = handle
+
+    def __del__(self) -> None:  # pragma: no cover - backstop
+        try:
+            self.release()
+        except Exception:  # noqa: BLE001 - a destructor must never raise
+            pass
 
     def release(self) -> None:
         if self._handle is None:

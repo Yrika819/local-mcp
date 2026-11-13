@@ -47,7 +47,7 @@ assumption is false. So R1b was still open on Windows, and the reviewer's
 | 7 | TOCTOU | Scan and write are separate operations; documented as a residual, classified wholesale as C3/R-1 | Re-classified by attacker (§4). With the root now owner-only, **another OS user cannot create the racing entry at all**; what remains is genuinely the same-user (A1) and administrator (A3) boundary |
 | 8 | Windows ACL | Not checked | Full DACL read (`GetNamedSecurityInfoW` + `GetAce`); write ACEs outside `{owner, SYSTEM, Administrators, OWNER RIGHTS}` refuse the root; the owner must be the running user; a root's write ACEs must carry `OI\|CI` so children inherit them; `NULL`/absent DACL, object/callback ACEs and unmodelled ACE types are refusals. `verify_private_tree` then walks every entry |
 | 9 | POSIX permission | Mode only (`& 0o077`) | Mode **and** owner uid; creation is atomic (`mkdir(0o700)`, not `mkdir()`+`chmod()`); directories require owner `rwx`, regular files only "no group/world bits" |
-| 10 | Workspace / state separation | `root/state` and `root/repo`, separate session record | Unchanged; both are now verified to carry the owner-only DACL by inheritance |
+| 10 | Workspace / state separation | `root/state` and `root/repo`, separate session record | Unchanged; both are verified to grant write access only to the owner and trusted principals (the property, not the inheritance mechanism) |
 | 11 | Model prompt / evidence record | `attempts/<n>/logs/step-*.txt`, `evidence.json`, prompt bytes, redaction | Unchanged |
 | 12 | Test-grant isolation | `test-grant` compiled only under the non-default `test-grant-fixture` feature; issuance refuses an unmarked state root; `resolve_grant` independently refuses a `TEST_FIXTURE_V1` grant whose fixture id does not match a marker in the running state root | Unchanged — audited and confirmed, see §6 |
 | 13 | Writes outside the fixture | "Create only, never delete": no deletion primitive exists in the driver (source-grep test); `_assert_disposable_base` refuses a relative base, the home directory, a drive root, a reparse-pointed base, and any base inside a Git work tree | The lexical checks and the re-entry check of the **parent chain** run before anything is created, only the last missing component is created, and every location-dependent check (home, drive root, shell folder, reparse point, Git work tree, re-entry) is applied again to the **canonical** path. A refused base can still be left behind empty by the `mkdir` that follows a *passing* parent check, and that is stated rather than hidden |
@@ -143,12 +143,22 @@ was not enough, in three ways that are now closed:
 
 | Round-6 finding | Severity | Disposition |
 | --- | --- | --- |
-| A writable parent still permits cross-user replacement of the **root entry** | High | `private_root.assert_parent_cannot_reenter`: a base is refused when an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` on it (Windows) or when it is group/other-writable and not sticky (POSIX). `Modify` on the parent is not enough to move a protected *child*, but it does contain `DELETE` on the parent itself (see §4.3), which is why the base must be private all the way up |
+| A writable parent still permits cross-user replacement of the **root entry** | High | `private_root.assert_path_cannot_reenter`: every component of the path is refused when an untrusted trustee holds `FILE_DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`/`GENERIC_ALL` on it (Windows) or when it is group/other-writable and not sticky (POSIX). `Modify` on the parent is not enough to move a protected *child*, but it does contain `DELETE` on the parent itself (see §4.3), which is why the base must be private all the way up |
 | Accepted roots need not **propagate** their protection to children | High | The root check now requires every write ACE to carry `OI|CI` (Windows), and `verify_private_tree` walks and verifies **every** entry after creation and on reuse instead of a hand-picked sample |
 | POSIX creation **failed** on ordinary seeded files | High | `_posix_assert` required `0o700` of regular files, so the marker (0644/0600) could never pass. Files are now checked only for owner and for no group/world bits; directories keep the `0o700` requirement. This was a real regression introduced by the first fix |
 | Base validation created directories before refusing, and resolved before checking links | Medium | `_refuse_unsafe_base_path` runs on the supplied path first; only the last missing component is created, and a missing intermediate directory is refused |
 | The checkpoint claimed a per-call no-write proof that did not exist | Medium | The digest is now taken around **each** model call and recorded per call; the evidence still says "digest comparison", never "OS-enforced read-only isolation" |
 | The closure record cited a review section that did not exist yet | Low | `H5_3_EVIDENCE.md` §10 now carries round 6 verbatim with its dispositions |
+
+### 4.5 What round 11 changed
+
+| Round-11 finding | Severity | Disposition |
+| --- | --- | --- |
+| A **child directory** passed the tree check with a non-inheritable owner ACE, so a file created inside it later could receive the environment's default DACL | High | Every directory in the tree must carry inheritable write ACEs (and no `NO_PROPAGATE_INHERIT`); a directory is a propagation point, not just an entry |
+| A failed setup leaked the exclusive run lease until process exit | Medium | `make_fixture` releases the lease when anything after it fails, and the lease has a destructor backstop |
+| The POSIX sticky-directory control created a fixture with a fixed run id under the shared temporary directory, which could adopt and rewrite a directory the test did not create | Medium | The control asserts `assert_path_cannot_reenter` directly instead of creating anything |
+| No regression test covered `NO_PROPAGATE_INHERIT`, and nothing proved the skeleton is verified before seeding | Medium | Both added: an `OI|CI|NP` owner ACE is refused, and a refused reuse leaves the previously seeded file byte-identical |
+| The digest help and two document statements still claimed more than the checks show | Low | Corrected: the digest covers regular-file bytes only, and the property is stated instead of the mechanism |
 
 ### 4.4 What round 10 changed
 

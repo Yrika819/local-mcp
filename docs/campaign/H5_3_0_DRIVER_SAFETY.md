@@ -82,7 +82,7 @@ deliberate driver decision with a recorded reason.
 
 ## 4. Tests that hold the property
 
-`scripts/h5-d/test_fixture_safety.py` — 41 tests, no model, no binary, runs in CI
+`scripts/h5-d/test_fixture_safety.py` — 43 tests, no model, no binary, runs in CI
 (the `quality` job gained a `Run real-model driver safety self-tests` step):
 
 * unique root per run, `state`/`repo` separated, marker written and correct;

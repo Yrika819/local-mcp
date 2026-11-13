@@ -352,12 +352,12 @@ class OwnerOnlyRootTests(DisposableBase):
             with self.assertRaises(driver.FixtureSafetyError):
                 driver.make_fixture(parent, "shared-temp")
         else:
-            # A sticky, root-owned /tmp only lets the entry owner (and root)
-            # remove an entry, so it stays an acceptable base on POSIX.
-            fixture = driver.make_fixture(parent, "shared-temp")
-            self.assertEqual(
-                stat.S_IMODE(fixture.root.lstat().st_mode) & 0o077, 0
-            )
+            # A sticky, root-owned /tmp only lets the entry owner (and root) remove
+            # an entry, so it stays an acceptable base on POSIX. The check is
+            # asserted directly: creating a fixture under the shared temporary
+            # directory would adopt or rewrite a directory this test did not create
+            # (round 11, Medium).
+            pr.assert_path_cannot_reenter(parent)
 
         fixture = driver.make_fixture(self.base, "shared-parent")
         if os.name != "nt":
@@ -535,6 +535,62 @@ class OwnerOnlyRootTests(DisposableBase):
             pr.assert_private_root(fixture.root)
         with self.assertRaises(driver.FixtureSafetyError):
             driver.make_fixture(self.base, "non-inheritable")
+
+    def test_a_root_ace_that_stops_inheriting_is_refused(self) -> None:
+        # Round 11: OI|CI plus NO_PROPAGATE_INHERIT stops after one generation, so a
+        # grandchild would fall back to the environment's default DACL.
+        if os.name != "nt":
+            self.skipTest("Windows inheritance flags")
+        import subprocess as sp
+
+        import private_root as pr
+
+        parent = self.base / "no-propagate-parent"
+        parent.mkdir()
+        root = parent / "root"
+        root.mkdir()
+        owner = self._owner_sid()
+        for arguments in (
+            ["/inheritance:r"],
+            ["/grant:r", f"*{owner}:(OI)(CI)(NP)(F)"],
+            ["/grant", "*S-1-5-18:(OI)(CI)(F)"],
+            ["/grant", "*S-1-5-32-544:(OI)(CI)(F)"],
+        ):
+            completed = sp.run(
+                ["icacls", str(root), *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                self.skipTest(f"icacls is unavailable: {completed.stderr.strip()}")
+        with self.assertRaises(pr.PrivateRootError):
+            pr.assert_private_root(root)
+
+    def test_a_bad_skeleton_is_refused_before_any_seeded_file_is_rewritten(self) -> None:
+        # Round 11: verification must happen before seeding, so a refused reuse
+        # cannot truncate or rewrite the previous run's workspace.
+        fixture = driver.make_fixture(self.base, "skeleton-order")
+        fixture.release()
+        seeded = fixture.workspace / "src" / "main.rs"
+        before = seeded.read_text(encoding="utf-8")
+        if os.name == "nt":
+            import subprocess as sp
+
+            owner = self._owner_sid()
+            completed = sp.run(
+                ["icacls", str(fixture.workspace / "src"), "/grant:r", f"*{owner}:(F)"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                self.skipTest(f"icacls is unavailable: {completed.stderr.strip()}")
+        else:
+            os.chmod(fixture.workspace / "src", 0o755)
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(self.base, "skeleton-order")
+        self.assertEqual(seeded.read_text(encoding="utf-8"), before)
 
     def test_a_child_that_became_writable_by_others_is_refused(self) -> None:
         # Review round 6 (High): a child's DACL can diverge from the root's, so the

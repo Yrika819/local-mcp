@@ -547,6 +547,19 @@ def make_fixture(
     except private_root.PrivateRootError as error:
         raise FixtureSafetyError(str(error)) from error
 
+    try:
+        return _seed_fixture(root, base, run_id, lease)
+    except BaseException:
+        # A failed setup must not keep the root leased until process exit, or the
+        # same run id could never be retried (round 11, Medium).
+        lease.release()
+        raise
+
+
+def _seed_fixture(
+    root: Path, base: Path, run_id: str, lease: object
+) -> "Fixture":
+    """Create the fixture contents inside an already leased root."""
     state = root / "state"
     repo = root / "repo"
     for path in (state, repo, state / "sessions", repo / "src", repo / "data"):
@@ -1122,9 +1135,12 @@ def main() -> int:
             "makes the workspace unreadable to the model (see "
             "docs/campaign/H5_3_EVIDENCE.md); 'workspace-write' is an explicit, "
             "recorded deviation and every read-only call is followed by a "
-            "workspace-digest comparison. A matching digest shows the workspace ended "
-            "where it started; it does not prove the model wrote nothing, because a "
-            "write followed by a restore leaves the same digest."
+            "workspace-digest comparison. The digest covers the bytes of every regular "
+            "file; it does not record empty directories, directory reparse points, "
+            "permissions or metadata, and it uses sentinel values for unreadable and "
+            "multiply linked files. A matching digest therefore does not prove the "
+            "model wrote nothing - a write followed by a restore leaves the same "
+            "digest."
         ),
     )
     return drive(parser.parse_args())

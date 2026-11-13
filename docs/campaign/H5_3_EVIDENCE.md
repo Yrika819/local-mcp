@@ -377,4 +377,14 @@ Reviewer's declared `NOT VERIFIED` for round 9: same list, plus it did not execu
 | 4 | Medium | A POSIX-only test called a removed function | Fixed |
 | 5 | Low | Documents and CLI help overstated the digest and per-entry checks | Fixed |
 
-### Round 11 — final HEAD — recorded below in §10.1
+### Round 11 — `ffa38b2` (round-10 remediation) — verdict `NOT_READY`
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 1 | **High** | A child *directory* passed the tree check with a non-inheritable owner ACE, so a file created inside it later could receive the default DACL | Fixed: every directory in the tree must carry inheritable write ACEs and no `NO_PROPAGATE_INHERIT` |
+| 2 | Medium | A failed setup leaked the exclusive run lease until process exit | Fixed: released on failure, with a destructor backstop |
+| 3 | Medium | The POSIX sticky control created a fixed-id fixture under the shared temporary directory and could adopt/rewrite a directory it did not create | Fixed: the control asserts the check directly |
+| 4 | Medium | No regression test for `NO_PROPAGATE_INHERIT`, and no control proving verification happens before seeding | Fixed: both added |
+| 5 | Low | The digest help and two document statements still overstated the checks | Fixed |
+
+### Round 12 — final HEAD — recorded below in §10.1
