@@ -40,12 +40,25 @@ TEST_FIXTURE_ROOT = Path.home() / ".goallatch-h5d-test-fixtures"
 
 class DisposableBase(unittest.TestCase):
     def setUp(self) -> None:
-        TEST_FIXTURE_ROOT.mkdir(mode=0o700, exist_ok=True)
+        # Round 9 (Medium): the tests must not change the mode of a path that
+        # might already exist, and must not follow a link. The shared root is
+        # created once, then *verified*; if it is not private the test fails
+        # instead of repairing something that is not this suite's to repair.
+        root = TEST_FIXTURE_ROOT
+        if root.is_symlink():
+            self.fail(f"{root} is a symbolic link; refusing to use it")
+        if not root.exists():
+            root.mkdir(mode=0o700)
+        info = root.lstat()
         if os.name != "nt":
-            os.chmod(TEST_FIXTURE_ROOT, 0o700)
-        self.base = TEST_FIXTURE_ROOT / (
-            self._testMethodName + "-" + uuid.uuid4().hex[:8]
-        )
+            if info.st_uid != os.geteuid():
+                self.fail(f"{root} is owned by uid {info.st_uid}, not by this user")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                self.fail(
+                    f"{root} is group/world accessible; refusing to change an "
+                    "existing directory's mode"
+                )
+        self.base = root / (self._testMethodName + "-" + uuid.uuid4().hex[:8])
         self.base.mkdir()
 
     def tearDown(self) -> None:
@@ -418,6 +431,23 @@ class OwnerOnlyRootTests(DisposableBase):
                 self.skipTest(f"icacls is unavailable: {completed.stderr.strip()}")
         with self.assertRaises(pr.PrivateRootError):
             pr.assert_private_root(root)
+
+    def test_a_path_that_resolves_to_the_home_is_refused(self) -> None:
+        # Round 9 (High): a lexical path such as `<home>/x/..` passes a textual
+        # home check and then resolves to the home itself, so the resolved location
+        # is judged too.
+        sneaky = TEST_FIXTURE_ROOT / ".."
+        with self.assertRaises(driver.FixtureSafetyError):
+            driver.make_fixture(sneaky, "resolve-to-home")
+
+    def test_an_attempt_directory_is_never_shared(self) -> None:
+        # Round 9 (Medium): two runs reusing one root must not land in the same
+        # attempt directory and interleave their evidence.
+        import private_root as pr
+
+        fixture = driver.make_fixture(self.base, "attempt-exclusive")
+        with self.assertRaises(FileExistsError):
+            pr.create_private_dir_exclusive(fixture.attempt_dir)
 
     def test_no_fixture_base_is_offered_by_default(self) -> None:
         # The OS temporary directory is not an implicit default any more: on a

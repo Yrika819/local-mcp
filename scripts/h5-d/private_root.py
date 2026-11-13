@@ -61,6 +61,7 @@ __all__ = [
     "assert_path_cannot_reenter",
     "restrict_file",
     "create_private_dir",
+    "create_private_dir_exclusive",
     "trustee_report",
     "support_class",
 ]
@@ -878,6 +879,20 @@ def create_private_dir(path: Path) -> None:
         return
     # An existing directory is one this harness created on an earlier attempt of
     # the same owned root, so tightening it is still its own decision.
+    os.chmod(path, POSIX_OWNER_ONLY_MODE)
+    _posix_assert(path, expect_directory=True)
+
+
+def create_private_dir_exclusive(path: Path) -> None:
+    """Create a directory that must not exist yet, owner-only.
+
+    Raises `FileExistsError` when something is already there, so a caller that
+    allocates numbered directories can move to the next number instead of sharing.
+    """
+    os.mkdir(path)
+    if _windows_only():
+        _windows_assert(path, _load_windows_api(), require_protected_dacl=False)
+        return
     os.chmod(path, POSIX_OWNER_ONLY_MODE)
     _posix_assert(path, expect_directory=True)
 

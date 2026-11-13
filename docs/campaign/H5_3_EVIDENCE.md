@@ -356,4 +356,15 @@ model.
 
 Reviewer's declared `NOT VERIFIED` for round 8: same list as round 7.
 
-### Round 9 — final HEAD — recorded below in §10.1
+### Round 9 — `1c9d7a7` (round-8 remediation) — verdict `NOT_READY`
+
+| # | Severity | Finding | Disposition |
+| --- | --- | --- | --- |
+| 1 | **High** | A lexical path such as `<home>/x/..` passed the textual home check and then resolved to the home itself; only the reparse and Git checks were repeated on the canonical path | Fixed: every location-dependent check (home, drive root, shell folder, reparse point, Git work tree, re-entry) is applied again to the resolved path, and the parent chain's re-entry check runs before the base is created |
+| 2 | Medium | `create_private_dir` accepting an existing directory let two concurrent runs compute the same attempt number and interleave their evidence | Fixed: attempt directories are created exclusively; a collision takes the next number and running out refuses the run |
+| 3 | Medium | The test setup called `chmod` on a predictable path that could already exist and be a link | Fixed: the shared test root is verified (not a link, owned by the user, no group/world bits) and the suite fails rather than repairing it |
+| 4 | Low | Two documents claimed more than the code does: "checked before anything is created" and "inheritance is proven" | Fixed: the record states the order that is actually implemented and says the per-entry check proves the property, not the mechanism |
+
+Reviewer's declared `NOT VERIFIED` for round 9: same list, plus it did not execute the concurrent-attempt race or the path-bypass examples.
+
+### Round 10 — final HEAD — recorded below in §10.1

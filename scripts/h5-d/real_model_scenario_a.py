@@ -236,15 +236,28 @@ def _existing_ancestors(path: Path) -> list[Path]:
     return ancestors
 
 
+def _reentry(base: Path) -> None:
+    try:
+        private_root.assert_path_cannot_reenter(base)
+    except private_root.PrivateRootError as error:
+        raise FixtureSafetyError(str(error)) from error
+
+
 def _assert_disposable_base(base: Path) -> Path:
     """Canonicalise the fixture base and refuse anything that is not disposable.
 
-    Refused: the user's home, a drive root, anything inside a Git work tree, any
-    reparse-pointed segment, and any base whose other principals can rename or
-    delete a child entry. The base may be created, but only when it is missing
-    *and* every existing ancestor and the base itself already passed the checks;
-    a missing intermediate directory is refused rather than created (fail closed,
-    and nothing is written outside the fixture).
+    Refused: the user's home, a drive root, a shell folder, anything inside a Git
+    work tree, any reparse-pointed segment, and any component of the path that a
+    stranger could write, rename or delete.
+
+    The order is deliberate. Every lexical check and the re-entry check of the
+    *parent* chain run before anything is created, so a refused base is not
+    created first. Only the last component may be missing (a missing intermediate
+    directory is refused rather than built). After creation, every check that
+    depends on the real location - home, drive root, shell folder, reparse point,
+    Git work tree, re-entry - is applied again to the canonical path, because a
+    lexical path such as `<home>/x/..` passes a textual home check and then
+    resolves to the home itself.
     """
     base = base.parent if base.name in ("", base.anchor) else base
     _refuse_unsafe_base_path(base)
@@ -255,22 +268,25 @@ def _assert_disposable_base(base: Path) -> Path:
                 f"{base.parent} does not exist; the driver creates only the last "
                 "component of --work-dir and refuses to build a tree"
             )
+        _reentry(base.parent)
         base.mkdir()
     canonical = base.resolve()
 
-    # Re-check the canonical form: the path above was proven free of reparse
-    # points at the time of the check, and this is the path all later writes use.
+    # Everything below judges the *resolved* location, which is the path every
+    # later write uses.
     if _reparse_components(canonical, Path(canonical.anchor)):
         raise FixtureSafetyError(f"{canonical} is reached through a reparse point")
+    if canonical.name in ("", canonical.anchor):
+        raise FixtureSafetyError(f"{canonical} is a drive root")
+    if canonical == Path.home():
+        raise FixtureSafetyError(f"{canonical} is the home directory")
+    _refuse_unsafe_base_path(canonical)
     for candidate in (canonical, *canonical.parents):
         if (candidate / ".git").exists():
             raise FixtureSafetyError(
                 f"{canonical} is inside the Git work tree at {candidate}"
             )
-    try:
-        private_root.assert_path_cannot_reenter(canonical)
-    except private_root.PrivateRootError as error:
-        raise FixtureSafetyError(str(error)) from error
+    _reentry(canonical)
     return canonical
 
 
@@ -431,9 +447,22 @@ def _next_attempt_dir(root: Path) -> Path:
         for child in attempts.iterdir()
         if child.is_dir() and child.name.isdigit()
     ]
-    attempt = attempts / str((max(used) + 1) if used else 1)
-    _mkdir_private(attempt)
-    return attempt
+    # Exclusive: two runs reusing the same root must never share an attempt
+    # directory, or their logs and evidence would interleave. A collision takes
+    # the next number; running out of numbers refuses the run.
+    for _ in range(32):
+        attempt = attempts / str((max(used) + 1) if used else 1)
+        try:
+            private_root.create_private_dir_exclusive(attempt)
+        except FileExistsError:
+            used = [*used, int(attempt.name)]
+            continue
+        except private_root.PrivateRootError as error:
+            raise FixtureSafetyError(str(error)) from error
+        return attempt
+    raise FixtureSafetyError(
+        f"{attempts} has no free attempt directory; refusing to share one"
+    )
 
 
 def make_fixture(
