@@ -117,10 +117,12 @@ separate filesystem operations, so a process that can create entries inside an
 *owned* fixture root between the two could still win the race. This is recorded
 rather than defended, for a specific reason:
 
-* the fixture root is already owned by the invoking user and lives under the OS
-  temporary directory; a process that can create entries there is running as the
-  same OS user and already has the operator's authority. That is exactly the
-  C3/R-1 same-user boundary that this program does not solve;
+* the fixture root is created with owner-only permissions on POSIX (`0o700`) and
+  a reused root that is group- or world-accessible is refused, so another user
+  cannot create entries in it at all. Where the root is nevertheless writable by
+  a second user (a deliberately shared parent with permissive ACLs), the residual
+  is the C3/R-1 same-user/shared-directory boundary that this program does not
+  solve;
 * what the scan does guarantee is the property that mattered: an operator cannot
   point the harness at a root that *already* redirects somewhere else. The scan
   runs before the ownership marker is read, so a marker reachable through a hard

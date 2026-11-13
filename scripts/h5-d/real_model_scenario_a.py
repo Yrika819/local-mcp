@@ -205,6 +205,26 @@ def _assert_disposable_base(base: Path) -> Path:
     return canonical
 
 
+def _assert_private_fixture_root(root: Path) -> None:
+    """A fixture root must not be writable by anyone but its owner.
+
+    Review round 5 (R1b): a group- or world-writable root lets another user
+    replace a fixture file with a link between the hazard scan and the write, and
+    the harness would then write with the operator's authority. Windows `%TEMP%`
+    is already per-user, so this is a POSIX check; a root that fails it is
+    refused rather than silently chmod-ed, because changing another directory's
+    permissions is not this harness's decision.
+    """
+    if os.name == "nt":
+        return
+    mode = stat.S_IMODE(root.lstat().st_mode)
+    if mode & 0o077:
+        raise FixtureSafetyError(
+            f"{root} is group- or world-accessible (mode {oct(mode)}); "
+            "a shared fixture root cannot be proven private, so it is refused"
+        )
+
+
 def _write_marker(root: Path, run_id: str) -> None:
     marker = {
         "schema": FIXTURE_MARKER_SCHEMA,
@@ -351,9 +371,12 @@ def make_fixture(
         if _reparse_components(root, base):
             raise FixtureSafetyError(f"{root} is reached through a reparse point")
         _refuse_reused_root_hazards(root)
+        _assert_private_fixture_root(root)
         _claim_existing_root(root, run_id)
     else:
         root.mkdir()
+        if os.name != "nt":
+            os.chmod(root, 0o700)
         _write_marker(root, run_id)
 
     if _reparse_components(root, base):
