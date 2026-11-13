@@ -37,8 +37,8 @@ works only in `.local/h53`.
 | H5.3-C D1 host kill / Job Object | **PASS** | §4 |
 | H5.3-C D2 surviving lock holder | **PASS** | §5 |
 | H5.3-D R2-11 / F5 | **PARTIAL** | §4 below |
-| H5.3-E independent review | see §5 | |
-| H5.3-F CI / integration readiness | see §6 | |
+| H5.3-E independent review | **DONE** | 5 rounds, `gpt-6.1-terra` high, 0 Critical / 0 High; H5_3_EVIDENCE.md §8 |
+| H5.3-F CI / integration readiness | see §6 and the PR #57 checks | |
 
 ## 3. Defects found by real execution and closed in H5.3
 

@@ -241,3 +241,55 @@ designed contract, with `replace_tasks` as the repair primitive.
 | A real *detached* `atomic-publish` helper surviving the host | `NOT_VERIFIED` and not attempted; the Job Object is designed to prevent it |
 | `codex --sandbox read-only` being usable on Windows | `NOT_VERIFIED` as a capability; it is recorded as broken |
 | C3 / R-1 OS-user separation | unresolved design constraint, unchanged |
+
+## 8. H5.3-E — independent security review (real, recorded)
+
+| Item | Value |
+| --- | --- |
+| Model | `gpt-6.1-terra` (explicit `-m`), reasoning `high` |
+| Transport | `codex exec`, prompt on stdin |
+| Context | independent: a fresh `codex exec` process per round, no implementation history, no shared session with the implementer |
+| Target | a detached worktree at the frozen commit (`.local/h53-review`), so the reviewer could not touch the deliverable |
+| Read capability | `--sandbox workspace-write` **inside the throwaway worktree only**, because `--sandbox read-only` cannot read the workspace on Windows (H53-4) |
+| Modification check | `git status --short` in the review worktree was empty after every round |
+| Rounds | 5 |
+
+Round-by-round disposition:
+
+| Round | HEAD | Findings | Disposition |
+| --- | --- | --- | --- |
+| 1 | `a819904` | Medium: nested symlink inside a reused fixture root; Medium: published resolve rule stricter than the validator; Low: unpublished `REQUIRE_READONLY_REASSESSMENT` barrier | all three reproduced and fixed |
+| 2 | `575847d` | R1 PARTIAL (depth limit, digest followed links); R3 PARTIAL (barrier both too strict and too loose); Low: drift test only matched substrings | all fixed (unbounded scan, digest refuses indirection, barrier rewritten, behavioural test added) |
+| 3 | `119dbfc` | Medium: hard links are not reparse points, so a fixture file could alias an outside file; Medium: barrier still differed in four ways; Low: substring drift test | all fixed (hard links refused, wording corrected, approved wording pinned by exact equality) |
+| 4 | `de92563` | R3 FIXED, drift test acceptable; R1 PARTIAL — the marker was read before the scan, and the scan/write pair is not atomic | ordering fixed; TOCTOU documented as a C3/R-1 residual |
+| 5 | `f74b805` | R1a FIXED, ordering SAFE, no new findings; R1b kept open for a group/world-writable root | roots are now created `0o700` on POSIX and a shared root is refused |
+
+**Critical / High findings across all five rounds: 0.**
+
+The reviewer's mechanical verdict on the last round was `NOT_READY` for one
+harness-only reason: on a deliberately shared, group-writable fixture directory
+another user could still race the harness. That is now refused for any root the
+harness can see, and what remains is the C3/R-1 same-user/shared-directory
+boundary. It is a residual of the *test harness*, not of the product's authority
+model: the product's write path is the publication helper and the host grant, not
+this script.
+
+Reviewer-declared `NOT_VERIFIED` in every round, carried forward here:
+
+* Windows junction traversal and concurrent filesystem replacement were reasoned
+  about, not executed;
+* the reviewer did not run the test suite (by instruction), so it reviewed code
+  and diffs, not observed behaviour;
+* crash recovery, revocation and Job Object containment were not re-verified with
+  live processes by the reviewer — H5.3-C's own harness is that evidence.
+
+## 9. Separation of evidence classes (required by the brief)
+
+| Class | What it is | Where |
+| --- | --- | --- |
+| Fixed fixture / deterministic answers | C1's writer path, D1/D2 entirely | `crash_host_kill.py`, `real_model_scenario_c.py` |
+| Host fault injection | the 2 MiB `RESPONSE_TOO_LARGE` trigger in C1 | `real_model_scenario_c.py` |
+| Real OS processes | Job Object containment, `TerminateProcess`, a live lock holder | `crash_host_kill.py` D1/D2 |
+| Real model inference | C1 and C2, `gpt-6.1-terra` high | `real_model_scenario_c.py`, `real_model_scenario_c2.py` |
+| Rust test suite | 1700 tests with `test-grant-fixture`, 1696 without | CI matrix + local runs |
+| Independent review | 5 read-only rounds by a separate `codex exec` context | this section |
