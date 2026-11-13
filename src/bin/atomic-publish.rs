@@ -101,6 +101,15 @@ fn main() {
         }
     };
 
+    // H5.3-C: test-only hold inside the publication critical section.
+    //
+    // Compiled only under the non-default `test-grant-fixture` feature, so a
+    // shipped helper has no such seam. It lets a crash-recovery test observe the
+    // helper *while it holds the lock and before it writes*, which is the only
+    // state in which "the host died mid-publication" is reproducible.
+    #[cfg(feature = "test-grant-fixture")]
+    test_hold::hold("in-critical-section", &request.lock_path);
+
     match workspace_publish::publish(workspace_publish::PublishRequest {
         destination: &target,
         parent: &parent,
@@ -117,6 +126,55 @@ fn main() {
             eprintln!("goallatch-publish-error:{}", error.class());
             eprintln!("atomic-publish failed: {error}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// H5.3-C crash-recovery harness seam.
+///
+/// The whole module is compiled out without the `test-grant-fixture` feature, so
+/// this cannot exist in a shipped helper. When `LOCAL_MCP_TEST_HELPER_HOLD`
+/// names a directory, the helper publishes `<point>.reached` (its own pid and the
+/// lock path) and waits for `<point>.release` before it touches the workspace.
+///
+/// A crash-recovery test uses it to prove the helper was *inside* the critical
+/// section — holding the publication lock, having written nothing yet — and only
+/// then kills the host. Because it never runs without the test feature, it cannot
+/// weaken the production publication path.
+#[cfg(feature = "test-grant-fixture")]
+mod test_hold {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// How long the helper waits for a release before continuing on its own.
+    ///
+    /// A bounded wait matters: a harness that dies must not leave the helper
+    /// holding the publication fence forever.
+    const HOLD_LIMIT: Duration = Duration::from_secs(120);
+
+    pub(super) fn hold(point: &str, lock_path: &str) {
+        let Ok(directory) = std::env::var("LOCAL_MCP_TEST_HELPER_HOLD") else {
+            return;
+        };
+        if directory.is_empty() {
+            return;
+        }
+        let directory = PathBuf::from(directory);
+        if std::fs::create_dir_all(&directory).is_err() {
+            return;
+        }
+        let reached = directory.join(format!("{point}.reached"));
+        let release = directory.join(format!("{point}.release"));
+        let record = format!("pid={}\nlock={lock_path}\n", std::process::id());
+        if std::fs::write(&reached, record).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + HOLD_LIMIT;
+        while Instant::now() < deadline {
+            if release.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

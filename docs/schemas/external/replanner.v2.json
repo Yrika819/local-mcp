@@ -656,7 +656,7 @@
       "type": "array"
     },
     "resolve_needs_replan": {
-      "description": "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean",
+      "description": "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean; each listed Task must also gain a new hard dependency in this proposal's add_dependencies",
       "items": {
         "type": "string"
       },

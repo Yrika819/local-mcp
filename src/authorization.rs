@@ -2166,14 +2166,32 @@ pub(crate) fn goal_identity_digest(goal: &Goal) -> Result<String, GrantError> {
 
 /// Convert one canonical absolute operation path to the grant's root-relative
 /// spelling. Both inputs must already be canonical.
+///
+/// H5.3: a `WRITE_UTF8` operation whose `expected_preimage` is `ABSENT` names a
+/// file that does not exist yet, and `fs::canonicalize` fails on a missing path.
+/// The external Writer therefore could not create a file at all, even though the
+/// published contract offers `{kind: ABSENT}`. A missing target is resolved
+/// through its parent instead: the parent must exist and canonicalize inside the
+/// workspace, and the final component is re-attached only after it passes the
+/// same strict component validation as every other segment. A parent that is a
+/// symlink out of the workspace still fails the `strip_prefix` below, so this
+/// does not widen the scope.
 pub(crate) fn relative_workspace_path(
     path: &Path,
     workspace_root: &Path,
 ) -> Result<NormalizedWorkspacePath, GrantRefusal> {
     // Match the root's spelling convention so a Windows verbatim operation path
     // and a compact managed root compare correctly.
-    let path = config::canonical_path_like(path, workspace_root)
-        .map_err(|_| GrantRefusal::ScopeMismatch)?;
+    let path = match config::canonical_path_like(path, workspace_root) {
+        Ok(path) => path,
+        Err(_) => {
+            let name = path.file_name().ok_or(GrantRefusal::ScopeMismatch)?;
+            let parent = path.parent().ok_or(GrantRefusal::ScopeMismatch)?;
+            let parent = config::canonical_path_like(parent, workspace_root)
+                .map_err(|_| GrantRefusal::ScopeMismatch)?;
+            parent.join(name)
+        }
+    };
     let relative = path
         .strip_prefix(workspace_root)
         .map_err(|_| GrantRefusal::ScopeMismatch)?;

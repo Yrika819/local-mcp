@@ -1287,3 +1287,122 @@ fn serde_defaulted_replanner_fields_are_optional_in_the_contract() {
         "serde-defaulted fields must not be required by the published contract"
     );
 }
+
+/// The approved published wording, pinned by
+/// `the_published_replanner_contract_states_the_needs_replan_dependency_requirement`.
+///
+/// A contract sentence is the interface a model reads, so a silent edit is a
+/// contract change. These constants exist so an edit cannot land without a
+/// deliberate update here and a matching behavioural test.
+const APPROVED_RESOLVE_DEPENDENCY_RULE: &str = "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal, so the blocked Task gains a new hard dependency; the `dependency` is that Task's new prerequisite, which is normally a repair Task added by this same proposal (`ref_kind` `NEW`), and an existing Task (`ref_kind` `EXISTING`) is also accepted; a resolution without such an edge is refused as REPLANNER_SCHEMA_VIOLATION";
+
+const APPROVED_READONLY_REASSESSMENT_RULE: &str = "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and that rejected trigger is resolved, either the trigger's dependency chain (including dependencies this proposal adds) reaches a Task that was created after the rejected plan revision, is CODEX_READONLY with READ_ONLY scope, and is completed with no blockers, at least one evidence item, no UNKNOWN side effect and a passing latest verification result, or the chain reaches a new Task that is CODEX_READONLY with READ_ONLY scope and SAFE_READ_ONLY replay safety; in the second case every new Task whose operation_kind is not READ_ONLY must depend on one of those qualifying new READ_ONLY Tasks, and different new mutating Tasks may use different qualifying prerequisites";
+
+#[test]
+fn the_published_replanner_contract_states_the_needs_replan_dependency_requirement() {
+    // H5.2-C: a real model answered `resolve_needs_replan` without the matching
+    // `add_dependencies` edge six times. The validator was right to refuse it,
+    // but the requirement was not published. This test binds the published text
+    // to the enforced rule so the two cannot drift apart again in silence.
+    let replanner = contract::contract_for_role(WorkRole::Replanner);
+
+    let condition = replanner
+        .conditions
+        .iter()
+        .find(|condition| condition.code == "REPLANNER_RESOLVE_REQUIRES_NEW_DEPENDENCY")
+        .expect("the enforced pairing must be a published condition");
+    for needle in [
+        "resolve_needs_replan",
+        "add_dependencies",
+        "task",
+        "dependency",
+        "REPLANNER_SCHEMA_VIOLATION",
+    ] {
+        assert!(
+            condition.detail.contains(needle),
+            "the published resolve condition must mention {needle:?}: {}",
+            condition.detail
+        );
+    }
+
+    // The schema field description carries the same requirement, so a client
+    // that reads only the JSON Schema still sees it.
+    let schema = contract::schema(replanner);
+    let description = schema["properties"]["resolve_needs_replan"]["description"]
+        .as_str()
+        .expect("resolve_needs_replan must publish a description");
+    assert!(
+        description.contains("add_dependencies"),
+        "the field description must state the dependency requirement: {description}"
+    );
+
+    // A published example must be syntactically valid JSON and show both halves
+    // of the relationship. The behavioural half lives in
+    // `replanner::the_published_resolve_needs_replan_shape_is_accepted`.
+    let example = replanner
+        .notes
+        .iter()
+        .find(|note| note.contains("\"add_dependencies\""))
+        .expect("the Replanner notes must publish a resolution example");
+    let start = example
+        .find('{')
+        .expect("the example carries a JSON object");
+    let end = example
+        .rfind('}')
+        .expect("the example carries a JSON object");
+    let fragment: Value =
+        serde_json::from_str(&example[start..=end]).expect("the published fragment is valid JSON");
+    assert!(fragment["add_dependencies"].is_array());
+    assert!(fragment["resolve_needs_replan"].is_array());
+    let edge = &fragment["add_dependencies"][0];
+    assert_eq!(edge["task"]["ref_kind"], json!("EXISTING"));
+    assert_eq!(edge["dependency"]["ref_kind"], json!("NEW"));
+    assert_eq!(
+        fragment["resolve_needs_replan"][0], edge["task"]["task_id"],
+        "the resolved Task must be the edge target, not the edge dependency"
+    );
+
+    // The published rule must not claim more than the validator enforces: the
+    // validator only requires the resolved Task to be an edge *target*, so the
+    // prerequisite may be a NEW repair Task or an EXISTING Task. Publishing the
+    // stricter claim would be the same drift in the other direction.
+    assert!(
+        condition.detail.contains("task") && condition.detail.contains("dependency"),
+        "the rule must name both ends of the edge: {}",
+        condition.detail
+    );
+    assert!(
+        condition.detail.contains("EXISTING") && condition.detail.contains("NEW"),
+        "the rule must state that both prerequisite kinds are accepted: {}",
+        condition.detail
+    );
+
+    // The published claim that an EXISTING prerequisite is accepted must be true
+    // of the validator, not merely written down:
+    // `replanner::resolving_against_a_preexisting_prerequisite_is_accepted` builds
+    // exactly that proposal and asserts it is applied.
+
+    // The conditional readonly-reassessment barrier is published in full, so a
+    // model that resolves a rejected pristine plan is told about the
+    // completed-task exception and the properties a new prerequisite needs.
+    //
+    // Independent review round 3 asked for the *complete approved wording* to be
+    // asserted rather than selected substrings, because "EXISTING is never
+    // accepted" would satisfy a substring check while contradicting the rule.
+    // The text below is therefore pinned exactly; changing it is a deliberate
+    // contract change that must also re-read `validate_readonly_reassessment_barrier`
+    // and `replanner::the_published_resolve_needs_replan_shape_is_accepted`.
+    let barrier = replanner
+        .conditions
+        .iter()
+        .find(|condition| condition.code == "REPLANNER_READONLY_REASSESSMENT_BARRIER")
+        .expect("the conditional reassessment barrier must be published");
+    assert_eq!(
+        barrier.detail, APPROVED_READONLY_REASSESSMENT_RULE,
+        "the published reassessment rule must be the approved wording, not merely contain it"
+    );
+    assert_eq!(
+        condition.detail, APPROVED_RESOLVE_DEPENDENCY_RULE,
+        "the published resolve rule must be the approved wording, not merely contain it"
+    );
+}

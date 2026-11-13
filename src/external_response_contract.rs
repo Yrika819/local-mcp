@@ -137,8 +137,34 @@ pub(crate) const LIMIT_SHA256_HEX: usize = 64;
 pub(crate) const READONLY_STATUS_VALUES: &[&str] =
     &["candidate_complete", "blocked", "needs_replan", "failed"];
 
-pub(crate) const REPLANNER_RESOLVE_NOTE: &str =
-    "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean";
+pub(crate) const REPLANNER_RESOLVE_NOTE: &str = "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean; each listed Task must also gain a new hard dependency in this proposal's add_dependencies";
+
+/// The exact pairing `replanner.rs` enforces when it applies a resolution.
+///
+/// H5.2-C: a real model repeatedly answered `resolve_needs_replan` without the
+/// matching `add_dependencies` edge. The host was right to refuse it, but the
+/// published contract did not say so. The wording below is derived from, and
+/// must stay equivalent to, the `dependency_targets` check in
+/// `src/replanner.rs::validate`.
+pub(crate) const REPLANNER_RESOLVE_DEPENDENCY_RULE: &str = "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal, so the blocked Task gains a new hard dependency; the `dependency` is that Task's new prerequisite, which is normally a repair Task added by this same proposal (`ref_kind` `NEW`), and an existing Task (`ref_kind` `EXISTING`) is also accepted; a resolution without such an edge is refused as REPLANNER_SCHEMA_VIOLATION";
+
+/// What `validate_readonly_reassessment_barrier` actually enforces.
+///
+/// Published because the rule is conditional: it applies only when the host
+/// recorded a pre-execution plan rejection with the `REQUIRE_READONLY_REASSESSMENT`
+/// policy. It is deliberately stated in full, including the completed-task
+/// exception and the worker and replay-safety qualifiers, because a partial
+/// statement is as misleading as no statement.
+pub(crate) const REPLANNER_READONLY_REASSESSMENT_RULE: &str = "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and that rejected trigger is resolved, either the trigger's dependency chain (including dependencies this proposal adds) reaches a Task that was created after the rejected plan revision, is CODEX_READONLY with READ_ONLY scope, and is completed with no blockers, at least one evidence item, no UNKNOWN side effect and a passing latest verification result, or the chain reaches a new Task that is CODEX_READONLY with READ_ONLY scope and SAFE_READ_ONLY replay safety; in the second case every new Task whose operation_kind is not READ_ONLY must depend on one of those qualifying new READ_ONLY Tasks, and different new mutating Tasks may use different qualifying prerequisites";
+
+/// A short, valid JSON fragment of the resolution relationship.
+///
+/// It is a fragment on purpose: the identity echo is published by
+/// `REPLANNER_BASE_REVISION_ECHO` and the full repair Task object by the
+/// `replanner_task` definition. `the_published_resolve_needs_replan_shape_is_accepted`
+/// in `src/replanner.rs` proves that a complete proposal carrying exactly this
+/// relationship is accepted, so the published shape is not aspirational.
+pub(crate) const REPLANNER_RESOLVE_EXAMPLE: &str = r#"resolve a NEEDS_REPLAN Task by adding the repair Task and pointing the blocked Task at it in the same proposal (a fragment of the full replanner object, not a complete answer): {"add_dependencies":[{"task":{"ref_kind":"EXISTING","task_id":"<blocked-task-id>"},"dependency":{"ref_kind":"NEW","proposal_id":"<new-repair-proposal_id>"}}],"resolve_needs_replan":["<blocked-task-id>"]}"#;
 
 // ---------------------------------------------------------------------------
 // Field contract.
@@ -687,8 +713,16 @@ const REPLANNER_CONDITIONS: &[Condition] = &[
         detail: REPLANNER_RESOLVE_NOTE,
     },
     Condition {
+        code: "REPLANNER_RESOLVE_REQUIRES_NEW_DEPENDENCY",
+        detail: REPLANNER_RESOLVE_DEPENDENCY_RULE,
+    },
+    Condition {
         code: "REPLANNER_EXCLUSIVE_PRIMITIVES",
         detail: "pristine_plan_supersession and replace_tasks may not be combined with the additive fields, with each other, or with a scope wider than the Task being replaced",
+    },
+    Condition {
+        code: "REPLANNER_READONLY_REASSESSMENT_BARRIER",
+        detail: REPLANNER_READONLY_REASSESSMENT_RULE,
     },
     Condition {
         code: "REPLANNER_HOST_REVALIDATION",
@@ -813,6 +847,8 @@ const REPLANNER_NOTES: &[&str] = &[
     "Return exactly one JSON object. Any additional property is refused.",
     "Additive replanning is monotonic: add Tasks, dependencies, verification, mandatory flags, criterion bindings, or resolve needs_replan.",
     "Replacement primitives are typed and travel with explicit request ids issued by the host.",
+    REPLANNER_RESOLVE_EXAMPLE,
+    "A Task whose own shape was already too large, too broad, or outside its budget can never succeed on an unchanged replay: resolving it adds the repair prerequisite but the host will never re-arm that Task, so it can only be finalised through replace_tasks.",
 ];
 
 pub(crate) const CONTRACTS: &[ResponseContract] = &[

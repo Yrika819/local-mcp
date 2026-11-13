@@ -228,11 +228,19 @@
         },
         {
           "code": "REPLANNER_RESOLVE_NEEDS_REPLAN_ARRAY",
-          "detail": "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean"
+          "detail": "resolve_needs_replan is a JSON array of existing Task id strings, never a boolean; each listed Task must also gain a new hard dependency in this proposal's add_dependencies"
+        },
+        {
+          "code": "REPLANNER_RESOLVE_REQUIRES_NEW_DEPENDENCY",
+          "detail": "each id in resolve_needs_replan must be the `task` of an add_dependencies entry in the same proposal, so the blocked Task gains a new hard dependency; the `dependency` is that Task's new prerequisite, which is normally a repair Task added by this same proposal (`ref_kind` `NEW`), and an existing Task (`ref_kind` `EXISTING`) is also accepted; a resolution without such an edge is refused as REPLANNER_SCHEMA_VIOLATION"
         },
         {
           "code": "REPLANNER_EXCLUSIVE_PRIMITIVES",
           "detail": "pristine_plan_supersession and replace_tasks may not be combined with the additive fields, with each other, or with a scope wider than the Task being replaced"
+        },
+        {
+          "code": "REPLANNER_READONLY_REASSESSMENT_BARRIER",
+          "detail": "when the host recorded a pre-execution plan rejection with the REQUIRE_READONLY_REASSESSMENT policy and that rejected trigger is resolved, either the trigger's dependency chain (including dependencies this proposal adds) reaches a Task that was created after the rejected plan revision, is CODEX_READONLY with READ_ONLY scope, and is completed with no blockers, at least one evidence item, no UNKNOWN side effect and a passing latest verification result, or the chain reaches a new Task that is CODEX_READONLY with READ_ONLY scope and SAFE_READ_ONLY replay safety; in the second case every new Task whose operation_kind is not READ_ONLY must depend on one of those qualifying new READ_ONLY Tasks, and different new mutating Tasks may use different qualifying prerequisites"
         },
         {
           "code": "REPLANNER_HOST_REVALIDATION",
@@ -250,7 +258,9 @@
       "notes": [
         "Return exactly one JSON object. Any additional property is refused.",
         "Additive replanning is monotonic: add Tasks, dependencies, verification, mandatory flags, criterion bindings, or resolve needs_replan.",
-        "Replacement primitives are typed and travel with explicit request ids issued by the host."
+        "Replacement primitives are typed and travel with explicit request ids issued by the host.",
+        "resolve a NEEDS_REPLAN Task by adding the repair Task and pointing the blocked Task at it in the same proposal (a fragment of the full replanner object, not a complete answer): {\"add_dependencies\":[{\"task\":{\"ref_kind\":\"EXISTING\",\"task_id\":\"<blocked-task-id>\"},\"dependency\":{\"ref_kind\":\"NEW\",\"proposal_id\":\"<new-repair-proposal_id>\"}}],\"resolve_needs_replan\":[\"<blocked-task-id>\"]}",
+        "A Task whose own shape was already too large, too broad, or outside its budget can never succeed on an unchanged replay: resolving it adds the repair prerequisite but the host will never re-arm that Task, so it can only be finalised through replace_tasks."
       ],
       "optional_fields": [
         "add_tasks",
@@ -270,7 +280,7 @@
         "summary"
       ],
       "role": "REPLANNER",
-      "schema_digest": "sha256:a91c9757ed5cc6251771fd885d7e63b84cb822c9a36ec24c819b0504aff56054"
+      "schema_digest": "sha256:31d928e2080df6c2f5d09832afd58f232c19fe7e7dca2cfd1225ee80ebd242da"
     }
   ]
 }

@@ -141,6 +141,13 @@ impl DriverError {
             Self::Persistence(OrchestratorError::GoalNotFound) => "GOAL_NOT_FOUND",
             Self::Persistence(OrchestratorError::CorruptGoal(_)) => "GOAL_STATE_CORRUPT",
             Self::Persistence(OrchestratorError::UnsupportedSchema(_)) => "UNSUPPORTED_GOAL_SCHEMA",
+            // H5.3: a durable state refusal is not a storage failure. Reporting
+            // `PENDING -> READY` as `GOAL_PERSISTENCE_ERROR` told an operator the
+            // disk broke when the Goal was in fact refusing an impossible
+            // transition, which is the opposite of the truth.
+            Self::Persistence(OrchestratorError::InvalidTransition { .. }) => {
+                "GOAL_TASK_TRANSITION_REFUSED"
+            }
             Self::Persistence(_) => "GOAL_PERSISTENCE_ERROR",
             Self::RequestUnavailable { code, .. } => code,
         }
@@ -155,6 +162,9 @@ impl DriverError {
             }
             Self::Persistence(OrchestratorError::RevisionConflict { .. }) => {
                 "the goal changed while the host was deciding the next external step"
+            }
+            Self::Persistence(OrchestratorError::InvalidTransition { .. }) => {
+                "the durable task DAG refused a transition; the goal needs reconciliation, not a retry"
             }
             Self::Persistence(_) => "durable goal persistence failed",
             Self::RequestUnavailable { detail, .. } => detail,
@@ -1094,4 +1104,40 @@ fn build_planner_request(
         });
     }
     Ok((payload, OUTPUT_CONTRACT_PLANNER_V1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H5.3: a durable state refusal must never be reported as a storage failure.
+    ///
+    /// A real recovery run reached `PENDING -> READY` for a Task whose failure
+    /// class forbids an unchanged retry, and the client was told
+    /// `GOAL_PERSISTENCE_ERROR`. An operator reading that looks at the disk.
+    #[test]
+    fn a_durable_transition_refusal_is_not_reported_as_a_persistence_failure() {
+        let error = DriverError::Persistence(OrchestratorError::InvalidTransition {
+            entity: "task",
+            from: "PENDING".to_owned(),
+            to: "READY".to_owned(),
+            reason: "structured failure class forbids replaying the identical Task shape"
+                .to_owned(),
+        });
+        assert_eq!(error.code(), "GOAL_TASK_TRANSITION_REFUSED");
+        assert_ne!(error.code(), "GOAL_PERSISTENCE_ERROR");
+        assert!(
+            error.message().contains("reconciliation"),
+            "the message must point at recovery, not at the store: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_genuine_store_failure_is_still_a_persistence_failure() {
+        let error = DriverError::Persistence(OrchestratorError::PersistenceIo(
+            std::io::Error::other("disk"),
+        ));
+        assert_eq!(error.code(), "GOAL_PERSISTENCE_ERROR");
+    }
 }
